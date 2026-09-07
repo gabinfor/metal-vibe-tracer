@@ -116,7 +116,7 @@ final class StudioController: NSViewController {
   var project = ProjectDocument()
   var projectURL: URL?
   var importInProgress = false
-  var isBusy: Bool { exportRenderer != nil || importInProgress }
+  var isBusy: Bool { exportRenderer != nil || previewDenoiseJob != nil || importInProgress }
   var pauseButton: NSButton?
   private let autosaveQueue = DispatchQueue(label: "VibeTracer.autosave", qos: .utility)
   var selectedSlot = 1, page = 0, sidebarVisible = true
@@ -132,12 +132,16 @@ final class StudioController: NSViewController {
   var exportURL: URL?
   var exportHDR = false, exportRaw = false, exportDenoise = true, previousPaused = false
   var exportDenoiseJob: OIDNProgress?
+  var previewDenoiseJob: OIDNProgress?
+  var oidnPreviewWasPaused = false
   var messageUntil = Date.distantPast
   static let sceneNames = [
     "Architectural Pavilion", "Cornell Box", "Veach MIS Benchmark", "Cornell Glass & Mirror",
     "Cornell Fog Study", "Reflective Ring Study", "Imported Mesh Studio",
   ]
-  static let strategyNames = ["ReSTIR DI", "Standard MIS", "Light Only (NEE)", "BSDF Only"]
+  static let strategyNames = [
+    "ReSTIR Direct + Path-Traced GI", "Standard MIS", "Light Only (NEE)", "BSDF Only",
+  ]
   override var undoManager: UndoManager? { history }
 
   init(renderer: PathTracerRenderer, window: NSWindow) {
@@ -279,6 +283,12 @@ final class StudioController: NSViewController {
       button("Cancel Export") { [weak self] in self?.cancelExport() }
       return
     }
+    if previewDenoiseJob != nil {
+      heading("OIDN preview…")
+      text("The current accumulation is frozen while OIDN denoises it.")
+      button("Cancel OIDN Preview") { [weak self] in self?.cancelOIDNPreview() }
+      return
+    }
     switch page {
     case 0: renderPanel()
     case 1: cameraPanel()
@@ -305,9 +315,16 @@ final class StudioController: NSViewController {
       self.rebuild()
     }
     if renderer.samplingMode != 0 {
-      text("MetalFX is available with ReSTIR DI. This strategy displays raw accumulation.")
+      text("MetalFX is available with ReSTIR Direct + Path-Traced GI. This strategy displays raw accumulation.")
     }
     if !renderer.supportsMetalFX { text("MetalFX is not supported by this GPU.") }
+    if renderer.offlineDenoisedPreview != nil {
+      button("Clear OIDN Preview") { [weak self] in self?.clearOIDNPreview() }
+      text("The viewport and preview capture show the OIDN result. Clearing it restores the previous render state.")
+    } else {
+      button("OIDN Preview Current Frame") { [weak self] in self?.startOIDNPreview() }
+      text("Freezes and denoises the current accumulated samples at the preview render resolution.")
+    }
     number(
       "Sample limit (0 = unlimited)", Float(renderer.options.maxSamples), 0...16384, 0, reset: false
     ) { [weak self] in self?.renderer.options.maxSamples = UInt32($0.rounded()) }
@@ -735,6 +752,10 @@ final class StudioController: NSViewController {
   }
   func pause() {
     guard !isBusy else { return }
+    if renderer.offlineDenoisedPreview != nil {
+      clearOIDNPreview(resume: true)
+      return
+    }
     renderer.paused.toggle()
     renderer.lastTick = Date()
     messageUntil = .distantPast

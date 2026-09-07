@@ -2256,6 +2256,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var lastCompletion = Date()
     var presentationNeedsRefresh = true
     var lastDisplay: MTLTexture?
+    var offlineDenoisedPreview: MTLTexture?
     var lastUniforms: Uniforms?
     var onFrameUpdate: ((UInt32) -> Void)?
     var onError: ((String) -> Void)?
@@ -2365,6 +2366,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         renderElapsed = 0; lastTick = Date(); completedSamples = 0
         generation &+= 1
         frameIndex = 0
+        if offlineDenoisedPreview != nil {
+            offlineDenoisedPreview = nil
+            paused = false
+        }
         if resetDenoiser { metalFXHistoryNeedsReset = true }
     }
 
@@ -2455,7 +2460,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 
     // Refresh only the display while paused/stopped; never trace another sample.
     func presentCurrentFrame(_ command: MTLCommandBuffer, output: MTLTexture) -> Bool {
-        guard let raw=accumTexture, let display=lastDisplay else { return false }
+        guard let raw=accumTexture else { return false }
+        if let oidn = offlineDenoisedPreview {
+            lastPresentationUsedMetalFX = false
+            return encodeDisplay(command,display:oidn,raw:raw,output:output)
+        }
+        guard let display=lastDisplay else { return false }
         if presentationNeedsRefresh, let samples=sampleTexture, let positions=historyPosDepth,
            let normals=historyNormalMat, let albedo=gbufferAlbedoRough, let uniforms=lastUniforms {
             return encodePresentation(commandBuffer:command,accumulation:raw,samples:samples,

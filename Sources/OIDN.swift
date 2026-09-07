@@ -38,6 +38,21 @@ struct OIDNImage {
   let width: Int
   let height: Int
   let pixels: [SIMD4<Float>]
+
+  func makeTexture(device: MTLDevice) throws -> MTLTexture {
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+    descriptor.storageMode = .shared
+    descriptor.usage = [.shaderRead]
+    guard let texture = device.makeTexture(descriptor: descriptor) else {
+      throw MaterialLibrary.error("Could not allocate the OIDN result texture.")
+    }
+    pixels.withUnsafeBytes { bytes in
+      texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
+        withBytes: bytes.baseAddress!, bytesPerRow: width * 16)
+    }
+    return texture
+  }
 }
 
 // REFERENCES.md: OIDN250. Thin dynamic binding to the upstream C99 API.

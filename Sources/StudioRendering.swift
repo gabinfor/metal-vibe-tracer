@@ -191,17 +191,7 @@ extension StudioController {
         let image = try OIDNDenoiser.denoise(
           color: color, albedo: albedo, normal: normal, commandQueue: r.commandQueue,
           progress: job)
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-          pixelFormat: .rgba32Float, width: image.width, height: image.height, mipmapped: false)
-        descriptor.storageMode = .shared
-        descriptor.usage = [.shaderRead]
-        guard let texture = r.device.makeTexture(descriptor: descriptor) else {
-          throw MaterialLibrary.error("Could not allocate the denoised export texture.")
-        }
-        image.pixels.withUnsafeBytes { bytes in
-          texture.replace(region: MTLRegionMake2D(0, 0, image.width, image.height), mipmapLevel: 0,
-            withBytes: bytes.baseAddress!, bytesPerRow: image.width * 16)
-        }
+        let texture = try image.makeTexture(device: r.device)
         DispatchQueue.main.async { [weak self, weak r, weak job] in
           guard let self, let r, let job, self.exportDenoiseJob === job,
             self.exportRenderer === r else { return }
@@ -254,6 +244,77 @@ extension StudioController {
       }
     }
     command.commit()
+  }
+
+  func startOIDNPreview() {
+    guard !isBusy else { return }
+    guard OIDNDenoiser.isAvailable else {
+      show("Open Image Denoise is unavailable. Rebuild the app to install OIDN.")
+      return
+    }
+    guard renderer.completedSamples > 0, let color = renderer.accumTexture,
+      let albedo = renderer.gbufferAlbedoRough, let normal = renderer.historyNormalMat
+    else {
+      show("Wait for at least one completed sample before previewing OIDN.")
+      return
+    }
+    let samples = renderer.completedSamples
+    oidnPreviewWasPaused = renderer.paused
+    renderer.paused = true
+    let job = OIDNProgress()
+    previewDenoiseJob = job
+    job.onProgress = { [weak self, weak job] fraction in
+      DispatchQueue.main.async {
+        guard let self, let job, self.previewDenoiseJob === job else { return }
+        self.status.stringValue = "OIDN preview: \(Int(fraction * 100))%"
+      }
+    }
+    rebuild()
+    status.stringValue = "Preparing OIDN preview of \(samples) spp…"
+    DispatchQueue.global(qos: .userInitiated).async { [weak self, weak job] in
+      guard let self, let job else { return }
+      do {
+        let image = try OIDNDenoiser.denoise(
+          color: color, albedo: albedo, normal: normal, commandQueue: self.renderer.commandQueue,
+          progress: job)
+        let texture = try image.makeTexture(device: self.renderer.device)
+        DispatchQueue.main.async { [weak self, weak job] in
+          guard let self, let job, self.previewDenoiseJob === job else { return }
+          self.previewDenoiseJob = nil
+          self.renderer.offlineDenoisedPreview = texture
+          self.renderer.presentationNeedsRefresh = true
+          self.rebuild()
+          self.show("Showing OIDN preview of \(samples) spp")
+        }
+      } catch {
+        DispatchQueue.main.async { [weak self, weak job] in
+          guard let self, let job, self.previewDenoiseJob === job else { return }
+          self.previewDenoiseJob = nil
+          self.renderer.paused = self.oidnPreviewWasPaused
+          self.renderer.lastTick = Date()
+          self.rebuild()
+          self.show("OIDN preview failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  func cancelOIDNPreview() {
+    previewDenoiseJob?.cancel()
+    previewDenoiseJob = nil
+    renderer.paused = oidnPreviewWasPaused
+    renderer.lastTick = Date()
+    rebuild()
+    show("OIDN preview cancelled")
+  }
+
+  func clearOIDNPreview(resume: Bool = false) {
+    renderer.offlineDenoisedPreview = nil
+    renderer.presentationNeedsRefresh = true
+    renderer.paused = resume ? false : oidnPreviewWasPaused
+    renderer.lastTick = Date()
+    rebuild()
+    show(resume ? "Resumed live rendering" : "Cleared OIDN preview")
   }
   func capturePreview() {
     guard !isBusy, let raw = renderer.accumTexture, renderer.lastDisplay != nil

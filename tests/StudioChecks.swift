@@ -212,6 +212,18 @@ for page in 0..<6 {
     require(controller.stack.arrangedSubviews.count>3,"inspector page \(page) contains controls")
     require(controller.sidebar.frame.width>300 && controller.viewport.frame.width>300,"inspector layout leaves room for viewport")
 }
+frameDone=false
+testRenderer.onFrameUpdate={_ in frameDone=true}
+testRenderer.renderFrame(output:studioOutput);waitUntil({frameDone})
+controller.startOIDNPreview()
+waitUntil({controller.previewDenoiseJob==nil},seconds:45)
+require(testRenderer.offlineDenoisedPreview != nil && testRenderer.paused,"controller displays a frozen OIDN viewport preview")
+let oidnPreviewCommand=testRenderer.commandQueue.makeCommandBuffer()!
+require(testRenderer.presentCurrentFrame(oidnPreviewCommand,output:studioOutput),"OIDN viewport presentation encodes")
+oidnPreviewCommand.commit();oidnPreviewCommand.waitUntilCompleted()
+require(oidnPreviewCommand.status == .completed && !testRenderer.lastPresentationUsedMetalFX,"OIDN viewport preview bypasses MetalFX")
+controller.clearOIDNPreview()
+require(testRenderer.offlineDenoisedPreview == nil && !testRenderer.paused,"clearing OIDN preview restores live rendering")
 controller.page=3;controller.rebuild();controller.view.layoutSubtreeIfNeeded()
 if let rep=controller.sidebar.bitmapImageRepForCachingDisplay(in:controller.sidebar.bounds) {
     controller.sidebar.cacheDisplay(in:controller.sidebar.bounds,to:rep)
@@ -245,4 +257,4 @@ waitUntil({controller.exportRenderer==nil},seconds:45)
 let exported=NSBitmapImageRep(data:try Data(contentsOf:exportURL))!
 require(exported.pixelsWide==48 && exported.pixelsHigh==32,"controller export uses requested output dimensions")
 controller.saveTimer?.invalidate();controller.viewport.delegate=nil
-print("PASS: six AppKit inspector pages, undo/redo, independent export flow")
+print("PASS: six AppKit inspector pages, OIDN viewport preview, undo/redo, independent export flow")
