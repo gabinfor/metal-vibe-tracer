@@ -1,0 +1,18 @@
+<materialx version="1.39"><nodegraph name="Graph">
+  <input name="tint" type="color3" value="0.8,0.2,0.1"/>
+  <constant name="red" type="color3"><input name="value" type="color3" interfacename="tint"/></constant>
+  <mix name="blend" type="color3">
+    <input name="bg" type="color3" nodename="red"/>
+    <input name="fg" type="color3" value="0.2,0.4,0.9"/>
+    <input name="mix" type="float" value="0.25"/>
+  </mix>
+  <multiply name="mul" type="float"><input name="in1" type="float" value="0.8"/><input name="in2" type="float" value="0.5"/></multiply>
+  <output name="color" type="color3" nodename="blend"/>
+  <output name="rough" type="float" nodename="mul"/>
+</nodegraph>
+<open_pbr_surface name="Paint" type="surfaceshader">
+  <input name="base_color" type="color3" nodegraph="Graph" output="color"/>
+  <input name="specular_roughness" type="float" nodegraph="Graph" output="rough"/>
+  <input name="coat_weight" type="float" value="0.3"/>
+  <input name="coat_roughness" type="float" value="0.2"/>
+</open_pbr_surface></materialx>

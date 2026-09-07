@@ -1,0 +1,14 @@
+#usda 1.0
+(
+    subLayers = [@StandardShaderBall/standard_shader_ball_scene.usda@]
+    metersPerUnit = 0.01
+    upAxis = "Y"
+    startTimeCode = 3
+    endTimeCode = 3
+)
+over "standard_shader_ball_scene" (
+    variants = {
+        string surface_geometry = "triangulated"
+        string example_material = "usdpreview_plastic"
+    }
+) {}
