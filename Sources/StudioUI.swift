@@ -106,12 +106,15 @@ final class ActionColor: NSColorWell {
   }
   @objc func changed() { update?(color) }
 }
+final class TopAlignedStackView: NSStackView {
+  override var isFlipped: Bool { true }
+}
 
 final class StudioController: NSViewController {
   let renderer: PathTracerRenderer
   weak var hostWindow: NSWindow?
   let viewport: InteractiveMTKView
-  let sidebar = NSScrollView(), stack = NSStackView(), status = NSTextField(labelWithString: "")
+  let sidebar = NSScrollView(), stack = TopAlignedStackView(), status = NSTextField(labelWithString: "")
   let history = UndoManager()
   var project = ProjectDocument()
   var projectURL: URL?
@@ -140,8 +143,9 @@ final class StudioController: NSViewController {
     "Cornell Fog Study", "Reflective Ring Study", "Imported Mesh Studio",
   ]
   static let strategyNames = [
-    "ReSTIR Direct + Path-Traced GI", "Standard MIS", "Light Only (NEE)", "BSDF Only",
+    "ReSTIR Direct + First-Bounce GI", "Standard MIS", "Light Only (NEE)", "BSDF Only",
   ]
+  static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 
   init(renderer: PathTracerRenderer, window: NSWindow) {
@@ -195,6 +199,8 @@ final class StudioController: NSViewController {
     stack.orientation = .vertical
     stack.alignment = .leading
     stack.spacing = 10
+    stack.setContentHuggingPriority(.required, for: .vertical)
+    stack.setContentCompressionResistancePriority(.required, for: .vertical)
     stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 16, right: 12)
     sidebar.documentView = stack
     status.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -271,7 +277,7 @@ final class StudioController: NSViewController {
       child.removeFromSuperview()
     }
     popup(
-      ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page
+      ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export", "Settings"], page
     ) { [weak self] i in
       self?.page = i
       self?.rebuild()
@@ -295,7 +301,8 @@ final class StudioController: NSViewController {
     case 2: lightingPanel()
     case 3: materialPanel()
     case 4: objectPanel()
-    default: filePanel()
+    case 5: filePanel()
+    default: settingsPanel()
     }
   }
   func renderPanel() {
@@ -315,7 +322,7 @@ final class StudioController: NSViewController {
       self.rebuild()
     }
     if renderer.samplingMode != 0 {
-      text("MetalFX is available with ReSTIR Direct + Path-Traced GI. This strategy displays raw accumulation.")
+      text("MetalFX is available with ReSTIR Direct + First-Bounce GI. This strategy displays raw accumulation.")
     }
     if !renderer.supportsMetalFX { text("MetalFX is not supported by this GPU.") }
     if renderer.offlineDenoisedPreview != nil {
@@ -325,16 +332,14 @@ final class StudioController: NSViewController {
       button("OIDN Preview Current Frame") { [weak self] in self?.startOIDNPreview() }
       text("Freezes and denoises the current accumulated samples at the preview render resolution.")
     }
-    number(
-      "Sample limit (0 = unlimited)", Float(renderer.options.maxSamples), 0...16384, 0, reset: false
-    ) { [weak self] in self?.renderer.options.maxSamples = UInt32($0.rounded()) }
-    number(
-      "Time limit, seconds (0 = unlimited)", Float(renderer.options.timeLimit), 0...3600, 0,
-      reset: false
-    ) { [weak self] in self?.renderer.options.timeLimit = Double($0) }
-    option("Preview resolution scale", \.previewScale, 0.1...1, 0.5)
-    option("Scattering depth", \.depth, 1...64, 16)
     heading("Display")
+    popup(Self.viewportNames, Int(renderer.viewportMode)) { [weak self] i in
+      guard let self else { return }
+      self.checkpoint("Viewport mode")
+      self.renderer.viewportMode = UInt32(i)
+      self.changed(reset: false)
+      self.rebuild()
+    }
     option("Exposure, EV", \.exposure, -16...16, 0, reset: false)
     option("White balance, cool → warm", \.whiteBalance, -1...1, 0, reset: false)
     popup(
@@ -350,15 +355,60 @@ final class StudioController: NSViewController {
     text(
       "The left side shows raw accumulation. Exposure and white balance affect the display and PNG export; EXR preserves linear radiance."
     )
+    text("Inspection views bypass tone mapping and denoising, and do not reset the progressive render.")
+  }
+
+  func settingsPanel() {
+    heading("Render limits")
+    number(
+      "Sample limit (0 = unlimited)", Float(renderer.options.maxSamples), 0...16384, 0, reset: false
+    ) { [weak self] in self?.renderer.options.maxSamples = UInt32($0.rounded()) }
+    number(
+      "Time limit, seconds (0 = unlimited)", Float(renderer.options.timeLimit), 0...3600, 0,
+      reset: false
+    ) { [weak self] in self?.renderer.options.timeLimit = Double($0) }
+    option("Preview resolution scale", \.previewScale, 0.1...1, 0.5)
+    option("Scattering depth", \.depth, 1...64, 16)
+
+    heading("Open Image Denoise")
+    popup(["Quality: Fast", "Quality: Balanced", "Quality: High"], Int(renderer.oidnOptions.quality)) {
+      [weak self] i in self?.setOIDN("OIDN quality") { $0.quality = UInt32(i) }
+    }
+    popup(["Guides: Color only", "Guides: Albedo", "Guides: Albedo + normal"], Int(renderer.oidnOptions.guides)) {
+      [weak self] i in self?.setOIDN("OIDN guides") { $0.guides = UInt32(i) }
+    }
+    button("Treat guides as noisy: \(renderer.oidnOptions.treatGuidesAsNoisy ? "On" : "Off")") { [weak self] in
+      self?.setOIDN("OIDN guide noise") { $0.treatGuidesAsNoisy.toggle() }
+    }
+    button("Robust HDR input scale: \(renderer.oidnOptions.robustInputScale ? "On" : "Off")") { [weak self] in
+      self?.setOIDN("OIDN HDR scale") { $0.robustInputScale.toggle() }
+    }
+    button("Diffuse firefly suppression: \(renderer.oidnOptions.suppressDiffuseFireflies ? "On" : "Off")") { [weak self] in
+      self?.setOIDN("OIDN firefly suppression") { $0.suppressDiffuseFireflies.toggle() }
+    }
+    text("The robust scale and diffuse firefly filter prevent isolated HDR samples from expanding into false bright patches. They affect only OIDN output; raw accumulation is preserved.")
+
+    heading("Experimental")
     popup(["Ring boost: Off", "Ring boost: On"], Int(renderer.enableSMS)) { [weak self] i in
       guard let self else { return }
       self.checkpoint("Ring boost")
       self.renderer.enableSMS = UInt32(i)
       self.changed()
     }
-    text(
-      "Ring boost is an artistic approximation for the original ring position. Leave it off for physically based comparisons or transformed objects."
-    )
+    text("Ring boost is an artistic approximation for the original ring position.")
+  }
+
+  func setOIDN(_ name: String, _ update: (inout OIDNOptions) -> Void) {
+    guard !isBusy else { return }
+    checkpoint(name)
+    update(&renderer.oidnOptions)
+    if renderer.offlineDenoisedPreview != nil {
+      renderer.offlineDenoisedPreview = nil
+      renderer.paused = oidnPreviewWasPaused
+    }
+    renderer.presentationNeedsRefresh = true
+    changed(reset: false)
+    rebuild()
   }
   func cameraPanel() {
     heading("Camera")
@@ -719,7 +769,7 @@ final class StudioController: NSViewController {
     }
     let exportSource = exportDenoise ? 0 : (exportRaw ? 1 : 2)
     popup([
-      "Export source: OIDN offline (high quality)",
+      "Export source: OIDN offline (configured)",
       "Export source: raw accumulation",
       "Export source: MetalFX display",
     ], exportSource) { [weak self] i in
@@ -775,6 +825,8 @@ final class StudioController: NSViewController {
     p.fog = renderer.enableFog
     p.ring = renderer.enableSMS
     p.denoise = renderer.denoiserEnabled
+    p.oidn = renderer.oidnOptions
+    p.viewportMode = renderer.viewportMode
     p.options = renderer.options
     p.camera = CameraState(renderer)
     p.scenes[Int(renderer.sceneIndex)] = renderer.materials.state()
@@ -827,6 +879,8 @@ final class StudioController: NSViewController {
     renderer.enableFog = p.fog
     renderer.enableSMS = p.ring
     renderer.denoiserEnabled = p.denoise && renderer.supportsMetalFX
+    renderer.oidnOptions = p.oidn ?? OIDNOptions()
+    renderer.viewportMode = p.viewportMode ?? 0
     renderer.options = p.options
     p.camera.apply(renderer)
     renderer.resetAccumulation()

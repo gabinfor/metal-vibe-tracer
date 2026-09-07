@@ -72,6 +72,7 @@ final class OIDNDenoiser {
   ) -> Void
   private typealias SetFilterBool = @convention(c) (Handle?, UnsafePointer<CChar>?, Bool) -> Void
   private typealias SetFilterInt = @convention(c) (Handle?, UnsafePointer<CChar>?, Int32) -> Void
+  private typealias SetFilterFloat = @convention(c) (Handle?, UnsafePointer<CChar>?, Float) -> Void
   private typealias SetProgress = @convention(c) (
     Handle?, (@convention(c) (UnsafeMutableRawPointer?, Double) -> Bool)?, UnsafeMutableRawPointer?
   ) -> Void
@@ -92,6 +93,7 @@ final class OIDNDenoiser {
     let setFilterImage: SetFilterImage
     let setFilterBool: SetFilterBool
     let setFilterInt: SetFilterInt
+    let setFilterFloat: SetFilterFloat
     let setProgress: SetProgress
     let commitFilter: CommitFilter
     let executeFilter: ExecuteFilter
@@ -132,6 +134,7 @@ final class OIDNDenoiser {
         setFilterImage = try load("oidnSetFilterImage", SetFilterImage.self)
         setFilterBool = try load("oidnSetFilterBool", SetFilterBool.self)
         setFilterInt = try load("oidnSetFilterInt", SetFilterInt.self)
+        setFilterFloat = try load("oidnSetFilterFloat", SetFilterFloat.self)
         setProgress = try load("oidnSetFilterProgressMonitorFunction", SetProgress.self)
         commitFilter = try load("oidnCommitFilter", CommitFilter.self)
         executeFilter = try load("oidnExecuteFilter", ExecuteFilter.self)
@@ -210,8 +213,12 @@ final class OIDNDenoiser {
 
   static func denoise(
     color: MTLTexture, albedo: MTLTexture, normal: MTLTexture,
-    commandQueue: MTLCommandQueue, progress: OIDNProgress
+    commandQueue: MTLCommandQueue, progress: OIDNProgress,
+    options: OIDNOptions = OIDNOptions()
   ) throws -> OIDNImage {
+    guard options.quality <= 2, options.guides <= 2 else {
+      throw MaterialLibrary.error("Invalid OIDN settings.")
+    }
     guard color.width == albedo.width, color.height == albedo.height,
       color.width == normal.width, color.height == normal.height
     else { throw MaterialLibrary.error("OIDN color and guide dimensions do not match.") }
@@ -220,8 +227,8 @@ final class OIDNDenoiser {
     guard !overflow, pixelCount > 0, pixelCount <= Int.max / 48 else {
       throw MaterialLibrary.error("The requested OIDN image is too large.")
     }
-    // Four float3 images plus Metal readback and OIDN's internal workspace.
-    let estimated = UInt64(pixelCount) * 80
+    // Four float3 images, a luminance snapshot, Metal readback, and OIDN's workspace.
+    let estimated = UInt64(pixelCount) * 84
     guard estimated < ProcessInfo.processInfo.physicalMemory / 2 else {
       throw MaterialLibrary.error("This OIDN export needs too much system memory. Reduce the output dimensions.")
     }
@@ -272,6 +279,60 @@ final class OIDNDenoiser {
       }
     }
 
+    @inline(__always) func luminance(_ pointer: UnsafeMutablePointer<Float>, _ index: Int) -> Float {
+      0.2126 * pointer[index * 3] + 0.7152 * pointer[index * 3 + 1]
+        + 0.0722 * pointer[index * 3 + 2]
+    }
+    // A sparse Monte Carlo firefly can be expanded into a broad false highlight by
+    // any spatial denoiser. Estimate exposure robustly and suppress only isolated
+    // outliers on locally compatible diffuse surfaces; raw accumulation is untouched.
+    let sampleStride = max(1, pixelCount / 65_536)
+    var sourceLuminance = [Float](repeating: 0, count: pixelCount)
+    var luminanceSamples: [Float] = []
+    luminanceSamples.reserveCapacity((pixelCount + sampleStride - 1) / sampleStride)
+    for index in 0..<pixelCount { sourceLuminance[index] = luminance(colorData, index) }
+    for index in Swift.stride(from: 0, to: pixelCount, by: sampleStride) {
+      luminanceSamples.append(sourceLuminance[index])
+    }
+    luminanceSamples.sort()
+    let percentileIndex = min(luminanceSamples.count - 1, Int(Double(luminanceSamples.count) * 0.99))
+    let robustLuminance = max(1e-4, luminanceSamples[percentileIndex])
+    if options.suppressDiffuseFireflies && width > 2 && height > 2 {
+      for y in 1..<(height - 1) {
+        for x in 1..<(width - 1) {
+          let index = y * width + x
+          let guide = reads[2].pixel(index, width: width)
+          guard abs(guide.w) < 0.25 else { continue } // MaterialType.diffuse
+          let centerNormal = SIMD3<Float>(guide.x, guide.y, guide.z)
+          let centerAlbedo4 = reads[1].pixel(index, width: width)
+          let centerAlbedo = SIMD3<Float>(centerAlbedo4.x, centerAlbedo4.y, centerAlbedo4.z)
+          var largest: Float = 0, secondLargest: Float = 0, compatible = 0
+          for oy in -1...1 { for ox in -1...1 where ox != 0 || oy != 0 {
+            let neighbor = (y + oy) * width + x + ox
+            let neighborGuide = reads[2].pixel(neighbor, width: width)
+            let neighborNormal = SIMD3<Float>(neighborGuide.x, neighborGuide.y, neighborGuide.z)
+            let neighborAlbedo4 = reads[1].pixel(neighbor, width: width)
+            let neighborAlbedo = SIMD3<Float>(neighborAlbedo4.x, neighborAlbedo4.y, neighborAlbedo4.z)
+            if abs(neighborGuide.w) < 0.25 && simd_dot(centerNormal, neighborNormal) > 0.95
+                && simd_length_squared(centerAlbedo - neighborAlbedo) < 0.02 {
+              compatible += 1
+              let value = sourceLuminance[neighbor]
+              if value > largest { secondLargest = largest; largest = value }
+              else if value > secondLargest { secondLargest = value }
+            }
+          }}
+          let center = sourceLuminance[index]
+          let cap = max(robustLuminance * 4, secondLargest * 8)
+          if compatible >= 4 && center > cap && cap > 0 {
+            let scale = cap / center
+            colorData[index * 3] *= scale
+            colorData[index * 3 + 1] *= scale
+            colorData[index * 3 + 2] *= scale
+          }
+        }
+      }
+    }
+
     let filter = "RT".withCString { api.newFilter(device, $0) }
     guard let filter else {
       try check(api, device, "creating the OIDN filter")
@@ -284,13 +345,17 @@ final class OIDNDenoiser {
       }
     }
     setImage("color", colorBuffer)
-    setImage("albedo", albedoBuffer)
-    setImage("normal", normalBuffer)
+    if options.guides >= 1 { setImage("albedo", albedoBuffer) }
+    if options.guides >= 2 { setImage("normal", normalBuffer) }
     setImage("output", outputBuffer)
     "hdr".withCString { api.setFilterBool(filter, $0, true) }
-    // The per-frame guides contain stochastic edge coverage, so let OIDN prefilter them.
-    "cleanAux".withCString { api.setFilterBool(filter, $0, false) }
-    "quality".withCString { api.setFilterInt(filter, $0, 6) } // OIDN_QUALITY_HIGH
+    // Accumulated guides can still contain stochastic edge coverage at low samples.
+    "cleanAux".withCString { api.setFilterBool(filter, $0, !options.treatGuidesAsNoisy) }
+    let qualities: [Int32] = [4, 5, 6] // OIDN_QUALITY_FAST/BALANCED/HIGH
+    "quality".withCString { api.setFilterInt(filter, $0, qualities[Int(options.quality)]) }
+    if options.robustInputScale {
+      "inputScale".withCString { api.setFilterFloat(filter, $0, 1 / robustLuminance) }
+    }
     api.setProgress(filter, oidnProgressMonitor, Unmanaged.passUnretained(progress).toOpaque())
     api.commitFilter(filter)
     try check(api, device, "committing the OIDN filter")

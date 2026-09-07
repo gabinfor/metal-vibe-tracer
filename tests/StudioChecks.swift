@@ -115,8 +115,8 @@ let oidnColor=gpu.makeTexture(descriptor:oidnDescriptor)!,oidnAlbedo=gpu.makeTex
 var oidnColorPixels=[SIMD4<Float>](),oidnAlbedoPixels=[SIMD4<Float>](),oidnNormalPixels=[SIMD4<Float>]()
 for i in 0..<(32*32) {
     let noise:Float = (i & 1)==0 ? 0.35 : -0.35
-    oidnColorPixels.append(SIMD4(2+noise,1+noise*0.5,0.5+noise*0.25,1))
-    oidnAlbedoPixels.append(SIMD4(0.8,0.5,0.2,1));oidnNormalPixels.append(SIMD4(0,1,0,1))
+    oidnColorPixels.append(i == 16*32+16 ? SIMD4(200,160,80,1) : SIMD4(2+noise,1+noise*0.5,0.5+noise*0.25,1))
+    oidnAlbedoPixels.append(SIMD4(0.8,0.5,0.2,1));oidnNormalPixels.append(SIMD4(0,1,0,0))
 }
 oidnColor.replace(region:MTLRegionMake2D(0,0,32,32),mipmapLevel:0,withBytes:&oidnColorPixels,bytesPerRow:32*16)
 oidnAlbedo.replace(region:MTLRegionMake2D(0,0,32,32),mipmapLevel:0,withBytes:&oidnAlbedoPixels,bytesPerRow:32*16)
@@ -127,6 +127,11 @@ let oidnReference=SIMD3<Float>(2,1,0.5)
 let oidnRawError=oidnColorPixels.reduce(Float(0)){$0+simd_length_squared(SIMD3($1.x,$1.y,$1.z)-oidnReference)}/Float(oidnColorPixels.count)
 let oidnFilteredError=oidnImage.pixels.reduce(Float(0)){$0+simd_length_squared(SIMD3($1.x,$1.y,$1.z)-oidnReference)}/Float(oidnImage.pixels.count)
 require(oidnFilteredError<oidnRawError,"OIDN reduces synthetic HDR noise")
+require(oidnImage.pixels[16*32+16].x < 20,"OIDN preprocessing suppresses isolated diffuse fireflies")
+var fastColorOnly=OIDNOptions();fastColorOnly.quality=0;fastColorOnly.guides=0
+fastColorOnly.treatGuidesAsNoisy=false;fastColorOnly.robustInputScale=false;fastColorOnly.suppressDiffuseFireflies=false
+let oidnUnguided=try OIDNDenoiser.denoise(color:oidnColor,albedo:oidnAlbedo,normal:oidnNormal,commandQueue:testRenderer.commandQueue,progress:OIDNProgress(),options:fastColorOnly)
+require(oidnUnguided.pixels.allSatisfy({$0.x.isFinite && $0.y.isFinite && $0.z.isFinite}),"configured OIDN color-only fast path")
 print("PASS: OIDN runtime, HDR input and auxiliary guides")
 // A uniform HDR environment is directly visible and lights secondary paths.
 fixturePixels=Array(repeating:SIMD4(2,1,0.5,1),count:4)
@@ -138,10 +143,10 @@ let env=checkStudio(studioUniforms)[2]
 require(abs(env.x-6)<0.02 && abs(env.y-3)<0.02,"linear HDR environment brightness")
 print("PASS: PNG orientation and dimensions, HDR EXR export and environment loading")
 
-var document=ProjectDocument();document.scene=6;document.scenes[6]=testRenderer.materials.state();document.triangles=triangles;document.environmentData=testRenderer.materials.environmentData;document.options.exposure=2
+var document=ProjectDocument();document.scene=6;document.scenes[6]=testRenderer.materials.state();document.triangles=triangles;document.environmentData=testRenderer.materials.environmentData;document.options.exposure=2;document.oidn=fastColorOnly;document.viewportMode=2
 let archive=try JSONEncoder().encode(document)
 let decoded=try JSONDecoder().decode(ProjectDocument.self,from:archive);try decoded.validate()
-require(decoded.triangles.count==2 && decoded.environmentData==document.environmentData && decoded.options.exposure==2,"project roundtrip embeds geometry, environment and settings")
+require(decoded.triangles.count==2 && decoded.environmentData==document.environmentData && decoded.options.exposure==2 && decoded.oidn==fastColorOnly && decoded.viewportMode==2,"project roundtrip embeds geometry, environment and settings")
 var invalid=decoded;invalid.scenes[6]!.surfaces=[]
 do{try invalid.validate();require(false,"reject malformed project before applying")}catch{}
 print("PASS: portable project roundtrip and invalid project rejection")
@@ -196,6 +201,21 @@ testRenderer.options.exposure=2;testRenderer.options.compare=0.5
 require(testRenderer.encodeDisplay(displayCommand,display:testRenderer.lastDisplay!,raw:testRenderer.accumTexture!,output:studioOutput),"display encoder")
 displayCommand.commit();displayCommand.waitUntilCompleted()
 require(displayCommand.status == .completed && testRenderer.frameIndex==beforeCount,"display adjustment preserves accumulation")
+let debugDescriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba32Float,width:testRenderer.accumTexture!.width,height:testRenderer.accumTexture!.height,mipmapped:false)
+debugDescriptor.storageMode = .shared;debugDescriptor.usage=[.shaderRead,.shaderWrite]
+let debugOutput=gpu.makeTexture(descriptor:debugDescriptor)!
+var debugSignatures=[Float]()
+for mode in UInt32(1)...4 {
+    testRenderer.viewportMode=mode
+    let command=testRenderer.commandQueue.makeCommandBuffer()!
+    require(testRenderer.presentCurrentFrame(command,output:debugOutput),"viewport inspection mode encodes")
+    command.commit();command.waitUntilCompleted();require(command.status == .completed,"viewport inspection command")
+    let pixels=readTexture(debugOutput)
+    require(pixels.allSatisfy({$0.x.isFinite && $0.y.isFinite && $0.z.isFinite}),"finite viewport inspection")
+    debugSignatures.append(pixels.reduce(0){$0+$1.x+$1.y+$1.z}/Float(pixels.count))
+}
+testRenderer.viewportMode=0
+require(Set(debugSignatures.map{Int(($0*1000).rounded())}).count>=3 && testRenderer.frameIndex==beforeCount,"viewport inspection modes are distinct and preserve accumulation")
 testRenderer.options.timeLimit=2;testRenderer.options.maxSamples=0;testRenderer.renderElapsed=2
 require(testRenderer.reachedLimit,"time target stops rendering")
 print("PASS: production render scale, MetalFX, sample/time limits, display-only accumulation preservation")
@@ -207,7 +227,7 @@ let testWindow=NSWindow(contentRect:NSRect(x:0,y:0,width:900,height:680),styleMa
 let controller=StudioController(renderer:testRenderer,window:testWindow)
 testWindow.contentView=controller.view
 controller.viewport.isPaused=true
-for page in 0..<6 {
+for page in 0..<7 {
     controller.page=page;controller.rebuild();controller.view.layoutSubtreeIfNeeded()
     require(controller.stack.arrangedSubviews.count>3,"inspector page \(page) contains controls")
     require(controller.sidebar.frame.width>300 && controller.viewport.frame.width>300,"inspector layout leaves room for viewport")

@@ -8,7 +8,7 @@ import CoreImage
 
 // Algorithm/API citations and adaptation notes: REFERENCES.md (stable keys below).
 // ============================================================================
-// 1. Metal Shading Language: Multi-Bounce ReSTIR DI & Path Tracing
+// 1. Metal Shading Language: ReSTIR DI/GI and Path Tracing
 // ============================================================================
 
 func loadOpenPBRSource() -> String {
@@ -117,10 +117,11 @@ struct Uniforms {
     float4x4 prevViewProj;
     uint frameIndex;
     uint sceneIndex;
-    uint samplingMode;     // 0 = ReSTIR DI, 1 = MIS, 2 = Light Only, 3 = BSDF Only
+    uint samplingMode;     // 0 = ReSTIR DI+GI, 1 = MIS, 2 = Light, 3 = BSDF
     uint enableSMS;        // Legacy field name: 1 = artistic ring boost, 0 = off
     uint skyMode;          // 0 = Golden Hour, 1 = High Noon, 2 = Twilight/Studio
     uint enableFog;        // 1 = single-scatter camera fog, 0 = off
+    uint viewportMode;     // 0 = beauty, 1 = albedo, 2 = normals, 3 = depth, 4 = material
     uint width;
     uint height;
     float2 jitter;         // Shared subpixel offset, in pixels, excluding the 0.5 pixel center.
@@ -1171,6 +1172,39 @@ float eval_restir_target_pdf(float3 p, float3 n, float3 rayDir, Material mat, Li
     return length(bsdf * candidate.emission * cos_th) * light_geometry(p, candidate, sceneIndex, lightSize,images);
 }
 
+// First-indirect diffuse reconnection in area measure. The stored secondary
+// radiance is direction independent because GI candidates require a diffuse x2.
+// REFERENCES.md: RESTIRGI2021.
+float gi_geometry(float3 x1, float3 n1, float3 x2, float3 n2) {
+    float3 delta = x2 - x1;
+    float d2 = dot(delta, delta);
+    if (d2 < 1e-10f) return 0.0f;
+    float3 direction = delta * rsqrt(d2);
+    return max(0.0f, dot(n1, direction)) * max(0.0f, dot(n2, -direction)) / d2;
+}
+
+float eval_restir_gi_target(float3 x1, float3 n1, float3 rayDir, Material mat,
+                            float3 x2, float3 n2, float3 secondaryRadiance) {
+    float geometry = gi_geometry(x1, n1, x2, n2);
+    if (geometry <= 0.0f || !all(isfinite(secondaryRadiance))) return 0.0f;
+    float3 direction = normalize(x2 - x1);
+    return length(eval_bsdf(mat, n1, -rayDir, direction) * secondaryRadiance * geometry);
+}
+
+bool gi_connection_visible(float3 x1, float3 n1, float3 x2,
+                           constant Uniforms &u, constant MaterialResources &images) {
+    float3 delta = x2 - x1;
+    float distanceToSample = length(delta);
+    if (distanceToSample <= 2.0f * ray_epsilon(x1, u)) return false;
+    Ray connection;
+    connection.direction = delta / distanceToSample;
+    connection.origin = ray_origin(x1, n1, connection.direction, u);
+    float endpointDistance = length(x2 - connection.origin);
+    HitRecord blocker;
+    return !trace_scene(connection, u.sceneIndex, blocker, images, u) ||
+        blocker.t >= endpointDistance - 2.0f * ray_epsilon(x2, u);
+}
+
 // Shadow endpoints are measured from the offset origin to avoid self-occlusion.
 bool light_visible(float3 p, float3 n, LightSample ls, uint sceneIndex, constant MaterialResources &materialImages, constant Uniforms &u) {
     if (ls.pdf <= 0.0f) return false;
@@ -1294,6 +1328,14 @@ kernel void restir_temporal_kernel(
     texture2d<float, access::read> histReservoirWeights [[texture(8)]],
     texture2d<float, access::read> histPosDepth [[texture(9)]],
     texture2d<float, access::read> histNormalMat [[texture(10)]],
+    texture2d<float, access::write> outGIPosPdf [[texture(11)]],
+    texture2d<float, access::write> outGINormal [[texture(12)]],
+    texture2d<float, access::write> outGIRadiance [[texture(13)]],
+    texture2d<float, access::write> outGIWeights [[texture(14)]],
+    texture2d<float, access::read> histGIPosPdf [[texture(15)]],
+    texture2d<float, access::read> histGINormal [[texture(16)]],
+    texture2d<float, access::read> histGIRadiance [[texture(17)]],
+    texture2d<float, access::read> histGIWeights [[texture(18)]],
     constant Uniforms &uniforms [[buffer(0)]],
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
@@ -1333,6 +1375,10 @@ kernel void restir_temporal_kernel(
         outSamplePosDir.write(float4(0.0f), gid);
         outSampleEmitPdf.write(float4(0.0f), gid);
         outReservoirWeights.write(float4(0.0f), gid);
+        outGIPosPdf.write(float4(0.0f), gid);
+        outGINormal.write(float4(0.0f), gid);
+        outGIRadiance.write(float4(0.0f), gid);
+        outGIWeights.write(float4(0.0f), gid);
         return;
     }
 
@@ -1344,10 +1390,14 @@ kernel void restir_temporal_kernel(
         ? (rec.front_face ? rec.mat.ior : -rec.mat.ior) : rec.mat.roughness;
     gbufferAlbedoRough.write(float4(surfaceColor, surfaceParameter), gid);
 
-    if (uniforms.samplingMode != 0 || rec.mat.type != DIFFUSE) {
+    if (uniforms.viewportMode > 0 || uniforms.samplingMode != 0 || rec.mat.type != DIFFUSE) {
         outSamplePosDir.write(float4(0.0f), gid);
         outSampleEmitPdf.write(float4(0.0f), gid);
         outReservoirWeights.write(float4(0.0f), gid);
+        outGIPosPdf.write(float4(0.0f), gid);
+        outGINormal.write(float4(0.0f), gid);
+        outGIRadiance.write(float4(0.0f), gid);
+        outGIWeights.write(float4(0.0f), gid);
         return;
     }
 
@@ -1427,6 +1477,100 @@ kernel void restir_temporal_kernel(
     outSamplePosDir.write(float4(storeDirPos, float(selectedSample.isDirectional)), gid);
     outSampleEmitPdf.write(float4(selectedSample.emission, selectedSample.pdf), gid);
     outReservoirWeights.write(float4(weightSum, M, W, 0.0f), gid);
+
+    // ReSTIR GI initial path: x0(camera) -> x1(primary diffuse) -> x2(diffuse)
+    // -> sampled light. Store x2 and its one-sample outgoing direct radiance;
+    // deeper transport remains in the ordinary path continuation.
+    float3 selectedGIPos = float3(0.0f);
+    float3 selectedGINormal = float3(0.0f);
+    float3 selectedGIRadiance = float3(0.0f);
+    float selectedGISourcePdf = 0.0f;
+    float giWeightSum = 0.0f;
+    float giM = 1.0f;
+    float3 giDirection, giBSDFWeight;
+    float giBSDFPdf;
+    if (sample_bsdf(rec.mat, rec.normal, ray.direction, rec.front_face, seed,
+                    giDirection, giBSDFWeight, giBSDFPdf) && giBSDFPdf > 0.0f) {
+        Ray giRay;
+        giRay.origin = ray_origin(rec.position, rec.geometricNormal, giDirection, uniforms);
+        giRay.direction = giDirection;
+        HitRecord secondary;
+        if (trace_scene(giRay, uniforms.sceneIndex, secondary, materialImages, uniforms)) {
+            resolve_material(secondary, giRay, uniforms, surfaceSettings, materialImages,
+                (rec.t + secondary.t) * 2.0f * fov_scale / float(uniforms.height));
+            if (secondary.mat.type == DIFFUSE) {
+                float3 secondaryRadiance = float3(0.0f);
+                LightSample giLight = sample_direct_light(secondary.position, secondary.normal,
+                    uniforms, seed, materialImages);
+                if (giLight.pdf > 0.0f && light_visible(secondary.position,
+                    secondary.geometricNormal, giLight, uniforms.sceneIndex, materialImages, uniforms)) {
+                    float secondaryCosine = max(0.0f, dot(secondary.normal, giLight.wi));
+                    float secondaryBSDFPdf;
+                    float3 secondaryBSDF = eval_bsdf_with_pdf(secondary.mat, secondary.normal,
+                        -giRay.direction, giLight.wi, secondaryBSDFPdf);
+                    float mis = power_heuristic(giLight.pdf, secondaryBSDFPdf);
+                    secondaryRadiance = secondaryBSDF * secondaryCosine * giLight.emission *
+                        (mis / giLight.pdf);
+                }
+                float3 giDelta = secondary.position - rec.position;
+                float d2 = dot(giDelta, giDelta);
+                float cosSecondary = max(0.0f, dot(secondary.normal, -giDirection));
+                float sourcePdfArea = d2 > 1e-10f ? giBSDFPdf * cosSecondary / d2 : 0.0f;
+                float pHat = eval_restir_gi_target(rec.position, rec.normal, ray.direction,
+                    rec.mat, secondary.position, secondary.normal, secondaryRadiance);
+                if (sourcePdfArea > 0.0f && pHat > 0.0f) {
+                    selectedGIPos = secondary.position;
+                    selectedGINormal = secondary.normal;
+                    selectedGIRadiance = secondaryRadiance;
+                    selectedGISourcePdf = sourcePdfArea;
+                    giWeightSum = pHat / sourcePdfArea;
+                }
+            }
+        }
+    }
+
+    // Temporal GI reservoir merge. Primary-surface reprojection defines the
+    // reuse domain; the secondary point is reconnected and reweighted at x1.
+    float4 giPrevClip = uniforms.prevViewProj * float4(rec.position, 1.0f);
+    if (giPrevClip.w > 0.0f && uniforms.frameIndex > 1) {
+        float2 prevUV = (giPrevClip.xy / giPrevClip.w) * float2(0.5f, -0.5f) + 0.5f;
+        int2 prevCoord = int2(prevUV * float2(float(uniforms.width), float(uniforms.height)));
+        if (all(prevUV >= 0.0f) && all(prevUV < 1.0f) && prevCoord.x >= 0 &&
+            prevCoord.x < int(uniforms.width) && prevCoord.y >= 0 && prevCoord.y < int(uniforms.height)) {
+            float4 oldPos = histPosDepth.read(uint2(prevCoord));
+            float4 oldNormal = histNormalMat.read(uint2(prevCoord));
+            bool sameSurface = oldPos.w > 0.0f && oldNormal.w == float(rec.mat.type) &&
+                dot(oldNormal.xyz, rec.normal) > 0.95f &&
+                distance(oldPos.xyz, rec.position) < max(0.01f, rec.t * 0.01f);
+            float4 oldGIWeights = histGIWeights.read(uint2(prevCoord));
+            float4 oldGIPosPdf = histGIPosPdf.read(uint2(prevCoord));
+            float4 oldGINormal = histGINormal.read(uint2(prevCoord));
+            if (sameSurface && oldGIWeights.y > 0.0f && oldGIWeights.z > 0.0f &&
+                oldGIPosPdf.w > 0.0f && oldGINormal.w > 0.0f) {
+                float3 oldGIRadiance = histGIRadiance.read(uint2(prevCoord)).xyz;
+                float pHat = eval_restir_gi_target(rec.position, rec.normal, ray.direction, rec.mat,
+                    oldGIPosPdf.xyz, oldGINormal.xyz, oldGIRadiance);
+                float clampedM = min(oldGIWeights.y, 20.0f);
+                float temporalWeight = pHat * oldGIWeights.z * clampedM;
+                giM += clampedM;
+                giWeightSum += temporalWeight;
+                if (rand_f(seed) * giWeightSum < temporalWeight) {
+                    selectedGIPos = oldGIPosPdf.xyz;
+                    selectedGINormal = oldGINormal.xyz;
+                    selectedGIRadiance = oldGIRadiance;
+                    selectedGISourcePdf = oldGIPosPdf.w;
+                }
+            }
+        }
+    }
+    float selectedGITarget = eval_restir_gi_target(rec.position, rec.normal, ray.direction,
+        rec.mat, selectedGIPos, selectedGINormal, selectedGIRadiance);
+    float giW = giM > 0.0f && selectedGITarget > 0.0f
+        ? giWeightSum / (giM * selectedGITarget) : 0.0f;
+    outGIPosPdf.write(float4(selectedGIPos, selectedGISourcePdf), gid);
+    outGINormal.write(float4(selectedGINormal, selectedGISourcePdf > 0.0f ? 1.0f : 0.0f), gid);
+    outGIRadiance.write(float4(selectedGIRadiance, 0.0f), gid);
+    outGIWeights.write(float4(giWeightSum, giM, giW, 0.0f), gid);
 }
 
 // ============================================================================
@@ -1442,6 +1586,12 @@ kernel void shading_kernel(
     texture2d<float, access::read> inReservoirWeights [[texture(5)]],
     texture2d<float, access::read_write> accumTexture [[texture(6)]],
     texture2d<float, access::write> sampleTexture [[texture(7)]],
+    texture2d<float, access::read> inGIPosPdf [[texture(8)]],
+    texture2d<float, access::read> inGINormal [[texture(9)]],
+    texture2d<float, access::read> inGIRadiance [[texture(10)]],
+    texture2d<float, access::read> inGIWeights [[texture(11)]],
+    texture2d<float, access::read_write> oidnAlbedoAccum [[texture(12)]],
+    texture2d<float, access::read_write> oidnNormalAccum [[texture(13)]],
     constant Uniforms &uniforms [[buffer(0)]],
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
@@ -1453,6 +1603,19 @@ kernel void shading_kernel(
     float4 posDepth = gbufferPosDepth.read(gid);
     float3 radiance = float3(0.0f);
     float specularHitDistance = 0.0f;
+
+    // Inspection views only need the G-buffer. Keep guide accumulation alive,
+    // but skip all direct, indirect, and BSDF path work while they are shown.
+    if (uniforms.viewportMode > 0) {
+        if (uniforms.frameIndex <= 1) {
+            float4 albedoGuide = gbufferAlbedoRough.read(gid);
+            float4 normalGuide = gbufferNormalMat.read(gid);
+            oidnAlbedoAccum.write(albedoGuide, gid);
+            oidnNormalAccum.write(normalGuide, gid);
+        }
+        sampleTexture.write(float4(0), gid);
+        return;
+    }
 
     float aspect = float(uniforms.width) / float(uniforms.height);
     float fov_scale = tan((uniforms.cameraPos.w * 0.5f) * PI / 180.0f);
@@ -1555,6 +1718,58 @@ kernel void shading_kernel(
                         radiance += bsdf * cos_th * selectedSample.emission * W * light_geometry(pos, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
                     }
                 }
+
+                // Spatial ReSTIR GI reuse for the first indirect diffuse vertex.
+                float4 selectedGIPosPdf = inGIPosPdf.read(gid);
+                float4 selectedGINormal = inGINormal.read(gid);
+                float3 selectedGIRadiance = inGIRadiance.read(gid).xyz;
+                float4 currentGIWeights = inGIWeights.read(gid);
+                float giTarget = selectedGINormal.w > 0.0f
+                    ? eval_restir_gi_target(pos, norm, primaryRay.direction, mat,
+                        selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
+                float giWeightSum = giTarget * currentGIWeights.z * currentGIWeights.y;
+                float giM = currentGIWeights.y;
+                for (int i = 0; i < 4; ++i) {
+                    float2 offset = (rand_f2(seed) * 2.0f - 1.0f) * spatialRadius;
+                    int2 nCoord = int2(gid) + int2(offset);
+                    if (nCoord.x < 0 || nCoord.x >= int(uniforms.width) ||
+                        nCoord.y < 0 || nCoord.y >= int(uniforms.height)) continue;
+                    float4 neighborPrimary = gbufferPosDepth.read(uint2(nCoord));
+                    float4 neighborPrimaryNormal = gbufferNormalMat.read(uint2(nCoord));
+                    bool compatible = neighborPrimary.w > 0.0f &&
+                        neighborPrimaryNormal.w == float(mat.type) &&
+                        dot(norm, neighborPrimaryNormal.xyz) > 0.95f &&
+                        abs(posDepth.w - neighborPrimary.w) < 0.05f * posDepth.w;
+                    if (!compatible) continue;
+                    float4 neighborWeights = inGIWeights.read(uint2(nCoord));
+                    float4 neighborPosPdf = inGIPosPdf.read(uint2(nCoord));
+                    float4 neighborNormal = inGINormal.read(uint2(nCoord));
+                    if (neighborWeights.y <= 0.0f || neighborWeights.z <= 0.0f ||
+                        neighborPosPdf.w <= 0.0f || neighborNormal.w <= 0.0f) continue;
+                    float3 neighborRadiance = inGIRadiance.read(uint2(nCoord)).xyz;
+                    float neighborTarget = eval_restir_gi_target(pos, norm, primaryRay.direction,
+                        mat, neighborPosPdf.xyz, neighborNormal.xyz, neighborRadiance);
+                    float neighborWeight = neighborTarget * neighborWeights.z * neighborWeights.y;
+                    giWeightSum += neighborWeight;
+                    giM += neighborWeights.y;
+                    if (rand_f(seed) * giWeightSum < neighborWeight) {
+                        selectedGIPosPdf = neighborPosPdf;
+                        selectedGINormal = neighborNormal;
+                        selectedGIRadiance = neighborRadiance;
+                    }
+                }
+                float finalGITarget = selectedGINormal.w > 0.0f
+                    ? eval_restir_gi_target(pos, norm, primaryRay.direction, mat,
+                        selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
+                float giW = giM > 0.0f && finalGITarget > 0.0f
+                    ? giWeightSum / (giM * finalGITarget) : 0.0f;
+                if (giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
+                    selectedGIPosPdf.xyz, uniforms, materialImages)) {
+                    float3 direction = normalize(selectedGIPosPdf.xyz - pos);
+                    float3 primaryBSDF = eval_bsdf(mat, norm, -primaryRay.direction, direction);
+                    float geometry = gi_geometry(pos, norm, selectedGIPosPdf.xyz, selectedGINormal.xyz);
+                    radiance += primaryBSDF * selectedGIRadiance * geometry * giW;
+                }
             } else if (mat.type != DIELECTRIC && !(mat.type == GLOSSY && mat.roughness < 0.02f) && uniforms.samplingMode != 3) {
                 LightSample ls = sample_direct_light(pos, norm, uniforms, seed, materialImages);
                 if (ls.pdf > 0.0f) {
@@ -1630,14 +1845,16 @@ kernel void shading_kernel(
                     break;
                 }
 
-                if (!is_delta(rec.mat) && uniforms.samplingMode != 3) {
+                bool restirGISecondary = uniforms.samplingMode == 0 && mat.type == DIFFUSE &&
+                    bounce == 1 && rec.mat.type == DIFFUSE;
+                if (!is_delta(rec.mat) && uniforms.samplingMode != 3 && !restirGISecondary) {
                     LightSample ls = sample_direct_light(rec.position, rec.normal, uniforms, seed, materialImages);
                     if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms)) {
                         float cosine = abs(dot(rec.normal, ls.wi));
                         float pdf;
                         float3 bsdf = eval_bsdf_with_pdf(rec.mat, rec.normal, -currentRay.direction, ls.wi, pdf);
                         // At the last vertex there will be no BSDF light sample.
-                        bool useMIS = uniforms.samplingMode != 2 && scatteringDepth < scatteringLimit;
+                        bool useMIS = uniforms.samplingMode <= 1 && scatteringDepth < scatteringLimit;
                         float weight = useMIS ? power_heuristic(ls.pdf, pdf) : 1.0f;
                         radiance += throughput * bsdf * cosine * ls.emission * weight / ls.pdf;
                     }
@@ -1664,6 +1881,26 @@ kernel void shading_kernel(
         radiance = float3(0.0f);
     }
     radiance = max(radiance, float3(0.0f));
+
+    // OIDN auxiliary inputs must use the same jitter/reconstruction filter as
+    // beauty. Accumulate them with the identical running box filter instead of
+    // passing the final stochastic G-buffer sample.
+    float4 albedoGuide = gbufferAlbedoRough.read(gid);
+    float4 normalGuide = gbufferNormalMat.read(gid);
+    if (uniforms.frameIndex > 1) {
+        float3 previousAlbedo = oidnAlbedoAccum.read(gid).xyz;
+        float3 previousNormal = oidnNormalAccum.read(gid).xyz;
+        if (all(isfinite(previousAlbedo))) {
+            albedoGuide.xyz = previousAlbedo +
+                (albedoGuide.xyz - previousAlbedo) / float(uniforms.frameIndex);
+        }
+        if (all(isfinite(previousNormal))) {
+            normalGuide.xyz = previousNormal +
+                (normalGuide.xyz - previousNormal) / float(uniforms.frameIndex);
+        }
+    }
+    oidnAlbedoAccum.write(albedoGuide, gid);
+    oidnNormalAccum.write(normalGuide, gid);
 
     // MetalFX consumes the current noisy frame, never the progressively averaged image.
     sampleTexture.write(float4(radiance, specularHitDistance), gid);
@@ -1856,10 +2093,35 @@ kernel void present_kernel(
     texture2d<float, access::read> hdr [[texture(0)]],
     texture2d<float, access::write> output [[texture(1)]],
     texture2d<float, access::read> raw [[texture(2)]],
+    texture2d<float, access::read> albedo [[texture(3)]],
+    texture2d<float, access::read> normalMaterial [[texture(4)]],
+    texture2d<float, access::read> positionDepth [[texture(5)]],
     constant float4 *display [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
     uint2 source=min(uint2(float2(gid)*float2(hdr.get_width(),hdr.get_height())/float2(output.get_width(),output.get_height())),uint2(hdr.get_width()-1,hdr.get_height()-1));
+    uint viewportMode=uint(display[0].z+0.5f);
+    if(viewportMode==1) {
+        float3 c=clamp(albedo.read(source).rgb,0.0f,1.0f);
+        output.write(float4(pow(c,float3(1.0f/2.2f)),1),gid); return;
+    }
+    if(viewportMode==2) {
+        float4 n=normalMaterial.read(source);
+        float3 c=n.w<0.0f ? float3(0) : normalize(n.xyz)*0.5f+0.5f;
+        output.write(float4(c,1),gid); return;
+    }
+    if(viewportMode==3) {
+        float d=positionDepth.read(source).w;
+        float c=d>0.0f ? clamp(log2(1.0f+d)/8.0f,0.0f,1.0f) : 0.0f;
+        output.write(float4(c,c,c,1),gid); return;
+    }
+    if(viewportMode==4) {
+        float4 n=normalMaterial.read(source);
+        float rough=clamp(albedo.read(source).w,0.0f,1.0f);
+        float type=n.w;
+        float3 palette=type<0.0f?float3(0):type<0.5f?float3(0.25f,0.65f,1):type<1.5f?float3(1,0.65f,0.15f):type<2.5f?float3(0.35f,0.9f,0.55f):type<3.5f?float3(1,0.25f,0.25f):float3(0.75f,0.35f,1);
+        output.write(float4(mix(palette,float3(rough),0.3f),1),gid); return;
+    }
     bool useRaw=display[0].w>0 && float(gid.x)/output.get_width()<display[0].w;
     float3 c=(useRaw?raw.read(source).rgb:hdr.read(source).rgb)*exp2(display[0].x)*display[1].rgb;
     if(display[0].y<0.5f) c=tonemap(c);
@@ -1888,6 +2150,7 @@ struct Uniforms {
     var enableSMS: UInt32
     var skyMode: UInt32
     var enableFog: UInt32
+    var viewportMode: UInt32
     var width: UInt32
     var height: UInt32
     var jitter: SIMD2<Float> = .zero
@@ -2221,6 +2484,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var gbufferAlbedoRough: MTLTexture?
     var accumTexture: MTLTexture?
     var sampleTexture: MTLTexture?
+    var oidnAlbedoAccum: MTLTexture?
+    var oidnNormalAccum: MTLTexture?
 
     var resPosDirA: MTLTexture?
     var resEmitPdfA: MTLTexture?
@@ -2230,12 +2495,21 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var resEmitPdfB: MTLTexture?
     var resWeightsB: MTLTexture?
 
+    var giPosPdfA: MTLTexture?
+    var giNormalA: MTLTexture?
+    var giRadianceA: MTLTexture?
+    var giWeightsA: MTLTexture?
+    var giPosPdfB: MTLTexture?
+    var giNormalB: MTLTexture?
+    var giRadianceB: MTLTexture?
+    var giWeightsB: MTLTexture?
+
     var prevViewProj = matrix_identity_float4x4
     var frameIndex: UInt32 = 0
     private var sampleIndex: UInt32 = 0
 
     var sceneIndex: UInt32 = 0 { didSet { if oldValue != sceneIndex { applyPreset(.perspective) } } }
-    var samplingMode: UInt32 = 0 { didSet { resetAccumulation() } } // 0 = ReSTIR DI, 1 = MIS, 2 = Light Only, 3 = BSDF Only
+    var samplingMode: UInt32 = 0 { didSet { resetAccumulation() } } // 0 ReSTIR DI+GI, 1 MIS, 2 light, 3 BSDF
     var enableSMS: UInt32 = 0 { didSet { resetAccumulation() } }
     var skyMode: UInt32 = 0 { didSet { resetAccumulation() } }
     var enableFog: UInt32 = 0 { didSet { resetAccumulation() } }
@@ -2247,6 +2521,19 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var fov: Float = 38.0 { didSet { resetAccumulation(resetDenoiser: false) } }
 
     var options = StudioOptions()
+    var oidnOptions = OIDNOptions()
+    var viewportMode: UInt32 = 0 {
+        didSet {
+            if oldValue == 0 && viewportMode > 0 { debugFrames = 0 }
+            if oldValue > 0 && viewportMode == 0 {
+                frameIndex = frameIndex >= debugFrames ? frameIndex - debugFrames : 0
+                sampleIndex = sampleIndex >= debugFrames ? sampleIndex - debugFrames : 0
+                completedSamples = frameIndex
+                debugFrames = 0
+            }
+            if oldValue != viewportMode { presentationNeedsRefresh = true }
+        }
+    }
     var paused = false
     var renderElapsed: TimeInterval = 0
     var gpuMilliseconds: Double = 0
@@ -2262,6 +2549,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var onError: ((String) -> Void)?
     private let inFlightFrames = DispatchSemaphore(value: 3)
     private var generation: UInt64 = 0
+    private var debugFrames: UInt32 = 0
     var interactionGeneration: UInt64 { generation }
 
     func cameraClipPlanes() -> (near: Float, far: Float) {
@@ -2275,7 +2563,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let pixels = UInt64(width) * UInt64(height)
         // Accumulation, G-buffer, reservoirs, display output, and optional MetalFX
         // working textures. The estimate deliberately includes allocation overlap.
-        let bytesPerPixel: UInt64 = denoiserEnabled ? 256 : 192
+        // First-bounce GI reservoirs and OIDN guide accumulation add 144 B/pixel.
+        let bytesPerPixel: UInt64 = denoiserEnabled ? 400 : 336
         let required = pixels.multipliedReportingOverflow(by: bytesPerPixel)
         if required.overflow { return "Render dimensions are too large." }
         let recommended = device.recommendedMaxWorkingSetSize
@@ -2387,7 +2676,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let group = MTLSize(width: 8, height: 8, depth: 1)
         var display = accumulation
         lastPresentationUsedMetalFX = false
-        if denoiserEnabled && supportsMetalFX && uniforms.samplingMode == 0 {
+        if denoiserEnabled && supportsMetalFX && uniforms.samplingMode == 0 && viewportMode == 0 {
             if metalFX?.output.width != accumulation.width || metalFX?.output.height != accumulation.height {
                 do {
                     metalFX = try MetalFXDenoiser(device: device, width: accumulation.width, height: accumulation.height)
@@ -2439,19 +2728,30 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         } else {
             metalFXHistoryNeedsReset = true
         }
-        guard encodeDisplay(commandBuffer, display: display, raw: accumulation, output: output) else { return nil }
+        // Inspection views use the progressively accumulated guides so camera
+        // jitter cannot make albedo or normals shimmer. MetalFX above still
+        // receives the current noisy frame and its matching per-frame guides.
+        guard encodeDisplay(commandBuffer, display: display, raw: accumulation, output: output,
+                            albedo: oidnAlbedoAccum ?? materials,
+                            normals: oidnNormalAccum ?? normals,
+                            positions: positions) else { return nil }
         lastDisplay = display
         presentationNeedsRefresh = false
         return display
     }
 
-    func encodeDisplay(_ commandBuffer: MTLCommandBuffer, display: MTLTexture, raw: MTLTexture, output: MTLTexture) -> Bool {
+    func encodeDisplay(_ commandBuffer: MTLCommandBuffer, display: MTLTexture, raw: MTLTexture,
+                       output: MTLTexture, albedo: MTLTexture? = nil,
+                       normals: MTLTexture? = nil, positions: MTLTexture? = nil) -> Bool {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
         encoder.label = "Display tone mapping"
         encoder.setComputePipelineState(presentPipeline)
         encoder.setTexture(display,index:0); encoder.setTexture(output,index:1); encoder.setTexture(raw,index:2)
+        encoder.setTexture(albedo ?? oidnAlbedoAccum ?? gbufferAlbedoRough ?? raw,index:3)
+        encoder.setTexture(normals ?? oidnNormalAccum ?? historyNormalMat ?? raw,index:4)
+        encoder.setTexture(positions ?? historyPosDepth ?? raw,index:5)
         let warmth = options.whiteBalance
-        var controls = [SIMD4<Float>(options.exposure, options.toneMap, 0, lastPresentationUsedMetalFX ? options.compare : 0),
+        var controls = [SIMD4<Float>(options.exposure, options.toneMap, Float(viewportMode), lastPresentationUsedMetalFX ? options.compare : 0),
                         SIMD4<Float>(exp2(warmth*0.5),1,exp2(-warmth*0.5),1)]
         encoder.setBytes(&controls,length:32,index:0)
         encoder.dispatchThreads(MTLSize(width:output.width,height:output.height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
@@ -2529,12 +2829,24 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let newWeightA = device.makeTexture(descriptor: desc32),
                   let newPosB = device.makeTexture(descriptor: desc32),
                   let newEmitB = device.makeTexture(descriptor: desc32),
-                  let newWeightB = device.makeTexture(descriptor: desc32) else {
+                  let newWeightB = device.makeTexture(descriptor: desc32),
+                  let newOIDNAlbedo = device.makeTexture(descriptor: desc32),
+                  let newOIDNNormal = device.makeTexture(descriptor: desc32),
+                  let newGIPosA = device.makeTexture(descriptor: desc32),
+                  let newGINormalA = device.makeTexture(descriptor: desc16),
+                  let newGIRadianceA = device.makeTexture(descriptor: desc32),
+                  let newGIWeightsA = device.makeTexture(descriptor: desc32),
+                  let newGIPosB = device.makeTexture(descriptor: desc32),
+                  let newGINormalB = device.makeTexture(descriptor: desc16),
+                  let newGIRadianceB = device.makeTexture(descriptor: desc32),
+                  let newGIWeightsB = device.makeTexture(descriptor: desc32) else {
                 onError?("Could not allocate render textures. Try a smaller window.")
                 return
             }
             accumTexture = newAccum
             sampleTexture = newSample
+            oidnAlbedoAccum = newOIDNAlbedo
+            oidnNormalAccum = newOIDNNormal
             gbufferPosDepth = newPosition
             historyPosDepth = newHistoryPosition
             gbufferNormalMat = newNormal
@@ -2542,6 +2854,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             gbufferAlbedoRough = newAlbedo
             resPosDirA = newPosA; resEmitPdfA = newEmitA; resWeightsA = newWeightA
             resPosDirB = newPosB; resEmitPdfB = newEmitB; resWeightsB = newWeightB
+            giPosPdfA = newGIPosA; giNormalA = newGINormalA
+            giRadianceA = newGIRadianceA; giWeightsA = newGIWeightsA
+            giPosPdfB = newGIPosB; giNormalB = newGINormalB
+            giRadianceB = newGIRadianceB; giWeightsB = newGIWeightsB
 
             resetAccumulation()
         }
@@ -2553,6 +2869,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
               let hPos = historyPosDepth, let hNorm = historyNormalMat,
               let rPosA = resPosDirA, let rEmitA = resEmitPdfA, let rWeightA = resWeightsA,
               let rPosB = resPosDirB, let rEmitB = resEmitPdfB, let rWeightB = resWeightsB,
+              let giPosA = giPosPdfA, let giNormA = giNormalA,
+              let giRadA = giRadianceA, let giWeightA = giWeightsA,
+              let giPosB = giPosPdfB, let giNormB = giNormalB,
+              let giRadB = giRadianceB, let giWeightB = giWeightsB,
+              let oidnAlbedo = oidnAlbedoAccum, let oidnNormal = oidnNormalAccum,
               let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
 
         let nextFrame = frameIndex + 1
@@ -2587,6 +2908,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enableSMS: enableSMS,
             skyMode: skyMode,
             enableFog: enableFog,
+            viewportMode: viewportMode,
             width: UInt32(w),
             height: UInt32(h),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
@@ -2615,6 +2937,14 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc1.setTexture(rWeightB, index: 8)
             enc1.setTexture(hPos, index: 9)
             enc1.setTexture(hNorm, index: 10)
+            enc1.setTexture(giPosA, index: 11)
+            enc1.setTexture(giNormA, index: 12)
+            enc1.setTexture(giRadA, index: 13)
+            enc1.setTexture(giWeightA, index: 14)
+            enc1.setTexture(giPosB, index: 15)
+            enc1.setTexture(giNormB, index: 16)
+            enc1.setTexture(giRadB, index: 17)
+            enc1.setTexture(giWeightB, index: 18)
             guard materials.bind(enc1) else {
                 enc1.endEncoding()
                 onError?("Could not update material bindings.")
@@ -2638,6 +2968,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc2.setTexture(rWeightA, index: 5)
             enc2.setTexture(accum, index: 6)
             enc2.setTexture(samples, index: 7)
+            enc2.setTexture(giPosA, index: 8)
+            enc2.setTexture(giNormA, index: 9)
+            enc2.setTexture(giRadA, index: 10)
+            enc2.setTexture(giWeightA, index: 11)
+            enc2.setTexture(oidnAlbedo, index: 12)
+            enc2.setTexture(oidnNormal, index: 13)
             guard materials.bind(enc2) else {
                 enc2.endEncoding()
                 onError?("Could not update material bindings.")
@@ -2713,6 +3049,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let tmpPos = resPosDirA; resPosDirA = resPosDirB; resPosDirB = tmpPos
         let tmpEmit = resEmitPdfA; resEmitPdfA = resEmitPdfB; resEmitPdfB = tmpEmit
         let tmpWeight = resWeightsA; resWeightsA = resWeightsB; resWeightsB = tmpWeight
+        swap(&giPosPdfA, &giPosPdfB)
+        swap(&giNormalA, &giNormalB)
+        swap(&giRadianceA, &giRadianceB)
+        swap(&giWeightsA, &giWeightsB)
 
         swap(&gbufferPosDepth, &historyPosDepth)
         swap(&gbufferNormalMat, &historyNormalMat)
@@ -2729,6 +3069,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 guard let self = self else { return }
                 if succeeded {
                     guard self.generation == submittedGeneration else { return }
+                    if self.viewportMode > 0 { self.debugFrames &+= 1 }
                     self.completedSamples=nextFrame
                     self.gpuMilliseconds=(completedBuffer.gpuEndTime-completedBuffer.gpuStartTime)*1000
                     let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)

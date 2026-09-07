@@ -57,7 +57,7 @@ func makeUniforms(scene: UInt32, mode: UInt32, width: Int, height: Int, fog: UIn
     return Uniforms(cameraPos: SIMD4<Float>(eye, r.fov), cameraTarget: SIMD4<Float>(r.target, 16),
         cameraUp: SIMD4<Float>(0, 1, 0, 0), sunParams: SIMD4<Float>(0.65, 0.45, -0.60, 850),
         currentViewProj: vp, prevViewProj: vp, frameIndex: 1, sceneIndex: scene, samplingMode: mode,
-        enableSMS: 0, skyMode: 0, enableFog: fog, width: UInt32(width), height: UInt32(height))
+        enableSMS: 0, skyMode: 0, enableFog: fog, viewportMode: 0, width: UInt32(width), height: UInt32(height))
 }
 let library = try gpu.makeLibrary(source: metalSource + checks, options: shaderCompileOptions())
 let checkPipeline = try gpu.makeComputePipelineState(function: library.makeFunction(name: "regression_checks")!)
@@ -83,6 +83,7 @@ var lastMaterials = [SIMD4<Float>]()
 var lastPositions = [SIMD4<Float>]()
 var lastSamples = [SIMD4<Float>]()
 var lastMotion = [SIMD4<Float>]()
+var lastGIWeights = [SIMD4<Float>]()
 var lastResets = [Bool]()
 var lastDenoiseMilliseconds = 0.0
 
@@ -135,6 +136,9 @@ func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool 
     let albedo = texture(.rgba16Float), accum = texture(.rgba32Float), noisy = texture(.rgba32Float), output = texture(.rgba32Float)
     var current = (0..<3).map { _ in texture(.rgba32Float) }
     var history = (0..<3).map { _ in texture(.rgba32Float) }
+    var giCurrent = [texture(.rgba32Float), texture(.rgba16Float), texture(.rgba32Float), texture(.rgba32Float)]
+    var giHistory = [texture(.rgba32Float), texture(.rgba16Float), texture(.rgba32Float), texture(.rgba32Float)]
+    let oidnAlbedo = texture(.rgba32Float), oidnNormal = texture(.rgba32Float)
     var display = accum
     for frame in 1...samples {
         u.prevViewProj = u.currentViewProj
@@ -155,6 +159,7 @@ func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool 
         let e1 = cb.makeComputeCommandEncoder()!
         e1.setComputePipelineState(testRenderer.restirTemporalPipeline)
         let first = [pos, normal, albedo] + current + history + [previousPos, previousNormal]
+            + giCurrent + giHistory
         for (i, t) in first.enumerated() { e1.setTexture(t, index: i) }
         testRenderer.materials.bind(e1)
         e1.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -162,7 +167,8 @@ func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool 
         e1.endEncoding()
         let e2 = cb.makeComputeCommandEncoder()!
         e2.setComputePipelineState(testRenderer.shadingPipeline)
-        let second = [pos, normal, albedo] + current + [accum, noisy]
+        let second = [pos, normal, albedo] + current + [accum, noisy] + giCurrent
+            + [oidnAlbedo, oidnNormal]
         for (i, t) in second.enumerated() { e2.setTexture(t, index: i) }
         testRenderer.materials.bind(e2)
         e2.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -178,12 +184,14 @@ func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool 
         require(cb.status == .completed, "scene \(u.sceneIndex), strategy \(u.samplingMode): \(String(describing: cb.error))")
         lastDenoiseMilliseconds = (cb.gpuEndTime - cb.gpuStartTime) * 1000
         swap(&pos, &previousPos); swap(&normal, &previousNormal); swap(&current, &history)
+        swap(&giCurrent, &giHistory)
     }
     lastDisplay = readTexture(display)
     lastMaterials = readTexture(albedo)
     lastNormals = readTexture(previousNormal)
     lastPositions = readTexture(previousPos)
     lastSamples = readTexture(noisy)
+    lastGIWeights = readTexture(giHistory[3])
     if denoise && u.samplingMode == 0 { lastMotion = readTexture(testRenderer.metalFX!.motion) }
     require(lastDisplay.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }, "finite denoised image")
     let pixels = readTexture(accum)
@@ -304,6 +312,7 @@ print("PASS: 20 angular/roughness energy cases and independent BRDF integration"
 
 let denoiseUniforms = makeUniforms(scene: 1, mode: 0, width: 128, height: 96)
 let lowSamples = render(denoiseUniforms, samples: 4)
+require(lastGIWeights.contains { $0.y > 0 && $0.z > 0 }, "first-bounce ReSTIR GI produces valid reservoirs")
 let rawDisplay = lastDisplay
 let lowWithFilter = render(denoiseUniforms, samples: 4, denoise: true)
 require(lastResets == [true, false, false, false], "stationary MetalFX temporal history")

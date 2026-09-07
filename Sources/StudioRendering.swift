@@ -87,6 +87,8 @@ extension StudioController {
       r.skyMode = p.sky
       r.enableFog = p.fog
       r.enableSMS = p.ring
+      r.oidnOptions = p.oidn ?? OIDNOptions()
+      r.viewportMode = 0
       r.denoiserEnabled = !exportDenoise && !exportRaw && p.denoise && r.supportsMetalFX
       r.options = p.options
       r.options.previewScale = 1
@@ -172,7 +174,7 @@ extension StudioController {
 
   private func beginOfflineDenoise(renderer r: PathTracerRenderer, url: URL) {
     guard exportDenoiseJob == nil, let color = r.accumTexture,
-      let albedo = r.gbufferAlbedoRough, let normal = r.historyNormalMat
+      let albedo = r.oidnAlbedoAccum, let normal = r.oidnNormalAccum
     else { return }
     r.onFrameUpdate = nil
     r.onError = nil
@@ -190,7 +192,7 @@ extension StudioController {
       do {
         let image = try OIDNDenoiser.denoise(
           color: color, albedo: albedo, normal: normal, commandQueue: r.commandQueue,
-          progress: job)
+          progress: job, options: r.oidnOptions)
         let texture = try image.makeTexture(device: r.device)
         DispatchQueue.main.async { [weak self, weak r, weak job] in
           guard let self, let r, let job, self.exportDenoiseJob === job,
@@ -253,7 +255,7 @@ extension StudioController {
       return
     }
     guard renderer.completedSamples > 0, let color = renderer.accumTexture,
-      let albedo = renderer.gbufferAlbedoRough, let normal = renderer.historyNormalMat
+      let albedo = renderer.oidnAlbedoAccum, let normal = renderer.oidnNormalAccum
     else {
       show("Wait for at least one completed sample before previewing OIDN.")
       return
@@ -276,7 +278,7 @@ extension StudioController {
       do {
         let image = try OIDNDenoiser.denoise(
           color: color, albedo: albedo, normal: normal, commandQueue: self.renderer.commandQueue,
-          progress: job)
+          progress: job, options: self.renderer.oidnOptions)
         let texture = try image.makeTexture(device: self.renderer.device)
         DispatchQueue.main.async { [weak self, weak job] in
           guard let self, let job, self.previewDenoiseJob === job else { return }

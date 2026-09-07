@@ -52,6 +52,15 @@ struct StudioOptions: Codable {
   var lightIntensity: Float = 1, lightSize: Float = 1
   var aperture: Float = 0, focusDistance: Float = 4.6
 }
+struct OIDNOptions: Codable, Equatable {
+  // UI indices map to OIDN FAST (4), BALANCED (5), and HIGH (6).
+  var quality: UInt32 = 2
+  // 0 = color only, 1 = albedo, 2 = albedo + normal.
+  var guides: UInt32 = 2
+  var treatGuidesAsNoisy = true
+  var robustInputScale = true
+  var suppressDiffuseFireflies = true
+}
 struct SceneState: Codable {
   var surfaces = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
   var objects = Array(repeating: ObjectSettings(), count: SceneLimits.materials)
@@ -74,6 +83,9 @@ struct ProjectDocument: Codable {
   var meshName = "No mesh"
   var graph: SceneGraph?
   var importReport: [String]?
+  // Optional so version 1/2 projects written before these controls remain readable.
+  var oidn: OIDNOptions?
+  var viewportMode: UInt32?
 
   func validate() throws {
     func bad() throws { throw MaterialLibrary.error("Invalid or unsupported project data.") }
@@ -94,6 +106,12 @@ struct ProjectDocument: Codable {
     else {
       try bad()
       return
+    }
+    if let oidn {
+      guard oidn.quality <= 2, oidn.guides <= 2 else { try bad(); return }
+    }
+    if let viewportMode {
+      guard viewportMode <= 4 else { try bad(); return }
     }
     func cameraOK(_ c: CameraState) -> Bool {
       c.yaw.isFinite && (-1.5...1.5).contains(c.pitch) && (0.0001...1_000_000).contains(c.distance)
