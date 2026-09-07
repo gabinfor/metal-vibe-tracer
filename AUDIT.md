@@ -1,4 +1,4 @@
-# Vibe Tracer audit and implementation handoff
+# Metal Vibe Tracer audit and implementation handoff
 
 Date: 2026-09-07. Requested scope: renderer correctness, performance, visuals, GUI, import/export, persistence, and features.
 

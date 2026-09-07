@@ -3,7 +3,7 @@ set -eu
 cd -- "$(dirname -- "$0")"
 python3 scripts/prepare_shaders.py
 /usr/bin/python3 scripts/prepare_usd.py
-app="build/VibeTracer.app"
+app="build/MetalVibeTracer.app"
 mkdir -p "$app/Contents/Resources"
 cp build/ShaderResources/OpenPBR.metal "$app/Contents/Resources/"
 cp Vendor/OpenPBR/LICENSE "$app/Contents/Resources/OpenPBR-LICENSE"
@@ -14,14 +14,14 @@ cp -R build/OpenUSD "$app/Contents/Resources/"
 cp Vendor/OpenUSD/UPSTREAM.md "$app/Contents/Resources/OpenUSD-UPSTREAM.md"
 cp REFERENCES.md "$app/Contents/Resources/REFERENCES.md"
 mkdir -p "$app/Contents/MacOS" build/module-cache
-xcrun swiftc -O -target "$(uname -m)-apple-macosx26.0" -module-cache-path build/module-cache main.swift Sources/*.swift -o "$app/Contents/MacOS/VibeTracer"
+xcrun swiftc -O -target "$(uname -m)-apple-macosx26.0" -module-cache-path build/module-cache main.swift Sources/*.swift -o "$app/Contents/MacOS/MetalVibeTracer"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>CFBundleExecutable</key><string>VibeTracer</string>
+    <key>CFBundleExecutable</key><string>MetalVibeTracer</string>
     <key>CFBundleIdentifier</key><string>local.vibetracer.app</string>
-    <key>CFBundleName</key><string>Vibe Tracer</string>
+    <key>CFBundleName</key><string>Metal Vibe Tracer</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>

@@ -884,7 +884,7 @@ final class StudioController: NSViewController {
     }
   }
   func openProject() {
-    chooseOpen("Open Vibe Tracer project", extensions: ["vtrace", "json"]) { [weak self] url in
+    chooseOpen("Open Metal Vibe Tracer project", extensions: ["vtrace", "json"]) { [weak self] url in
       guard let self else { return }
       do {
         let p = try JSONDecoder().decode(ProjectDocument.self, from: self.readBounded(url, maximum: 768 * 1024 * 1024))
@@ -1149,7 +1149,7 @@ final class StudioController: NSViewController {
         sub.addItem(e)
       }
     }
-    menu("Vibe Tracer", [("Quit Vibe Tracer", "q", #selector(quit))])
+    menu("Metal Vibe Tracer", [("Quit Metal Vibe Tracer", "q", #selector(quit))])
     menu(
       "File",
       [

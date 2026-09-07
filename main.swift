@@ -2822,7 +2822,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let device=MTLCreateSystemDefaultDevice() else { throw MaterialLibrary.error("Metal is unavailable.") }
             let renderer=try PathTracerRenderer(device:device)
             window=NSWindow(contentRect:NSRect(x:0,y:0,width:1120,height:820),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
-            window.title="Vibe Tracer";window.contentMinSize=NSSize(width:700,height:440);window.center()
+            window.title="Metal Vibe Tracer";window.contentMinSize=NSSize(width:700,height:440);window.center()
             studio=StudioController(renderer:renderer,window:window)
             window.contentView=studio.view
             window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)

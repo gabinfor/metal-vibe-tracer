@@ -1,4 +1,4 @@
-# Vibe Tracer references
+# Metal Vibe Tracer references
 
 Last reviewed: **2026-09-07**. Web references below were checked on the dates recorded by each entry.
 

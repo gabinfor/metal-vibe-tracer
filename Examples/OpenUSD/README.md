@@ -1,6 +1,6 @@
 # OpenUSD import and reference scenes
 
-Use **Objects → Open USD scene…** in Vibe Tracer. The official OpenUSD 26.08 SDK composes the stage; the existing Swift/Metal renderer renders the imported snapshot. USDA, USDC, USD and USDZ are supported. OpenUSD supplies scene interchange, not a replacement rendering engine.
+Use **Objects → Open USD scene…** in Metal Vibe Tracer. The official OpenUSD 26.08 SDK composes the stage; the existing Swift/Metal renderer renders the imported snapshot. USDA, USDC, USD and USDZ are supported. OpenUSD supplies scene interchange, not a replacement rendering engine.
 
 ## A complete reference we can use now
 
@@ -11,7 +11,7 @@ From the project directory:
 ```sh
 /usr/bin/python3 scripts/fetch_reference_scene.py
 ./build.sh
-open build/VibeTracer.app
+open build/MetalVibeTracer.app
 ```
 
 Open `build/reference-scenes/ShaderBall-triangulated.usda` with the USD button. This separate override chooses the supplied triangulated geometry and PreviewSurface plastic variant at frame 3; upstream files are unchanged. The downloaded asset is pinned to commit `3b75c2dad6a494897557dcca0098257bcf42a8c6`, checked against Git object hashes, and recorded in `DOWNLOAD.json`. Original docs and license stay beside the files. The import has 17 mesh assets, 24 nodes, 11 materials, 63,882 triangles and five rectangular lights.

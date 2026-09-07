@@ -1,4 +1,4 @@
-# Vibe Tracer
+# Metal Vibe Tracer
 
 A standalone macOS AppKit and Metal path tracer with six procedural scenes, an OBJ/OpenUSD mesh studio, editable materials, four lighting strategies, and PNG/OpenEXR export. The existing renderer remains in `main.swift`; project, inspector, asset-loading, and export code lives in `Sources/`.
 
@@ -14,7 +14,7 @@ Requires macOS 26 or later, a Metal GPU, and Xcode 26 command-line tools. MetalF
 
 ```sh
 ./build.sh
-open build/VibeTracer.app
+open build/MetalVibeTracer.app
 ```
 
 The build preprocesses pinned, vendored OpenPBR headers and bundles the resulting shader plus upstream license/attributions. The first build downloads a checksum-pinned 40.7 MB official OpenUSD 26.8 wheel and bundles it. Later builds use the cached runtime. OpenUSD import requires Apple’s `/usr/bin/python3` CPython 3.9 from the command-line tools; no system Python packages are installed. Metal shaders compile at runtime; the separately downloadable Metal command-line toolchain is not required.
