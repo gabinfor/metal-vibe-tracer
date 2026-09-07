@@ -71,6 +71,10 @@ extension StudioController {
   func startExport(url: URL, hdr: Bool) {
     guard !isBusy else { return }
     do {
+      if exportDenoise && !OIDNDenoiser.isAvailable {
+        throw MaterialLibrary.error(
+          "Open Image Denoise is unavailable. Rebuild Metal Vibe Tracer to install the OIDN runtime.")
+      }
       let p = snapshot()
       try p.validate()
       let r = try PathTracerRenderer(device: renderer.device, sharing: renderer)
@@ -83,7 +87,7 @@ extension StudioController {
       r.skyMode = p.sky
       r.enableFog = p.fog
       r.enableSMS = p.ring
-      r.denoiserEnabled = !exportRaw && p.denoise && r.supportsMetalFX
+      r.denoiserEnabled = !exportDenoise && !exportRaw && p.denoise && r.supportsMetalFX
       r.options = p.options
       r.options.previewScale = 1
       r.options.compare = 0
@@ -136,6 +140,8 @@ extension StudioController {
     } catch { show("Export failed: \(error.localizedDescription)") }
   }
   func cancelExport() {
+    exportDenoiseJob?.cancel()
+    exportDenoiseJob = nil
     exportRenderer?.onFrameUpdate = nil
     exportRenderer?.onError = nil
     exportRenderer = nil
@@ -148,9 +154,12 @@ extension StudioController {
     show("Export cancelled")
   }
   func finishExport() {
-    guard let r = exportRenderer, let url = exportURL,
-      let texture = exportHDR ? r.lastDisplay : exportOutput
-    else { return }
+    guard let r = exportRenderer, let url = exportURL else { return }
+    if exportDenoise {
+      beginOfflineDenoise(renderer: r, url: url)
+      return
+    }
+    guard let texture = exportHDR ? r.lastDisplay : exportOutput else { return }
     do {
       try RenderImage.write(texture: texture, url: url, hdr: exportHDR)
       cancelExport()
@@ -159,6 +168,92 @@ extension StudioController {
       cancelExport()
       show("Export failed: \(error.localizedDescription)")
     }
+  }
+
+  private func beginOfflineDenoise(renderer r: PathTracerRenderer, url: URL) {
+    guard exportDenoiseJob == nil, let color = r.accumTexture,
+      let albedo = r.gbufferAlbedoRough, let normal = r.historyNormalMat
+    else { return }
+    r.onFrameUpdate = nil
+    r.onError = nil
+    let job = OIDNProgress()
+    exportDenoiseJob = job
+    job.onProgress = { [weak self, weak job] fraction in
+      DispatchQueue.main.async {
+        guard let self, let job, self.exportDenoiseJob === job else { return }
+        self.status.stringValue = "OIDN offline denoising: \(Int(fraction * 100))%"
+      }
+    }
+    status.stringValue = "Preparing OIDN offline denoising…"
+    DispatchQueue.global(qos: .userInitiated).async { [weak self, weak r, weak job] in
+      guard let self, let r, let job else { return }
+      do {
+        let image = try OIDNDenoiser.denoise(
+          color: color, albedo: albedo, normal: normal, commandQueue: r.commandQueue,
+          progress: job)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+          pixelFormat: .rgba32Float, width: image.width, height: image.height, mipmapped: false)
+        descriptor.storageMode = .shared
+        descriptor.usage = [.shaderRead]
+        guard let texture = r.device.makeTexture(descriptor: descriptor) else {
+          throw MaterialLibrary.error("Could not allocate the denoised export texture.")
+        }
+        image.pixels.withUnsafeBytes { bytes in
+          texture.replace(region: MTLRegionMake2D(0, 0, image.width, image.height), mipmapLevel: 0,
+            withBytes: bytes.baseAddress!, bytesPerRow: image.width * 16)
+        }
+        DispatchQueue.main.async { [weak self, weak r, weak job] in
+          guard let self, let r, let job, self.exportDenoiseJob === job,
+            self.exportRenderer === r else { return }
+          self.writeOfflineDenoised(texture, renderer: r, url: url)
+        }
+      } catch {
+        DispatchQueue.main.async { [weak self, weak r, weak job] in
+          guard let self, let r, let job, self.exportDenoiseJob === job,
+            self.exportRenderer === r else { return }
+          self.cancelExport()
+          self.show("Export failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func writeOfflineDenoised(_ texture: MTLTexture, renderer r: PathTracerRenderer, url: URL) {
+    if exportHDR {
+      do {
+        try RenderImage.write(texture: texture, url: url, hdr: true)
+        cancelExport()
+        show("Saved OIDN-denoised \(url.lastPathComponent)")
+      } catch {
+        cancelExport()
+        show("Export failed: \(error.localizedDescription)")
+      }
+      return
+    }
+    guard let output = exportOutput, let command = r.commandQueue.makeCommandBuffer(),
+      r.encodeDisplay(command, display: texture, raw: texture, output: output)
+    else {
+      cancelExport()
+      show("Export failed: could not tone-map the OIDN result.")
+      return
+    }
+    command.addCompletedHandler { [weak self, weak r] completed in
+      DispatchQueue.main.async {
+        guard let self, let r, self.exportRenderer === r else { return }
+        do {
+          guard completed.status == .completed else {
+            throw MaterialLibrary.error(completed.error?.localizedDescription ?? "OIDN tone mapping failed.")
+          }
+          try RenderImage.write(texture: output, url: url, hdr: false)
+          self.cancelExport()
+          self.show("Saved OIDN-denoised \(url.lastPathComponent)")
+        } catch {
+          self.cancelExport()
+          self.show("Export failed: \(error.localizedDescription)")
+        }
+      }
+    }
+    command.commit()
   }
   func capturePreview() {
     guard !isBusy, let raw = renderer.accumTexture, renderer.lastDisplay != nil

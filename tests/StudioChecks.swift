@@ -108,6 +108,26 @@ let png=NSBitmapImageRep(data:try Data(contentsOf:pngURL))!
 require(png.pixelsWide==2 && png.pixelsHigh==2,"PNG export dimensions")
 let topLeft=png.colorAt(x:0,y:0)!.usingColorSpace(.sRGB)!
 require(topLeft.redComponent>0.95 && topLeft.blueComponent<0.05,"PNG keeps top-left orientation")
+// OIDN consumes linear HDR color with primary-surface albedo/normal guides.
+let oidnDescriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba32Float,width:32,height:32,mipmapped:false)
+oidnDescriptor.storageMode = .shared;oidnDescriptor.usage=[.shaderRead]
+let oidnColor=gpu.makeTexture(descriptor:oidnDescriptor)!,oidnAlbedo=gpu.makeTexture(descriptor:oidnDescriptor)!,oidnNormal=gpu.makeTexture(descriptor:oidnDescriptor)!
+var oidnColorPixels=[SIMD4<Float>](),oidnAlbedoPixels=[SIMD4<Float>](),oidnNormalPixels=[SIMD4<Float>]()
+for i in 0..<(32*32) {
+    let noise:Float = (i & 1)==0 ? 0.35 : -0.35
+    oidnColorPixels.append(SIMD4(2+noise,1+noise*0.5,0.5+noise*0.25,1))
+    oidnAlbedoPixels.append(SIMD4(0.8,0.5,0.2,1));oidnNormalPixels.append(SIMD4(0,1,0,1))
+}
+oidnColor.replace(region:MTLRegionMake2D(0,0,32,32),mipmapLevel:0,withBytes:&oidnColorPixels,bytesPerRow:32*16)
+oidnAlbedo.replace(region:MTLRegionMake2D(0,0,32,32),mipmapLevel:0,withBytes:&oidnAlbedoPixels,bytesPerRow:32*16)
+oidnNormal.replace(region:MTLRegionMake2D(0,0,32,32),mipmapLevel:0,withBytes:&oidnNormalPixels,bytesPerRow:32*16)
+let oidnImage=try OIDNDenoiser.denoise(color:oidnColor,albedo:oidnAlbedo,normal:oidnNormal,commandQueue:testRenderer.commandQueue,progress:OIDNProgress())
+require(oidnImage.width==32 && oidnImage.height==32 && oidnImage.pixels.allSatisfy({$0.x.isFinite && $0.y.isFinite && $0.z.isFinite}),"OIDN offline HDR filtering")
+let oidnReference=SIMD3<Float>(2,1,0.5)
+let oidnRawError=oidnColorPixels.reduce(Float(0)){$0+simd_length_squared(SIMD3($1.x,$1.y,$1.z)-oidnReference)}/Float(oidnColorPixels.count)
+let oidnFilteredError=oidnImage.pixels.reduce(Float(0)){$0+simd_length_squared(SIMD3($1.x,$1.y,$1.z)-oidnReference)}/Float(oidnImage.pixels.count)
+require(oidnFilteredError<oidnRawError,"OIDN reduces synthetic HDR noise")
+print("PASS: OIDN runtime, HDR input and auxiliary guides")
 // A uniform HDR environment is directly visible and lights secondary paths.
 fixturePixels=Array(repeating:SIMD4(2,1,0.5,1),count:4)
 hdrTexture.replace(region:MTLRegionMake2D(0,0,2,2),mipmapLevel:0,withBytes:&fixturePixels,bytesPerRow:32)

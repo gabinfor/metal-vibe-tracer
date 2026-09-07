@@ -130,7 +130,8 @@ final class StudioController: NSViewController {
   var exportRenderer: PathTracerRenderer?
   var exportOutput: MTLTexture?
   var exportURL: URL?
-  var exportHDR = false, exportRaw = false, previousPaused = false
+  var exportHDR = false, exportRaw = false, exportDenoise = true, previousPaused = false
+  var exportDenoiseJob: OIDNProgress?
   var messageUntil = Date.distantPast
   static let sceneNames = [
     "Architectural Pavilion", "Cornell Box", "Veach MIS Benchmark", "Cornell Glass & Mirror",
@@ -699,14 +700,20 @@ final class StudioController: NSViewController {
     number("Export samples", Float(renderer.options.exportSamples), 1...16384, 128, reset: false) {
       [weak self] in self?.renderer.options.exportSamples = UInt32($0.rounded())
     }
-    popup(
-      ["Export source: selected display", "Export source: raw accumulation"], exportRaw ? 1 : 0
-    ) { [weak self] i in self?.exportRaw = i == 1 }
+    let exportSource = exportDenoise ? 0 : (exportRaw ? 1 : 2)
+    popup([
+      "Export source: OIDN offline (high quality)",
+      "Export source: raw accumulation",
+      "Export source: MetalFX display",
+    ], exportSource) { [weak self] i in
+      self?.exportDenoise = i == 0
+      self?.exportRaw = i == 1
+    }
     button("Render and export PNG…") { [weak self] in self?.beginExport(hdr: false) }
     button("Render and export HDR OpenEXR…") { [weak self] in self?.beginExport(hdr: true) }
     button("Capture current preview PNG…") { [weak self] in self?.capturePreview() }
     text(
-      "Export renders at the requested dimensions independently of preview scale. EXR stores linear floating-point radiance. PNG uses the current exposure, white balance and tone map."
+      "OIDN filters the converged linear render with albedo and normal guides. EXR stores linear floating-point radiance. PNG uses the current exposure, white balance and tone map."
     )
   }
   func show(_ message: String) {

@@ -47,3 +47,13 @@ Local adaptations select the triangulated/plastic variants in a separate layer,
 map supported shading to OpenPBR, and snapshot into this renderer. Original
 source files are unchanged. Assets and generated renders/projects are optional
 local downloads, not bundled with the application. See Examples/OpenUSD/README.md.
+
+## Intel Open Image Denoise
+
+Copyright Intel Corporation. Licensed under the Apache License,
+Version 2.0. Source: https://github.com/RenderKit/oidn. The application bundles
+the official, unmodified Open Image Denoise 2.5.0 macOS runtime for offline
+final-frame denoising. Its complete license and bundled dependency notices are
+preserved under `Contents/Frameworks/OIDN/doc`. Pinned archive details and the
+boundary between upstream code and local integration are documented in
+`Vendor/OIDN/UPSTREAM.md` and `REFERENCES.md`.

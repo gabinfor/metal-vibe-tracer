@@ -3,6 +3,7 @@ set -eu
 cd -- "$(dirname -- "$0")"
 python3 scripts/prepare_shaders.py
 /usr/bin/python3 scripts/prepare_usd.py
+python3 scripts/prepare_oidn.py
 app="build/MetalVibeTracer.app"
 mkdir -p "$app/Contents/Resources"
 cp build/ShaderResources/OpenPBR.metal "$app/Contents/Resources/"
@@ -12,6 +13,10 @@ cp THIRD_PARTY_NOTICES.md "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
 cp scripts/usd_bridge.py "$app/Contents/Resources/"
 cp -R build/OpenUSD "$app/Contents/Resources/"
 cp Vendor/OpenUSD/UPSTREAM.md "$app/Contents/Resources/OpenUSD-UPSTREAM.md"
+mkdir -p "$app/Contents/Frameworks"
+rm -rf "$app/Contents/Frameworks/OIDN"
+cp -R build/OIDN "$app/Contents/Frameworks/OIDN"
+cp Vendor/OIDN/UPSTREAM.md "$app/Contents/Resources/OIDN-UPSTREAM.md"
 cp REFERENCES.md "$app/Contents/Resources/REFERENCES.md"
 mkdir -p "$app/Contents/MacOS" build/module-cache
 xcrun swiftc -O -target "$(uname -m)-apple-macosx26.0" -module-cache-path build/module-cache main.swift Sources/*.swift -o "$app/Contents/MacOS/MetalVibeTracer"

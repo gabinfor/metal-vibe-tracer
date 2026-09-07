@@ -9,6 +9,7 @@ import platform
 root = Path(__file__).resolve().parents[1]
 subprocess.run([sys.executable, str(root / 'scripts/prepare_shaders.py')], check=True)
 subprocess.run(['/usr/bin/python3', str(root / 'scripts/prepare_usd.py')], check=True)
+subprocess.run([sys.executable, str(root / 'scripts/prepare_oidn.py')], check=True)
 subprocess.run(['/usr/bin/python3', str(root / 'tests/USDChecks.py')], check=True)
 source = (root / 'main.swift').read_text()
 # Retain production definitions, replacing only the GUI entry point.
