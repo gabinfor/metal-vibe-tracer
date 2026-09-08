@@ -2,18 +2,6 @@
 
 An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Explore lighting and materials in real time, import scenes, and export denoised renders.
 
-## Gallery
-
-The images below are rendered by Metal Vibe Tracer and included as lightweight project illustrations.
-
-![Pavilion scene with ReSTIR direct lighting and first-bounce GI](docs/images/pavilion-restir.png)
-
-![OpenPBR texture and material comparison](docs/images/openpbr-materials.png)
-
-![OpenUSD reference scene imported into the renderer](docs/images/openusd-reference.png)
-
-![Grazing-angle cylinder regression comparison](docs/images/grazing-cylinder.png)
-
 ## Features
 
 - **Path tracing:** ReSTIR direct lighting and first-bounce diffuse GI, with Standard MIS, light-only, and BSDF-only comparison modes.
