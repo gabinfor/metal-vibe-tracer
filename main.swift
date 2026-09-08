@@ -801,7 +801,10 @@ float power_heuristic(float p_f, float p_g) {
 float3 sample_cosine_hemisphere(float3 n, thread uint &seed) {
     float2 r = rand_f2(seed);
     float phi = TWO_PI * r.x;
-    float cos_th = sqrt(r.y);
+    // Center the radial draw in its 24-bit bin: an exact zero creates a
+    // tangent ray whose rounded dot-product PDF can be tiny but positive.
+    // Such a sample acquires enormous inverse-PDF weights during GI reuse.
+    float cos_th = sqrt(r.y + (0.5f / 16777216.0f));
     float sin_th = sqrt(max(0.0f, 1.0f - cos_th * cos_th));
     float3 u, v;
     make_basis(n, u, v);
@@ -1199,7 +1202,9 @@ bool gi_connection_visible(float3 x1, float3 n1, float3 x2,
     Ray connection;
     connection.direction = delta / distanceToSample;
     connection.origin = ray_origin(x1, n1, connection.direction, u);
-    float endpointDistance = length(x2 - connection.origin);
+    float3 endpointDelta = x2 - connection.origin;
+    float endpointDistance = length(endpointDelta);
+    connection.direction = endpointDelta / endpointDistance;
     HitRecord blocker;
     return !trace_scene(connection, u.sceneIndex, blocker, images, u) ||
         blocker.t >= endpointDistance - 2.0f * ray_epsilon(x2, u);
@@ -1807,7 +1812,8 @@ kernel void shading_kernel(
                 if (!previousDelta && scatteringDepth >= scatteringLimit) break;
                 if (!previousDelta) ++scatteringDepth;
                 bool previousNEE = !previousDelta && uniforms.samplingMode != 3;
-                // ReSTIR covers primary diffuse hits; glossy and later bounces use MIS.
+                // Primary diffuse DI reservoirs estimate the full direct integral.
+                // Only conventional NEE vertices have complementary power weights.
                 bool previousMIS = uniforms.samplingMode == 1 ||
                     (uniforms.samplingMode == 0 && (bounce > 1 || currentHit.mat.type != DIFFUSE));
                 if (!sample_bsdf(currentHit.mat, currentHit.normal, currentRay.direction,

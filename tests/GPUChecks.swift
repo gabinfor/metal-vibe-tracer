@@ -7,7 +7,7 @@ guard let gpu = MTLCreateSystemDefaultDevice() else {
     exit(2)
 }
 let testRenderer = try PathTracerRenderer(device: gpu)
-require(MemoryLayout<Uniforms>.stride == 288, "Swift/Metal uniform layout")
+require(MemoryLayout<Uniforms>.stride == 304, "Swift/Metal uniform layout")
 print("PASS: runtime shader compilation on \(gpu.name)")
 
 let checks = """
@@ -15,14 +15,19 @@ kernel void regression_checks(device uint *results [[buffer(0)]], constant Unifo
     Material matte = { DIFFUSE, float3(0.8f), float3(0), 0.0f, 1.0f };
     HitRecord hit;
     Ray inside = { float3(0), float3(1, 0, 0) };
-    results[0] = intersect_box(inside, float3(0), float3(1), 0, matte, 0.001f, 100, hit)
+    results[0] = sizeof(Uniforms) == 304 && intersect_box(inside, float3(0), float3(1), 0, matte, 0.001f, 100, hit)
         && abs(hit.t - 1.0f) < 1e-5f && !hit.front_face && hit.normal.x < -0.99f;
     Ray parallel = { float3(2, 0, 0), float3(0, 1, 0) };
     results[1] = !intersect_box(parallel, float3(0), float3(1), 0, matte, 0.001f, 100, hit);
     uint seed = 17;
     bool bounded = true;
     for (int i = 0; i < 100000; ++i) { float v = rand_f(seed); bounded = bounded && v >= 0.0f && v < 1.0f; }
-    results[2] = bounded;
+    // This seed makes the second PCG draw exactly zero. The radial sample
+    // must stay above the tangent plane to avoid enormous GI reuse weights.
+    uint grazingSeed = 890625759u;
+    float3 grazingNormal = normalize(float3(0.31456656f, 0, -0.9492354f));
+    float3 grazingSample = sample_cosine_hemisphere(grazingNormal, grazingSeed);
+    results[2] = bounded && dot(grazingNormal, grazingSample) > 0.0001f;
     results[3] = abs(power_heuristic(1e-10f, 1e-10f) - 0.5f) < 1e-6f;
     Material glass = { DIELECTRIC, float3(1), float3(0), 0, 1.52f };
     float3 direction, weight; float pdf;

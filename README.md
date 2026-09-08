@@ -1,121 +1,101 @@
 # Metal Vibe Tracer
 
-A standalone macOS AppKit and Metal path tracer with six procedural scenes, an OBJ/OpenUSD mesh studio, editable materials, four lighting strategies, and PNG/OpenEXR export. The existing renderer remains in `main.swift`; project, inspector, asset-loading, and export code lives in `Sources/`.
+An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Explore lighting and materials in real time, import scenes, and export denoised renders.
 
-See [REFERENCES.md](REFERENCES.md) for citations, implementation mappings, and differences from the published methods. Update it alongside changes to externally derived methods or dependencies.
+## Features
 
-## Development direction
+- **Path tracing:** ReSTIR direct lighting and first-bounce diffuse GI, with Standard MIS, light-only, and BSDF-only comparison modes.
+- **Materials:** OpenPBR surfaces, image textures, normal maps, and a supported subset of MaterialX graphs.
+- **Scenes:** six procedural test scenes, OBJ import, and OpenUSD scene import with hierarchy, instances, materials, lights, and cameras.
+- **Lighting:** procedural skies, HDRI environments, editable area lights, and a thin-lens camera.
+- **Denoising:** MetalFX interactive preview and Open Image Denoise for in-app snapshots and offline exports.
+- **Viewport:** beauty, albedo, world normals, depth, and material/roughness views.
+- **Projects:** portable `.vtrace` files with embedded assets, saved camera views, undo/redo, and autosave recovery.
+- **Export:** PNG and linear HDR OpenEXR at independent resolutions and sample counts.
 
-The current direction, confirmed September 4, 2026, is to retain and extend this Swift/Metal renderer. Adobe OpenPBR BSDFs and image texture support are now integrated into it. OBJ geometry, a bounded MaterialX graph compiler, and OpenUSD scene import are integrated. The official OpenUSD SDK supplies scene composition; rendering stays in Swift/Metal, including ReSTIR. MetalFX remains available for interactive preview, while Intel Open Image Denoise supplies high-quality offline export denoising.
+## Requirements
 
-## Build and run
+- macOS 26 or later
+- A Metal-capable GPU; tested on Apple M4
+- Xcode 26 command-line tools
+- Internet access for the first build
 
-Requires macOS 26 or later, a Metal GPU, and Xcode 26 command-line tools. MetalFX denoising is enabled only when the GPU reports support; this integration was verified on an Apple M4. From this directory:
+MetalFX preview requires a supported GPU. OpenUSD import uses the command-line tools’ `/usr/bin/python3` (CPython 3.9).
+
+## Getting started
 
 ```sh
+git clone https://github.com/gabinfor/metal-vibe-tracer.git
+cd metal-vibe-tracer
 ./build.sh
 open build/MetalVibeTracer.app
 ```
 
-The build preprocesses pinned, vendored OpenPBR headers and bundles the resulting shader plus upstream license/attributions. The first build downloads a checksum-pinned 40.7 MB official OpenUSD 26.8 wheel and the 51.4 MB official OIDN 2.5.0 runtime for the current Mac architecture. Later builds use the cached runtimes. OpenUSD import requires Apple’s `/usr/bin/python3` CPython 3.9 from the command-line tools; no system Python packages are installed. Metal shaders compile at runtime; the separately downloadable Metal command-line toolchain is not required.
+The first build downloads pinned OpenUSD 26.8 and Open Image Denoise 2.5.0 runtimes. Later builds reuse the cache. OpenPBR shader sources are vendored, and Metal shaders compile at runtime; the separate Metal command-line toolchain is not required.
 
-## Inspector and navigation
+## Usage
 
-Use **Inspector** to show/hide the scrollable sidebar. The window can shrink to 700×440. The inspector has seven pages; selecting Materials no longer changes the scene.
+Choose a scene in the inspector, then adjust its camera, lighting, materials, and objects. Use **Render** to change the sampling strategy or viewport mode. **Settings…** is available in the top toolbar and the macOS application menu.
 
-- **Render:** ReSTIR Direct + First-Bounce GI, MIS, NEE, and BSDF strategies; MetalFX and OIDN preview; beauty, albedo, world-normal, log-depth, and material/roughness viewport modes; exposure, white balance, tone maps, and a raw/MetalFX divider. ReSTIR resamples primary direct lighting and the first diffuse indirect vertex; deeper diffuse, glossy, and transmission paths continue through the path tracer.
-- **Camera:** presets, numeric position/target and FOV, aperture radius, focus distance, and named saved views. Drag to orbit, Shift-drag to pan, scroll to zoom. Click a surface to select its material/object group. Aperture zero is the original pinhole camera.
-- **Lighting:** sky presets, sun direction/intensity, HDRI loading/rotation/brightness, finite-light color/intensity/size, and the existing fog preview. Sky/HDRI lighting applies to Pavilion and Mesh Studio; finite-light controls apply to Cornell, Veach, and Ring scenes. Veach's four emitters share the light controls.
-- **Materials & Textures:** scene-aware object/group selection, OpenPBR presets, tint, roughness, metalness, coat, anisotropy, fuzz, IOR, transmission, normal strength, UV repeat/offset/rotation, image previews, scalar-map channel selection, and portable material presets. Numeric fields and sliders include per-property reset buttons.
-- **Objects:** imported hierarchy, rename/reparent, shared mesh instances, per-node visibility/transforms, deletion, OBJ append, and frame selection/all. Procedural objects retain visibility, translation, XYZ rotation, uniform scale, and transform reset. Transforms pivot around the scene origin. Architecture and Cornell room surfaces are grouped; finite emitters use Lighting controls.
-- **Project & Export:** New/Open/Save/Save As, independent output dimensions, export sample count, OIDN offline/raw/MetalFX source choice, PNG, HDR OpenEXR, and current-preview PNG capture.
-- **Settings:** sample/time limits, preview scale, scattering depth, OIDN quality/guides/noisy-guide/HDR-scale/firefly controls, and the experimental ring boost. Limits of zero mean unlimited. OIDN and viewport display changes preserve raw samples. The inspector is top-aligned for quick access on short pages.
+| Action | Control |
+| --- | --- |
+| Orbit / pan / zoom | Drag / Shift-drag / scroll |
+| Select a surface | Click in the viewport |
+| Open / save project | ⌘O / ⌘S |
+| Undo / redo | ⌘Z / ⇧⌘Z |
+| Pause or resume / restart | ⌘P / ⌘R |
+| Export controls | ⌘E |
+| Settings | ⌘, |
+| Show or hide inspector | ⌘I |
 
-Keyboard shortcuts: Cmd-O opens, Cmd-S saves, Cmd-Z/Shift-Cmd-Z undo/redo, Cmd-P pauses/resumes, Cmd-R restarts accumulation, and Cmd-E opens export controls. Changes to exposure, white balance, comparison, and tone mapping preserve raw accumulated samples. MetalFX operates at the internal render resolution, is available with ReSTIR on supported GPUs, and maintains its own temporal history.
+Use **OIDN Preview Current Frame** to denoise the current accumulation inside the app. For a final image, open **Export**, choose a resolution and sample count, and select OIDN, raw, or MetalFX output. PNG includes display adjustments; OpenEXR preserves linear HDR radiance.
 
-## Projects and materials
+Projects embed imported assets and can be reopened without the original files. The app restores its latest autosave on startup.
 
-Version 2 `.vtrace` projects embed texture bytes, the environment image, mesh assets, stable scene-node/material IDs, parent transforms, face bindings, MaterialX expression programs, per-scene state, camera, render controls, and saved views. Version 1 projects remain readable; their single imported mesh migrates when another OBJ is appended. They do not depend on original asset paths. Version and value validation runs before loading, and failed asset decoding preserves the active project. `.vmat` presets carry one material, including its MaterialX program/images when present, or manual maps and UV/channel settings. Undo/Redo restores project edits (up to 40 actions); render samples and pause state are not project edits.
+See the [user guide](docs/USER_GUIDE.md) for material controls, project behavior, import coverage, and export details.
 
-Changes autosave after a one-second debounce and on normal quit to `~/Library/Application Support/VibeTracer/Autosave.vtrace`. Pending snapshots are serialized in order, and quit flushes the final state before termination; a failed final write offers Cancel Quit. The last autosave is restored on startup. Explicit project saves are atomic and remain separate from the recovery file.
+## Example assets
 
-Base-color images decode as sRGB and multiply tint. Roughness and metalness maps use linear data and replace scalar values; select R/G/B/A for packed maps. Tangent-space normals use +Y and remain linear. **Clear** restores the scalar parameter's effect. Maps use repeat wrapping, mipmaps, and an approximate ray-cone footprint, and are evaluated at primary and secondary hits. UV repeat/offset/rotation and normal strength can be edited independently.
+- [MaterialX examples](Examples/MaterialX/README.md)
+- [OpenUSD examples and reference scenes](Examples/OpenUSD/README.md)
+- [Poly Haven HDRI test selection](Examples/HDRI/README.md)
 
-**Original scene material** preserves its original type while allowing maps. A metalness map promotes it to OpenPBR; editing surface parameters or tint also creates a custom OpenPBR surface. Original ideal mirrors/glass retain their delta behavior; new rough surfaces have a roughness floor of 0.03. Volumetric absorption, subsurface scattering, opacity, thin films, dispersion, UDIMs, and displacement remain outside the exposed material model.
-
-## OpenUSD scenes
-
-In **Objects**, choose **Open USD scene…** for `.usd`, `.usda`, `.usdc`, or `.usdz`. Import opens a complete scene, including supported lighting and cameras, and replaces the current imported content. It composes references, payloads, and selected variants with the official SDK at the stage’s start time. Cancel leaves the active scene intact. The report lists fallbacks and unsupported features and remains available in Objects. Save as `.vtrace` to embed meshes, material images, matrices, lights, and the report for portable reopening; Undo restores the previous project.
-
-Supported: polygon meshes (including concave faces), indexed UV0/normals, material face subsets, hierarchy, shared mesh assets, nonuniform/mirrored transforms, stage units/up-axis, visibility, perspective cameras as saved views, rectangular area lights, one textured dome, and one distant light. PreviewSurface’s metallic workflow and supported direct MaterialX UsdShade nodes map to the existing bounded OpenPBR evaluator. Area-light radiance is editable in Materials. Original imported matrices are retained beneath the inspector’s local transform adjustments.
-
-This is snapshot import, not full USD round-trip editing. Subdivision uses control cages; point instancers, skinned animation, volumes/curves, arbitrary shader networks, USD export, and external `.mtlx` Sdf composition are not implemented. OCIO/ACES color management, camera roll/lens shift, and some light features are not represented. The importer reports approximations; PreviewSurface-to-OpenPBR shading is not an exact BSDF match. Existing limits remain 256 nodes, 56 imported materials and 500,000 rendered triangles. See [OpenUSD coverage and reference scenes](Examples/OpenUSD/README.md).
-
-## MaterialX materials
-
-A small walkthrough is included in [Examples/MaterialX](Examples/MaterialX/README.md).
-
-In **Materials**, use **Import MaterialX…** to load a self-contained `.mtlx` document. On an imported mesh, supported materials enter the scene library and the first is assigned to the selected face subset. On a procedural surface, the first supported material replaces that slot. The import report lists rejected materials and ignored look assignments. Select a mesh child to change its subset bindings; edits to a shared material affect every assignment.
-
-This is a bounded local importer/evaluator, not the MaterialX SDK or a visual node editor. It accepts 1.38/1.39 XML and the `open_pbr_surface` model. Supported nodes are `constant`, `texcoord` (UV0), `image`, `multiply`, `add`, `subtract`, `mix`, `clamp`, scalar `extract`, `normalmap`, `rotate2d` (constant degrees), and matching-width/scalar-broadcast `convert`. Nodegraph outputs and interface inputs resolve into the same program. Authored constants and default surface inputs are editable in the inspector; graph structure remains imported. Reset buttons restore the persisted imported default. Graph parameters use linear values.
-
-Images use relative local paths at import, then embed their bytes. Supported color spaces are linear/lin_rec709/raw/none and srgb/srgb_texture. Images use periodic addressing and linear/mipmap filtering. UV arithmetic can tile/offset coordinates; `place2d`, additional UV sets, UDIMs, procedural noise, custom definitions, XInclude, OCIO transforms, and look assignment rules are unsupported. Missing images and unsupported connected nodes reject the affected material. Each material supports up to 64 instructions, with 128 graph images total.
-
-Mapped OpenPBR inputs are base color/weight/metalness, specular roughness/weight/IOR/anisotropy, coat weight/roughness, fuzz weight, transmission weight, and surface normal. The renderer retains its roughness floor (0.03), IOR range (1.01–2.5), and 0–1 color/weight limits. Other authored surface inputs must be recognized default values; non-default subsurface, emission, opacity, dispersion, thin-film, and volume features are rejected. No `.mtlx` graph export is implemented. `REFERENCES.md` documents the implementation and adaptations.
-
-## Meshes, environments, and export
-
-**Import OBJ** reads positions, optional UVs/normals, positive and negative indices, and convex polygon faces (fan triangulation). Missing normals use face normals. A median-split CPU BVH accelerates triangle intersections inside the existing Metal tracer, including shadows, reflections, transmission, picking, and denoiser guide rays. Import opens Mesh Studio, appends assets, and frames the new import. `o` and `g` become parent/mesh nodes; `usemtl` creates face subsets with named materials. Select a mesh in Objects or click it in the viewport, then choose a subset and material in Materials. Instances share geometry and initially share materials; assignments can be changed per instance. Parent visibility is inherited, and reparenting preserves local transform values. MTL shading, curves, vertex colors, and animation are not imported. Triangulate concave polygons before import. Limits are 256 scene nodes, 56 imported materials plus eight procedural slots, and 500,000 triangles across instances. The initial GPU bridge flattens visible instances and rebuilds the BVH after edits; complex imports and embedded project files can take noticeable time.
-
-HDRI loading accepts equirectangular HDR/EXR and supported ordinary images, converts to linear extended sRGB, and clamps negative converted channels to zero. The environment uses the existing sun-cone/cosine mixture proposals with matching PDFs, not a luminance importance map; small bright features may converge slowly.
-
-**Render and export** uses a separate renderer at the requested dimensions and sample count, pauses the preview, and supports cancellation during rendering and denoising. OIDN offline is the default source: it filters the converged linear HDR accumulation with progressively accumulated primary-surface guides and the configured quality. Its default robust HDR scale and diffuse-only isolated-firefly filter address false bright regions without altering raw samples. Raw accumulation and the MetalFX display remain selectable. **OIDN Preview Current Frame** on the Render page freezes the current samples, filters them in the background, and displays the result directly in the viewport; preview capture then saves that view. Clear the preview to restore the prior paused/running state. PNG applies display adjustments after denoising. OpenEXR preserves the selected source's linear HDR radiance without exposure or tone mapping. Both encoders preserve top-left orientation and write atomically. Output dimensions range from 16 to 8192 per axis; large sizes depend on available GPU and system memory. The divider is for preview comparison and is omitted from full-resolution exports.
-
-## Performance
-
-Plain scene diffuse surfaces take a Lambert fast path instead of preparing all OpenPBR layers for each ReSTIR candidate. Layered direct lighting shares BSDF preparation between evaluation and PDF, reservoir work skips ineligible surfaces, and materials without maps skip footprint calculations. Albedo and World Normals inspection views run the G-buffer pass only and preserve the beauty sample count. Shader arithmetic uses Metal's relaxed mode, which preserves NaN/Inf handling. OpenPBR presets, texture filtering, denoising, resolution, and path-depth settings are retained.
-
-The September 4 Apple M4 paired test reduced the default Pavilion with MetalFX from 92.00 to 23.72 ms per frame at 640×480 (3.88×). A coated OpenPBR floor improved from 107.12 to 65.51 ms. See [tests/PERFORMANCE.md](tests/PERFORMANCE.md) for method, limitations, and all results.
-
-For an interleaved before/after GPU comparison, run `python3 tests/benchmark.py /path/to/previous/main.swift` from this directory after building. The previous source must use the current 288-byte uniform layout, 256-map scene/MaterialX argument buffer, and matching shader resources. Older incompatible baselines are rejected rather than compared with incompatible buffers. This test warms both pipelines, alternates execution order, and measures GPU command-buffer time at 640×480, excluding CPU image readback. Results depend on scene, other GPU work, and temperature; they are not a native-window FPS guarantee.
-
-## Changes
-
-- Use Adobe's pinned OpenPBR 1.1.1 implementation for non-delta BSDF evaluation, sampling, and PDFs, including rough transmission and microfacet multiple-scattering compensation. Add a denser local metal-energy table to resolve measured grazing-angle lookup errors. Primary OpenPBR/glossy surfaces use MIS even in ReSTIR mode. Exact ideal mirror/glass paths remain compatible with the existing renderer.
-- Exclude ideal mirror/glass chains from the scattering-depth budget. They terminate through energy-compensated Russian roulette instead of becoming black at a fixed bounce count. The gold cylinder uses a finite-roughness OpenPBR conductor so near-horizontal views do not compound a colored perfect-mirror tint across dozens of interior reflections. MetalFX material guides also follow longer chains.
-- Use Apple’s `MTLFXTemporalDenoisedScaler` at native resolution for ReSTIR. It receives each noisy HDR frame, depth, pixel motion, world normals, diffuse/specular albedo, roughness, and reflection distance. Deterministic reflected/refracted material guides preserve information inside smooth metal and glass surfaces. A denoise mask identifies noiseless sky and emitter pixels. The custom à-trous filter has been removed. Captures follow the selected display.
-- Use the official Intel Open Image Denoise 2.5.0 `RT` filter for final-frame exports and in-app preview. Beauty and auxiliary inputs share progressive reconstruction; quality, guides, noisy-guide handling, input scaling, and OIDN-only diffuse firefly suppression are configurable.
-- Reuse a first diffuse indirect vertex with temporal and spatial ReSTIR GI reservoirs. Deeper paths remain ordinary path tracing, and Standard MIS remains the reference mode.
-- Preserve visible emitter radiance and the first glass hit's entry/exit information through the G-buffer.
-- Apply complementary MIS weights to light sampling and BSDF paths; honor BSDF-only and light-only modes throughout the path. Rough glossy bounces use the same BRDF and PDF as direct lighting.
-- Sample one consistent sky radiance function with a complete sun/sky mixture density. Store actual sphere-light intersections.
-- Use area measure for finite-light reservoir reuse, count rejected candidates, and validate history against previous position, normal, and material. Match camera rays to reprojection matrices.
-- Handle rays inside boxes and parallel to box faces; keep random values below one; bound Russian roulette probabilities and use running-average accumulation.
-- Implement the fog toggle as a bounded, approximate single-scatter camera effect.
-- Allocate render targets atomically, skip zero-size drawables, cap queued frames, report GPU errors, and publish sample counts after GPU completion.
-- Pad capture rows, check GPU completion, prevent concurrent capture requests, write PNG files atomically, and preserve capture/save status messages.
-- Report startup errors, keep controls within the minimum window size, and quit when the window closes.
-
-## Approximation limits
-
-The ReSTIR mode reuses direct-light samples and a first diffuse indirect vertex on primary diffuse surfaces, and uses MIS for glossy surfaces and deeper bounces. It uses practical temporal/spatial reuse with history rejection and limited history counts. Its GI subset omits glossy shift mappings, generalized MIS, and reuse beyond the first indirect vertex, so it is not a fully unbiased reference implementation. Standard MIS with fog and ring boost off is the comparison mode.
-
-The original “SMS” routine is a simplified artistic ring-caustic boost with an empirical gain, not a full specular-manifold solver. It is now labeled **Ring boost**, is off by default, and does not solve glass caustics. Glass and mirror paths still participate in ordinary path tracing. Fog is a camera-segment preview with approximate light attenuation, not a full multiple-scattering volume integrator. Scene 4's fog is controlled explicitly by the Atmosphere menu.
-
-OpenPBR compensation is approximate. White-furnace tests check finite sets of roughness and view angles, not all possible layered configurations. Normal mapping uses hemisphere guards and geometric-normal ray offsets; it is not a full energy-preserving microgeometry transport solution. MetalFX receives unaveraged frames and maintains its own temporal history. Shared Halton jitter aligns the color and guide buffers, and motion vectors exclude that jitter. Smooth orbit/zoom resets the raw accumulation while preserving MetalFX history; scene/settings changes, presets, resize, re-enabling MetalFX, and explicit Reset invalidate denoiser history. Mirrors and glass participate in native denoising rather than being bypassed. The MetalFX material guides approximate ideal reflection/transmission with bounded auxiliary paths; complex multiple reflections may still lose detail. MetalFX can soften fine details and does not converge identically to the raw progressive average. OIDN filters the final progressive average and now receives matching accumulated primary albedo/normal guides. Reflections and transmission are inferred from color rather than represented by reflected guide geometry. Raw export remains available for reference output. Procedural primitives remain analytic; imported triangles now use the local BVH.
-
-## Verification
+To download the optional 4K HDRI selection locally:
 
 ```sh
+python3 scripts/fetch_test_hdris.py
+```
+
+## Development
+
+The renderer and embedded Metal kernels live in `main.swift`. App controls, project handling, importers, and export code are in `Sources/`.
+
+```sh
+./build.sh
 python3 tests/verify.py
 ```
 
-The test runner compiles the production Swift definitions, compiles the real Metal shaders on the GPU, checks box intersections and dielectric total internal reflection, renders all 24 scene/strategy combinations at a non-aligned size, checks visible-light emission and fog, and compares mean Cornell-box radiance across stochastic strategies. The suite also checks 20 white-furnace angle/roughness combinations against unit energy and independent BRDF integration, compares low-sample denoising against a high-sample reference, checks raw-buffer invariance and non-ReSTIR bypass, validates stationary/moving-camera motion and history resets, and inspects reflection hit-distance and material guides. It explicitly verifies that the native MetalFX path ran, that first-bounce GI reservoirs are populated, and exercises the bundled OIDN filter with an isolated HDR-firefly regression. Render comparisons are saved in `build/checks` (raw, denoised, high-sample reference, left to right). It also checks OpenPBR eval/sample/PDF consistency (including rough-glass entry and exit), real texture decoding, sRGB versus linear data, mipmaps, wrapping, failed-load preservation, mapped secondary reflections, and all four lighting strategies with OpenPBR presets. `build/checks/openpbr-textures.png` shows the original scene, mapped raw render, and MetalFX output. It requires GPU access and opens no window. The MaterialX checks cover multi-object/subset imports, shared instances, hierarchy validation, CPU graph validation, GPU arithmetic and sRGB/UV/normal evaluation, portable graph/image round trips, inspector edits, and rendering strategies. The Studio checks additionally exercise project validation and embedded assets, OBJ/BVH/visibility/transforms, thin-lens focus, light-size PDFs, PNG orientation, HDR EXR round trips, render scale/limits, inspector construction, undo/redo, and an OIDN-denoised independent export. Native file-panel interactions still require manual verification.
+The verification suite runs the production shaders on Metal and checks rendering, materials, denoising, imports, project persistence, and UI construction. GPU access is required. Diagnostic images are written to `build/checks/`. Native file dialogs and mouse interactions require manual checks.
 
-For API validation, run `MTL_DEBUG_LAYER=1 python3 tests/verify.py`. Physical mouse gestures and native file dialogs still require manual verification. To run the Studio and MaterialX integration coverage, use `python3 tests/verify.py --studio-only`. Inspector and export artifacts are written to `build/checks/studio/`.
+For Metal API validation:
 
-The grazing-cylinder regression follows a ray through more than 40 interior reflections to the floor, verifies that the interior receives light with and without MetalFX, and compares scattering budgets of 16 and 64. `build/checks/cylinder-grazing.png` shows raw, MetalFX, and the larger-budget reference from left to right.
+```sh
+MTL_DEBUG_LAYER=1 python3 tests/verify.py
+```
 
-To regenerate the local metal-energy table (requires a Metal GPU), run `python3 scripts/generate_metal_energy.py`. Ordinary builds use the checked-in `Shaders/MetalEnergy.metal`. Vendor sources remain unmodified; generated lookup substitutions and citations are documented in `REFERENCES.md`.
+See [performance notes](tests/PERFORMANCE.md) for measurements and [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
 
-OpenUSD tests exercise the real SDK process, layered references, native instances, USDC/USDZ, units/axis transforms, concave faces, primvars, cancellation, portable emission state, one-sided area lights and sampled/evaluated GPU PDF agreement. If the optional ASWF asset is downloaded, the suite imports it, saves `build/reference-scenes/StandardShaderBall-audit.vtrace` plus `import-report-audit.txt`, and renders `build/checks/openusd-audit-reference.png`.
+## Known limitations
+
+- ReSTIR GI currently reuses the first diffuse indirect vertex. Deeper and glossy transport use ordinary path tracing; practical reservoir reuse is not a fully unbiased reference estimator. Use Standard MIS with fog and ring boost disabled for comparisons.
+- HDRI sampling has no luminance importance map, so small bright features can converge slowly.
+- OpenUSD import is a scene snapshot, with partial material and light support. Animation, subdivision evaluation, volumes, curves, and USD export are unsupported.
+- MaterialX support is a bounded importer, with no node editor or graph export. OCIO/ACES color management, UDIMs, displacement, and several advanced material features are unsupported.
+- MetalFX can soften detail. OIDN works on the accumulated image; raw output remains available for comparison.
+- Fog and the optional ring-caustic boost are approximate preview effects.
+
+## Acknowledgments
+
+Built with Apple Metal and MetalFX, Adobe OpenPBR, OpenUSD, and Intel Open Image Denoise. Optional HDRI test assets are from Poly Haven under CC0.
+
+Third-party licenses and attribution are retained with the vendored dependencies and bundled resources. Full citations and implementation notes are in [REFERENCES.md](REFERENCES.md).

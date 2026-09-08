@@ -175,10 +175,7 @@ final class StudioController: NSViewController {
     bar.orientation = .horizontal
     bar.spacing = 8
     let toggle = ActionButton("Inspector") { [weak self] in
-      guard let self else { return }
-      self.sidebarVisible.toggle()
-      self.sidebarWidth.constant = self.sidebarVisible ? 340 : 0
-      self.sidebar.isHidden = !self.sidebarVisible
+      self?.inspectorAction()
     }
     bar.addArrangedSubview(toggle)
     bar.addArrangedSubview(ActionButton("Open…") { [weak self] in self?.openProject() })
@@ -194,6 +191,7 @@ final class StudioController: NSViewController {
       })
     let spacer = NSView()
     bar.addArrangedSubview(spacer)
+    bar.addArrangedSubview(ActionButton("Settings…") { [weak self] in self?.settingsAction() })
     sidebar.hasVerticalScroller = true
     sidebar.drawsBackground = true
     stack.orientation = .vertical
@@ -276,13 +274,18 @@ final class StudioController: NSViewController {
       stack.removeArrangedSubview(child)
       child.removeFromSuperview()
     }
-    popup(
-      ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export", "Settings"], page
-    ) { [weak self] i in
-      self?.page = i
-      self?.rebuild()
+    if page == 6 {
+      button("‹ Back to Inspector") { [weak self] in self?.page = 0; self?.rebuild() }
+      heading("Settings")
+    } else {
+      popup(
+        ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page
+      ) { [weak self] i in
+        self?.page = i
+        self?.rebuild()
+      }
+      popup(Self.sceneNames, Int(renderer.sceneIndex)) { [weak self] i in self?.switchScene(i) }
     }
-    popup(Self.sceneNames, Int(renderer.sceneIndex)) { [weak self] i in self?.switchScene(i) }
     if exportRenderer != nil {
       heading("Rendering export…")
       text("The preview is paused while the export renders.")
@@ -1231,7 +1234,7 @@ final class StudioController: NSViewController {
         sub.addItem(e)
       }
     }
-    menu("Metal Vibe Tracer", [("Quit Metal Vibe Tracer", "q", #selector(quit))])
+    menu("Metal Vibe Tracer", [("Settings…", ",", #selector(settingsAction)), ("Quit Metal Vibe Tracer", "q", #selector(quit))])
     menu(
       "File",
       [
@@ -1252,9 +1255,40 @@ final class StudioController: NSViewController {
     }
     menu(
       "Render",
-      [("Pause / Resume", "p", #selector(pauseAction)), ("Restart", "r", #selector(restartAction))])
-    menu("View", [("Frame Selection", "f", #selector(frameSelectionAction)), ("Frame All Imported Objects", "F", #selector(frameAllAction))])
+      [("Pause / Resume", "p", #selector(pauseAction)), ("Restart", "r", #selector(restartAction)),
+       ("Denoise Current Frame with OIDN", "", #selector(oidnAction)),
+       ("Clear OIDN Preview", "", #selector(clearOIDNAction))])
+    menu("View", [("Show / Hide Inspector", "i", #selector(inspectorAction)), ("Frame Selection", "f", #selector(frameSelectionAction)), ("Frame All Imported Objects", "F", #selector(frameAllAction))])
+    if let viewMenu = main.items.last?.submenu {
+      viewMenu.addItem(.separator())
+      for (index, title) in Self.viewportNames.enumerated() {
+        let item = NSMenuItem(title: title, action: #selector(viewportAction(_:)), keyEquivalent: "")
+        item.tag = index
+        item.target = self
+        viewMenu.addItem(item)
+      }
+    }
     NSApp.mainMenu = main
+  }
+  @objc func inspectorAction() {
+    sidebarVisible.toggle()
+    sidebarWidth.constant = sidebarVisible ? 340 : 0
+    sidebar.isHidden = !sidebarVisible
+  }
+  @objc func settingsAction() {
+    guard !isBusy else { return }
+    if !sidebarVisible { inspectorAction() }
+    page = 6
+    rebuild()
+  }
+  @objc func oidnAction() { guard !isBusy else { return }; startOIDNPreview() }
+  @objc func clearOIDNAction() { guard !isBusy else { return }; clearOIDNPreview(); rebuild() }
+  @objc func viewportAction(_ sender: NSMenuItem) {
+    guard !isBusy else { return }
+    checkpoint("Viewport")
+    renderer.viewportMode = UInt32(sender.tag)
+    changed(reset: false)
+    rebuild()
   }
   @objc func saveAsAction() { saveProject(asNew: true) }
   @objc func importOBJAction() { importMesh() }
@@ -1283,6 +1317,10 @@ final class StudioController: NSViewController {
 extension StudioController: NSMenuItemValidation {
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     if item.action == #selector(quit) { return true }
+    if item.action == #selector(inspectorAction) { return true }
+    if item.action == #selector(viewportAction(_:)) {
+      item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
+    }
     if isBusy { return false }
     if item.action == #selector(undoAction) {
       item.title = history.undoMenuItemTitle
