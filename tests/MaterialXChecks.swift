@@ -100,6 +100,13 @@ for body in [
     bad.materials.isEmpty && bad.report.joined().contains("NOT imported"),
     "unsupported and invalid graphs reported")
 }
+let unsupportedColor = try parseMX(
+  "<image name=\"aces\" type=\"color3\" colorspace=\"acescg\"><input name=\"file\" type=\"filename\" value=\"color.png\"/></image><open_pbr_surface name=\"badColor\" type=\"surfaceshader\"><input name=\"base_color\" type=\"color3\" nodename=\"aces\"/></open_pbr_surface>"
+)
+require(
+  unsupportedColor.materials.isEmpty
+    && unsupportedColor.report.joined().contains("OCIO/ACES transforms are not available"),
+  "unsupported MaterialX color spaces are rejected with guidance")
 var badProgram = mxProgram
 badProgram.roots[0] = -1
 do {

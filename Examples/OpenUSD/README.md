@@ -36,7 +36,7 @@ This establishes a usable scene for visual inspection. It is **not yet a matched
 | Meshes | Planar concave polygon triangulation, holes, authored orientation, indexed UV0/normals, inherited and subset material bindings. |
 | Scene | Parent transforms, visibility, shared mesh assets, stage units/Y- or Z-up; full affine matrices including nonuniform scale and mirroring. |
 | Materials | PreviewSurface metallic workflow and a bounded set of direct MaterialX UsdShade nodes. Local compiler limits remain in README. Unsupported materials report a displayColor fallback. |
-| Lights | Rectangle → one-sided triangle emitter; one textured dome; one distant sun. Radiance editable in Materials. Other light types report omission. |
+| Lights | Rectangles and disks become one-sided polygon emitters; spheres become reported rectangular approximations; one textured dome; one distant sun. Radiance editable in Materials. Other light types report omission. |
 | Camera | Perspective camera poses/FOV become saved orbit views; first valid camera is active. |
 | Persistence | Embedded `.vtrace` snapshot, import report, undo and cancellation; original USD files are unchanged. |
 

@@ -250,13 +250,19 @@ def import_stage(filename,directory,frame=None):
                 if camera.projection!=Gf.Camera.Perspective:report.append(path+': orthographic camera skipped');continue
                 world=cache.GetLocalToWorldTransform(prim)*conversion;eye=world.Transform(Gf.Vec3d(0));forward=normalize(vec(world.TransformDir(Gf.Vec3d(0,0,-1))));up=normalize(vec(world.TransformDir(Gf.Vec3d(0,1,0))))
                 cameras.append({'name':str(prim.GetName()),'eye':vec(eye),'direction':forward,'up':up,'fov':float(camera.GetFieldOfView(Gf.Camera.FOVVertical)),'focus':float(UsdGeom.Camera(prim).GetFocusDistanceAttr().Get(time))*UsdGeom.GetStageMetersPerUnit(stage)})
-            elif prim.IsA(UsdLux.RectLight):
+            elif prim.IsA(UsdLux.RectLight) or prim.IsA(UsdLux.DiskLight) or prim.IsA(UsdLux.SphereLight):
                 if imageable and imageable.ComputeVisibility(time)=='invisible':continue
-                light=UsdLux.RectLight(prim);width=float(light.GetWidthAttr().Get(time));height=float(light.GetHeightAttr().Get(time))
+                is_rect=prim.IsA(UsdLux.RectLight);is_disk=prim.IsA(UsdLux.DiskLight)
+                light=UsdLux.RectLight(prim) if is_rect else (UsdLux.DiskLight(prim) if is_disk else UsdLux.SphereLight(prim))
+                if is_rect: width=float(light.GetWidthAttr().Get(time));height=float(light.GetHeightAttr().Get(time))
+                else:
+                    radius=float(light.GetRadiusAttr().Get(time))
+                    if radius<=0: report.append(path+': degenerate light skipped');continue
+                    width=height=2*radius
                 world=cache.GetLocalToWorldTransform(prim)*conversion
                 strength=float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time));color=vec(light.GetColorAttr().Get(time))
                 if light.GetEnableColorTemperatureAttr().Get(time):report.append(path+': light color temperature is not applied')
-                if light.GetTextureFileAttr().Get(time):report.append(path+': textured area light imported with constant color')
+                if is_rect and light.GetTextureFileAttr().Get(time):report.append(path+': textured area light imported with constant color')
                 if prim.HasAPI(UsdLux.ShapingAPI) or light.GetFiltersRel().GetTargets() or light.GetDiffuseAttr().Get(time)!=1 or light.GetSpecularAttr().Get(time)!=1:report.append(path+': light shaping, filters and diffuse/specular weights are not applied')
                 area=Gf.Cross(world.TransformDir(Gf.Vec3d(width,0,0)),world.TransformDir(Gf.Vec3d(0,height,0))).GetLength()
                 if area<1e-12:report.append(path+': degenerate area light skipped');continue
@@ -264,15 +270,24 @@ def import_stage(filename,directory,frame=None):
                 material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':[max(0,x*strength) for x in color]}
                 if len(materials)>=56:fail('Stage exceeds 56 materials including lights')
                 materials.append(material)
-                ps=[[-width/2,-height/2,0],[-width/2,height/2,0],[width/2,height/2,0],[width/2,-height/2,0]];triangles=[]
-                for a,b,c in [(0,1,2),(0,2,3)]:triangles.append(dict(a=ps[a]+[1],b=ps[b]+[1],c=ps[c]+[1],na=[0,0,-1,0],nb=[0,0,-1,0],nc=[0,0,-1,0],uvab=[0,0,0,1],uvc=[1,1,0,0]))
+                if is_disk:
+                    ps=[[0,0,0]]+[[radius*math.cos(2*math.pi*i/8),radius*math.sin(2*math.pi*i/8),0] for i in range(8)]
+                    triangles=[]
+                    for i in range(8):
+                        a,b=1+i,1+(i+1)%8
+                        triangles.append(dict(a=ps[0]+[1],b=ps[b]+[1],c=ps[a]+[1],na=[0,0,-1,0],nb=[0,0,-1,0],nc=[0,0,-1,0],uvab=[.5,.5,.5,.5],uvc=[.5+.5*math.cos(2*math.pi*i/8),.5+.5*math.sin(2*math.pi*i/8),0,0]))
+                else:
+                    ps=[[-width/2,-height/2,0],[-width/2,height/2,0],[width/2,height/2,0],[width/2,-height/2,0]];triangles=[]
+                    for a,b,c in [(0,1,2),(0,2,3)]:triangles.append(dict(a=ps[a]+[1],b=ps[b]+[1],c=ps[c]+[1],na=[0,0,-1,0],nb=[0,0,-1,0],nc=[0,0,-1,0],uvab=[0,0,0,1],uvc=[1,1,0,0]))
                 asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':['Emission']};assets.append(asset)
                 parent=prim.GetParent()
                 while parent and str(parent.GetPath()) not in nodeIDs:parent=parent.GetParent()
                 pp=str(parent.GetPath()) if parent else None
                 local=world*(worlds[pp].GetInverse() if pp in worlds else Gf.Matrix4d(1))
                 nodes.append({'id':uid(),'name':str(prim.GetName()),'parent':nodeIDs.get(pp,rootID),'mesh':asset['id'],'transform':identity_settings(),'bindings':[material['id']],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]})
-                rendered+=2
+                rendered+=len(triangles)
+                if is_disk: report.append(path+': disk light imported as an eight-sided emissive polygon')
+                elif not is_rect: report.append(path+': sphere light imported as a rectangular emitter approximation')
             elif prim.IsA(UsdLux.DomeLight):
                 light=UsdLux.DomeLight(prim);asset=light.GetTextureFileAttr().Get(time)
                 if asset and asset.path:

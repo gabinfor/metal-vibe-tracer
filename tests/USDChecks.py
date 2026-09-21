@@ -50,6 +50,14 @@ area=Usd.Stage.CreateNew(str(lightFile));UsdGeom.SetStageMetersPerUnit(area,1)
 floor=UsdGeom.Mesh.Define(area,'/Floor');floor.CreatePointsAttr([(-2,0,-2),(2,0,-2),(2,0,2),(-2,0,2)]);floor.CreateFaceVertexCountsAttr([4]);floor.CreateFaceVertexIndicesAttr([0,3,2,1]);floor.CreateSubdivisionSchemeAttr('none');floor.CreateDisplayColorAttr([(.6,.6,.6)])
 light=UsdLux.RectLight.Define(area,'/Area');light.CreateWidthAttr(1);light.CreateHeightAttr(1);light.CreateIntensityAttr(4);light.AddTranslateOp().Set((0,2,0));light.AddRotateXOp().Set(-90)
 area.GetRootLayer().Save()
+coverage=Usd.Stage.CreateNew(str(out/'light-coverage.usda'));UsdGeom.SetStageMetersPerUnit(coverage,1)
+disk=UsdLux.DiskLight.Define(coverage,'/Disk');disk.CreateRadiusAttr(.5);disk.CreateIntensityAttr(2)
+sphere=UsdLux.SphereLight.Define(coverage,'/Sphere');sphere.CreateRadiusAttr(.25);sphere.CreateIntensityAttr(2);sphere.AddTranslateOp().Set((1,1,0))
+coverage.GetRootLayer().Save()
+coverage_result=bridge.import_stage(str(out/'light-coverage.usda'),out)
+assert len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8
+assert any('disk light imported' in line for line in coverage_result['report'])
+assert any('sphere light imported' in line for line in coverage_result['report'])
 # Reference scene override is separate; upstream files and notices remain unchanged.
 reference=ROOT/'build/reference-scenes/StandardShaderBall'
 if reference.exists():

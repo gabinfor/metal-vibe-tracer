@@ -220,6 +220,8 @@ struct MaterialResources {
     device GraphHeader *graphHeaders [[id(389)]];
     device float4 *emissions [[id(390)]];
     device uint *emitters [[id(391)]];
+    texture2d<float> environmentRows [[id(392)]];
+    texture2d<float> environmentColumns [[id(393)]];
 };
 float3 rotate_object(float3 p, float3 a) {
     p.yz = float2(cos(a.x)*p.y-sin(a.x)*p.z, sin(a.x)*p.y+cos(a.x)*p.z);
@@ -636,7 +638,36 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
     }
     return hit;
 }
-// REFERENCES.md: PBRT2023. Lat-long lookup with the existing sun/cosine proposal mixture.
+uint environment_cdf_index(texture2d<float> cdf, uint count, uint row, float value) {
+    uint low = 0, high = max(1u, count) - 1;
+    for (uint iteration = 0; iteration < 16 && low < high; ++iteration) {
+        uint middle = (low + high) / 2;
+        float cumulative = cdf.read(uint2(cdf.get_width() == 1 ? 0 : middle, row), 0).x;
+        if (cumulative >= value) high = middle; else low = middle + 1;
+    }
+    return low;
+}
+
+float environment_cdf_value(texture2d<float> cdf, uint x, uint y) {
+    return cdf.read(uint2(x, y), 0).x;
+}
+
+float environment_image_pdf(float3 wi, constant Uniforms &u, constant MaterialResources &images) {
+    uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
+    float theta = acos(clamp(wi.y, -1.0f, 1.0f));
+    float sinTheta = max(1e-5f, sin(theta));
+    float2 uv = float2(atan2(wi.z, wi.x) / TWO_PI + 0.5f + u.environment.y / TWO_PI, theta / PI);
+    uv.x = fract(uv.x); uv.y = clamp(uv.y, 0.0f, 1.0f - 1e-7f);
+    uint x = min(width - 1, uint(uv.x * float(width))), y = min(height - 1, uint(uv.y * float(height)));
+    float row = environment_cdf_value(images.environmentRows, 0, y);
+    float previousRow = y == 0 ? 0.0f : environment_cdf_value(images.environmentRows, 0, y - 1);
+    float column = environment_cdf_value(images.environmentColumns, x, y);
+    float previousColumn = x == 0 ? 0.0f : environment_cdf_value(images.environmentColumns, x - 1, y);
+    float cellProbability = max(0.0f, row - previousRow) * max(0.0f, column - previousColumn);
+    return cellProbability * float(width * height) / (2.0f * PI * PI * sinTheta);
+}
+
+// REFERENCES.md: PBRT2023. Lat-long lookup with luminance-weighted image sampling.
 float3 eval_environment(float3 d, constant Uniforms &u, constant MaterialResources &images) {
     float3 result;
     if(u.environment.z>0.5f) {
@@ -892,7 +923,8 @@ float imported_geometry(float3 p,float3 position,uint index,constant MaterialRes
     return d2>1e-12f && dot(n,n)>1e-20f ? max(0.0f,dot(normalize(n),-d*rsqrt(d2)))/d2:0;
 }
 float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant MaterialResources &images) {
-    return (1.0f-imported_light_probability(u,images))*eval_environment_pdf(wi,n,u);
+    float pdf = u.environment.z > 0.5f ? environment_image_pdf(wi,u,images) : eval_environment_pdf(wi,n,u);
+    return (1.0f-imported_light_probability(u,images))*pdf;
 }
 // Both proposals sample the same environment, with their full mixture PDF.
 LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread uint &seed, constant MaterialResources &materialImages) {
@@ -908,7 +940,20 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
         ls.pdf=geometry>1e-12f ? importedProbability/(float(count)*area*geometry):0;
         return ls;
     }
-    if ((u.sceneIndex == 0 || u.sceneIndex == 6)) {
+    if ((u.sceneIndex == 0 || u.sceneIndex == 6) && u.environment.z > 0.5f) {
+        uint width = materialImages.environmentMap.get_width(), height = materialImages.environmentMap.get_height();
+        uint y = environment_cdf_index(materialImages.environmentRows, height, 0, rand_f(seed));
+        uint x = environment_cdf_index(materialImages.environmentColumns, width, y, rand_f(seed));
+        float2 uv = (float2(float(x) + rand_f(seed), float(y) + rand_f(seed))) / float2(width, height);
+        float theta = uv.y * PI, phi = (uv.x - 0.5f - u.environment.y / TWO_PI) * TWO_PI;
+        float sinTheta = sin(theta);
+        ls.wi = normalize(float3(sinTheta * cos(phi), cos(theta), sinTheta * sin(phi)));
+        ls.position = p + ls.wi * 1e6f;
+        ls.dist = 1e6f;
+        ls.isDirectional = 1;
+        ls.pdf = eval_environment_pdf(ls.wi, n, u, materialImages);
+        ls.emission = eval_environment(ls.wi, u, materialImages);
+    } else if ((u.sceneIndex == 0 || u.sceneIndex == 6)) {
         float sunProbability=(u.environment.x>0 && u.environment.z<0.5f && u.sunParams.w>0) ? 0.60f:0.0f;
         if (rand_f(seed) < sunProbability) {
             // Direct Sun Disc Cone Sampling (60%)
@@ -2322,6 +2367,9 @@ final class MaterialLibrary {
     var bindingsDirty = false
     var environmentData: Data?
     var environmentTexture: MTLTexture!
+    var environmentRows: MTLTexture!
+    var environmentColumns: MTLTexture!
+    var defaultEnvironmentSampling: MTLTexture!
     var triangleBuffer: MTLBuffer!, nodeBuffer: MTLBuffer!
     var meshTriangles: [MeshTriangle] = []
     var hasSceneGraph = false
@@ -2368,6 +2416,19 @@ final class MaterialLibrary {
         defaultTextures = defaults
         images = (0..<(SceneLimits.materials * 4)).map { defaults[$0 % 4 == 0 ? 0 : ($0 % 4 == 3 ? 2 : 1)] }
         environmentTexture=images[0]
+        let importanceDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
+        importanceDescriptor.storageMode = .shared
+        importanceDescriptor.usage = .shaderRead
+        guard let importance = device.makeTexture(descriptor: importanceDescriptor) else {
+            throw Self.error("Could not allocate environment sampling data.")
+        }
+        var one = [Float(1)]
+        importance.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0,
+                           withBytes: &one, bytesPerRow: MemoryLayout<Float>.stride)
+        environmentRows = importance
+        environmentColumns = importance
+        defaultEnvironmentSampling = importance
         guard let triangles = device.makeBuffer(length:128,options:.storageModeShared),
               let nodes = device.makeBuffer(length:48,options:.storageModeShared) else {
             throw Self.error("Could not allocate imported-scene buffers.")
@@ -2464,6 +2525,8 @@ final class MaterialLibrary {
         argumentEncoder.setArgumentBuffer(buffer, offset: 0)
         for (i, texture) in replacement.enumerated() { argumentEncoder.setTexture(texture, index: i) }
         argumentEncoder.setTexture(environmentTexture,index:256)
+        argumentEncoder.setTexture(environmentRows,index:392)
+        argumentEncoder.setTexture(environmentColumns,index:393)
         argumentEncoder.setBuffer(triangleBuffer,offset:0,index:257)
         argumentEncoder.setBuffer(nodeBuffer,offset:0,index:258)
         guard let objectBuffer=objects.withUnsafeBytes({ bindingBuffer(bytes:$0.baseAddress!,length:$0.count) }) else { throw Self.error("Could not allocate object settings.") }
@@ -2538,7 +2601,7 @@ final class MaterialLibrary {
             do { try rebuildArguments(images) }
             catch { return false }
         }
-        encoder.useResources([environmentTexture!, triangleBuffer!, nodeBuffer!, objectBuffer!, graphInstructionBuffer!, graphHeaderBuffer!, emissionBuffer!, emitterBuffer!],usage:.read)
+        encoder.useResources([environmentTexture!, environmentRows!, environmentColumns!, triangleBuffer!, nodeBuffer!, objectBuffer!, graphInstructionBuffer!, graphHeaderBuffer!, emissionBuffer!, emitterBuffer!],usage:.read)
         encoder.useResources(graphTextures.map { $0 as MTLResource },usage:.read)
         settings.withUnsafeBytes { bytes in
             encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 1)

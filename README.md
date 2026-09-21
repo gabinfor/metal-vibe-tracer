@@ -93,7 +93,7 @@ See [performance notes](tests/PERFORMANCE.md) for measurements and [REFERENCES.m
 ## Known limitations
 
 - ReSTIR GI currently reuses the first diffuse indirect vertex. Deeper and glossy transport use ordinary path tracing; practical reservoir reuse is not a fully unbiased reference estimator. Use Standard MIS with fog and ring boost disabled for comparisons.
-- HDRI sampling has no luminance importance map, so small bright features can converge slowly.
+- HDRI sampling uses a luminance-weighted lat-long distribution; very small or high-contrast features can still require additional samples.
 - OpenUSD import is a scene snapshot, with partial material and light support. Animation, subdivision evaluation, volumes, curves, and USD export are unsupported.
 - MaterialX support is a bounded importer, with no node editor or graph export. OCIO/ACES color management, UDIMs, displacement, and several advanced material features are unsupported.
 - MetalFX can soften detail. OIDN works on the accumulated image; raw output remains available for comparison.

@@ -427,13 +427,68 @@ extension MaterialLibrary {
     try validateDecodedTexture(result, encodedBytes: data.count)
     return result
   }
+
+  func environmentImportance(_ pixels: [Float], width: Int, height: Int) throws -> (MTLTexture, MTLTexture) {
+    guard pixels.count == width * height * 4, width > 0, height > 0 else {
+      throw Self.error("Invalid environment sampling dimensions.")
+    }
+    var rowWeights = Array(repeating: Float(0), count: height)
+    var columnWeights = Array(repeating: Float(0), count: width * height)
+    for y in 0..<height {
+      let theta = (.pi * (Float(y) + 0.5)) / Float(height)
+      let sinTheta = max(1e-4, sin(theta))
+      for x in 0..<width {
+        let offset = (y * width + x) * 4
+        let luminance = max(0, 0.2126 * pixels[offset] + 0.7152 * pixels[offset + 1] + 0.0722 * pixels[offset + 2])
+        let weight = max(1e-6, luminance) * sinTheta
+        rowWeights[y] += weight
+        columnWeights[y * width + x] = weight
+      }
+    }
+    func cdf(_ weights: [Float], count: Int, rows: Int) -> [Float] {
+      var result = Array(repeating: Float(0), count: weights.count)
+      for row in 0..<rows {
+        let start = row * count
+        let total = max(1e-12, weights[start..<start + count].reduce(0, +))
+        var sum: Float = 0
+        for index in 0..<count {
+          sum += weights[start + index] / total
+          result[start + index] = index == count - 1 ? 1 : sum
+        }
+      }
+      return result
+    }
+    let rows = cdf(rowWeights, count: height, rows: 1)
+    let columns = cdf(columnWeights, count: width, rows: height)
+    let rowDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .r32Float, width: 1, height: height, mipmapped: false)
+    rowDescriptor.storageMode = .shared
+    rowDescriptor.usage = .shaderRead
+    let columnDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+    columnDescriptor.storageMode = .shared
+    columnDescriptor.usage = .shaderRead
+    guard let rowTexture = device.makeTexture(descriptor: rowDescriptor),
+      let columnTexture = device.makeTexture(descriptor: columnDescriptor) else {
+      throw Self.error("Could not allocate environment sampling data.")
+    }
+    rowTexture.replace(region: MTLRegionMake2D(0, 0, 1, height), mipmapLevel: 0,
+      withBytes: rows, bytesPerRow: MemoryLayout<Float>.stride)
+    columnTexture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
+      withBytes: columns, bytesPerRow: width * MemoryLayout<Float>.stride)
+    return (rowTexture, columnTexture)
+  }
+
   func setEnvironment(_ bytes: Data?) throws {
     guard let bytes else {
-      let oldTexture = environmentTexture, oldData = environmentData, oldArgument = argumentBuffer
-      environmentTexture = images[0]; environmentData = nil
+      let oldTexture = environmentTexture, oldRows = environmentRows, oldColumns = environmentColumns,
+        oldData = environmentData, oldArgument = argumentBuffer
+      environmentTexture = images[0]; environmentRows = defaultEnvironmentSampling
+      environmentColumns = defaultEnvironmentSampling; environmentData = nil
       do { try rebuildArguments(images) }
       catch {
-        environmentTexture = oldTexture; environmentData = oldData; argumentBuffer = oldArgument
+        environmentTexture = oldTexture; environmentRows = oldRows; environmentColumns = oldColumns
+        environmentData = oldData; argumentBuffer = oldArgument
         restoreArgumentEncoder(oldArgument)
         throw error
       }
@@ -471,12 +526,16 @@ extension MaterialLibrary {
     }
     imageTexture.replace(
       region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: w * 16)
+    let (rowSampling, columnSampling) = try environmentImportance(pixels, width: w, height: h)
     try validateCandidateTextures(images: images, environment: imageTexture)
-    let oldTexture = environmentTexture, oldData = environmentData, oldArgument = argumentBuffer
-    environmentTexture = imageTexture; environmentData = bytes
+    let oldTexture = environmentTexture, oldRows = environmentRows, oldColumns = environmentColumns,
+      oldData = environmentData, oldArgument = argumentBuffer
+    environmentTexture = imageTexture; environmentRows = rowSampling; environmentColumns = columnSampling
+    environmentData = bytes
     do { try rebuildArguments(images) }
     catch {
-      environmentTexture = oldTexture; environmentData = oldData; argumentBuffer = oldArgument
+      environmentTexture = oldTexture; environmentRows = oldRows; environmentColumns = oldColumns
+      environmentData = oldData; argumentBuffer = oldArgument
       throw error
     }
   }

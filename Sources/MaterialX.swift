@@ -319,7 +319,7 @@ private final class MXCompiler {
       color != "linear", color != "none", color != "raw"
     {
       guard color == "srgb_texture" || color == "srgb" else {
-        try fail("Unsupported color space \(color).")
+        try fail("Unsupported MaterialX color space '\(color)'; use linear, raw, or sRGB, or convert with OCIO before import.")
       }
       for i in 0..<3 {
         let x = result[i]
@@ -430,7 +430,7 @@ private final class MXCompiler {
       let url = URL(fileURLWithPath: prefix + path, relativeTo: baseURL).standardizedFileURL
       let color = input.attributes["colorspace"] ?? e.inherited("colorspace") ?? "lin_rec709"
       guard ["lin_rec709", "linear", "raw", "none", "srgb_texture", "srgb"].contains(color) else {
-        try fail("Unsupported image colorspace \(color).")
+        try fail("Unsupported MaterialX image color space '\(color)'; OCIO/ACES transforms are not available in this importer.")
       }
       let srgb = color == "srgb_texture" || color == "srgb"
       let key = url.path + "|" + String(srgb)
