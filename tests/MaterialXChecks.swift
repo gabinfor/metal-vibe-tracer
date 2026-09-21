@@ -135,6 +135,16 @@ let textureProgram = textureImport.materials[0]
 try testRenderer.materials.restore(SceneState())
 try testRenderer.materials.prepareMaterialX([8: mxProgram, 9: textureProgram])
 try testRenderer.materials.setMesh(mxTris)
+let bindingBuildCount = testRenderer.materials.meshBuildCount
+var reboundScene = mxScene
+let reboundMaterial = try reboundScene.addMaterial("Rebound")
+let reboundNodeIndex = reboundScene.nodes.firstIndex(where: { $0.name == "Face" })!
+reboundScene.nodes[reboundNodeIndex].bindings[0] = reboundMaterial.id
+try testRenderer.materials.setMeshBindings(reboundScene)
+require(testRenderer.materials.meshBuildCount == bindingBuildCount
+    && testRenderer.materials.orderedTriangles.contains(where: { Int($0.uvc.z) == reboundMaterial.slot }),
+  "material rebinding updates triangle slots without rebuilding the BVH")
+try testRenderer.materials.setMeshBindings(mxScene)
 testRenderer.materials.hasSceneGraph = true
 let mxKernel = """
   kernel void materialx_checks(constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],constant MaterialResources &images [[buffer(2)]],device float4 *out [[buffer(3)]]) {

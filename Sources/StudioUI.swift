@@ -119,9 +119,15 @@ final class StudioController: NSViewController {
   var project = ProjectDocument()
   var projectURL: URL?
   var importInProgress = false
-  var isBusy: Bool { exportRenderer != nil || previewDenoiseJob != nil || importInProgress }
+  var projectOperationInProgress = false
+  var isBusy: Bool {
+    exportRenderer != nil || previewDenoiseJob != nil || importInProgress || projectOperationInProgress
+  }
   var pauseButton: NSButton?
   private let autosaveQueue = DispatchQueue(label: "VibeTracer.autosave", qos: .utility)
+  private let projectIOQueue = DispatchQueue(label: "VibeTracer.project-io", qos: .userInitiated)
+  private var documentRevision: UInt64 = 0
+  private var projectOperationGeneration: UInt64 = 0
   var selectedSlot = 1, page = 0, sidebarVisible = true
   var selectedNode: UUID?
   var selectedSubset = 0
@@ -857,6 +863,7 @@ final class StudioController: NSViewController {
     } catch { show(error.localizedDescription) }
   }
   func changed(reset: Bool = true) {
+    documentRevision &+= 1
     hostWindow?.isDocumentEdited = true
     if reset { renderer.resetAccumulation() }
     saveTimer?.invalidate()
@@ -864,7 +871,7 @@ final class StudioController: NSViewController {
       self?.autosave()
     }
   }
-  func restore(_ p: ProjectDocument) throws {
+  private func prepareResources(_ p: ProjectDocument) throws -> MaterialLibrary {
     try p.validate()
     let resources = try MaterialLibrary(
       device: renderer.device, function: renderer.materialFunction)
@@ -872,6 +879,9 @@ final class StudioController: NSViewController {
     try resources.setEnvironment(p.environmentData)
     try resources.setMesh(p.graph?.renderTriangles() ?? p.triangles)
     resources.hasSceneGraph = p.graph != nil
+    return resources
+  }
+  private func applyProject(_ p: ProjectDocument, resources: MaterialLibrary) {
     isRestoring = true
     defer { isRestoring = false }
     renderer.materials = resources
@@ -888,6 +898,9 @@ final class StudioController: NSViewController {
     p.camera.apply(renderer)
     renderer.resetAccumulation()
     rebuild()
+  }
+  func restore(_ p: ProjectDocument) throws {
+    applyProject(p, resources: try prepareResources(p))
   }
   func switchScene(_ i: Int) {
     guard !isBusy, UInt32(i) != renderer.sceneIndex else { return }
@@ -970,16 +983,36 @@ final class StudioController: NSViewController {
   }
   func openProject() {
     chooseOpen("Open Metal Vibe Tracer project", extensions: ["vtrace", "json"]) { [weak self] url in
+      self?.beginOpenProject(url)
+    }
+  }
+  func beginOpenProject(_ url: URL) {
+    projectOperationGeneration &+= 1
+    let generation = projectOperationGeneration
+    projectOperationInProgress = true
+    show("Opening \(url.lastPathComponent)…")
+    projectIOQueue.async { [weak self] in
       guard let self else { return }
-      do {
-        let p = try JSONDecoder().decode(ProjectDocument.self, from: self.readBounded(url, maximum: 768 * 1024 * 1024))
-        try p.validate()
-        self.checkpoint("Open project")
-        try self.restore(p)
-        self.projectURL = url
-        self.hostWindow?.isDocumentEdited = false
-        self.show("Opened \(url.lastPathComponent)")
-      } catch { self.show(error.localizedDescription) }
+      let result = Result { () -> (ProjectDocument, MaterialLibrary) in
+        let data = try self.readBounded(url, maximum: 768 * 1024 * 1024)
+        let document = try JSONDecoder().decode(ProjectDocument.self, from: data)
+        return (document, try self.prepareResources(document))
+      }
+      DispatchQueue.main.async { [weak self] in
+        guard let self, generation == self.projectOperationGeneration else { return }
+        self.projectOperationInProgress = false
+        switch result {
+        case .success(let (document, resources)):
+          self.checkpoint("Open project")
+          self.applyProject(document, resources: resources)
+          self.projectURL = url
+          self.documentRevision &+= 1
+          self.hostWindow?.isDocumentEdited = false
+          self.show("Opened \(url.lastPathComponent)")
+        case .failure(let error): self.show(error.localizedDescription)
+        }
+        self.rebuild()
+      }
     }
   }
   func readBounded(_ url: URL, maximum: Int) throws -> Data {
@@ -994,15 +1027,9 @@ final class StudioController: NSViewController {
     return data
   }
   func saveProject(asNew: Bool = false) {
-    guard !isBusy else { return }
+    guard exportRenderer == nil, previewDenoiseJob == nil, !importInProgress else { return }
     let write: (URL) -> Void = { [weak self] url in
-      guard let self else { return }
-      do {
-        try JSONEncoder().encode(self.snapshot()).write(to: url, options: .atomic)
-        self.projectURL = url
-        self.hostWindow?.isDocumentEdited = false
-        self.show("Saved \(url.lastPathComponent)")
-      } catch { self.show(error.localizedDescription) }
+      self?.beginSaveProject(url)
     }
     if let url = projectURL, !asNew {
       write(url)
@@ -1010,6 +1037,31 @@ final class StudioController: NSViewController {
       chooseSave(
         "Save project", name: projectURL?.lastPathComponent ?? "Untitled.vtrace", ext: "vtrace",
         write)
+    }
+  }
+  func beginSaveProject(_ url: URL) {
+    let document = snapshot()
+    let revision = documentRevision
+    projectOperationGeneration &+= 1
+    let generation = projectOperationGeneration
+    projectOperationInProgress = true
+    show("Saving \(url.lastPathComponent)…")
+    projectIOQueue.async { [weak self] in
+      let result = Result {
+        try JSONEncoder().encode(document).write(to: url, options: .atomic)
+      }
+      DispatchQueue.main.async { [weak self] in
+        guard let self, generation == self.projectOperationGeneration else { return }
+        self.projectOperationInProgress = false
+        switch result {
+        case .success:
+          self.projectURL = url
+          if self.documentRevision == revision { self.hostWindow?.isDocumentEdited = false }
+          self.show("Saved \(url.lastPathComponent)")
+        case .failure(let error): self.show(error.localizedDescription)
+        }
+        self.rebuild()
+      }
     }
   }
   func saveView() {

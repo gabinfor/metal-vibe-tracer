@@ -373,10 +373,21 @@ extension MaterialLibrary {
       emissions: emissions)
   }
   func restore(_ state: SceneState) throws {
+    guard state.surfaces.count <= SceneLimits.materials,
+      state.objects.count <= SceneLimits.materials,
+      state.maps.count <= SceneLimits.materials * 4,
+      state.names.count <= SceneLimits.materials * 4
+    else { throw Self.error("Scene state exceeds the material capacity.") }
     // Build all textures before publishing a restored scene.
-    var replacement = images
+    var replacement = (0..<(SceneLimits.materials * 4)).map { defaultTexture(channel: $0 % 4) }
     for i in state.maps.indices {
-      if let bytes = state.maps[i] { replacement[i] = try texture(data: bytes, channel: i % 4) }
+      guard let bytes = state.maps[i] else { continue }
+      if payloads.indices.contains(i), payloads[i] == bytes {
+        replacement[i] = images[i]
+      } else {
+        replacement[i] = try texture(data: bytes, channel: i % 4)
+      }
+      try validateCandidateTextures(images: replacement)
     }
     let oldSettings = settings, oldObjects = objects, oldPayloads = payloads, oldNames = fileNames
     let oldEmissions = emissions, oldMaterialX = materialX, oldImages = images
@@ -399,14 +410,13 @@ extension MaterialLibrary {
       graphTextures = oldGraphTextures; graphInstructionBuffer = oldGraphInstructions
       graphHeaderBuffer = oldGraphHeaders; argumentBuffer = oldArgument
       objectBuffer = oldObjectBuffer; emissionBuffer = oldEmissionBuffer; emitterBuffer = oldEmitterBuffer
+      restoreArgumentEncoder(oldArgument)
       bindingsDirty = false
       throw error
     }
   }
   func texture(data: Data, channel: Int) throws -> MTLTexture {
-    guard data.count <= 128 * 1024 * 1024 else {
-      throw Self.error("Texture file exceeds the 128 MiB import limit.")
-    }
+    try validateEncodedImage(data)
     let result = try loader.newTexture(
       data: data,
       options: [
@@ -424,6 +434,7 @@ extension MaterialLibrary {
       do { try rebuildArguments(images) }
       catch {
         environmentTexture = oldTexture; environmentData = oldData; argumentBuffer = oldArgument
+        restoreArgumentEncoder(oldArgument)
         throw error
       }
       return
@@ -435,6 +446,12 @@ extension MaterialLibrary {
     else { throw Self.error("Could not decode the environment image (maximum 16384×8192).") }
     let w = Int(image.extent.width)
     let h = Int(image.extent.height)
+    let decodedBytes = UInt64(w).multipliedReportingOverflow(by: UInt64(h))
+    guard !decodedBytes.overflow,
+      !decodedBytes.partialValue.multipliedReportingOverflow(by: 16).overflow,
+      uniqueTextureBytes(images + graphTextures + [environmentTexture])
+        + decodedBytes.partialValue * 16 <= textureBudget
+    else { throw Self.error("Environment image exceeds the safe GPU memory budget.") }
     var pixels = Array(repeating: Float(0), count: w * h * 4)
     let color = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
     CIContext().render(
@@ -454,6 +471,7 @@ extension MaterialLibrary {
     }
     imageTexture.replace(
       region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: w * 16)
+    try validateCandidateTextures(images: images, environment: imageTexture)
     let oldTexture = environmentTexture, oldData = environmentData, oldArgument = argumentBuffer
     environmentTexture = imageTexture; environmentData = bytes
     do { try rebuildArguments(images) }
@@ -463,6 +481,7 @@ extension MaterialLibrary {
     }
   }
   func setMesh(_ triangles: [MeshTriangle]) throws {
+    meshBuildCount += 1
     let (ordered, nodes) = OBJMesh.build(triangles)
     func buffer<T>(_ values: [T]) throws -> MTLBuffer {
       if values.isEmpty {
@@ -488,6 +507,53 @@ extension MaterialLibrary {
     catch {
       orderedTriangles = oldOrdered; triangleBuffer = oldTriangles; nodeBuffer = oldNodes
       meshTriangles = oldMesh; nodeCount = oldNodeCount; argumentBuffer = oldArgument
+      restoreArgumentEncoder(oldArgument)
+      throw error
+    }
+  }
+
+  func setMeshBindings(_ graph: SceneGraph) throws {
+    try graph.validate()
+    let slots = Dictionary(uniqueKeysWithValues: graph.materials.map { ($0.id, $0.slot) })
+    func rebound(_ input: [MeshTriangle]) throws -> [MeshTriangle] {
+      try input.map { triangle in
+        var result = triangle
+        let nodeIndex = Int(result.uvc.w) - 1
+        let subset = Int(result.na.w)
+        guard graph.nodes.indices.contains(nodeIndex),
+          graph.nodes[nodeIndex].bindings.indices.contains(subset),
+          let slot = slots[graph.nodes[nodeIndex].bindings[subset]]
+        else { throw Self.error("Scene binding no longer matches flattened geometry.") }
+        result.uvc.z = Float(slot)
+        return result
+      }
+    }
+    let candidateOrdered = try rebound(orderedTriangles)
+    let candidateMesh = try rebound(meshTriangles)
+    let candidateBuffer: MTLBuffer
+    if candidateOrdered.isEmpty {
+      guard let buffer = device.makeBuffer(length: 128, options: .storageModeShared) else {
+        throw Self.error("Could not allocate imported mesh bindings.")
+      }
+      candidateBuffer = buffer
+    } else {
+      guard let buffer = candidateOrdered.withUnsafeBytes({ bytes in
+        device.makeBuffer(bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared)
+      }) else { throw Self.error("Could not allocate imported mesh bindings.") }
+      candidateBuffer = buffer
+    }
+    let oldOrdered = orderedTriangles, oldMesh = meshTriangles
+    let oldTriangleBuffer = triangleBuffer, oldArgument = argumentBuffer
+    orderedTriangles = candidateOrdered
+    meshTriangles = candidateMesh
+    triangleBuffer = candidateBuffer
+    do { try rebuildArguments(images) }
+    catch {
+      orderedTriangles = oldOrdered
+      meshTriangles = oldMesh
+      triangleBuffer = oldTriangleBuffer
+      argumentBuffer = oldArgument
+      restoreArgumentEncoder(oldArgument)
       throw error
     }
   }

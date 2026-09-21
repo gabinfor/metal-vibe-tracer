@@ -1,7 +1,13 @@
 build/
 .DS_Store
 __pycache__/
+.env
+.env.*
+*.pem
+*.key
+*.p12
 
 # Optional local HDRI test assets
 Examples/HDRI/*.hdr
 Examples/HDRI/*.partial
+Examples/HDRI/*.exr

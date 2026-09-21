@@ -151,6 +151,39 @@ var invalid=decoded;invalid.scenes[6]!.surfaces=[]
 do{try invalid.validate();require(false,"reject malformed project before applying")}catch{}
 print("PASS: portable project roundtrip and invalid project rejection")
 
+let mapBytes = try Data(contentsOf: pngURL)
+var mappedState = SceneState()
+mappedState.maps[4] = mapBytes
+mappedState.names[4] = "audit.png"
+mappedState.surfaces[1].mapMask = 1
+try testRenderer.materials.restore(mappedState)
+weak var releasedMap = testRenderer.materials.images[4] as AnyObject
+try testRenderer.materials.restore(SceneState())
+require(testRenderer.materials.payloads[4] == nil && testRenderer.materials.settings[1].mapMask == 0
+    && testRenderer.materials.images[4].width == 1,
+  "empty-state restore replaces absent maps with shared defaults")
+autoreleasepool { }
+require(releasedMap == nil, "empty-state restore releases the obsolete map")
+let baseTextureBytes = testRenderer.materials.uniqueTextureBytes(
+  testRenderer.materials.images + testRenderer.materials.graphTextures + [testRenderer.materials.environmentTexture])
+try testRenderer.materials.restore(mappedState)
+let oneMapBytes = testRenderer.materials.uniqueTextureBytes(
+  testRenderer.materials.images + testRenderer.materials.graphTextures + [testRenderer.materials.environmentTexture])
+try testRenderer.materials.restore(SceneState())
+var twoMapState = mappedState
+twoMapState.maps[8] = mapBytes
+twoMapState.names[8] = "audit-2.png"
+twoMapState.surfaces[2].mapMask = 1
+testRenderer.materials.textureBudgetOverride = baseTextureBytes + (oneMapBytes - baseTextureBytes)
+do {
+  try testRenderer.materials.restore(twoMapState)
+  require(false, "aggregate texture budget rejects a multi-image candidate")
+} catch {}
+require(testRenderer.materials.payloads[4] == nil && testRenderer.materials.images[4].width == 1,
+  "failed aggregate texture preparation preserves the published state")
+testRenderer.materials.textureBudgetOverride = nil
+print("PASS: restored map release and aggregate candidate texture budgeting")
+
 let stableState = testRenderer.materials.state()
 let stableArgument = testRenderer.materials.argumentBuffer
 var failedState = stableState
@@ -184,8 +217,23 @@ func waitUntil(_ condition:()->Bool,seconds:Double=30) {
     while !condition() && Date()<deadline {RunLoop.main.run(until:Date().addingTimeInterval(0.01))}
     require(condition(),"async operation completes")
 }
+testRenderer.samplingMode=1
+testRenderer.denoiserEnabled=false
+var allocationDone=false
+testRenderer.onFrameUpdate={_ in allocationDone=true}
+testRenderer.renderFrame(output:studioOutput);waitUntil({allocationDone})
+let nonReSTIRBytes=testRenderer.residentFrameBytes
+require(testRenderer.resPosDirA?.width==1 && testRenderer.giPosPdfA?.width==1,
+  "non-ReSTIR mode uses placeholder reservoirs")
+testRenderer.samplingMode=0
+testRenderer.denoiserEnabled=true
+frameDone=false
+testRenderer.onFrameUpdate={_ in frameDone=true}
 testRenderer.renderFrame(output:studioOutput);waitUntil({frameDone})
 require(testRenderer.accumTexture?.width==48 && testRenderer.metalFX?.output.width==48,"preview scale preserves native-resolution MetalFX")
+require(testRenderer.resPosDirA?.width==48 && testRenderer.giPosPdfA?.width==48
+    && testRenderer.residentFrameBytes > nonReSTIRBytes,
+  "ReSTIR transition allocates full-size reservoirs")
 let beforeCount=testRenderer.frameIndex
 for enabled in [false,true] {
     testRenderer.denoiserEnabled=enabled

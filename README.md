@@ -17,7 +17,7 @@ An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Expl
 
 - macOS 26 or later
 - A Metal-capable GPU; tested on Apple M4
-- Xcode 26 command-line tools
+- Xcode 27 command-line tools (Swift 6.4)
 - Internet access for the first build
 
 MetalFX preview requires a supported GPU. OpenUSD import uses the command-line tools’ `/usr/bin/python3` (CPython 3.9).
@@ -82,6 +82,11 @@ For Metal API validation:
 ```sh
 MTL_DEBUG_LAYER=1 python3 tests/verify.py
 ```
+
+Release validation was completed on an Apple M4 with Xcode 27, Swift 6.4,
+and macOS 26. The application is currently distributed as an unsigned local
+build; signing, notarization, and clean-machine installation remain release
+packaging work.
 
 See [performance notes](tests/PERFORMANCE.md) for measurements and [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
 

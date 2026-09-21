@@ -30,7 +30,7 @@ CACHE = ROOT / "build/oidn-cache" / ARCHIVE
 DEST = ROOT / "build/OIDN"
 MANIFEST = DEST / "VIBE_RUNTIME.json"
 
-if MANIFEST.exists():
+if MANIFEST.exists() and (DEST / "lib/libOpenImageDenoise.2.dylib").is_file() and (DEST / "doc").is_dir():
     try:
         state = json.loads(MANIFEST.read_text())
         if state.get("version") == VERSION and state.get("sha256") == EXPECTED:

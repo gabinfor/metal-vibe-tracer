@@ -2,6 +2,10 @@
 """Exercise the real SDK bridge with composed layers, packages and schemas."""
 import sys,pathlib,json,importlib.util,zipfile
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+runtime=ROOT/'build/OpenUSD'
+manifest=json.loads((runtime/'VIBE_RUNTIME.json').read_text())
+assert manifest['version']=='26.8' and manifest['python']=='cp39' and len(manifest['sha256'])==64
+assert runtime.is_dir() and (runtime/'pxr/Usd/_usd.so').is_file()
 sys.path.insert(0,str(ROOT/'build/OpenUSD'))
 from pxr import Usd,UsdGeom,UsdShade,UsdLux,UsdUtils,Gf,Sdf
 spec=importlib.util.spec_from_file_location('usd_bridge',ROOT/'scripts/usd_bridge.py');bridge=importlib.util.module_from_spec(spec);spec.loader.exec_module(bridge)

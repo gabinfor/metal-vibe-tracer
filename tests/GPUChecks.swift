@@ -50,6 +50,13 @@ kernel void regression_checks(device uint *results [[buffer(0)]], constant Unifo
     // colored delta cavity compounds its tint over dozens of wall bounces.
     Ray grazing = { float3(0.7f, -0.44f, -0.5f), normalize(float3(0, -0.01f, 1)) };
     results[7] = trace_scene(grazing, 0, hit) && hit.mat.type == GLOSSY && !is_delta(hit.mat);
+    Uniforms terminal = u;
+    terminal.cameraTarget.w = 1;
+    bool depth1 = !restir_gi_has_complementary_bsdf(terminal.cameraTarget.w);
+    terminal.cameraTarget.w = 2;
+    bool depth2 = !restir_gi_has_complementary_bsdf(terminal.cameraTarget.w);
+    terminal.cameraTarget.w = 3;
+    results[8] = depth1 && depth2 && restir_gi_has_complementary_bsdf(terminal.cameraTarget.w);
 }
 """
 func makeUniforms(scene: UInt32, mode: UInt32, width: Int, height: Int, fog: UInt32 = 0) -> Uniforms {
@@ -66,7 +73,7 @@ func makeUniforms(scene: UInt32, mode: UInt32, width: Int, height: Int, fog: UIn
 }
 let library = try gpu.makeLibrary(source: metalSource + checks, options: shaderCompileOptions())
 let checkPipeline = try gpu.makeComputePipelineState(function: library.makeFunction(name: "regression_checks")!)
-let results = gpu.makeBuffer(length: 8 * 4, options: .storageModeShared)!
+let results = gpu.makeBuffer(length: 9 * 4, options: .storageModeShared)!
 var checkUniforms = makeUniforms(scene: 2, mode: 1, width: 1, height: 1)
 let checkCommand = testRenderer.commandQueue.makeCommandBuffer()!
 let checkEncoder = checkCommand.makeComputeCommandEncoder()!
@@ -78,8 +85,8 @@ checkEncoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerT
 checkEncoder.endEncoding()
 checkCommand.commit(); checkCommand.waitUntilCompleted()
 require(checkCommand.status == .completed, "GPU regression command: \(String(describing: checkCommand.error))")
-let names = ["inside-box exit", "parallel-box miss", "random endpoints", "small-PDF MIS", "glass total internal reflection", "emission weighting", "sphere emitter endpoints", "finite-roughness grazing cylinder"]
-for i in 0..<8 { require(results.contents().load(fromByteOffset: i * 4, as: UInt32.self) == 1, names[i]) }
+let names = ["inside-box exit", "parallel-box miss", "random endpoints", "small-PDF MIS", "glass total internal reflection", "emission weighting", "sphere emitter endpoints", "finite-roughness grazing cylinder", "terminal ReSTIR GI weighting"]
+for i in names.indices { require(results.contents().load(fromByteOffset: i * 4, as: UInt32.self) == 1, names[i]) }
 print("PASS: \(names.joined(separator: ", "))")
 
 var lastDisplay = [SIMD4<Float>]()

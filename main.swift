@@ -5,6 +5,7 @@ import MetalFX
 import simd
 import UniformTypeIdentifiers
 import CoreImage
+import ImageIO
 
 // Algorithm/API citations and adaptation notes: REFERENCES.md (stable keys below).
 // ============================================================================
@@ -1282,6 +1283,12 @@ float emission_weight(bool previousDelta, bool previousNEE, bool previousMIS,
     return previousMIS ? power_heuristic(bsdfPDF, lightPDF) : 0.0f;
 }
 
+// A camera-primary-secondary diffuse path can sample the secondary BSDF only
+// when the scattering budget permits the second non-delta continuation.
+bool restir_gi_has_complementary_bsdf(float pathDepth) {
+    return int(pathDepth) > 2;
+}
+
 // Bounded, single-scatter camera fog. This preview does not model multiple scattering.
 float3 apply_camera_fog(float3 color, Ray ray, float surfaceDistance,
                         constant Uniforms &u, thread uint &seed, constant MaterialResources &materialImages) {
@@ -1395,7 +1402,11 @@ kernel void restir_temporal_kernel(
         ? (rec.front_face ? rec.mat.ior : -rec.mat.ior) : rec.mat.roughness;
     gbufferAlbedoRough.write(float4(surfaceColor, surfaceParameter), gid);
 
-    if (uniforms.viewportMode > 0 || uniforms.samplingMode != 0 || rec.mat.type != DIFFUSE) {
+    // Non-ReSTIR and inspection passes bind 1x1 placeholder reservoirs. They do
+    // not read or write those resources, so the host need not allocate full-size
+    // DI/GI history for these modes.
+    if (uniforms.viewportMode > 0 || uniforms.samplingMode != 0) return;
+    if (rec.mat.type != DIFFUSE) {
         outSamplePosDir.write(float4(0.0f), gid);
         outSampleEmitPdf.write(float4(0.0f), gid);
         outReservoirWeights.write(float4(0.0f), gid);
@@ -1513,7 +1524,8 @@ kernel void restir_temporal_kernel(
                     float secondaryBSDFPdf;
                     float3 secondaryBSDF = eval_bsdf_with_pdf(secondary.mat, secondary.normal,
                         -giRay.direction, giLight.wi, secondaryBSDFPdf);
-                    float mis = power_heuristic(giLight.pdf, secondaryBSDFPdf);
+                    float mis = restir_gi_has_complementary_bsdf(uniforms.cameraTarget.w)
+                        ? power_heuristic(giLight.pdf, secondaryBSDFPdf) : 1.0f;
                     secondaryRadiance = secondaryBSDF * secondaryCosine * giLight.emission *
                         (mis / giLight.pdf);
                 }
@@ -2323,9 +2335,12 @@ final class MaterialLibrary {
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
     var orderedTriangles:[MeshTriangle]=[] { didSet { emittersDirty = true } }
+    var meshBuildCount = 0
     let loader: MTKTextureLoader
     // Internal fault-injection point used by the native regression suite. Nil in production.
     var bindingAllocationFailureCountdown: Int?
+    // Internal seam for bounded memory-accounting tests. Production uses the device budget.
+    var textureBudgetOverride: UInt64?
 
     private func bindingBuffer(bytes: UnsafeRawPointer? = nil, length: Int) -> MTLBuffer? {
         if let count = bindingAllocationFailureCountdown {
@@ -2353,13 +2368,61 @@ final class MaterialLibrary {
         defaultTextures = defaults
         images = (0..<(SceneLimits.materials * 4)).map { defaults[$0 % 4 == 0 ? 0 : ($0 % 4 == 3 ? 2 : 1)] }
         environmentTexture=images[0]
-        triangleBuffer=device.makeBuffer(length:128,options:.storageModeShared)!
-        nodeBuffer=device.makeBuffer(length:48,options:.storageModeShared)!
+        guard let triangles = device.makeBuffer(length:128,options:.storageModeShared),
+              let nodes = device.makeBuffer(length:48,options:.storageModeShared) else {
+            throw Self.error("Could not allocate imported-scene buffers.")
+        }
+        triangleBuffer=triangles
+        nodeBuffer=nodes
         try prepareMaterialX([:])
     }
 
     static func error(_ message: String) -> NSError {
         NSError(domain: "Materials", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    func defaultTexture(channel: Int) -> MTLTexture {
+        defaultTextures[channel == 0 ? 0 : (channel == 3 ? 2 : 1)]
+    }
+
+    var textureBudget: UInt64 {
+        textureBudgetOverride ?? max(UInt64(256 * 1024 * 1024), device.recommendedMaxWorkingSetSize / 4)
+    }
+
+    func uniqueTextureBytes(_ textures: [MTLTexture]) -> UInt64 {
+        var seen = Set<ObjectIdentifier>()
+        return textures.reduce(0) { total, texture in
+            let id = ObjectIdentifier(texture as AnyObject)
+            guard seen.insert(id).inserted else { return total }
+            return total + UInt64(texture.allocatedSize)
+        }
+    }
+
+    func validateEncodedImage(_ data: Data, maximumWidth: Int = 16384,
+                              maximumHeight: Int = 16384,
+                              maximumPixels: UInt64 = 67_108_864) throws {
+        guard data.count <= 128 * 1024 * 1024 else {
+            throw Self.error("Texture file exceeds the 128 MiB import limit.")
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else {
+            throw Self.error("Could not read texture dimensions.")
+        }
+        let pixels = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+        guard !pixels.overflow, width <= maximumWidth, height <= maximumHeight,
+              pixels.partialValue <= maximumPixels else {
+            throw Self.error("Decoded texture exceeds the supported dimensions or pixel count.")
+        }
+        // RGBA16 plus a complete mip chain is a conservative predecode estimate
+        // for the formats accepted by the material loader.
+        let estimate = pixels.partialValue.multipliedReportingOverflow(by: 11)
+        guard !estimate.overflow,
+              uniqueTextureBytes(images + graphTextures + [environmentTexture]) + estimate.partialValue <= textureBudget else {
+            throw Self.error("Scene textures exceed the safe GPU memory budget.")
+        }
     }
 
     func validateDecodedTexture(_ texture: MTLTexture, encodedBytes: Int) throws {
@@ -2370,10 +2433,27 @@ final class MaterialLibrary {
         guard texture.width <= 16384, texture.height <= 16384, pixels <= 67_108_864 else {
             throw Self.error("Decoded texture exceeds the 16,384 pixel side or 64 megapixel limit.")
         }
-        let existing = (images + graphTextures).reduce(UInt64(0)) { $0 + UInt64($1.allocatedSize) }
-        let budget = max(UInt64(256 * 1024 * 1024), device.recommendedMaxWorkingSetSize / 4)
-        guard existing + UInt64(texture.allocatedSize) <= budget else {
+        guard uniqueTextureBytes(images + graphTextures + [environmentTexture, texture]) <= textureBudget else {
             throw Self.error("Scene textures exceed the safe GPU memory budget.")
+        }
+    }
+
+    func validateCandidateTextures(images candidateImages: [MTLTexture],
+                                   graph candidateGraph: [MTLTexture]? = nil,
+                                   environment candidateEnvironment: MTLTexture? = nil) throws {
+        let graph = candidateGraph ?? graphTextures
+        guard let environment = candidateEnvironment ?? environmentTexture,
+              let currentEnvironment = environmentTexture else {
+            throw Self.error("Material environment binding is unavailable.")
+        }
+        let candidate = candidateImages + graph + [environment]
+        let steady = uniqueTextureBytes(candidate)
+        // Old resources may remain live for already-encoded command buffers while
+        // a complete replacement is prepared and published.
+        let existing = images + graphTextures + [currentEnvironment]
+        let peak = uniqueTextureBytes(existing + candidate)
+        guard steady <= textureBudget, peak <= textureBudget else {
+            throw Self.error("Scene textures exceed the safe GPU memory budget during replacement.")
         }
     }
 
@@ -2411,6 +2491,13 @@ final class MaterialLibrary {
         bindingsDirty = false
     }
 
+    // Rebind the encoder when a transactional rebuild fails.  The encoder is
+    // mutable state separate from `argumentBuffer`; leaving it pointed at the
+    // failed temporary buffer makes the next draw use stale bindings.
+    func restoreArgumentEncoder(_ buffer: MTLBuffer?) {
+        if let buffer { argumentEncoder.setArgumentBuffer(buffer, offset: 0) }
+    }
+
     func load(url: URL, slot: Int, channel: Int) throws {
         guard (0..<SceneLimits.materials).contains(slot), (0..<4).contains(channel) else { throw Self.error("Invalid material slot.") }
         let resource = try url.resourceValues(forKeys: [.fileSizeKey])
@@ -2418,16 +2505,17 @@ final class MaterialLibrary {
             throw Self.error("Texture file exceeds the 128 MiB import limit.")
         }
         let bytes = try Data(contentsOf:url, options: .mappedIfSafe)
+        try validateEncodedImage(bytes)
         let texture = try loader.newTexture(data: bytes, options: [
             .SRGB: channel == 0, .generateMipmaps: true,
             .origin: MTKTextureLoader.Origin.topLeft,
             .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
             .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue)
         ])
-        try validateDecodedTexture(texture, encodedBytes: bytes.count)
         texture.label = "\((slot < Self.names.count ? Self.names[slot] : "Material \(slot)")): \(Self.mapNames[channel]) — \(url.lastPathComponent)"
         var replacement = images
         replacement[slot * 4 + channel] = texture
+        try validateCandidateTextures(images: replacement)
         try rebuildArguments(replacement)
         payloads[slot * 4 + channel] = bytes
         fileNames[slot * 4 + channel] = url.lastPathComponent
@@ -2437,7 +2525,7 @@ final class MaterialLibrary {
     func clear(slot: Int, channel: Int) throws {
         guard (0..<SceneLimits.materials).contains(slot), (0..<4).contains(channel) else { throw Self.error("Invalid material slot.") }
         var replacement = images
-        replacement[slot * 4 + channel] = defaultTextures[channel == 0 ? 0 : (channel == 3 ? 2 : 1)]
+        replacement[slot * 4 + channel] = defaultTexture(channel: channel)
         try rebuildArguments(replacement)
         payloads[slot * 4 + channel] = nil
         settings[slot].mapMask &= ~(1 << channel)
@@ -2462,6 +2550,26 @@ final class MaterialLibrary {
 }
 
 class PathTracerRenderer: NSObject, MTKViewDelegate {
+    struct FrameResourcePlan {
+        let width: Int
+        let height: Int
+        let usesReSTIR: Bool
+        let usesMetalFX: Bool
+
+        var bytesPerPixel: UInt64 {
+            // Beauty/sample/position/OIDN accumulations: 6 RGBA32F; three
+            // normal/material guides: 3 RGBA16F. ReSTIR adds DI (6 RGBA32F)
+            // and GI (6 RGBA32F + 2 RGBA16F). MetalFX formats total 55 B/pixel.
+            120 + (usesReSTIR ? 208 : 0) + (usesMetalFX ? 55 : 0)
+        }
+        var bytes: UInt64? {
+            guard width > 0, height > 0 else { return nil }
+            let pixels = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+            guard !pixels.overflow else { return nil }
+            let result = pixels.partialValue.multipliedReportingOverflow(by: bytesPerPixel)
+            return result.overflow ? nil : result.partialValue
+        }
+    }
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
 
@@ -2563,20 +2671,61 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return (near, max(100, min(1_000_000, distance * 2_000)))
     }
     private var rejectedRenderSize: SIMD2<Int>?
+    private var frameResourcesUseReSTIR: Bool?
+    var concurrentRenderBytes: UInt64 = 0
+
+    var residentFrameBytes: UInt64 {
+        let textures: [MTLTexture?] = [
+            historyPosDepth, historyNormalMat, gbufferPosDepth, gbufferNormalMat,
+            gbufferAlbedoRough, accumTexture, sampleTexture, oidnAlbedoAccum,
+            oidnNormalAccum, resPosDirA, resEmitPdfA, resWeightsA, resPosDirB,
+            resEmitPdfB, resWeightsB, giPosPdfA, giNormalA, giRadianceA,
+            giWeightsA, giPosPdfB, giNormalB, giRadianceB, giWeightsB,
+        ]
+        var seen = Set<ObjectIdentifier>()
+        let metalFXTextures: [MTLTexture?] = metalFX.map { fx in
+            [fx.color, fx.depth, fx.motion, fx.diffuse, fx.specular, fx.normal,
+             fx.roughness, fx.hitDistance, fx.denoiseMask, fx.output, fx.exposure]
+        } ?? []
+        return (textures + metalFXTextures).compactMap { $0 }.reduce(0) { total, texture in
+            let id = ObjectIdentifier(texture as AnyObject)
+            return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
+        }
+    }
 
     func renderMemoryError(width: Int, height: Int) -> String? {
-        guard width > 0, height > 0 else { return "Render dimensions must be positive." }
+        let plan = FrameResourcePlan(width: width, height: height,
+            usesReSTIR: samplingMode == 0 && viewportMode == 0,
+            usesMetalFX: denoiserEnabled && supportsMetalFX && samplingMode == 0 && viewportMode == 0)
+        guard let frameBytes = plan.bytes else { return "Render dimensions are too large." }
+        // Include the live frame set during resize/export, scene textures, and
+        // modest command/display headroom. Opaque framework allocations remain
+        // estimates and are intentionally covered by the final 32 B/pixel.
         let pixels = UInt64(width) * UInt64(height)
-        // Accumulation, G-buffer, reservoirs, display output, and optional MetalFX
-        // working textures. The estimate deliberately includes allocation overlap.
-        // First-bounce GI reservoirs and OIDN guide accumulation add 144 B/pixel.
-        let bytesPerPixel: UInt64 = denoiserEnabled ? 400 : 336
-        let required = pixels.multipliedReportingOverflow(by: bytesPerPixel)
-        if required.overflow { return "Render dimensions are too large." }
+        let headroom = pixels.multipliedReportingOverflow(by: 32)
+        guard !headroom.overflow else { return "Render dimensions are too large." }
+        let replacesExisting = accumTexture == nil || accumTexture?.width != width ||
+            accumTexture?.height != height || frameResourcesUseReSTIR != plan.usesReSTIR
+        let resident = replacesExisting ? residentFrameBytes : 0
+        let baseRequired = replacesExisting ? frameBytes : residentFrameBytes
+        let required = baseRequired.addingReportingOverflow(resident)
+        let needsMetalFX = plan.usesMetalFX &&
+            (metalFX == nil || metalFX?.output.width != width || metalFX?.output.height != height)
+        let fxPixels = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+        let additionalFX = (!replacesExisting && needsMetalFX && !fxPixels.overflow)
+            ? fxPixels.partialValue.multipliedReportingOverflow(by: 55).partialValue : 0
+        let withFX = required.partialValue.addingReportingOverflow(additionalFX)
+        let withConcurrent = withFX.partialValue.addingReportingOverflow(concurrentRenderBytes)
+        let withTextures = withConcurrent.partialValue.addingReportingOverflow(
+            materials.uniqueTextureBytes(materials.images + materials.graphTextures + [materials.environmentTexture]))
+        let total = withTextures.partialValue.addingReportingOverflow(headroom.partialValue)
+        if required.overflow || withFX.overflow || withConcurrent.overflow || withTextures.overflow || total.overflow {
+            return "Render dimensions are too large."
+        }
         let recommended = device.recommendedMaxWorkingSetSize
         let budget = max(UInt64(512 * 1024 * 1024), recommended * 7 / 10)
-        guard required.partialValue <= budget else {
-            let mib = required.partialValue / (1024 * 1024)
+        guard total.partialValue <= budget else {
+            let mib = total.partialValue / (1024 * 1024)
             let allowed = budget / (1024 * 1024)
             return "This render needs about \(mib) MiB of GPU memory; the safe budget is \(allowed) MiB. Reduce the output dimensions or preview scale."
         }
@@ -2814,13 +2963,24 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Float32 running means lose unit sample precision after 2^24 samples.
         if frameIndex >= 16_777_215 { resetAccumulation() }
 
-        if accumTexture == nil || accumTexture?.width != w || accumTexture?.height != h {
+        let needsReSTIR = samplingMode == 0 && viewportMode == 0
+        if accumTexture == nil || accumTexture?.width != w || accumTexture?.height != h ||
+            frameResourcesUseReSTIR != needsReSTIR {
             let desc32 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
             desc32.usage = [.shaderRead, .shaderWrite]
             desc32.storageMode = .private
             let desc16 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h, mipmapped: false)
             desc16.usage = [.shaderRead, .shaderWrite]
             desc16.storageMode = .private
+
+            let reservoir32 = needsReSTIR ? desc32 : {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: 1, height: 1, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private; return d
+            }()
+            let reservoir16 = needsReSTIR ? desc16 : {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private; return d
+            }()
 
             // Publish a complete set only after every allocation succeeds.
             guard let newAccum = device.makeTexture(descriptor: desc32),
@@ -2830,22 +2990,22 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let newNormal = device.makeTexture(descriptor: desc16),
                   let newHistoryNormal = device.makeTexture(descriptor: desc16),
                   let newAlbedo = device.makeTexture(descriptor: desc16),
-                  let newPosA = device.makeTexture(descriptor: desc32),
-                  let newEmitA = device.makeTexture(descriptor: desc32),
-                  let newWeightA = device.makeTexture(descriptor: desc32),
-                  let newPosB = device.makeTexture(descriptor: desc32),
-                  let newEmitB = device.makeTexture(descriptor: desc32),
-                  let newWeightB = device.makeTexture(descriptor: desc32),
+                  let newPosA = device.makeTexture(descriptor: reservoir32),
+                  let newEmitA = device.makeTexture(descriptor: reservoir32),
+                  let newWeightA = device.makeTexture(descriptor: reservoir32),
+                  let newPosB = device.makeTexture(descriptor: reservoir32),
+                  let newEmitB = device.makeTexture(descriptor: reservoir32),
+                  let newWeightB = device.makeTexture(descriptor: reservoir32),
                   let newOIDNAlbedo = device.makeTexture(descriptor: desc32),
                   let newOIDNNormal = device.makeTexture(descriptor: desc32),
-                  let newGIPosA = device.makeTexture(descriptor: desc32),
-                  let newGINormalA = device.makeTexture(descriptor: desc16),
-                  let newGIRadianceA = device.makeTexture(descriptor: desc32),
-                  let newGIWeightsA = device.makeTexture(descriptor: desc32),
-                  let newGIPosB = device.makeTexture(descriptor: desc32),
-                  let newGINormalB = device.makeTexture(descriptor: desc16),
-                  let newGIRadianceB = device.makeTexture(descriptor: desc32),
-                  let newGIWeightsB = device.makeTexture(descriptor: desc32) else {
+                  let newGIPosA = device.makeTexture(descriptor: reservoir32),
+                  let newGINormalA = device.makeTexture(descriptor: reservoir16),
+                  let newGIRadianceA = device.makeTexture(descriptor: reservoir32),
+                  let newGIWeightsA = device.makeTexture(descriptor: reservoir32),
+                  let newGIPosB = device.makeTexture(descriptor: reservoir32),
+                  let newGINormalB = device.makeTexture(descriptor: reservoir16),
+                  let newGIRadianceB = device.makeTexture(descriptor: reservoir32),
+                  let newGIWeightsB = device.makeTexture(descriptor: reservoir32) else {
                 onError?("Could not allocate render textures. Try a smaller window.")
                 return
             }
@@ -2864,6 +3024,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             giRadianceA = newGIRadianceA; giWeightsA = newGIWeightsA
             giPosPdfB = newGIPosB; giNormalB = newGINormalB
             giRadianceB = newGIRadianceB; giWeightsB = newGIWeightsB
+            frameResourcesUseReSTIR = needsReSTIR
 
             resetAccumulation()
         }
@@ -3147,44 +3308,6 @@ class InteractiveMTKView: MTKView {
             renderer?.distance = max(0.0001, min(1_000_000, current * exp(-delta * 0.015)))
             onUserOrbit?()
         }
-    }
-}
-
-// ============================================================================
-// 4. GUI & HUD Layout
-// ============================================================================
-
-class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: NSWindow!
-    var studio: StudioController!
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let studio else { return .terminateNow }
-        do {
-            try studio.flushAutosave()
-            return .terminateNow
-        } catch {
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "The final autosave failed"
-            alert.informativeText = error.localizedDescription
-            alert.addButton(withTitle: "Cancel Quit")
-            alert.addButton(withTitle: "Quit Anyway")
-            return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
-        }
-    }
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        do {
-            guard let device=MTLCreateSystemDefaultDevice() else { throw MaterialLibrary.error("Metal is unavailable.") }
-            let renderer=try PathTracerRenderer(device:device)
-            window=NSWindow(contentRect:NSRect(x:0,y:0,width:1120,height:820),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
-            window.title="Metal Vibe Tracer";window.contentMinSize=NSSize(width:700,height:440);window.center()
-            studio=StudioController(renderer:renderer,window:window)
-            window.contentView=studio.view
-            window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
-            studio.restoreAutosave()
-        } catch { NSAlert(error:error).runModal(); NSApp.terminate(nil) }
     }
 }
 

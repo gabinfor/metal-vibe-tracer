@@ -1,6 +1,12 @@
 import Cocoa
 import simd
 
+enum GraphEditKind {
+  case metadata
+  case bindings
+  case geometry
+}
+
 extension StudioController {
   func selectGraphNode() {
     guard let graph = project.graph else { return }
@@ -53,7 +59,7 @@ extension StudioController {
       ) { [weak self] i in
         guard let self else { return }
         let subset = self.selectedSubset
-        self.editGraph("Assign material") { g in
+        self.editGraph("Assign material", kind: .bindings) { g in
           if let index = g.nodes.firstIndex(where: { $0.id == node.id }) {
             g.nodes[index].bindings[subset] = g.materials[i].id
           }
@@ -74,7 +80,7 @@ extension StudioController {
     button("New material for selection") { [weak self] in
       guard let self else { return }
       let subset = self.selectedSubset
-      self.editGraph("New material") { g in
+      self.editGraph("New material", kind: .bindings) { g in
         let m = try g.addMaterial("Material \(g.materials.count+1)")
         if let i = g.nodes.firstIndex(where: { $0.id == node.id }), !g.nodes[i].bindings.isEmpty {
           g.nodes[i].bindings[subset] = m.id
@@ -84,14 +90,16 @@ extension StudioController {
     }
     text("Material edits are shared by all subsets assigned to the same material.")
   }
-  func editGraph(_ title: String, rebuildGeometry: Bool = true, _ edit: (inout SceneGraph) throws -> Void) {
+  func editGraph(_ title: String, kind: GraphEditKind = .geometry,
+                 _ edit: (inout SceneGraph) throws -> Void) {
     guard !isBusy, var graph = project.graph else { return }
     let previousState = renderer.materials.state()
     let previousTriangles = renderer.materials.meshTriangles
     do {
       let previousMaterials = graph.materials
       try edit(&graph)
-      let triangles = rebuildGeometry ? try graph.renderTriangles() : nil
+      try graph.validate()
+      let triangles = kind == .geometry ? try graph.renderTriangles() : nil
       checkpoint(title)
       let remaining = Set(graph.materials.map(\.id))
       let removedSlots = previousMaterials.filter { !remaining.contains($0.id) }.map(\.slot)
@@ -110,17 +118,25 @@ extension StudioController {
         try renderer.materials.restore(state)
       }
       if let triangles { try renderer.materials.setMesh(triangles) }
+      else if kind == .bindings { try renderer.materials.setMeshBindings(graph) }
       renderer.materials.hasSceneGraph = true
       project.graph = graph
-      changed()
+      changed(reset: kind != .metadata)
       rebuild()
     } catch {
       // Resource publication is transactional at the library level; this also
       // rolls back a multi-step material-prune plus geometry edit.
-      try? renderer.materials.restore(previousState)
-      try? renderer.materials.setMesh(previousTriangles)
+      var rollbackFailures: [String] = []
+      do { try renderer.materials.restore(previousState) }
+      catch { rollbackFailures.append("materials: \(error.localizedDescription)") }
+      do { try renderer.materials.setMesh(previousTriangles) }
+      catch { rollbackFailures.append("mesh: \(error.localizedDescription)") }
       renderer.materials.hasSceneGraph = project.graph != nil
-      show(error.localizedDescription)
+      if rollbackFailures.isEmpty {
+        show(error.localizedDescription)
+      } else {
+        show("\(error.localizedDescription) Rollback also failed (\(rollbackFailures.joined(separator: "; "))).")
+      }
     }
   }
   func graphObjectPanel() {
@@ -143,7 +159,7 @@ extension StudioController {
         if alert.runModal() == .alertFirstButtonReturn,
           !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
-          self.editGraph("Rename object", rebuildGeometry: false) { g in
+          self.editGraph("Rename object", kind: .metadata) { g in
             g.nodes[g.nodes.firstIndex(where: { $0.id == node.id })!].name = field.stringValue
           }
         }

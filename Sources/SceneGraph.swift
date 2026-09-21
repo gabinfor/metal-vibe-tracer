@@ -270,7 +270,8 @@ struct SceneGraph: Codable {
             ))))
       let slots = node.bindings.map { slotsByID[$0]! }
       for var t in asset.triangles {
-        let slot = slots[Int(t.uvc.z)]
+        let subset = Int(t.uvc.z)
+        let slot = slots[subset]
         t.a = world * t.a
         t.b = world * t.b
         t.c = world * t.c
@@ -289,6 +290,10 @@ struct SceneGraph: Codable {
           t.uvc.x = uvB.x
           t.uvc.y = uvB.y
         }
+        // Retain the source subset beside the flattened node identity. The GPU
+        // reads only normal.xyz, so normal.w is host metadata used for fast
+        // material rebinding without rebuilding unchanged BVH bounds.
+        t.na.w = Float(subset)
         t.uvc.z = Float(slot)
         t.uvc.w = Float(index + 1)
         guard

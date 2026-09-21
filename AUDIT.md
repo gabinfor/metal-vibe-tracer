@@ -1,8 +1,27 @@
-# Metal Vibe Tracer audit and implementation handoff
+# Metal Vibe Tracer historical audit — September 7, 2026
 
 Date: 2026-09-07. Requested scope: renderer correctness, performance, visuals, GUI, import/export, persistence, and features.
 
-**Implementation update, 2026-09-07:** the shipping-priority findings and the concrete draft work in this audit have now been implemented and exercised with Metal API Validation. The detailed findings below remain as design history and as a roadmap for larger interchange/color-management work.
+> This file is a historical record of the September 7 audit. Its descriptions of
+> working-tree state, unfinished drafts, and commands awaiting execution are not
+> current instructions. For the September 11 follow-up and its implementation
+> status, see `docs/AUDIT_FIX_PLAN_2026-09-11.md`.
+
+## Current release status
+
+The implementation changes described in this historical audit are present in
+the current release candidate. On 2026-09-21, `./build.sh`,
+`/usr/bin/python3 tests/USDChecks.py`, and
+`MTL_DEBUG_LAYER=1 /usr/bin/python3 tests/verify.py` passed on an Apple M4
+with Xcode 27 and Swift 6.4. The full suite covered runtime shader compilation,
+all scenes and strategies, energy/BRDF checks, MetalFX, OIDN, persistence, UI,
+MaterialX, OpenUSD, and the ASWF Shader Ball.
+
+This file remains historical evidence and a record of broader limitations. Use
+the September 11 plan for implementation status. The app is not yet signed or
+notarized for clean-machine distribution.
+
+**Implementation update, 2026-09-07:** the shipping-priority findings and the concrete draft work in this audit were implemented and exercised with Metal API Validation. The detailed findings below are design history and a roadmap for larger interchange/color-management work.
 
 Implemented in this pass: ordered final autosave flush and quit-failure handling; transactional material/mesh/environment publication with propagated binding failures; decoded-asset/project/MaterialX structural bounds and GPU-memory preflight; cleared-resource release; cached emitter membership; enabled-light proposal probabilities; idle presentation suppression; compiled-pipeline reuse; faster BVH construction and graph flattening; metadata-only hierarchy edits; consistent import busy guards and generation-safe picking; bounded USD helper termination; scale-aware camera zoom/clipping/framing; persistent MaterialX parameter defaults and diffuse roughness; corrected USD sun/UV/default semantics; unused material reclamation; menu, precision, framing and dirty-state fixes.
 
@@ -10,9 +29,9 @@ Validation: `./build.sh` passed. The focused suite and full `MTL_DEBUG_LAYER=1 p
 
 Still intentionally outside this incremental renderer pass: an OCIO/ACES pipeline, exact Karma pixel matching, external MaterialX Sdf plugin composition, subdivision evaluation, skinning, point instancers, curves/volumes, a multi-million-triangle two-level accelerator, and clean-machine signed distribution. These are product-scale features rather than fixes that can be truthfully marked complete by this audit.
 
-## Read this first: current working-tree state
+## Historical working-tree state at the start of that audit
 
-The initial request authorized implementation, and several draft changes were made before the user switched to findings-only. They remain in the working tree; do not blindly reapply them or discard unrelated work. All project files are currently untracked, so `git diff` cannot reconstruct a complete original baseline.
+The statements in this section describe an intermediate September 7 session and are retained only to explain the original audit evidence. They do not describe the current repository and must not be followed as implementation instructions.
 
 - `build/audit-before/main.swift` and `build/audit-before/StudioModel.swift` contain copies made before this audit's edits. Other source files do not have equivalent audit snapshots.
 - `build/audit-build.log` reports a successful **Swift app build** after the draft edits. The app compiles its Metal source at runtime, so this does **not** validate shader compilation, GPU output, speed, or GUI behavior.
@@ -23,7 +42,7 @@ The initial request authorized implementation, and several draft changes were ma
 
 Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and upstream notices, per `AGENTS.md`. Update `REFERENCES.md` with the final implementation and actual validation outcomes.
 
-## Draft changes already present, awaiting review and tests
+## Draft changes recorded at that historical checkpoint
 
 | Area | Files / symbols | Present draft |
 | --- | --- | --- |

@@ -78,6 +78,18 @@ extension StudioController {
       let p = snapshot()
       try p.validate()
       let r = try PathTracerRenderer(device: renderer.device, sharing: renderer)
+      let previewTextures = renderer.materials.uniqueTextureBytes(
+        renderer.materials.images + renderer.materials.graphTextures
+          + [renderer.materials.environmentTexture])
+      let outputPixels = UInt64(p.options.outputWidth).multipliedReportingOverflow(
+        by: UInt64(p.options.outputHeight))
+      let outputBytes = outputPixels.overflow
+        ? UInt64.max
+        : outputPixels.partialValue.multipliedReportingOverflow(by: 4).partialValue
+      let previewTotal = renderer.residentFrameBytes.addingReportingOverflow(previewTextures)
+      let concurrentTotal = previewTotal.partialValue.addingReportingOverflow(outputBytes)
+      r.concurrentRenderBytes = previewTotal.overflow || concurrentTotal.overflow
+        ? UInt64.max : concurrentTotal.partialValue
       try r.materials.restore(renderer.materials.state())
       try r.materials.setEnvironment(p.environmentData)
       try r.materials.setMesh(p.graph?.renderTriangles() ?? p.triangles)

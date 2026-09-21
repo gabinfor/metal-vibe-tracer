@@ -1,6 +1,6 @@
 # Metal Vibe Tracer references
 
-Last reviewed: **2026-09-07**. Web references below were checked on the dates recorded by each entry.
+Last reviewed: **2026-09-11**. Web references below were checked on the dates recorded by each entry.
 
 This document records the algorithmic basis, identifiable formula sources, and API dependencies of the current renderer. It distinguishes implementation references from related work. The supplied `main.swift` did not include a complete bibliography, so matching an existing formula to a publication does not establish the original file's copying history or authorship.
 
@@ -278,3 +278,11 @@ Validation on Apple M4, September 7, 2026: `./build.sh`, the focused Studio/Mate
 ### GI sampling endpoint correction — 2026-09-08
 
 `sample_cosine_hemisphere` centers the radial draw in its 24-bit random bin before taking its square root. An exact-zero radial draw previously produced a tangent direction whose floating-point dot-product PDF could remain slightly positive. The resulting inverse-PDF GI reservoir weights reached millions and spread bright patches through reuse. This local numerical correction retains the cosine proposal; it does not clamp radiance or disable GI. `tests/GPUChecks.swift` exercises a PCG seed whose second draw is exactly zero.
+
+## September 11 audit fixes
+
+- `MIS1995` / `RESTIRGI2021`: `restir_gi_has_complementary_bsdf` makes the secondary direct-light MIS weight conditional on the path-depth budget actually permitting its complementary BSDF continuation. At terminal secondary vertices, the single available NEE technique receives unit weight. The existing bounded first-bounce reuse and its documented bias remain unchanged.
+- Apple Image I/O and Metal resource lifecycle: `MaterialLibrary.validateEncodedImage` reads per-image pixel dimensions with `CGImageSourceCopyPropertiesAtIndex` before Metal texture decoding. Candidate accounting deduplicates shared texture objects, includes ordinary, MaterialX, and environment textures, and includes old/new overlap during replacement. Apple documents the [individual image properties](https://developer.apple.com/documentation/imageio/individual-image-properties) and describes [`recommendedMaxWorkingSetSize`](https://developer.apple.com/documentation/metal/mtldevice/recommendedmaxworkingsetsize) as an approximate performance-safe allocation threshold; local byte estimates and safety fractions remain project policy rather than platform guarantees. Reviewed September 11, 2026.
+- Frame resources: `PathTracerRenderer.FrameResourcePlan`, `renderMemoryError`, and `renderFrame` derive estimates and allocations from the active strategy. Full-resolution ReSTIR DI/GI reservoirs are allocated only for beauty-mode ReSTIR; other strategies and inspection modes bind safe 1×1 placeholders and skip reservoir access. Export preflight includes the live preview frame set.
+- Scene graph bridge: `SceneGraph.renderTriangles` retains source subset identity in host-only `MeshTriangle.na.w`; `MaterialLibrary.setMeshBindings` uses it with the flattened node identity to replace material slots and emitter bindings without rebuilding unchanged BVH bounds. Shader normal interpolation continues to read only `.xyz`.
+- Project/runtime lifecycle: explicit project file encoding, writing, reading, validation, and candidate material/mesh preparation run on serialized worker queues with generation/revision checks before UI publication. OpenUSD preparation validates required modules and an isolated SDK smoke import, extracts to staging, and atomically publishes a versioned runtime; OIDN cache reuse also checks its required library and documentation directory.

@@ -610,6 +610,7 @@ extension MaterialLibrary {
           textures.append(graphTextures[offset + index])
           continue
         }
+        try validateEncodedImage(image.data)
         let texture = try loader.newTexture(
             data: image.data,
             options: [
@@ -619,6 +620,7 @@ extension MaterialLibrary {
             ])
         try validateDecodedTexture(texture, encodedBytes: image.data.count)
         textures.append(texture)
+        try validateCandidateTextures(images: images, graph: textures)
       }
       var header = GraphHeader()
       for i in 0..<4 {
@@ -642,13 +644,17 @@ extension MaterialLibrary {
         device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
       })
     else { throw Self.error("Could not allocate MaterialX graph buffers.") }
+    try validateCandidateTextures(images: images, graph: textures)
     let old = (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX)
+    let oldArgument = argumentBuffer
     graphInstructionBuffer = instructionBuffer
     graphHeaderBuffer = headerBuffer
     graphTextures = textures
     materialX = programs
     do { try rebuildArguments(images) } catch {
       (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX) = old
+      argumentBuffer = oldArgument
+      restoreArgumentEncoder(oldArgument)
       throw error
     }
   }
