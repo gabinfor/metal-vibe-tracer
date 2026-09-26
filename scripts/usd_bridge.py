@@ -96,7 +96,8 @@ class MaterialTranslator:
             uv=self.add('multiply','vector2',[('in1','vector2',uv),('in2','vector2',self.expression(shader.GetInput('scale'),'vector2',[1,1]))])
             if shader.GetInput('rotation') and shader.GetInput('rotation').GetConnectedSource():fail('Connected UV rotation is unsupported')
             angle=float(get(shader,'rotation',0,self.time))
-            if angle:uv=self.add('rotate2d','vector2',[('in','vector2',uv),('amount','float',angle)])
+            # USD rotation is counter-clockwise; MaterialX rotate2d turns the other way (IMP_UsdTransform2d negates).
+            if angle:uv=self.add('rotate2d','vector2',[('in','vector2',uv),('amount','float',-angle)])
             result=self.add('add','vector2',[('in1','vector2',uv),('in2','vector2',self.expression(shader.GetInput('translation'),'vector2',[0,0]))])
         elif ident=='UsdUVTexture':
             for axis in ['wrapS','wrapT']:

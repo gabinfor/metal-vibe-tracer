@@ -111,13 +111,13 @@ private final class MXParser: NSObject, XMLParserDelegate {
     qualifiedName: String?, attributes: [String: String]
   ) {
     if stack.count >= 64 {
-      failure = "XML nesting exceeds 64 levels."
+      failure = "XML nesting exceeds 64 levels at line \(parser.lineNumber)."
       parser.abortParsing()
       return
     }
     elementCount += 1
     if elementCount > 4096 {
-      failure = "MaterialX document exceeds 4096 XML elements."
+      failure = "MaterialX document exceeds 4096 XML elements at line \(parser.lineNumber)."
       parser.abortParsing()
       return
     }
@@ -129,11 +129,49 @@ private final class MXParser: NSObject, XMLParserDelegate {
   func parser(
     _ parser: XMLParser, didEndElement name: String, namespaceURI: String?, qualifiedName: String?
   ) { if !stack.isEmpty { stack.removeLast() } }
+  // DTD declarations are rejected even when a declared encoding hides them from the text scan.
+  func rejectDeclaration(_ parser: XMLParser) {
+    failure = "MaterialX must not contain DTD declarations (line \(parser.lineNumber))."
+    parser.abortParsing()
+  }
+  func parser(_ parser: XMLParser, foundElementDeclarationWithName elementName: String, model: String) {
+    rejectDeclaration(parser)
+  }
+  func parser(
+    _ parser: XMLParser, foundAttributeDeclarationWithName attributeName: String,
+    forElement elementName: String, type: String?, defaultValue: String?
+  ) { rejectDeclaration(parser) }
+  func parser(_ parser: XMLParser, foundInternalEntityDeclarationWithName name: String, value: String?) {
+    rejectDeclaration(parser)
+  }
+  func parser(
+    _ parser: XMLParser, foundExternalEntityDeclarationWithName name: String, publicID: String?,
+    systemID: String?
+  ) { rejectDeclaration(parser) }
+  func parser(
+    _ parser: XMLParser, foundNotationDeclarationWithName name: String, publicID: String?,
+    systemID: String?
+  ) { rejectDeclaration(parser) }
+  func parser(
+    _ parser: XMLParser, foundUnparsedEntityDeclarationWithName name: String, publicID: String?,
+    systemID: String?, notationName: String?
+  ) { rejectDeclaration(parser) }
+}
+// Shared by every shader compiled from one document, so each image file is read once.
+private final class MXDocumentState {
+  var imageData: [String: Data] = [:], imageBytes = 0, notes: [String] = []
+  func note(_ message: String) { if !notes.contains(message) { notes.append(message) } }
 }
 enum MaterialXImporter {
   static func load(_ url: URL) throws -> MaterialXImport {
-    try read(
-      Data(contentsOf: url), baseURL: url.deletingLastPathComponent(), source: url.lastPathComponent
+    // Check the size before reading so an oversized file is never loaded.
+    let file = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+    guard file.isRegularFile == true, let size = file.fileSize, size <= 16_000_000 else {
+      throw MaterialLibrary.error("MaterialX must be a regular UTF-8 XML file (maximum 16 MB).")
+    }
+    return try read(
+      Data(contentsOf: url, options: .mappedIfSafe), baseURL: url.deletingLastPathComponent(),
+      source: url.lastPathComponent
     )
   }
   static func read(_ bytes: Data, baseURL: URL, source: String) throws -> MaterialXImport {
@@ -143,6 +181,17 @@ enum MaterialXImporter {
       throw MaterialLibrary.error(
         "MaterialX must be UTF-8 XML without external entities (maximum 16 MB).")
     }
+    // libxml2 honours a declared encoding; the text checks above hold only for UTF-8/ASCII.
+    let declaration = try NSRegularExpression(
+      pattern: #"^\x{FEFF}?\s*<\?xml[^>]*?\bencoding\s*=\s*["']([^"']*)["']"#)
+    let head = String(text.prefix(512))
+    if let match = declaration.firstMatch(in: head, range: NSRange(head.startIndex..., in: head)),
+      let range = Range(match.range(at: 1), in: head),
+      !["utf-8", "us-ascii", "ascii"].contains(head[range].lowercased())
+    {
+      throw MaterialLibrary.error(
+        "MaterialX must be UTF-8 XML; the declared encoding '\(head[range])' is not supported.")
+    }
     let reader = MXParser()
     let parser = XMLParser(data: bytes)
     parser.delegate = reader
@@ -151,7 +200,10 @@ enum MaterialXImporter {
       ["1.38", "1.39"].contains(root.attributes["version"] ?? "")
     else {
       throw MaterialLibrary.error(
-        reader.failure ?? parser.parserError?.localizedDescription
+        reader.failure
+          ?? parser.parserError.map {
+            "Invalid MaterialX XML at line \(parser.lineNumber), column \(parser.columnNumber): \($0.localizedDescription)"
+          }
           ?? "Expected a MaterialX 1.38 or 1.39 document.")
     }
     func descendants(_ e: MXElement) -> [MXElement] { [e] + e.children.flatMap(descendants) }
@@ -174,6 +226,7 @@ enum MaterialXImporter {
       indexed[e.path] = e
     }
     var result = MaterialXImport()
+    let document = MXDocumentState()
     let shaders = elements.filter {
       $0.attributes["type"] == "surfaceshader" && $0.category != "input" && $0.category != "output"
     }
@@ -187,7 +240,7 @@ enum MaterialXImporter {
             "Unsupported surface model \(shader.category); this importer supports open_pbr_surface."
           )
         }
-        let compiler = MXCompiler(root: root, elements: indexed, baseURL: baseURL)
+        let compiler = MXCompiler(root: root, elements: indexed, baseURL: baseURL, document: document)
         let program = try compiler.compile(shader, source: source)
         result.materials.append(program)
         result.report.append(
@@ -197,6 +250,7 @@ enum MaterialXImporter {
         result.report.append("\(shader.name): NOT imported — \(error.localizedDescription)")
       }
     }
+    result.report += document.notes
     for e in elements where ["look", "collection", "materialassign"].contains(e.category) {
       result.report.append(
         "\(e.name): look/collection assignments are not imported; assign materials in the inspector."
@@ -206,14 +260,15 @@ enum MaterialXImporter {
   }
 }
 private final class MXCompiler {
-  let root: MXElement, elements: [String: MXElement], baseURL: URL
+  let root: MXElement, elements: [String: MXElement], baseURL: URL, document: MXDocumentState
   var nodes: [GraphInstruction] = [], images: [MaterialXImage] = [],
     parameters: [MaterialXParameter] = []
   var cache: [String: Int32] = [:], active = Set<String>(), imageKeys: [String: Int] = [:]
-  init(root: MXElement, elements: [String: MXElement], baseURL: URL) {
+  init(root: MXElement, elements: [String: MXElement], baseURL: URL, document: MXDocumentState) {
     self.root = root
     self.elements = elements
     self.baseURL = baseURL
+    self.document = document
   }
   func fail(_ message: String) throws -> Never { throw MaterialLibrary.error(message) }
   func append(_ instruction: GraphInstruction) throws -> Int32 {
@@ -259,15 +314,18 @@ private final class MXCompiler {
     e.attributes["nodename"] != nil || e.attributes["nodegraph"] != nil
       || e.attributes["interfacename"] != nil
   }
-  func resolve(_ name: String, from e: MXElement) throws -> MXElement {
-    var scope = e.parent
+  func resolve(_ name: String, from e: MXElement, graph: Bool = false) throws -> MXElement {
+    // Connections name nodes beside the consuming node, never that node's own ports.
+    func candidate(_ c: MXElement) -> Bool {
+      c.attributes["name"] == name
+        && (graph ? c.category == "nodegraph" : c.category != "input" && c.category != "output")
+    }
+    var scope = e.category == "input" ? e.parent?.parent : e.parent
     while let current = scope {
-      if let found = current.children.first(where: { $0.attributes["name"] == name }) {
-        return found
-      }
+      if let found = current.children.first(where: candidate) { return found }
       scope = current.parent
     }
-    if let found = elements[name] { return found }
+    if let found = elements[name], candidate(found) { return found }
     try fail("Unresolved connection '\(name)' at \(e.path).")
   }
   func value(_ input: MXElement?, default v: SIMD4<Float>, label: String? = nil) throws -> Int32 {
@@ -281,7 +339,7 @@ private final class MXCompiler {
       )
     }
     if let name = e.attributes["nodegraph"] {
-      let graph = try resolve(name, from: e)
+      let graph = try resolve(name, from: e, graph: true)
       guard graph.category == "nodegraph",
         let output = graph.children.first(where: {
           $0.category == "output" && $0.name == (e.attributes["output"] ?? "out")
@@ -354,6 +412,38 @@ private final class MXCompiler {
       try fail("Unsupported node type \(type) at \(e.path).")
     }
   }
+  // Files are checked before reading; out-of-folder images are reported because they are embedded.
+  func imageData(_ url: URL, at e: MXElement) throws -> Data {
+    if let bytes = document.imageData[url.path] { return bytes }
+    let file: URLResourceValues
+    do { file = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]) } catch {
+      try fail("Missing image \(url.lastPathComponent): \(error.localizedDescription)")
+    }
+    guard file.isRegularFile == true, let size = file.fileSize else {
+      try fail("Image \(url.lastPathComponent) at \(e.path) is not a regular file.")
+    }
+    guard size <= 128 * 1024 * 1024 else {
+      try fail("Image \(url.lastPathComponent) exceeds the 128 MiB import limit.")
+    }
+    guard document.imageBytes + size <= 1 << 30 else {
+      try fail("MaterialX images exceed 1 GiB in total.")
+    }
+    let bytes: Data
+    do { bytes = try Data(contentsOf: url) } catch {
+      try fail("Missing image \(url.lastPathComponent): \(error.localizedDescription)")
+    }
+    guard bytes.count <= 128 * 1024 * 1024 else {
+      try fail("Image \(url.lastPathComponent) exceeds the 128 MiB import limit.")
+    }
+    let folder = baseURL.standardizedFileURL.resolvingSymlinksInPath().path
+    if !url.path.hasPrefix(folder.hasSuffix("/") ? folder : folder + "/") {
+      document.note(
+        "\(e.path): image \(url.path) is outside the document folder and is embedded in the project.")
+    }
+    document.imageBytes += bytes.count
+    document.imageData[url.path] = bytes
+    return bytes
+  }
   func node(_ e: MXElement) throws -> Int32 {
     if let i = cache[e.path] { return i }
     guard active.count < 64 else { try fail("MaterialX graph exceeds 64 expression levels.") }
@@ -387,7 +477,9 @@ private final class MXCompiler {
           input.name == "texcoord"
           ? ["vector2"]
           : input.name == "file" ? ["filename"] : input.name == "default" ? [type] : ["string"]
-      case "normalmap": expected = input.name == "scale" ? ["float", "vector2"] : ["vector3"]
+      case "normalmap":
+        expected =
+          input.name == "scale" ? ["float", "vector2"] : input.name == "space" ? ["string"] : ["vector3"]
       case "extract":
         expected =
           input.name == "index"
@@ -428,9 +520,21 @@ private final class MXCompiler {
       else { try fail("Image needs a local, non-UDIM filename at \(e.path).") }
       let prefix = input.inherited("fileprefix") ?? ""
       let url = URL(fileURLWithPath: prefix + path, relativeTo: baseURL).standardizedFileURL
-      let color = input.attributes["colorspace"] ?? e.inherited("colorspace") ?? "lin_rec709"
-      guard ["lin_rec709", "linear", "raw", "none", "srgb_texture", "srgb"].contains(color) else {
-        try fail("Unsupported MaterialX image color space '\(color)'; OCIO/ACES transforms are not available in this importer.")
+        .resolvingSymlinksInPath()
+      // MaterialX color-manages only color3/color4 values; other image types stay raw.
+      let linear = ["lin_rec709", "linear", "raw", "none"]
+      let color: String
+      if type.hasPrefix("color") {
+        color = input.attributes["colorspace"] ?? e.inherited("colorspace") ?? "lin_rec709"
+        guard linear.contains(color) || color == "srgb_texture" || color == "srgb" else {
+          try fail("Unsupported MaterialX image color space '\(color)'; OCIO/ACES transforms are not available in this importer.")
+        }
+      } else {
+        color = "raw"
+        if let tag = input.attributes["colorspace"] ?? e.attributes["colorspace"], !linear.contains(tag) {
+          document.note(
+            "\(e.path): colorspace '\(tag)' ignored on \(type) image; MaterialX color-manages only color3/color4 images.")
+        }
       }
       let srgb = color == "srgb_texture" || color == "srgb"
       let key = url.path + "|" + String(srgb)
@@ -439,10 +543,7 @@ private final class MXCompiler {
         imageIndex = i
       } else {
         guard images.count < SceneLimits.graphImages else { try fail("Too many MaterialX images.") }
-        let bytes: Data
-        do { bytes = try Data(contentsOf: url) } catch {
-          try fail("Missing image \(url.lastPathComponent): \(error.localizedDescription)")
-        }
+        let bytes = try imageData(url, at: e)
         imageIndex = images.count
         imageKeys[key] = imageIndex
         images.append(MaterialXImage(name: url.lastPathComponent, data: bytes, srgb: srgb))
@@ -489,7 +590,22 @@ private final class MXCompiler {
       instruction.value.x = index
       result = try append(instruction)
     case "normalmap":
-      try allowed(e, ["in", "scale"])
+      try allowed(e, ["in", "scale", "space", "normal", "tangent", "bitangent"])
+      // MaterialX 1.38 authors space="tangent" explicitly; frames must keep their geometric defaults.
+      if let space = e.input("space") {
+        let mode = space.attributes["value"] ?? "tangent"
+        guard !linked(space), mode == "tangent" else {
+          try fail(
+            mode == "object"
+              ? "Object-space normal maps are unsupported at \(e.path); use a tangent-space normal map."
+              : "Invalid normalmap space at \(e.path).")
+        }
+      }
+      for name in ["normal", "tangent", "bitangent"] {
+        if let frame = e.input(name), linked(frame) || frame.attributes["value"] != nil {
+          try fail("Custom normalmap \(name) is unsupported at \(e.path); leave it at its geometric default.")
+        }
+      }
       let a = try value(e.input("in"), default: SIMD4(0.5, 0.5, 1, 0))
       let scale = try literal(e.input("scale"), SIMD4(repeating: 1))
       instruction.code = SIMD4(8, a, 0, 0)
@@ -534,6 +650,8 @@ private final class MXCompiler {
       "transmission_scatter": .zero, "transmission_scatter_anisotropy": .zero,
       "transmission_dispersion_scale": .zero,
       "transmission_dispersion_abbe_number": SIMD4(repeating: 20), "subsurface_weight": .zero,
+      "subsurface_color": SIMD4(0.8, 0.8, 0.8, 0), "subsurface_radius": SIMD4(repeating: 1),
+      "subsurface_radius_scale": SIMD4(1, 0.5, 0.25, 0), "subsurface_scatter_anisotropy": .zero,
       "fuzz_color": SIMD4(repeating: 1), "fuzz_roughness": SIMD4(repeating: 0.5),
       "coat_color": SIMD4(repeating: 1), "coat_roughness_anisotropy": .zero,
       "coat_ior": SIMD4(repeating: 1.6), "coat_darkening": SIMD4(repeating: 1),
@@ -544,6 +662,16 @@ private final class MXCompiler {
     ]
     for i in shader.children
     where i.category == "input" && i.name != "base_diffuse_roughness" && !inputs.contains(where: { $0.0 == i.name }) {
+      // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
+      let frames = ["geometry_tangent": "Tworld", "geometry_coat_normal": "Nworld", "geometry_coat_tangent": "Tworld"]
+      if let frame = frames[i.name] {
+        guard !linked(i), i.attributes["value"] == nil,
+          (i.attributes["defaultgeomprop"] ?? frame) == frame
+        else {
+          try fail("\(i.name) must keep its geometric default; connected or constant values are unsupported.")
+        }
+        continue
+      }
       guard let fallback = defaults[i.name], !linked(i) else {
         try fail("Unsupported surface input \(i.name).")
       }
@@ -587,37 +715,39 @@ extension MaterialLibrary {
     var instructions: [GraphInstruction] = []
     var headers = Array(repeating: GraphHeader(), count: SceneLimits.materials)
     var textures: [MTLTexture] = []
-    var oldImageOffsets: [Int: Int] = [:]
-    var oldImageCount = 0
-    for slot in materialX.keys.sorted() {
-      oldImageOffsets[slot] = oldImageCount
-      oldImageCount += materialX[slot]!.images.count
+    // Identical encoded images share one decoded texture and graph binding across slots.
+    var bindings: [[Data: Int]] = [[:], [:]]
+    var reusable: [[Data: MTLTexture]] = [[:], [:]]
+    for (_, old) in materialX.sorted(by: { $0.key < $1.key }) {
+      for image in old.images where bindings[image.srgb ? 1 : 0][image.data] == nil {
+        let index = bindings[0].count + bindings[1].count
+        bindings[image.srgb ? 1 : 0][image.data] = index
+        if index < graphTextures.count { reusable[image.srgb ? 1 : 0][image.data] = graphTextures[index] }
+      }
     }
+    bindings = [[:], [:]]
     for slot in programs.keys.sorted() {
       guard (0..<SceneLimits.materials).contains(slot), let program = programs[slot] else {
         throw Self.error("Invalid graph material slot.")
       }
       try program.validate()
-      let imageOffset = textures.count
-      guard imageOffset + program.images.count <= SceneLimits.graphImages else {
-        throw Self.error("Scene exceeds 128 MaterialX images.")
-      }
-      for (index, image) in program.images.enumerated() {
-        if let old = materialX[slot], index < old.images.count,
-          old.images[index].srgb == image.srgb, old.images[index].data == image.data,
-          let offset = oldImageOffsets[slot], offset + index < graphTextures.count
-        {
-          textures.append(graphTextures[offset + index])
+      var imageIndices: [Int] = []
+      for image in program.images {
+        if let index = bindings[image.srgb ? 1 : 0][image.data] {
+          imageIndices.append(index)
+          continue
+        }
+        guard textures.count < SceneLimits.graphImages else {
+          throw Self.error("Scene exceeds 128 MaterialX images.")
+        }
+        bindings[image.srgb ? 1 : 0][image.data] = textures.count
+        imageIndices.append(textures.count)
+        if let texture = reusable[image.srgb ? 1 : 0][image.data] {
+          textures.append(texture)
           continue
         }
         try validateEncodedImage(image.data)
-        let texture = try loader.newTexture(
-            data: image.data,
-            options: [
-              .SRGB: image.srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
-              .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-              .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
-            ])
+        let texture = try decodeTexture(image.data, srgb: image.srgb)
         try validateDecodedTexture(texture, encodedBytes: image.data.count)
         textures.append(texture)
         try validateCandidateTextures(images: images, graph: textures)
@@ -631,7 +761,7 @@ extension MaterialLibrary {
       header.info = SIMD4(Int32(instructions.count), Int32(program.instructions.count), program.diffuseRoughness ?? -1, 0)
       headers[slot] = header
       for var node in program.instructions {
-        if node.code.x == 2 { node.value.x += Float(imageOffset) }
+        if node.code.x == 2 { node.value.x = Float(imageIndices[Int(node.value.x)]) }
         instructions.append(node)
       }
     }

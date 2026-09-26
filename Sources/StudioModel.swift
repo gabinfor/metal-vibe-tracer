@@ -465,15 +465,120 @@ extension MaterialLibrary {
   }
   func texture(data: Data, channel: Int) throws -> MTLTexture {
     try validateEncodedImage(data)
-    let result = try loader.newTexture(
+    let result = try decodeTexture(data, srgb: channel == 0)
+    try validateDecodedTexture(result, encodedBytes: data.count)
+    return result
+  }
+  // Material images always sample as RGBA. MTKTextureLoader keeps gray and gray+alpha
+  // files as R/RG, so those become swizzled views (RRR1, RRRG). sRGB cases the formats
+  // cannot express (16-bit data; RG8 sRGB, which would also decode alpha) are expanded
+  // to RGBA on the CPU.
+  func decodeTexture(_ data: Data, srgb: Bool) throws -> MTLTexture {
+    let texture = try loader.newTexture(
       data: data,
       options: [
-        .SRGB: channel == 0, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
+        .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
         .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
         .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
       ])
-    try validateDecodedTexture(result, encodedBytes: data.count)
-    return result
+    let format = texture.pixelFormat
+    if srgb, [.r8Unorm, .r16Unorm, .rg16Unorm, .rgba16Unorm, .rg8Unorm, .rg8Unorm_srgb].contains(format) {
+      return try expandedSRGB(data)
+    }
+    let swizzle: MTLTextureSwizzleChannels
+    switch format {
+    case .r8Unorm, .r8Unorm_srgb, .r16Unorm, .r16Float, .r32Float:
+      swizzle = MTLTextureSwizzleChannels(red: .red, green: .red, blue: .red, alpha: .one)
+    case .rg8Unorm, .rg8Unorm_srgb, .rg16Unorm, .rg16Float, .rg32Float:
+      swizzle = MTLTextureSwizzleChannels(red: .red, green: .red, blue: .red, alpha: .green)
+    default: return texture
+    }
+    guard
+      let view = texture.makeTextureView(
+        pixelFormat: format, textureType: texture.textureType, levels: 0..<texture.mipmapLevelCount,
+        slices: 0..<max(1, texture.arrayLength), swizzle: swizzle)
+    else { throw Self.error("Could not create a grayscale texture view.") }
+    return view
+  }
+  // 16-bit data becomes linear RGBA16Float (sRGB EOTF, IEC 61966-2-1, on color only);
+  // 8-bit gray (+alpha) becomes RGBA8 sRGB, whose hardware decode leaves alpha linear.
+  private func expandedSRGB(_ data: Data) throws -> MTLTexture {
+    let source = try loader.newTexture(
+      data: data,
+      options: [
+        .SRGB: false, .generateMipmaps: false, .origin: MTKTextureLoader.Origin.topLeft,
+        .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+        .textureStorageMode: NSNumber(value: MTLStorageMode.shared.rawValue),
+      ])
+    let layouts: [MTLPixelFormat: Int] = [
+      .r16Unorm: 1, .rg16Unorm: 2, .rgba16Unorm: 4, .r8Unorm: 1, .rg8Unorm: 2,
+    ]
+    guard let channels = layouts[source.pixelFormat] else {
+      throw Self.error("Unexpected texture format for sRGB expansion.")
+    }
+    let wide = source.pixelFormat != .r8Unorm && source.pixelFormat != .rg8Unorm
+    let width = source.width, height = source.height, pixelBytes = wide ? 8 : 4
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: wide ? .rgba16Float : .rgba8Unorm_srgb, width: width, height: height, mipmapped: true)
+    descriptor.usage = .shaderRead
+    descriptor.storageMode = .private
+    guard let texture = device.makeTexture(descriptor: descriptor),
+      let staging = device.makeBuffer(length: width * height * pixelBytes, options: .storageModeShared)
+    else { throw Self.error("Could not allocate the expanded sRGB texture.") }
+    let eotf = wide ? (0...65535).map { i -> Float16 in
+      let x = Float(i) / 65535
+      return Float16(x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4))
+    } : []
+    let sampleBytes = wide ? 2 : 1
+    let rows = max(1, min(height, 4_194_304 / (width * channels)))
+    var band = [UInt8](repeating: 0, count: rows * width * channels * sampleBytes)
+    for y0 in stride(from: 0, to: height, by: rows) {
+      let count = min(rows, height - y0)
+      band.withUnsafeMutableBytes { raw in
+        guard let base = raw.baseAddress else { return }
+        source.getBytes(
+          base, bytesPerRow: width * channels * sampleBytes,
+          from: MTLRegionMake2D(0, y0, width, count), mipmapLevel: 0)
+        if wide {
+          let samples = raw.bindMemory(to: UInt16.self)
+          let pixels = staging.contents().bindMemory(to: Float16.self, capacity: width * height * 4)
+          for i in 0..<(count * width) {
+            let s = i * channels, d = ((y0 * width) + i) * 4
+            let gray = eotf[Int(samples[s])]
+            pixels[d] = gray
+            pixels[d + 1] = channels == 4 ? eotf[Int(samples[s + 1])] : gray
+            pixels[d + 2] = channels == 4 ? eotf[Int(samples[s + 2])] : gray
+            pixels[d + 3] = channels == 1 ? 1 : Float16(Float(samples[s + channels - 1]) / 65535)
+          }
+        } else {
+          let pixels = staging.contents().bindMemory(to: UInt8.self, capacity: width * height * 4)
+          for i in 0..<(count * width) {
+            let d = ((y0 * width) + i) * 4
+            let gray = raw[i * channels]
+            pixels[d] = gray
+            pixels[d + 1] = gray
+            pixels[d + 2] = gray
+            pixels[d + 3] = channels == 2 ? raw[i * 2 + 1] : 255
+          }
+        }
+      }
+    }
+    guard let queue = device.makeCommandQueue(), let command = queue.makeCommandBuffer(),
+      let blit = command.makeBlitCommandEncoder()
+    else { throw Self.error("Could not upload the expanded sRGB texture.") }
+    blit.copy(
+      from: staging, sourceOffset: 0, sourceBytesPerRow: width * pixelBytes,
+      sourceBytesPerImage: width * height * pixelBytes,
+      sourceSize: MTLSize(width: width, height: height, depth: 1), to: texture, destinationSlice: 0,
+      destinationLevel: 0, destinationOrigin: MTLOrigin())
+    blit.generateMipmaps(for: texture)
+    blit.endEncoding()
+    command.commit()
+    command.waitUntilCompleted()
+    guard command.status == .completed else {
+      throw Self.error("Could not upload the expanded sRGB texture.")
+    }
+    return texture
   }
 
   func environmentImportance(_ pixels: [Float], width: Int, height: Int) throws -> (MTLTexture, MTLTexture) {

@@ -848,7 +848,8 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         case 8:{float3 normal=dot(a.xyz,a.xyz)==0?float3(0,0,1):a.xyz*2.0f-1.0f;normal.xy*=n.value.xy;
             v=float4(tangent_space_normal(hit,normal),0);break;}
         case 9:v=a-b;d=da+db;break;
-        case 10:{float angle=n.value.x;v=float4(cos(angle)*a.x-sin(angle)*a.y,sin(angle)*a.x+cos(angle)*a.y,0,0);d=float2(max(da.x,da.y)*1.414214f);break;}
+        // MaterialX 1.39 mx_rotate_vector2: (ca*x+sa*y, -sa*x+ca*y).
+        case 10:{float angle=n.value.x;v=float4(cos(angle)*a.x+sin(angle)*a.y,-sin(angle)*a.x+cos(angle)*a.y,0,0);d=float2(max(da.x,da.y)*1.414214f);break;}
         case 11:v=a;d=da;break;
         }
         values[i]=all(isfinite(v))?v:float4(0);densities[i]=d;
@@ -2607,7 +2608,9 @@ final class MaterialLibrary {
 
     func uniqueTextureBytes(_ textures: [MTLTexture]) -> UInt64 {
         var seen = Set<ObjectIdentifier>()
-        return textures.reduce(0) { total, texture in
+        return textures.reduce(0) { total, view in
+            // Swizzled grayscale views share their parent's storage.
+            let texture = view.parent ?? view
             let id = ObjectIdentifier(texture as AnyObject)
             guard seen.insert(id).inserted else { return total }
             return total + UInt64(texture.allocatedSize)
@@ -2737,12 +2740,7 @@ final class MaterialLibrary {
         }
         let bytes = try Data(contentsOf:url, options: .mappedIfSafe)
         try validateEncodedImage(bytes)
-        let texture = try loader.newTexture(data: bytes, options: [
-            .SRGB: channel == 0, .generateMipmaps: true,
-            .origin: MTKTextureLoader.Origin.topLeft,
-            .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-            .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue)
-        ])
+        let texture = try decodeTexture(bytes, srgb: channel == 0)
         texture.label = "\((slot < Self.names.count ? Self.names[slot] : "Material \(slot)")): \(Self.mapNames[channel]) — \(url.lastPathComponent)"
         var replacement = images
         replacement[slot * 4 + channel] = texture
