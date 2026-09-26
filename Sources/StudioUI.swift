@@ -1202,8 +1202,9 @@ final class StudioController: NSViewController {
         guard let objText = String(data: objData, encoding: .utf8) else {
           throw MaterialLibrary.error("OBJ must be UTF-8 text.")
         }
+        var skipped = 0
         let root = try p.appendOBJ(
-          objText, name: url.lastPathComponent)
+          objText, name: url.lastPathComponent, skipped: &skipped)
         self.checkpoint("Import OBJ")
         try self.restore(p)
         self.selectedNode = root
@@ -1211,6 +1212,9 @@ final class StudioController: NSViewController {
         self.frameMesh(recordUndo: false)
         self.changed()
         self.rebuild()
+        if skipped > 0 {
+          self.show("Imported \(url.lastPathComponent); skipped \(skipped) degenerate faces.")
+        }
       } catch { self.show(error.localizedDescription) }
     }
   }

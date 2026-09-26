@@ -99,6 +99,7 @@ struct HitRecord {
     float3 geometricNormal;
     uint objectID;
     uint triangle; // Mesh triangle index; 0xffffffff for analytic primitives.
+    float error; // absolute bound on position rounding along geometricNormal
 };
 
 struct LightSample {
@@ -384,10 +385,14 @@ bool intersect_box_local(Ray r, float3 center, float3 half_size, float yaw, Mate
     rec.front_face = dot(r.direction, w_norm) < 0.0f;
     rec.normal = rec.front_face ? w_norm : -w_norm;
     rec.mat = mat;
+    // Image row 0 is the top edge: side faces map v downward and u to the
+    // viewer's right (cross(up, outward normal)); the bottom mirrors the top.
+    // Tangent and bitangent are dP/du and dP/dv, as on imported meshes.
     float3 localT, localB;
-    if (abs(loc_norm.x) > 0.5f) { localT = float3(0,0,1); localB = float3(0,1,0); rec.uv = loc_hit.zy / (2.0f * half_size.zy) + 0.5f; rec.uvDensity = 1.0f / (2.0f * half_size.zy); }
-    else if (abs(loc_norm.y) > 0.5f) { localT = float3(1,0,0); localB = float3(0,0,1); rec.uv = loc_hit.xz / (2.0f * half_size.xz) + 0.5f; rec.uvDensity = 1.0f / (2.0f * half_size.xz); }
-    else { localT = float3(1,0,0); localB = float3(0,1,0); rec.uv = loc_hit.xy / (2.0f * half_size.xy) + 0.5f; rec.uvDensity = 1.0f / (2.0f * half_size.xy); }
+    float s = loc_norm.x + loc_norm.y + loc_norm.z;
+    if (abs(loc_norm.x) > 0.5f) { localT = float3(0,0,-s); localB = float3(0,-1,0); rec.uv = float2(-s * loc_hit.z, -loc_hit.y) / (2.0f * half_size.zy) + 0.5f; rec.uvDensity = 1.0f / (2.0f * half_size.zy); }
+    else if (abs(loc_norm.y) > 0.5f) { localT = float3(s,0,0); localB = float3(0,0,1); rec.uv = float2(s * loc_hit.x, loc_hit.z) / (2.0f * half_size.xz) + 0.5f; rec.uvDensity = 1.0f / (2.0f * half_size.xz); }
+    else { localT = float3(s,0,0); localB = float3(0,-1,0); rec.uv = float2(s * loc_hit.x, -loc_hit.y) / (2.0f * half_size.xy) + 0.5f; rec.uvDensity = 1.0f / (2.0f * half_size.xy); }
     rec.tangent = float3(cos(yaw)*localT.x-sin(yaw)*localT.z, localT.y, sin(yaw)*localT.x+cos(yaw)*localT.z);
     rec.bitangent = float3(cos(yaw)*localB.x-sin(yaw)*localB.z, localB.y, sin(yaw)*localB.x+cos(yaw)*localB.z);
     rec.geometricNormal = rec.normal;
@@ -418,9 +423,10 @@ bool intersect_cylinder_ring_local(Ray r, float3 center, float radius, float hei
                 rec.front_face = dot(r.direction, outward) < 0.0f;
                 rec.normal = rec.front_face ? outward : -outward;
                 rec.mat = mat;
-                rec.uv = float2(atan2(outward.z, outward.x) / TWO_PI + 0.5f, (y - center.y) / height + 0.5f);
+                // v runs downward like the sphere's, so image row 0 is the top rim.
+                rec.uv = float2(atan2(outward.z, outward.x) / TWO_PI + 0.5f, 0.5f - (y - center.y) / height);
                 rec.tangent = float3(-outward.z, 0, outward.x);
-                rec.bitangent = float3(0,1,0);
+                rec.bitangent = float3(0,-1,0);
                 rec.uvDensity = float2(1.0f / (TWO_PI * radius), 1.0f / height);
                 rec.geometricNormal = rec.normal;
                 return true;
@@ -473,11 +479,32 @@ bool intersect_cylinder_ring(Ray r, float3 center, float radius, float height, M
 float ray_epsilon(float3 p, constant Uniforms &u) {
     return u.sceneIndex==6 && u.lens.z>0 ? max(1e-7f, 9.536743e-7f * max(abs(p.x),max(abs(p.y),abs(p.z)))) : 0.001f;
 }
-float3 ray_origin(float3 p,float3 geometricNormal,float3 direction,constant Uniforms &u) {
-    return p+geometricNormal*(dot(direction,geometricNormal)>=0 ? ray_epsilon(p,u) : -ray_epsilon(p,u));
+float max_abs(float3 p) { return max(abs(p.x),max(abs(p.y),abs(p.z))); }
+// Imported-scene rounding bounds (PBRT2023 6.8): a position computed as
+// origin+t*direction rounds with |origin| and t, a barycentric one with the
+// triangle's vertex magnitudes. 2^-20 and 2^-19 keep margin for relaxed math.
+float ray_hit_error(Ray r, float t, float3 p, constant Uniforms &u) {
+    return u.sceneIndex==6 && u.lens.z>0 ? max(ray_epsilon(p,u), 9.536743e-7f*(max_abs(r.origin)+t)) : ray_epsilon(p,u);
+}
+float mesh_hit_error(MeshTriangle tri, float3 p, constant Uniforms &u) {
+    return u.sceneIndex==6 && u.lens.z>0 ? max(1e-7f, 1.907349e-6f*max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)))) : ray_epsilon(p,u);
+}
+// A segment ending on a surface: the blocker distance there carries the
+// rounding of both endpoints and of the segment length.
+float endpoint_tolerance(float3 origin, float3 endpoint, float d, constant Uniforms &u) {
+    float legacy=2.0f*ray_epsilon(endpoint,u);
+    return u.sceneIndex==6 && u.lens.z>0 ? max(legacy, 1.907349e-6f*(max_abs(origin)+max_abs(endpoint)+d)) : legacy;
+}
+float ray_t_min(float3 origin, constant Uniforms &u) {
+    return u.sceneIndex==6 && u.lens.z>0 ? ray_epsilon(origin,u)*0.25f : 0.001f;
+}
+// error is the originating hit's HitRecord.error; it never lowers the legacy offset.
+float3 ray_origin(float3 p,float3 geometricNormal,float3 direction,constant Uniforms &u,float error=0.0f) {
+    float offset=max(error,ray_epsilon(p,u));
+    return p+geometricNormal*(dot(direction,geometricNormal)>=0 ? offset : -offset);
 }
 
-bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSettings *objects = nullptr, float lightSize = 1.0f, float3 lightTint = float3(1)) {
+bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSettings *objects = nullptr, float lightSize = 1.0f, float3 lightTint = float3(1), float tMin = 0.001f) {
     float closest = 1e20f;
     bool hit = false;
     HitRecord t_rec;
@@ -490,8 +517,10 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
         Material teak_wood  = { DIFFUSE, float3(0.38f, 0.24f, 0.15f), float3(0.0f), 0, 1 };
 
         if (intersect_quad(r, float3(-8, -1.0f, -8), float3(16, 0, 0), float3(0, 0, 16), float3(0, 1, 0), false, travertine, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3(-3.8f, -1.0f, 2.8f), float3(7.6f, 0, 0), float3(0, 4.0f, 0), float3(0, 0, -1), false, back_wall, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3(-3.8f, -1.0f, -2.0f), float3(0, 0, 4.8f), float3(0, 4.0f, 0), float3(1, 0, 0), false, terracotta, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        // Walls start at their top-left corner as seen from the room, so image
+        // row 0 is the top edge and u runs to the viewer's right.
+        if (intersect_quad(r, float3(3.8f, 3.0f, 2.8f), float3(-7.6f, 0, 0), float3(0, -4.0f, 0), float3(0, 0, -1), false, back_wall, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3(-3.8f, 3.0f, 2.8f), float3(0, 0, -4.8f), float3(0, -4.0f, 0), float3(1, 0, 0), false, terracotta, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
         for (int i = 0; i < 4; ++i) {
             float z_pos = -0.6f + float(i) * 0.9f;
@@ -524,7 +553,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
 
     } else if (sceneIndex == 6) {
         Material floor = { DIFFUSE, float3(0.5f), float3(0), 0, 1 }; floor.slot = 1;
-        if (intersect_quad(r,float3(-10,-1,-10),float3(20,0,0),float3(0,0,20),float3(0,1,0),false,floor,0.001f,closest,t_rec,objects)) { hit=true; closest=t_rec.t; rec=t_rec; }
+        if (intersect_quad(r,float3(-10,-1,-10),float3(20,0,0),float3(0,0,20),float3(0,1,0),false,floor,tMin,closest,t_rec,objects)) { hit=true; closest=t_rec.t; rec=t_rec; }
     } else if (sceneIndex == 1 || sceneIndex == 4) {
         Material white = { DIFFUSE, float3(0.73f), float3(0.0f), 0, 1 };
         Material red   = { DIFFUSE, float3(0.65f, 0.05f, 0.05f), float3(0.0f), 0, 1 };
@@ -534,9 +563,9 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
 
         if (intersect_quad(r, float3(-1, -1, -1), float3(2, 0, 0), float3(0, 0, 2), float3(0, 1, 0), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
         if (intersect_quad(r, float3(-1,  1, -1), float3(2, 0, 0), float3(0, 0, 2), float3(0, -1, 0), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3(-1, -1,  1), float3(2, 0, 0), float3(0, 2, 0), float3(0, 0, -1), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3(-1, -1, -1), float3(0, 0, 2), float3(0, 2, 0), float3(1, 0, 0), true, red, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3( 1, -1, -1), float3(0, 0, 2), float3(0, 2, 0), float3(-1, 0, 0), true, green, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3( 1,  1,  1), float3(-2, 0, 0), float3(0, -2, 0), float3(0, 0, -1), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3(-1,  1,  1), float3(0, 0, -2), float3(0, -2, 0), float3(1, 0, 0), true, red, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3( 1,  1, -1), float3(0, 0, 2), float3(0, -2, 0), float3(-1, 0, 0), true, green, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
         if (intersect_quad(r, float3(0,0.999f,0)+(float3(-0.25f, 0.999f, -0.25f)-float3(0,0.999f,0))*lightSize, float3(0.5f, 0, 0)*lightSize, float3(0, 0, 0.5f)*lightSize, float3(0, -1, 0), true, light, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
@@ -553,9 +582,10 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
         for (int i = 0; i < 4; ++i) {
             Material plate_mat = { GLOSSY, float3(0.95f, 0.92f, 0.88f), float3(0.0f), roughnesses[i], 1 };
             plate_mat.slot = uint(i)+2;
-            float3 c = float3(xs[i] - 0.6f, -0.85f, -0.5f);
-            float3 u = float3(1.2f, 0.0f, 0.0f);
-            float3 v = float3(0.0f, 1.4f * sin(0.6f), 1.4f * cos(0.6f));
+            // Top-right corner as seen from the camera: image row 0 is the upper edge.
+            float3 u = float3(-1.2f, 0.0f, 0.0f);
+            float3 v = float3(0.0f, -1.4f * sin(0.6f), -1.4f * cos(0.6f));
+            float3 c = float3(xs[i] - 0.6f, -0.85f, -0.5f) - u - v;
             float3 n = normalize(cross(u, v));
             if (intersect_quad(r, c, u, v, n, false, plate_mat, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
         }
@@ -575,9 +605,9 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
 
         if (intersect_quad(r, float3(-1, -1, -1), float3(2, 0, 0), float3(0, 0, 2), float3(0, 1, 0), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
         if (intersect_quad(r, float3(-1,  1, -1), float3(2, 0, 0), float3(0, 0, 2), float3(0, -1, 0), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3(-1, -1,  1), float3(2, 0, 0), float3(0, 2, 0), float3(0, 0, -1), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3(-1, -1, -1), float3(0, 0, 2), float3(0, 2, 0), float3(1, 0, 0), true, red, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3( 1, -1, -1), float3(0, 0, 2), float3(0, 2, 0), float3(-1, 0, 0), true, green, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3( 1,  1,  1), float3(-2, 0, 0), float3(0, -2, 0), float3(0, 0, -1), true, white, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3(-1,  1,  1), float3(0, 0, -2), float3(0, -2, 0), float3(1, 0, 0), true, red, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3( 1,  1, -1), float3(0, 0, 2), float3(0, -2, 0), float3(-1, 0, 0), true, green, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
         if (intersect_quad(r, float3(0,0.999f,0)+(float3(-0.2f, 0.999f, -0.2f)-float3(0,0.999f,0))*lightSize, float3(0.4f, 0, 0)*lightSize, float3(0, 0, 0.4f)*lightSize, float3(0, -1, 0), true, light, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
@@ -593,7 +623,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
         Material light_mat  = { EMISSIVE, float3(0.0f), float3(45.0f, 42.0f, 38.0f), 0, 1 };
 
         if (intersect_quad(r, float3(-5, -1, -5), float3(10, 0, 0), float3(0, 0, 10), float3(0, 1, 0), false, floor_mat, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
-        if (intersect_quad(r, float3(-5, -1,  2), float3(10, 0, 0), float3(0, 5, 0), float3(0, 0, -1), false, back_wall, 0.001f, closest, t_rec, objects))  { hit = true; closest = t_rec.t; rec = t_rec; }
+        if (intersect_quad(r, float3( 5,  4,  2), float3(-10, 0, 0), float3(0, -5, 0), float3(0, 0, -1), false, back_wall, 0.001f, closest, t_rec, objects))  { hit = true; closest = t_rec.t; rec = t_rec; }
 
         if (intersect_quad(r, float3(0,1.9f,-0.5f)+(float3(-0.15f, 1.9f, -0.65f)-float3(0,1.9f,-0.5f))*lightSize, float3(0.3f, 0, 0)*lightSize, float3(0, 0, 0.3f)*lightSize, float3(0, -1, 0), true, light_mat, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
@@ -608,10 +638,35 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
 }
 
 
+bool mesh_node_hit(MeshNode node, Ray local, float nearT, float farT) {
+    for(int axis=0;axis<3;++axis) {
+        if(abs(local.direction[axis])<1e-8f) { if(local.origin[axis]<node.lo[axis] || local.origin[axis]>node.hi[axis]) farT=-1; }
+        else { float a=(node.lo[axis]-local.origin[axis])/local.direction[axis], b=(node.hi[axis]-local.origin[axis])/local.direction[axis]; nearT=max(nearT,min(a,b)); farT=min(farT,max(a,b)); }
+    }
+    return nearT<=farT;
+}
+// Interior nodes store their median-split axis in links.z; the child on the
+// ray's near side is popped first so closer hits shrink the search early.
+void push_mesh_children(MeshNode node, Ray local, thread int *stack, thread int &top) {
+    if(top>=62) return;
+    bool leftFirst=local.direction[clamp(node.links.z,0,2)]>=0;
+    stack[top++]=leftFirst?node.links.y:node.links.x; stack[top++]=leftFirst?node.links.x:node.links.y;
+}
+bool intersect_mesh_triangle(MeshTriangle tri, Ray local, float tMin, float tMax, thread float &t, thread float &b1, thread float &b2) {
+    float3 e1=tri.b.xyz-tri.a.xyz, e2=tri.c.xyz-tri.a.xyz;
+    float3 q=cross(local.direction,e2); float det=dot(e1,q);
+    if(abs(det)<=1e-7f*length(e1)*length(e2)) return false;
+    float3 d=local.origin-tri.a.xyz; b1=dot(d,q)/det;
+    float3 v=cross(d,e1); b2=dot(local.direction,v)/det;
+    t=dot(e2,v)/det;
+    return !(b1<0 || b2<0 || b1+b2>1 || t<tMin || t>=tMax);
+}
+
 // REFERENCES.md: PBRT2023, OBJ2026. Local determinant triangle test and median BVH.
 bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant MaterialResources &images, constant Uniforms &u) {
-    bool hit=trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz);
-    if(hit) rec.objectID=rec.mat.slot;
+    float tMin=ray_t_min(r.origin,u);
+    bool hit=trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz,tMin);
+    if(hit) { rec.objectID=rec.mat.slot; rec.error=ray_hit_error(r,rec.t,rec.position,u); }
     rec.triangle=0xffffffffu;
     if (sceneIndex != 6 || u.environment.w < 1 || (u.lens.z==0 && images.objects[7].rotationHidden.w > 0.5f)) return hit;
     ObjectSettings o=images.objects[7];
@@ -621,24 +676,18 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
     int stack[64]; int top=0; stack[top++]=0;
     while(top>0) {
         MeshNode node=images.nodes[stack[--top]];
-        float nearT=(u.lens.z>0 ? ray_epsilon(r.origin,u)*0.25f : 0.001f)/o.positionScale.w, farT=closest;
-        for(int axis=0;axis<3;++axis) {
-            if(abs(local.direction[axis])<1e-8f) { if(local.origin[axis]<node.lo[axis] || local.origin[axis]>node.hi[axis]) farT=-1; }
-            else { float a=(node.lo[axis]-local.origin[axis])/local.direction[axis], b=(node.hi[axis]-local.origin[axis])/local.direction[axis]; nearT=max(nearT,min(a,b)); farT=min(farT,max(a,b)); }
-        }
-        if(nearT>farT) continue;
-        if(node.links.w==0) { if(top<62) {stack[top++]=node.links.x;stack[top++]=node.links.y;} continue; }
+        if(!mesh_node_hit(node,local,tMin/o.positionScale.w,closest)) continue;
+        if(node.links.w==0) { push_mesh_children(node,local,stack,top); continue; }
         for(int k=0;k<node.links.w;++k) {
             MeshTriangle tri=images.triangles[node.links.z+k];
+            float t,b1,b2;
+            if(!intersect_mesh_triangle(tri,local,tMin/o.positionScale.w,closest,t,b1,b2)) continue;
             float3 e1=tri.b.xyz-tri.a.xyz, e2=tri.c.xyz-tri.a.xyz;
-            float3 q=cross(local.direction,e2); float det=dot(e1,q);
-            if(abs(det)<=1e-7f*length(e1)*length(e2)) continue;
-            float3 d=local.origin-tri.a.xyz; float b1=dot(d,q)/det;
-            float3 v=cross(d,e1); float b2=dot(local.direction,v)/det;
-            float t=dot(e2,v)/det;
-            if(b1<0 || b2<0 || b1+b2>1 || t<(u.lens.z>0 ? ray_epsilon(r.origin,u)*0.25f : 0.001f)/o.positionScale.w || t>=closest) continue;
             closest=t; hit=true; float b0=1-b1-b2;
-            rec.t=t; rec.position=local.origin+t*local.direction;
+            // Rebuild the point from barycentrics: it then lies on the triangle
+            // within vertex-magnitude rounding, independent of the ray length.
+            rec.t=t; rec.position=b0*tri.a.xyz+b1*tri.b.xyz+b2*tri.c.xyz;
+            rec.error=mesh_hit_error(tri,rec.position,u);
             float3 ng=normalize(cross(e1,e2)); rec.front_face=dot(ng,local.direction)<0;
             rec.geometricNormal=rec.front_face?ng:-ng;
             float3 smooth=b0*tri.na.xyz+b1*tri.nb.xyz+b2*tri.nc.xyz;
@@ -660,6 +709,31 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
         }
     }
     return hit;
+}
+// Visibility of a segment: any blocker before tMax ends the traversal, and no
+// hit attributes are built. A mesh blocker within its own rounding bound of
+// tMax is the endpoint surface itself.
+bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResources &images, constant Uniforms &u) {
+    float tMin=ray_t_min(r.origin,u);
+    HitRecord rec;
+    if(trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz,tMin) && rec.t<tMax) return true;
+    if (sceneIndex != 6 || u.environment.w < 1 || (u.lens.z==0 && images.objects[7].rotationHidden.w > 0.5f)) return false;
+    ObjectSettings o=images.objects[7];
+    if(u.lens.z>0) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
+    Ray local=object_ray(r,o);
+    float nearT=tMin/o.positionScale.w, farT=tMax/o.positionScale.w;
+    int stack[64]; int top=0; stack[top++]=0;
+    while(top>0) {
+        MeshNode node=images.nodes[stack[--top]];
+        if(!mesh_node_hit(node,local,nearT,farT)) continue;
+        if(node.links.w==0) { push_mesh_children(node,local,stack,top); continue; }
+        for(int k=0;k<node.links.w;++k) {
+            MeshTriangle tri=images.triangles[node.links.z+k];
+            float t,b1,b2,slack=u.lens.z>0 ? mesh_hit_error(tri,float3(0),u) : 0.0f;
+            if(intersect_mesh_triangle(tri,local,nearT,farT-slack,t,b1,b2)) return true;
+        }
+    }
+    return false;
 }
 // The marginal row CDF is a 1 x H texture; each conditional column CDF is a row
 // of the W x H texture. `marginal` selects the axis explicitly, so 1-wide maps work.
@@ -1222,9 +1296,8 @@ float3 sample_specular_manifold_caustic(float3 x, float3 n_x, constant Uniforms 
                 Ray r_zy; r_zy.origin = z + normalize(float3(cyl_c.x - z.x, 0.0f, cyl_c.z - z.z)) * 0.001f;
                 r_zy.direction = normalize(y_light - r_zy.origin);
 
-                HitRecord rec1, rec2;
-                bool occ1 = trace_scene(r_xz, u.sceneIndex, rec1, materialImages, u) && (rec1.t < dist_xz - 0.01f);
-                bool occ2 = trace_scene(r_zy, u.sceneIndex, rec2, materialImages, u) && (rec2.t < length(y_light - z) - 0.01f);
+                bool occ1 = scene_occluded(r_xz, u.sceneIndex, dist_xz - 0.01f, materialImages, u);
+                bool occ2 = scene_occluded(r_zy, u.sceneIndex, length(y_light - z) - 0.01f, materialImages, u);
 
                 if (!occ1 && !occ2) {
                     float cos_x = max(0.0f, dot(n_x, normalize(z - x)));
@@ -1288,33 +1361,31 @@ float eval_restir_gi_target(float3 x1, float3 n1, float3 rayDir, Material mat,
 }
 
 bool gi_connection_visible(float3 x1, float3 n1, float3 x2,
-                           constant Uniforms &u, constant MaterialResources &images) {
+                           constant Uniforms &u, constant MaterialResources &images, float error = 0.0f) {
     float3 delta = x2 - x1;
     float distanceToSample = length(delta);
     if (distanceToSample <= 2.0f * ray_epsilon(x1, u)) return false;
     Ray connection;
     connection.direction = delta / distanceToSample;
-    connection.origin = ray_origin(x1, n1, connection.direction, u);
+    connection.origin = ray_origin(x1, n1, connection.direction, u, error);
     float3 endpointDelta = x2 - connection.origin;
     float endpointDistance = length(endpointDelta);
     connection.direction = endpointDelta / endpointDistance;
-    HitRecord blocker;
-    return !trace_scene(connection, u.sceneIndex, blocker, images, u) ||
-        blocker.t >= endpointDistance - 2.0f * ray_epsilon(x2, u);
+    return !scene_occluded(connection, u.sceneIndex,
+        endpointDistance - endpoint_tolerance(connection.origin, x2, endpointDistance, u), images, u);
 }
 
 // Shadow endpoints are measured from the offset origin to avoid self-occlusion.
-bool light_visible(float3 p, float3 n, LightSample ls, uint sceneIndex, constant MaterialResources &materialImages, constant Uniforms &u) {
+bool light_visible(float3 p, float3 n, LightSample ls, uint sceneIndex, constant MaterialResources &materialImages, constant Uniforms &u, float error = 0.0f) {
     if (ls.pdf <= 0.0f) return false;
     Ray shadow;
-    shadow.origin = ray_origin(p,n,ls.wi,u);
+    shadow.origin = ray_origin(p,n,ls.wi,u,error);
     float3 delta = ls.isDirectional == 1 ? ls.wi : ls.position - shadow.origin;
     float d = ls.isDirectional == 1 ? 1e6f : length(delta);
-    float endpointTolerance=2*ray_epsilon(ls.isDirectional==1 ? p : ls.position,u);
+    float endpointTolerance=ls.isDirectional==1 ? 2*ray_epsilon(p,u) : endpoint_tolerance(shadow.origin,ls.position,d,u);
     if (d <= endpointTolerance) return false;
     shadow.direction = normalize(delta);
-    HitRecord blocker;
-    return !trace_scene(shadow, sceneIndex, blocker, materialImages, u) || blocker.t >= d - endpointTolerance;
+    return !scene_occluded(shadow, sceneIndex, d - endpointTolerance, materialImages, u);
 }
 
 bool is_delta(Material mat) {
@@ -1600,7 +1671,7 @@ kernel void restir_temporal_kernel(
     if (sample_bsdf(rec.mat, rec.normal, ray.direction, rec.front_face, seed,
                     giDirection, giBSDFWeight, giBSDFPdf) && giBSDFPdf > 0.0f) {
         Ray giRay;
-        giRay.origin = ray_origin(rec.position, rec.geometricNormal, giDirection, uniforms);
+        giRay.origin = ray_origin(rec.position, rec.geometricNormal, giDirection, uniforms, rec.error);
         giRay.direction = giDirection;
         HitRecord secondary;
         if (trace_scene(giRay, uniforms.sceneIndex, secondary, materialImages, uniforms)) {
@@ -1611,7 +1682,7 @@ kernel void restir_temporal_kernel(
                 LightSample giLight = sample_direct_light(secondary.position, secondary.normal,
                     uniforms, seed, materialImages);
                 if (giLight.pdf > 0.0f && light_visible(secondary.position,
-                    secondary.geometricNormal, giLight, uniforms.sceneIndex, materialImages, uniforms)) {
+                    secondary.geometricNormal, giLight, uniforms.sceneIndex, materialImages, uniforms, secondary.error)) {
                     float secondaryCosine = max(0.0f, dot(secondary.normal, giLight.wi));
                     float secondaryBSDFPdf;
                     float3 secondaryBSDF = eval_bsdf_with_pdf(secondary.mat, secondary.normal,
@@ -1821,7 +1892,7 @@ kernel void shading_kernel(
                 if (W > 0.0f) {
                     float3 dir = (selectedSample.isDirectional == 1) ? selectedSample.position : normalize(selectedSample.position - pos);
 
-                    if (light_visible(pos, primaryHit.geometricNormal, selectedSample, uniforms.sceneIndex, materialImages, uniforms)) {
+                    if (light_visible(pos, primaryHit.geometricNormal, selectedSample, uniforms.sceneIndex, materialImages, uniforms, primaryHit.error)) {
                         float cos_th = max(0.0f, dot(norm, dir));
                         float3 bsdf = eval_bsdf(mat, norm, -primaryRay.direction, dir);
                         radiance += bsdf * cos_th * selectedSample.emission * W * light_geometry(pos, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
@@ -1873,7 +1944,7 @@ kernel void shading_kernel(
                 float giW = giM > 0.0f && finalGITarget > 0.0f
                     ? giWeightSum / (giM * finalGITarget) : 0.0f;
                 if (giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
-                    selectedGIPosPdf.xyz, uniforms, materialImages)) {
+                    selectedGIPosPdf.xyz, uniforms, materialImages, primaryHit.error)) {
                     float3 direction = normalize(selectedGIPosPdf.xyz - pos);
                     float3 primaryBSDF = eval_bsdf(mat, norm, -primaryRay.direction, direction);
                     float geometry = gi_geometry(pos, norm, selectedGIPosPdf.xyz, selectedGINormal.xyz);
@@ -1882,7 +1953,7 @@ kernel void shading_kernel(
             } else if (mat.type != DIELECTRIC && !(mat.type == GLOSSY && mat.roughness < 0.02f) && uniforms.samplingMode != 3) {
                 LightSample ls = sample_direct_light(pos, norm, uniforms, seed, materialImages);
                 if (ls.pdf > 0.0f) {
-                    if (light_visible(pos, primaryHit.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms)) {
+                    if (light_visible(pos, primaryHit.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, primaryHit.error)) {
                         float cos_th = abs(dot(norm, ls.wi));
                         float bsdf_pdf;
                         float3 bsdf = eval_bsdf_with_pdf(mat, norm, -primaryRay.direction, ls.wi, bsdf_pdf);
@@ -1927,7 +1998,7 @@ kernel void shading_kernel(
                 float3 previousPosition = currentHit.position;
                 float3 previousNormal = currentHit.normal;
                 float3 offsetNormal = currentHit.geometricNormal;
-                currentRay.origin = ray_origin(previousPosition,offsetNormal,nextDirection,uniforms);
+                currentRay.origin = ray_origin(previousPosition,offsetNormal,nextDirection,uniforms,currentHit.error);
                 currentRay.direction = nextDirection;
 
                 HitRecord rec;
@@ -1959,7 +2030,7 @@ kernel void shading_kernel(
                     bounce == 1 && rec.mat.type == DIFFUSE;
                 if (!is_delta(rec.mat) && uniforms.samplingMode != 3 && !restirGISecondary) {
                     LightSample ls = sample_direct_light(rec.position, rec.normal, uniforms, seed, materialImages);
-                    if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms)) {
+                    if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, rec.error)) {
                         float cosine = abs(dot(rec.normal, ls.wi));
                         float pdf;
                         float3 bsdf = eval_bsdf_with_pdf(rec.mat, rec.normal, -currentRay.direction, ls.wi, pdf);
@@ -2071,7 +2142,7 @@ DenoiserMaterialGuide trace_denoiser_material(Ray ray, constant Uniforms &u,
             tint *= conductor_fresnel(hit.mat.albedo, max(0.0f, dot(-ray.direction, hit.normal)));
             next = reflect(ray.direction, hit.normal);
         }
-        ray.origin = ray_origin(hit.position,hit.geometricNormal,next,u);
+        ray.origin = ray_origin(hit.position,hit.geometricNormal,next,u,hit.error);
         ray.direction = normalize(next);
     }
     guide.specular = tint;
@@ -2114,12 +2185,24 @@ kernel void metalfx_guides_kernel(
             guideCamera+=radius*(cos(angle)*right+sin(angle)*up);
         }
         float3 wo = normalize(guideCamera - p.xyz);
+        // The G-buffer holds the shading normal. Specular guide rays re-trace the
+        // primary hit and offset along its geometric normal and rounding bound.
+        float3 offsetPosition = p.xyz, offsetNormal = normal; float offsetError = 0.0f;
+        if ((int(n.w) == GLOSSY && material.w < 0.15f) || int(n.w) == DIELECTRIC) {
+            Ray primary = { guideCamera, -wo };
+            HitRecord surface;
+            if (trace_scene(primary, u.sceneIndex, surface, materialImages, u) &&
+                distance(surface.position, p.xyz) <= max(1e-4f, 1e-3f * p.w)) {
+                offsetPosition = surface.position; offsetNormal = surface.geometricNormal; offsetError = surface.error;
+            }
+        }
         if (int(n.w) == DIFFUSE) diffuseAlbedo = material.xyz;
         if (int(n.w) == GLOSSY) {
             rough = clamp(material.w, 0.0f, 1.0f);
             specularAlbedo = conductor_fresnel(material.xyz, max(0.0f, dot(normal, wo)));
             if (rough < 0.15f) {
-                Ray reflected = { ray_origin(p.xyz,normal,normal,u), reflect(-wo, normal) };
+                float3 mirror = reflect(-wo, normal);
+                Ray reflected = { ray_origin(offsetPosition,offsetNormal,mirror,u,offsetError), mirror };
                 DenoiserMaterialGuide guide = trace_denoiser_material(reflected, u, surfaceSettings, materialImages);
                 diffuseAlbedo = specularAlbedo * guide.diffuse;
                 specularAlbedo *= guide.specular;
@@ -2143,12 +2226,13 @@ kernel void metalfx_guides_kernel(
             float cosI = max(0.0f, dot(normal, wo));
             float f0 = (1.0f - ior) / (1.0f + ior);
             float fresnel = f0 * f0 + (1.0f - f0 * f0) * pow(1.0f - cosI, 5.0f);
-            Ray reflected = { ray_origin(p.xyz,normal,normal,u), reflect(-wo, normal) };
+            float3 mirror = reflect(-wo, normal);
+            Ray reflected = { ray_origin(offsetPosition,offsetNormal,mirror,u,offsetError), mirror };
             DenoiserMaterialGuide r = trace_denoiser_material(reflected, u, surfaceSettings, materialImages);
             float3 transmitted = refract(-wo, normal, eta);
             DenoiserMaterialGuide t = r;
             if (dot(transmitted, transmitted) > 1e-8f) {
-                Ray refracted = { ray_origin(p.xyz,normal,-normal,u), normalize(transmitted) };
+                Ray refracted = { ray_origin(offsetPosition,offsetNormal,transmitted,u,offsetError), normalize(transmitted) };
                 t = trace_denoiser_material(refracted, u, surfaceSettings, materialImages);
             } else fresnel = 1.0f;
             diffuseAlbedo = material.xyz * mix(t.diffuse, r.diffuse, fresnel);

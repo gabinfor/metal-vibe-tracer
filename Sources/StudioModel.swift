@@ -223,6 +223,11 @@ struct ProjectDocument: Codable {
 enum OBJMesh {
   static func load(_ text: String) throws -> [MeshTriangle] { try parts(text).flatMap(\.triangles) }
   static func parts(_ text: String) throws -> [OBJPart] {
+    var skipped = 0
+    return try parts(text, skipped: &skipped)
+  }
+  // skipped counts faces left out because their edges are (numerically) collinear.
+  static func parts(_ text: String, skipped: inout Int) throws -> [OBJPart] {
     var positions: [SIMD3<Float>] = []
     var normals: [SIMD3<Float>] = []
     var uvs: [SIMD2<Float>] = []
@@ -231,21 +236,38 @@ enum OBJMesh {
     var group = "Mesh"
     var material = "Default"
     var total = 0
+    var lineNumber = 0, physicalLine = 0, pending = ""
+    func failure(_ message: String) -> Error {
+      MaterialLibrary.error("\(message.dropLast()) on line \(lineNumber).")
+    }
     func number(_ s: Substring) throws -> Float {
       guard let n = Float(s), n.isFinite, abs(n) < 1e8 else {
-        throw MaterialLibrary.error("OBJ contains an invalid number.")
+        throw failure("OBJ contains an invalid number.")
       }
       return n
     }
     func index(_ s: Substring, count: Int) throws -> Int {
       guard let n = Int(s), n != 0, n != Int.min else {
-        throw MaterialLibrary.error("Invalid OBJ index.")
+        throw failure("Invalid OBJ index.")
       }
       let i = n > 0 ? n - 1 : count + n
-      guard i >= 0 && i < count else { throw MaterialLibrary.error("OBJ index is out of bounds.") }
+      guard i >= 0 && i < count else { throw failure("OBJ index is out of bounds.") }
       return i
     }
-    for line in text.split(whereSeparator: \.isNewline) {
+    // The empty tail flushes a continuation on the file's last line.
+    let physicalLines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+    for raw in [physicalLines, [""]].joined() {
+      physicalLine += 1
+      if pending.isEmpty { lineNumber = physicalLine }
+      // A trailing backslash outside a comment continues the statement.
+      if let last = raw.lastIndex(where: { !$0.isWhitespace }), raw[last] == "\\",
+        !raw[..<last].contains("#")
+      {
+        pending += raw[..<last] + " "
+        continue
+      }
+      let line = pending.isEmpty ? raw : Substring(pending + raw)
+      pending = ""
       let fields = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
         .split(whereSeparator: \.isWhitespace)
       guard let kind = fields.first else { continue }
@@ -263,7 +285,7 @@ enum OBJMesh {
         continue
       }
       if kind == "v" || kind == "vn" {
-        guard fields.count >= 4 else { throw MaterialLibrary.error("Incomplete OBJ vertex.") }
+        guard fields.count >= 4 else { throw failure("Incomplete OBJ vertex.") }
         let v = try SIMD3<Float>(number(fields[1]), number(fields[2]), number(fields[3]))
         if kind == "v" {
           positions.append(v)
@@ -271,16 +293,17 @@ enum OBJMesh {
           normals.append(simd_length_squared(v) > 1e-12 ? simd_normalize(v) : SIMD3<Float>(0, 1, 0))
         }
       } else if kind == "vt" {
-        guard fields.count >= 3 else { throw MaterialLibrary.error("Incomplete OBJ UV.") }
-        uvs.append(try SIMD2<Float>(number(fields[1]), 1 - number(fields[2])))
+        // "vt u" is valid OBJ; v defaults to 0.
+        guard fields.count >= 2 else { throw failure("Incomplete OBJ UV.") }
+        uvs.append(try SIMD2<Float>(number(fields[1]), 1 - (fields.count >= 3 ? number(fields[2]) : 0)))
       } else if kind == "f" {
         guard fields.count >= 4, fields.count <= 4097 else {
-          throw MaterialLibrary.error("OBJ face must contain 3–4096 vertices.")
+          throw failure("OBJ face must contain 3–4096 vertices.")
         }
         var vertices: [(SIMD3<Float>, SIMD2<Float>, SIMD3<Float>?)] = []
         for f in fields.dropFirst() {
           let parts = f.split(separator: "/", omittingEmptySubsequences: false)
-          guard parts.count <= 3 else { throw MaterialLibrary.error("Invalid OBJ face.") }
+          guard parts.count <= 3 else { throw failure("Invalid OBJ face.") }
           let p = positions[try index(parts[0], count: positions.count)]
           let uv =
             parts.count > 1 && !parts[1].isEmpty
@@ -295,8 +318,15 @@ enum OBJMesh {
           let a = vertices[0]
           let b = vertices[i]
           let c = vertices[i + 1]
-          let cross = simd_cross(b.0 - a.0, c.0 - a.0)
-          if simd_length_squared(cross) < 1e-16 { continue }
+          let e1 = b.0 - a.0, e2 = c.0 - a.0
+          let cross = simd_cross(e1, e2)
+          // Relative test, matching the GPU determinant test: sub-millimetre
+          // faces in meter units stay; only collinear or coincident edges go.
+          let area = simd_length(cross)
+          guard area.isFinite, area > 1e-7 * simd_length(e1) * simd_length(e2) else {
+            skipped += 1
+            continue
+          }
           let n = simd_normalize(cross)
           if !result.contains(where: { $0.object == object && $0.group == group }) {
             result.append(OBJPart(object: object, group: group))
@@ -311,12 +341,15 @@ enum OBJMesh {
               uvab: SIMD4(a.1.x, a.1.y, b.1.x, b.1.y), uvc: SIMD4(c.1.x, c.1.y, Float(subset), 0)))
           total += 1
           guard total <= 500_000 else {
-            throw MaterialLibrary.error("OBJ exceeds the 500,000-triangle import limit.")
+            throw failure("OBJ exceeds the 500,000-triangle import limit.")
           }
         }
       }
     }
-    guard !result.isEmpty else { throw MaterialLibrary.error("OBJ contains no usable faces.") }
+    guard !result.isEmpty else {
+      throw MaterialLibrary.error(
+        skipped > 0 ? "OBJ contains no usable faces (\(skipped) degenerate faces skipped)." : "OBJ contains no usable faces.")
+    }
     return result
   }
   static func build(_ input: [MeshTriangle]) -> ([MeshTriangle], [MeshNode]) {
@@ -370,7 +403,8 @@ enum OBJMesh {
         let middle = (start + end) / 2
         partition(start, end, middle, axis)
         let left = buildNode(start, middle), right = buildNode(middle, end)
-        nodes[index].links = SIMD4(Int32(left), Int32(right), 0, 0)
+        // links.z keeps the split axis for near-first GPU traversal.
+        nodes[index].links = SIMD4(Int32(left), Int32(right), Int32(axis), 0)
       }
       return index
     }

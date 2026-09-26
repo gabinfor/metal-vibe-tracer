@@ -41,7 +41,11 @@ struct SceneGraph: Codable {
   var materials: [SceneMaterial] = []
 
   mutating func addOBJ(_ text: String, name: String) throws -> UUID {
-    let parts = try OBJMesh.parts(text)
+    var skipped = 0
+    return try addOBJ(text, name: name, skipped: &skipped)
+  }
+  mutating func addOBJ(_ text: String, name: String, skipped: inout Int) throws -> UUID {
+    let parts = try OBJMesh.parts(text, skipped: &skipped)
     let root = SceneNode(name: name)
     nodes.append(root)
     var parents: [String: UUID] = [:]
@@ -313,6 +317,10 @@ struct SceneGraph: Codable {
 extension ProjectDocument {
   // Build a candidate first: failed import preserves the existing document.
   mutating func appendOBJ(_ text: String, name: String) throws -> UUID {
+    var skipped = 0
+    return try appendOBJ(text, name: name, skipped: &skipped)
+  }
+  mutating func appendOBJ(_ text: String, name: String, skipped: inout Int) throws -> UUID {
     var p = self
     var graph = p.graph ?? SceneGraph()
     if p.graph == nil, !p.triangles.isEmpty {
@@ -350,7 +358,7 @@ extension ProjectDocument {
       p.scenes[6] = migrated
     }
     let root = try graph.addOBJ(
-      text, name: name)
+      text, name: name, skipped: &skipped)
     p.graph = graph
     p.triangles = []
     p.meshName = "\(graph.assets.count) meshes"

@@ -29,6 +29,7 @@ else:
     source += '\n' + (root / 'tests' / 'MaterialXChecks.swift').read_text()
 source += '\n' + (root / 'tests' / 'USDChecks.swift').read_text()
 source += '\n' + (root / 'tests' / 'Fix_lights.swift').read_text()
+source += '\n' + (root / 'tests' / 'Fix_geometry.swift').read_text()
 with tempfile.TemporaryDirectory(prefix='vibe-tracer-tests-') as directory:
     folder = Path(directory)
     swift = folder / 'main.swift'
