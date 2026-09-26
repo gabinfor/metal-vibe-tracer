@@ -28,6 +28,22 @@ final class OIDNProgress {
   }
 }
 
+/// Set by any worker of a parallel preprocessing pass once cancellation is observed.
+private final class OIDNCancelFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value = false
+  var isSet: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+  func set() {
+    lock.lock()
+    value = true
+    lock.unlock()
+  }
+}
+
 private let oidnProgressMonitor: @convention(c) (UnsafeMutableRawPointer?, Double) -> Bool = {
   pointer, fraction in
   guard let pointer else { return true }
@@ -152,19 +168,25 @@ final class OIDNDenoiser {
     let rowBytes: Int
     let pixelBytes: Int
     let half: Bool
+    // buffer.contents() is an Objective-C call; resolve it once, not per channel.
+    let base: UnsafeMutableRawPointer
 
-    func pixel(_ index: Int, width: Int) -> SIMD4<Float> {
+    init(buffer: MTLBuffer, rowBytes: Int, pixelBytes: Int, half: Bool) {
+      self.buffer = buffer
+      self.rowBytes = rowBytes
+      self.pixelBytes = pixelBytes
+      self.half = half
+      base = buffer.contents()
+    }
+
+    @inline(__always) func pixel(_ index: Int, width: Int) -> SIMD4<Float> {
       let offset = (index / width) * rowBytes + (index % width) * pixelBytes
-      var value = SIMD4<Float>(0, 0, 0, 1)
-      for channel in 0..<4 {
-        if half {
-          let bits = buffer.contents().load(fromByteOffset: offset + channel * 2, as: UInt16.self)
-          value[channel] = Float(Float16(bitPattern: bits))
-        } else {
-          value[channel] = buffer.contents().load(fromByteOffset: offset + channel * 4, as: Float.self)
-        }
+      if half {
+        let bits = base.loadUnaligned(fromByteOffset: offset, as: SIMD4<UInt16>.self)
+        return SIMD4<Float>(Float(Float16(bitPattern: bits.x)), Float(Float16(bitPattern: bits.y)),
+          Float(Float16(bitPattern: bits.z)), Float(Float16(bitPattern: bits.w)))
       }
-      return value
+      return base.loadUnaligned(fromByteOffset: offset, as: SIMD4<Float>.self)
     }
   }
 
@@ -211,10 +233,40 @@ final class OIDNDenoiser {
     (try? API()) != nil
   }
 
+  /// Host memory held at once by `denoise`: three guide readbacks (at most
+  /// RGBA32F, 256-byte rows), four FLOAT3 OIDN images, the luminance snapshot,
+  /// the returned pixels and their shared result texture, plus an allowance for
+  /// OIDN's device-limited scratch memory. `residentBytes` covers render frames
+  /// that stay alive in unified memory meanwhile.
+  static func hostMemoryBytes(width: Int, height: Int, residentBytes: UInt64 = 0) -> UInt64? {
+    guard width > 0, height > 0 else { return nil }
+    let pixels = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+    let rowBytes = UInt64(width).multipliedReportingOverflow(by: 16)
+    guard !pixels.overflow, !rowBytes.overflow else { return nil }
+    let readbackRow = (rowBytes.partialValue + 255) & ~UInt64(255)
+    let readback = readbackRow.multipliedReportingOverflow(by: UInt64(height) * 3)
+    let perPixel = pixels.partialValue.multipliedReportingOverflow(by: 4 * 12 + 4 + 16 + 16)
+    let scratch: UInt64 = 512 * 1024 * 1024
+    let images = readback.partialValue.addingReportingOverflow(perPixel.partialValue)
+    let withScratch = images.partialValue.addingReportingOverflow(scratch)
+    let total = withScratch.partialValue.addingReportingOverflow(residentBytes)
+    guard !readback.overflow, !perPixel.overflow, !images.overflow, !withScratch.overflow,
+      !total.overflow
+    else { return nil }
+    return total.partialValue
+  }
+
+  static func memoryError(width: Int, height: Int, residentBytes: UInt64 = 0) -> String? {
+    guard let estimated = hostMemoryBytes(width: width, height: height, residentBytes: residentBytes),
+      estimated < ProcessInfo.processInfo.physicalMemory / 2
+    else { return "This OIDN export needs too much system memory. Reduce the output dimensions." }
+    return nil
+  }
+
   static func denoise(
     color: MTLTexture, albedo: MTLTexture, normal: MTLTexture,
     commandQueue: MTLCommandQueue, progress: OIDNProgress,
-    options: OIDNOptions = OIDNOptions()
+    options: OIDNOptions = OIDNOptions(), residentBytes: UInt64 = 0
   ) throws -> OIDNImage {
     guard options.quality <= 2, options.guides <= 2 else {
       throw MaterialLibrary.error("Invalid OIDN settings.")
@@ -227,10 +279,8 @@ final class OIDNDenoiser {
     guard !overflow, pixelCount > 0, pixelCount <= Int.max / 48 else {
       throw MaterialLibrary.error("The requested OIDN image is too large.")
     }
-    // Four float3 images, a luminance snapshot, Metal readback, and OIDN's workspace.
-    let estimated = UInt64(pixelCount) * 84
-    guard estimated < ProcessInfo.processInfo.physicalMemory / 2 else {
-      throw MaterialLibrary.error("This OIDN export needs too much system memory. Reduce the output dimensions.")
+    if let message = memoryError(width: width, height: height, residentBytes: residentBytes) {
+      throw MaterialLibrary.error(message)
     }
 
     let reads = try readback([color, albedo, normal], queue: commandQueue)
@@ -290,15 +340,38 @@ final class OIDNDenoiser {
     var sourceLuminance = [Float](repeating: 0, count: pixelCount)
     var luminanceSamples: [Float] = []
     luminanceSamples.reserveCapacity((pixelCount + sampleStride - 1) / sampleStride)
+    // Optional exposure key: OIDN's log-average convention (0.18 / geometric
+    // mean), restricted to primary hits on non-emissive surfaces so a black
+    // background or a large emitter cannot set the key. Zero radiance is floored
+    // relative to the brightest counted surface, not by an absolute constant.
+    var keyLuminance: [Float] = []
     for index in 0..<pixelCount { sourceLuminance[index] = luminance(colorData, index) }
     for index in Swift.stride(from: 0, to: pixelCount, by: sampleStride) {
       luminanceSamples.append(sourceLuminance[index])
+      let material = reads[2].pixel(index, width: width).w
+      if options.robustInputScale && material > -0.5 && abs(material - 3) >= 0.25 { // MaterialType.emissive
+        keyLuminance.append(sourceLuminance[index])
+      }
     }
+    guard progress.update(0) else { throw MaterialLibrary.error("OIDN denoising was cancelled.") }
     luminanceSamples.sort()
     let percentileIndex = min(luminanceSamples.count - 1, Int(Double(luminanceSamples.count) * 0.99))
     let robustLuminance = max(1e-4, luminanceSamples[percentileIndex])
+    var robustInputScale: Float?
+    if let brightest = keyLuminance.max(), brightest > 0, brightest.isFinite {
+      let floor = brightest * 1e-4
+      let logSum = keyLuminance.reduce(Double(0)) { $0 + log(Double(max($1, floor))) }
+      let scale = Float(0.18 / exp(logSum / Double(keyLuminance.count)))
+      if scale.isFinite && scale > 0 { robustInputScale = scale }
+    }
     if options.suppressDiffuseFireflies && width > 2 && height > 2 {
-      for y in 1..<(height - 1) {
+      // Rows are independent: each writes only its own center pixels and reads
+      // the unmodified luminance snapshot.
+      let cancelled = OIDNCancelFlag()
+      DispatchQueue.concurrentPerform(iterations: height - 2) { row in
+        let y = row + 1
+        if row % 32 == 0, !progress.update(0) { cancelled.set() }
+        if cancelled.isSet { return }
         for x in 1..<(width - 1) {
           let index = y * width + x
           let guide = reads[2].pixel(index, width: width)
@@ -331,6 +404,7 @@ final class OIDNDenoiser {
           }
         }
       }
+      if cancelled.isSet { throw MaterialLibrary.error("OIDN denoising was cancelled.") }
     }
 
     let filter = "RT".withCString { api.newFilter(device, $0) }
@@ -353,8 +427,9 @@ final class OIDNDenoiser {
     "cleanAux".withCString { api.setFilterBool(filter, $0, !options.treatGuidesAsNoisy) }
     let qualities: [Int32] = [4, 5, 6] // OIDN_QUALITY_FAST/BALANCED/HIGH
     "quality".withCString { api.setFilterInt(filter, $0, qualities[Int(options.quality)]) }
-    if options.robustInputScale {
-      "inputScale".withCString { api.setFilterFloat(filter, $0, 1 / robustLuminance) }
+    // Without the optional key, inputScale stays NaN and OIDN computes its own.
+    if let robustInputScale {
+      "inputScale".withCString { api.setFilterFloat(filter, $0, robustInputScale) }
     }
     api.setProgress(filter, oidnProgressMonitor, Unmanaged.passUnretained(progress).toOpaque())
     api.commitFilter(filter)
@@ -366,6 +441,9 @@ final class OIDNDenoiser {
     let outputData = api.getBufferData(outputBuffer)!.assumingMemoryBound(to: Float.self)
     var pixels = [SIMD4<Float>](repeating: SIMD4(0, 0, 0, 1), count: pixelCount)
     for index in 0..<pixelCount {
+      if index % 262_144 == 0, !progress.update(1) {
+        throw MaterialLibrary.error("OIDN denoising was cancelled.")
+      }
       pixels[index] = SIMD4(
         outputData[index * 3], outputData[index * 3 + 1], outputData[index * 3 + 2], 1)
     }

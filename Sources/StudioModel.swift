@@ -83,7 +83,8 @@ struct OIDNOptions: Codable, Equatable {
   // 0 = color only, 1 = albedo, 2 = albedo + normal.
   var guides: UInt32 = 2
   var treatGuidesAsNoisy = true
-  var robustInputScale = true
+  // Off: OIDN computes its own HDR input scale (inputScale = NaN).
+  var robustInputScale = false
   var suppressDiffuseFireflies = true
 }
 struct SceneState: Codable {

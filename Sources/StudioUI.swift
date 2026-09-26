@@ -512,7 +512,7 @@ final class StudioController: NSViewController {
     button("Diffuse firefly suppression: \(renderer.oidnOptions.suppressDiffuseFireflies ? "On" : "Off")") { [weak self] in
       self?.setOIDN("OIDN firefly suppression") { $0.suppressDiffuseFireflies.toggle() }
     }
-    text("The robust scale and diffuse firefly filter prevent isolated HDR samples from expanding into false bright patches. They affect only OIDN output; raw accumulation is preserved.")
+    text("By default OIDN chooses its own HDR input scale; the robust scale instead keys exposure on lit, non-emissive surfaces. The diffuse firefly filter prevents isolated HDR samples from expanding into false bright patches. Both affect only OIDN output; raw accumulation is preserved.")
 
     heading("Experimental")
     popup(["Ring boost: Off", "Ring boost: On"], Int(renderer.enableSMS)) { [weak self] i in
@@ -2090,6 +2090,8 @@ extension StudioController: NSMenuItemValidation {
       item.title = history.redoMenuItemTitle
       return history.canRedo
     }
+    if item.action == #selector(clearOIDNAction) { return renderer.offlineDenoisedPreview != nil }
+    if item.action == #selector(oidnAction) { return renderer.offlineDenoisedPreview == nil }
     if item.action == #selector(frameSelectionAction) || item.action == #selector(frameAllAction) {
       return project.graph?.nodes.contains { $0.mesh != nil } == true || !project.triangles.isEmpty
     }

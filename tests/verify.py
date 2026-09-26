@@ -26,6 +26,7 @@ if '--usd-only' in sys.argv:
     source += '\n' + 'let application=' + studio.split('let application=')[1].split('for page in')[0]
 else:
     source += '\n' + (root / 'tests' / 'StudioChecks.swift').read_text()
+    source += '\n' + (root / 'tests' / 'Fix_oidn-export.swift').read_text()
     source += '\n' + (root / 'tests' / 'MaterialXChecks.swift').read_text()
 source += '\n' + (root / 'tests' / 'USDChecks.swift').read_text()
 source += '\n' + (root / 'tests' / 'Fix_integration.swift').read_text()

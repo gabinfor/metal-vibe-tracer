@@ -1,4 +1,5 @@
 import Cocoa
+import Compression
 import CoreImage
 import MetalKit
 import simd
@@ -110,6 +111,19 @@ extension StudioController {
       if let message = r.renderMemoryError(width: p.options.outputWidth, height: p.options.outputHeight) {
         throw MaterialLibrary.error(message)
       }
+      if exportDenoise {
+        // OIDN runs after the render while the export and preview frames stay resident.
+        let frames = PathTracerRenderer.FrameResourcePlan(
+          width: p.options.outputWidth, height: p.options.outputHeight,
+          usesReSTIR: r.samplingMode == 0, usesMetalFX: false).bytes
+        let resident = frames.map { $0.addingReportingOverflow(r.concurrentRenderBytes) }
+        if let message = OIDNDenoiser.memoryError(
+          width: p.options.outputWidth, height: p.options.outputHeight,
+          residentBytes: resident.flatMap { $0.overflow ? nil : $0.partialValue } ?? .max)
+        {
+          throw MaterialLibrary.error(message)
+        }
+      }
       let d = MTLTextureDescriptor.texture2DDescriptor(
         pixelFormat: .bgra8Unorm, width: p.options.outputWidth, height: p.options.outputHeight,
         mipmapped: false)
@@ -189,6 +203,8 @@ extension StudioController {
     else { return }
     r.onFrameUpdate = nil
     r.onError = nil
+    let resident = r.residentFrameBytes.addingReportingOverflow(r.concurrentRenderBytes)
+    let residentBytes = resident.overflow ? UInt64.max : resident.partialValue
     let job = OIDNProgress()
     exportDenoiseJob = job
     job.onProgress = { [weak self, weak job] fraction in
@@ -203,7 +219,7 @@ extension StudioController {
       do {
         let image = try OIDNDenoiser.denoise(
           color: color, albedo: albedo, normal: normal, commandQueue: r.commandQueue,
-          progress: job, options: r.oidnOptions)
+          progress: job, options: r.oidnOptions, residentBytes: residentBytes)
         let texture = try image.makeTexture(device: r.device)
         DispatchQueue.main.async { [weak self, weak r, weak job] in
           guard let self, let r, let job, self.exportDenoiseJob === job,
@@ -265,6 +281,11 @@ extension StudioController {
       showError("Open Image Denoise is unavailable. Rebuild the app to install OIDN.")
       return
     }
+    // Inspection views advance the sample counter without writing beauty radiance.
+    guard renderer.viewportMode == 0 else {
+      show("Switch the viewport to Beauty before previewing OIDN.")
+      return
+    }
     guard renderer.completedSamples > 0, let color = renderer.accumTexture,
       let albedo = renderer.oidnAlbedoAccum, let normal = renderer.oidnNormalAccum
     else {
@@ -272,8 +293,18 @@ extension StudioController {
       return
     }
     let samples = renderer.completedSamples
-    oidnPreviewWasPaused = renderer.paused
+    let generation = renderer.interactionGeneration
+    let residentBytes = renderer.residentFrameBytes
+    // A shown preview already froze rendering; keep the state saved before it.
+    if renderer.offlineDenoisedPreview == nil {
+      oidnPreviewWasPaused = renderer.paused
+    } else {
+      renderer.offlineDenoisedPreview = nil
+      renderer.presentationNeedsRefresh = true
+    }
     renderer.paused = true
+    // Camera gestures cannot move the view away from the frozen accumulation.
+    viewport.renderer = nil
     let job = OIDNProgress()
     previewDenoiseJob = job
     job.onProgress = { [weak self, weak job] fraction in
@@ -289,11 +320,19 @@ extension StudioController {
       do {
         let image = try OIDNDenoiser.denoise(
           color: color, albedo: albedo, normal: normal, commandQueue: self.renderer.commandQueue,
-          progress: job, options: self.renderer.oidnOptions)
+          progress: job, options: self.renderer.oidnOptions, residentBytes: residentBytes)
         let texture = try image.makeTexture(device: self.renderer.device)
         DispatchQueue.main.async { [weak self, weak job] in
           guard let self, let job, self.previewDenoiseJob === job else { return }
           self.previewDenoiseJob = nil
+          self.viewport.renderer = self.renderer
+          guard self.renderer.interactionGeneration == generation else {
+            self.renderer.paused = self.oidnPreviewWasPaused
+            self.renderer.lastTick = Date()
+            self.rebuild()
+            self.show("OIDN preview discarded because the view changed.")
+            return
+          }
           self.renderer.offlineDenoisedPreview = texture
           self.renderer.presentationNeedsRefresh = true
           self.rebuild()
@@ -303,6 +342,7 @@ extension StudioController {
         DispatchQueue.main.async { [weak self, weak job] in
           guard let self, let job, self.previewDenoiseJob === job else { return }
           self.previewDenoiseJob = nil
+          self.viewport.renderer = self.renderer
           self.renderer.paused = self.oidnPreviewWasPaused
           self.renderer.lastTick = Date()
           self.rebuild()
@@ -315,6 +355,7 @@ extension StudioController {
   func cancelOIDNPreview() {
     previewDenoiseJob?.cancel()
     previewDenoiseJob = nil
+    viewport.renderer = renderer
     renderer.paused = oidnPreviewWasPaused
     renderer.lastTick = Date()
     rebuild()
@@ -322,6 +363,8 @@ extension StudioController {
   }
 
   func clearOIDNPreview(resume: Bool = false) {
+    // oidnPreviewWasPaused is only meaningful while a preview is shown.
+    guard renderer.offlineDenoisedPreview != nil else { return }
     renderer.offlineDenoisedPreview = nil
     renderer.presentationNeedsRefresh = true
     renderer.paused = resume ? false : oidnPreviewWasPaused
@@ -365,22 +408,151 @@ extension StudioController {
 // REFERENCES.md: COREIMAGE2026. Linear extended-sRGB EXR, display-referred sRGB PNG.
 enum RenderImage {
   static func write(texture: MTLTexture, url: URL, hdr: Bool) throws {
-    let linear = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
     let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
-    guard let input = CIImage(mtlTexture: texture, options: [.colorSpace: hdr ? linear : srgb])
+    // HDR pixels bypass color management and are encoded locally: Core Image's EXR
+    // writer is half-float, and ImageIO's EXR encoder color-converts through a
+    // quantized matrix that leaks a hot channel into the others.
+    let colorSpace: Any = hdr ? NSNull() : srgb
+    guard let input = CIImage(mtlTexture: texture, options: [.colorSpace: colorSpace])
     else { throw MaterialLibrary.error("Could not read the rendered image.") }
     let image = input.oriented(.downMirrored)
-    let context = CIContext(mtlDevice: texture.device)
+    let context = hdr
+      ? CIContext(mtlDevice: texture.device, options: [
+        .workingColorSpace: NSNull(), .workingFormat: CIFormat.RGBAf, .cacheIntermediates: false])
+      : CIContext(mtlDevice: texture.device)
     let temporary = url.deletingLastPathComponent().appendingPathComponent(
       ".vibetracer-\(UUID().uuidString).\(hdr ? "exr":"png")")
     defer { try? FileManager.default.removeItem(at: temporary) }
     if hdr {
-      try context.writeOpenEXRRepresentation(of: image, to: temporary, options: [:])
+      let width = texture.width, height = texture.height
+      let (count, overflow) = width.multipliedReportingOverflow(by: height)
+      guard !overflow, count > 0, count <= Int.max / 16 else {
+        throw MaterialLibrary.error("The rendered image is too large to encode.")
+      }
+      var pixels = [SIMD4<Float>](repeating: .zero, count: count)
+      pixels.withUnsafeMutableBytes { bytes in
+        context.render(image, toBitmap: bytes.baseAddress!, rowBytes: width * 16,
+          bounds: CGRect(x: 0, y: 0, width: width, height: height), format: .RGBAf, colorSpace: nil)
+      }
+      try OpenEXRFloat.encode(pixels, width: width, height: height).write(to: temporary)
     } else {
       try context.writePNGRepresentation(
         of: image, to: temporary, format: .RGBA8, colorSpace: srgb, options: [:])
     }
     // Atomic replacement, including existing destinations chosen by NSSavePanel.
     try Data(contentsOf: temporary).write(to: url, options: .atomic)
+  }
+}
+
+// REFERENCES.md: OPENEXRLAYOUT. Single-part scanline OpenEXR with FLOAT (32-bit) R, G, B
+// channels, ZIP compression, and Rec. 709 chromaticities. Half-float output would
+// clip radiance above 65504.
+enum OpenEXRFloat {
+  static func encode(_ pixels: [SIMD4<Float>], width: Int, height: Int) throws -> Data {
+    guard width > 0, height > 0, pixels.count == width * height, width <= Int(Int32.max) / 192
+    else { throw MaterialLibrary.error("Invalid OpenEXR image dimensions.") }
+    var header = Data([0x76, 0x2f, 0x31, 0x01, 2, 0, 0, 0])
+    func attribute(_ name: String, _ type: String, _ value: Data) {
+      header.append(contentsOf: Array(name.utf8) + [0] + Array(type.utf8) + [0])
+      append(Int32(value.count), to: &header)
+      header.append(value)
+    }
+    var channels = Data()
+    for name in ["B", "G", "R"] { // Channel lists are sorted by name.
+      channels.append(contentsOf: Array(name.utf8) + [0])
+      append(Int32(2), to: &channels) // FLOAT
+      channels.append(contentsOf: [0, 0, 0, 0]) // pLinear + reserved
+      append(Int32(1), to: &channels); append(Int32(1), to: &channels)
+    }
+    channels.append(0)
+    var window = Data()
+    for value in [0, 0, width - 1, height - 1] { append(Int32(value), to: &window) }
+    var chromaticities = Data()
+    for value: Float in [0.64, 0.33, 0.30, 0.60, 0.15, 0.06, 0.3127, 0.3290] {
+      append(value, to: &chromaticities)
+    }
+    var center = Data(); append(Float(0), to: &center); append(Float(0), to: &center)
+    var one = Data(); append(Float(1), to: &one)
+    attribute("channels", "chlist", channels)
+    attribute("chromaticities", "chromaticities", chromaticities)
+    attribute("compression", "compression", Data([3])) // ZIP_COMPRESSION, 16 scanlines
+    attribute("dataWindow", "box2i", window)
+    attribute("displayWindow", "box2i", window)
+    attribute("lineOrder", "lineOrder", Data([0])) // INCREASING_Y
+    attribute("pixelAspectRatio", "float", one)
+    attribute("screenWindowCenter", "v2f", center)
+    attribute("screenWindowWidth", "float", one)
+    header.append(0)
+
+    let linesPerChunk = 16
+    let chunkCount = (height + linesPerChunk - 1) / linesPerChunk
+    var chunks = [Data](repeating: Data(), count: chunkCount)
+    chunks.withUnsafeMutableBufferPointer { output in
+      pixels.withUnsafeBufferPointer { source in
+        DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+          let first = chunk * linesPerChunk, lines = min(linesPerChunk, height - first)
+          var raw = [Float](repeating: 0, count: lines * width * 3)
+          for line in 0..<lines {
+            for channel in 0..<3 { // B, G, R planes per scanline
+              let plane = (line * 3 + channel) * width, row = (first + line) * width
+              for x in 0..<width { raw[plane + x] = source[row + x][2 - channel] }
+            }
+          }
+          let packed = raw.withUnsafeBytes { zipChunk(Array($0)) }
+          var block = Data()
+          append(Int32(first), to: &block)
+          append(Int32(packed.count), to: &block)
+          block.append(contentsOf: packed)
+          output[chunk] = block
+        }
+      }
+    }
+    var offset = UInt64(header.count + chunkCount * 8)
+    for chunk in chunks {
+      append(offset, to: &header)
+      offset += UInt64(chunk.count)
+    }
+    for chunk in chunks { header.append(chunk) }
+    return header
+  }
+
+  private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+    withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+  }
+  private static func append(_ value: Float, to data: inout Data) {
+    append(value.bitPattern, to: &data)
+  }
+
+  /// OpenEXR ZIP: split even/odd bytes, delta-encode, zlib-compress; stored raw
+  /// when compression does not shrink the block.
+  private static func zipChunk(_ raw: [UInt8]) -> [UInt8] {
+    let count = raw.count
+    var shuffled = [UInt8](repeating: 0, count: count)
+    let half = (count + 1) / 2
+    for index in 0..<count {
+      shuffled[index % 2 == 0 ? index / 2 : half + index / 2] = raw[index]
+    }
+    var previous = Int(shuffled[0])
+    for index in 1..<count {
+      let current = Int(shuffled[index])
+      shuffled[index] = UInt8(truncatingIfNeeded: current - previous + 128 + 256)
+      previous = current
+    }
+    var deflated = [UInt8](repeating: 0, count: count)
+    let size = compression_encode_buffer(
+      &deflated, count, shuffled, count, nil, COMPRESSION_ZLIB)
+    // COMPRESSION_ZLIB emits raw DEFLATE; OpenEXR expects a zlib (RFC 1950) stream.
+    guard size > 0, size + 6 < count else { return raw }
+    var a: UInt32 = 1, b: UInt32 = 0
+    var index = 0
+    while index < count {
+      let end = min(count, index + 5552)
+      for byte in shuffled[index..<end] { a += UInt32(byte); b += a }
+      a %= 65521; b %= 65521
+      index = end
+    }
+    let adler = (b << 16) | a
+    return [0x78, 0x01] + deflated[0..<size]
+      + [UInt8(adler >> 24), UInt8((adler >> 16) & 255), UInt8((adler >> 8) & 255), UInt8(adler & 255)]
   }
 }
