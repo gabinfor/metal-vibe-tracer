@@ -24,7 +24,8 @@ RUNTIME = BUILD / f"OpenUSD-{VERSION}-cp39-{EXPECTED[:12]}"
 MANIFEST = "VIBE_RUNTIME.json"
 WHEEL_PATTERN = f"usd_core-{VERSION}-cp39-*.whl"
 # Validate exactly the modules the bridge imports, so the runtime cannot drift from it.
-_BRIDGE_IMPORT = re.search(r"^from pxr import (.+)$", (ROOT / "scripts/usd_bridge.py").read_text(), re.M)
+# The bridge may guard the import (`try:from pxr import ...`) to report a missing SDK.
+_BRIDGE_IMPORT = re.search(r"^(?:try:\s*)?from pxr import ([\w ,]+)$", (ROOT / "scripts/usd_bridge.py").read_text(), re.M)
 if not _BRIDGE_IMPORT:
     raise SystemExit("scripts/usd_bridge.py no longer has a 'from pxr import' line")
 MODULES = tuple(name.strip() for name in _BRIDGE_IMPORT.group(1).split(","))
