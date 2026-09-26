@@ -74,7 +74,7 @@ extension StudioOptions {
       && environmentIntensity == o.environmentIntensity
       && environmentRotation == o.environmentRotation && lightColor == o.lightColor
       && lightIntensity == o.lightIntensity && lightSize == o.lightSize && aperture == o.aperture
-      && focusDistance == o.focusDistance
+      && focusDistance == o.focusDistance && sunAngle == o.sunAngle
   }
 }
 struct OIDNOptions: Codable, Equatable {

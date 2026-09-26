@@ -1368,7 +1368,7 @@ final class StudioController: NSViewController {
     projectIOQueue.async { [weak self] in
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, MaterialLibrary) in
-        let data = try self.readBounded(url, maximum: 768 * 1024 * 1024)
+        let data = try self.readBounded(url, maximum: ProjectDocument.maximumFileBytes)
         let document = try JSONDecoder().decode(ProjectDocument.self, from: data)
         return (document, try self.prepareResources(document, reuse: reuse))
       }
