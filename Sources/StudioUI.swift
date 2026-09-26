@@ -883,10 +883,15 @@ final class StudioController: NSViewController {
       self?.autosave()
     }
   }
-  private func prepareResources(_ p: ProjectDocument) throws -> MaterialLibrary {
+  // `resident` is the published library's snapshot, taken on the main thread. It
+  // stays live until applyProject, so the candidate budgets and shares against it.
+  private func prepareResources(_ p: ProjectDocument, resident: MaterialLibrary.ResidentTextures) throws
+    -> MaterialLibrary
+  {
     try p.validate()
     let resources = try MaterialLibrary(
       device: renderer.device, function: renderer.materialFunction)
+    resources.external = resident
     try resources.restore(p.scenes[Int(p.scene)] ?? SceneState())
     try resources.setEnvironment(p.environmentData)
     try resources.setMesh(p.graph?.renderTriangles() ?? p.triangles)
@@ -897,6 +902,7 @@ final class StudioController: NSViewController {
     isRestoring = true
     defer { isRestoring = false }
     renderer.materials = resources
+    resources.external = MaterialLibrary.ResidentTextures()
     project = p
     renderer.sceneIndex = p.scene
     renderer.samplingMode = p.strategy
@@ -912,7 +918,7 @@ final class StudioController: NSViewController {
     rebuild()
   }
   func restore(_ p: ProjectDocument) throws {
-    applyProject(p, resources: try prepareResources(p))
+    applyProject(p, resources: try prepareResources(p, resident: renderer.materials.residentSnapshot()))
   }
   func switchScene(_ i: Int) {
     guard !isBusy, UInt32(i) != renderer.sceneIndex else { return }
@@ -936,7 +942,7 @@ final class StudioController: NSViewController {
   }
   private func writeAutosave(_ document: ProjectDocument, to url: URL) throws {
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try JSONEncoder().encode(document).write(to: url, options: .atomic)
+    try document.encodeForSaving().write(to: url, options: .atomic)
   }
   func autosave() {
     guard !isRestoring else { return }
@@ -1003,12 +1009,13 @@ final class StudioController: NSViewController {
     let generation = projectOperationGeneration
     projectOperationInProgress = true
     show("Opening \(url.lastPathComponent)…")
+    let resident = renderer.materials.residentSnapshot()
     projectIOQueue.async { [weak self] in
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, MaterialLibrary) in
-        let data = try self.readBounded(url, maximum: 768 * 1024 * 1024)
+        let data = try self.readBounded(url, maximum: ProjectDocument.maximumFileBytes)
         let document = try JSONDecoder().decode(ProjectDocument.self, from: data)
-        return (document, try self.prepareResources(document))
+        return (document, try self.prepareResources(document, resident: resident))
       }
       DispatchQueue.main.async { [weak self] in
         guard let self, generation == self.projectOperationGeneration else { return }
@@ -1060,7 +1067,7 @@ final class StudioController: NSViewController {
     show("Saving \(url.lastPathComponent)…")
     projectIOQueue.async { [weak self] in
       let result = Result {
-        try JSONEncoder().encode(document).write(to: url, options: .atomic)
+        try document.encodeForSaving().write(to: url, options: .atomic)
       }
       DispatchQueue.main.async { [weak self] in
         guard let self, generation == self.projectOperationGeneration else { return }
@@ -1130,6 +1137,9 @@ final class StudioController: NSViewController {
     ) { [weak self] url in
       guard let self else { return }
       do {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        let old = self.renderer.materials.payloads[slot * 4 + channel]?.count ?? 0
+        try self.requireEmbeddedCapacity(self.snapshot().embeddedAssetBytes - old + size)
         self.checkpoint("Load texture")
         try self.renderer.materials.load(url: url, slot: slot, channel: channel)
         self.changed()
@@ -1163,7 +1173,8 @@ final class StudioController: NSViewController {
     chooseOpen("Load material preset", extensions: ["vmat"]) { [weak self] url in
       guard let self else { return }
       do {
-        let p = try JSONDecoder().decode(ProjectDocument.self, from: self.readBounded(url, maximum: 768 * 1024 * 1024))
+        let p = try JSONDecoder().decode(
+          ProjectDocument.self, from: self.readBounded(url, maximum: ProjectDocument.maximumFileBytes))
         try p.validate()
         guard let source = p.scenes[0] else {
           throw MaterialLibrary.error("Empty material preset.")
@@ -1179,6 +1190,9 @@ final class StudioController: NSViewController {
           state.maps[slot * 4 + c] = source.maps[4 + c]
           state.names[slot * 4 + c] = source.names[4 + c]
         }
+        var candidate = self.snapshot()
+        candidate.scenes[Int(self.renderer.sceneIndex)] = state
+        try self.requireEmbeddedCapacity(candidate.embeddedAssetBytes)
         self.checkpoint("Load material")
         try self.renderer.materials.restore(state)
         self.changed()
@@ -1190,15 +1204,46 @@ final class StudioController: NSViewController {
     chooseOpen(
       "Load equirectangular environment", extensions: ["hdr", "exr", "png", "jpg", "tif", "tiff"]
     ) { [weak self] url in
-      guard let self else { return }
-      do {
-        let bytes = try self.readBounded(url, maximum: 256 * 1024 * 1024)
-        self.checkpoint("Environment image")
-        try self.renderer.materials.setEnvironment(bytes)
-        self.project.environmentName = url.lastPathComponent
-        self.changed()
-        self.rebuild()
-      } catch { self.show(error.localizedDescription) }
+      guard let self, !self.isBusy else { return }
+      // Decode off the main thread against the live texture total; budget
+      // again and publish on the main thread, where the library is owned.
+      let materials = self.renderer.materials
+      let residentBytes = materials.uniqueTextureBytes(materials.residentTextures + materials.external.textures)
+      self.importInProgress = true
+      self.show("Loading \(url.lastPathComponent)…")
+      self.projectIOQueue.async { [weak self] in
+        guard let self else { return }
+        let result = Result { () -> MaterialLibrary.EnvironmentCandidate in
+          let bytes = try self.readBounded(url, maximum: 256 * 1024 * 1024)
+          return try materials.makeEnvironment(bytes, residentBytes: residentBytes)
+        }
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          self.importInProgress = false
+          do {
+            let candidate = try result.get()
+            guard self.renderer.materials === materials else {
+              throw MaterialLibrary.error("The project changed while the environment was loading.")
+            }
+            try self.requireEmbeddedCapacity(
+              self.snapshot().embeddedAssetBytes - (materials.environmentData?.count ?? 0) + candidate.data.count)
+            self.checkpoint("Environment image")
+            try materials.publishEnvironment(candidate)
+            self.project.environmentName = url.lastPathComponent
+            self.changed()
+            self.show("Loaded \(url.lastPathComponent)")
+          } catch { self.show(error.localizedDescription) }
+          self.rebuild()
+        }
+      }
+    }
+  }
+  // Keeps edits within the aggregate embedded-asset limit that open enforces.
+  func requireEmbeddedCapacity(_ total: Int) throws {
+    guard total <= ProjectDocument.embeddedAssetLimit else {
+      throw MaterialLibrary.error(
+        "Embedded images would total \(total / 1_048_576) MiB across all scenes, above the \(ProjectDocument.embeddedAssetLimit / 1_048_576) MiB project limit. Remove or downsize other maps, MaterialX images or the environment first."
+      )
     }
   }
   func importMesh() {

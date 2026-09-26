@@ -712,17 +712,42 @@ private final class MXCompiler {
 
 extension MaterialLibrary {
   func prepareMaterialX(_ programs: [Int: MaterialXProgram]) throws {
+    let candidate = try materialXCandidate(programs, images: images)
+    let old = (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX)
+    let oldArgument = argumentBuffer
+    graphInstructionBuffer = candidate.instructions
+    graphHeaderBuffer = candidate.headers
+    graphTextures = candidate.textures
+    materialX = programs
+    do { try rebuildArguments(images) } catch {
+      (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX) = old
+      argumentBuffer = oldArgument
+      throw error
+    }
+  }
+  // Builds graph resources without publishing them. Texture checks count
+  // `candidateImages` as the map set that will be published alongside.
+  func materialXCandidate(_ programs: [Int: MaterialXProgram], images candidateImages: [MTLTexture]) throws
+    -> (instructions: MTLBuffer, headers: MTLBuffer, textures: [MTLTexture])
+  {
     var instructions: [GraphInstruction] = []
     var headers = Array(repeating: GraphHeader(), count: SceneLimits.materials)
     var textures: [MTLTexture] = []
-    // Identical encoded images share one decoded texture and graph binding across slots.
+    // Identical encoded images share one decoded texture and graph binding across
+    // slots, reusing textures from this library's published graphs or from the
+    // published library a candidate replaces (`external`).
     var bindings: [[Data: Int]] = [[:], [:]]
     var reusable: [[Data: MTLTexture]] = [[:], [:]]
-    for (_, old) in materialX.sorted(by: { $0.key < $1.key }) {
-      for image in old.images where bindings[image.srgb ? 1 : 0][image.data] == nil {
-        let index = bindings[0].count + bindings[1].count
-        bindings[image.srgb ? 1 : 0][image.data] = index
-        if index < graphTextures.count { reusable[image.srgb ? 1 : 0][image.data] = graphTextures[index] }
+    for (graphs, published) in [(materialX, graphTextures), (external.materialX, external.graphTextures)] {
+      bindings = [[:], [:]]
+      for (_, old) in graphs.sorted(by: { $0.key < $1.key }) {
+        for image in old.images where bindings[image.srgb ? 1 : 0][image.data] == nil {
+          let index = bindings[0].count + bindings[1].count
+          bindings[image.srgb ? 1 : 0][image.data] = index
+          if index < published.count, reusable[image.srgb ? 1 : 0][image.data] == nil {
+            reusable[image.srgb ? 1 : 0][image.data] = published[index]
+          }
+        }
       }
     }
     bindings = [[:], [:]]
@@ -746,11 +771,11 @@ extension MaterialLibrary {
           textures.append(texture)
           continue
         }
-        try validateEncodedImage(image.data)
+        try validateEncodedImage(image.data, pending: candidateImages + textures)
         let texture = try decodeTexture(image.data, srgb: image.srgb)
-        try validateDecodedTexture(texture, encodedBytes: image.data.count)
+        try validateDecodedTexture(texture, encodedBytes: image.data.count, pending: candidateImages + textures)
         textures.append(texture)
-        try validateCandidateTextures(images: images, graph: textures)
+        try validateCandidateTextures(images: candidateImages, graph: textures)
       }
       var header = GraphHeader()
       for i in 0..<4 {
@@ -774,18 +799,7 @@ extension MaterialLibrary {
         device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
       })
     else { throw Self.error("Could not allocate MaterialX graph buffers.") }
-    try validateCandidateTextures(images: images, graph: textures)
-    let old = (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX)
-    let oldArgument = argumentBuffer
-    graphInstructionBuffer = instructionBuffer
-    graphHeaderBuffer = headerBuffer
-    graphTextures = textures
-    materialX = programs
-    do { try rebuildArguments(images) } catch {
-      (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX) = old
-      argumentBuffer = oldArgument
-      restoreArgumentEncoder(oldArgument)
-      throw error
-    }
+    try validateCandidateTextures(images: candidateImages, graph: textures)
+    return (instructionBuffer, headerBuffer, textures)
   }
 }

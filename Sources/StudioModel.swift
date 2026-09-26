@@ -100,6 +100,46 @@ struct ProjectDocument: Codable {
   var oidn: OIDNOptions?
   var viewportMode: UInt32?
 
+  // Aggregate embedded asset bytes (maps, MaterialX images, environment) across all scenes.
+  static let embeddedAssetLimit = 512 * 1024 * 1024
+  // Open accepts everything validate() accepts: JSON embeds assets as base64
+  // (4/3 size), each of up to 500,000 flat and 500,000 graph triangles encodes in
+  // at most ~600 bytes (507 measured with worst-case floats), and 64 MiB covers
+  // settings, graphs and names. Saving refuses anything larger, so every saved
+  // project reopens.
+  static let maximumFileBytes =
+    embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.triangles * 600 + 64 * 1024 * 1024
+
+  var embeddedAssetBytes: Int {
+    scenes.values.reduce(environmentData?.count ?? 0) { total, state in
+      total + state.maps.reduce(0) { $0 + ($1?.count ?? 0) }
+        + (state.materialX ?? [:]).values.reduce(0) { sum, program in
+          sum + program.images.reduce(0) { $0 + $1.data.count }
+        }
+    }
+  }
+
+  // Encodes a snapshot for save or autosave only if the open path accepts it.
+  func encodeForSaving() throws -> Data {
+    let embedded = embeddedAssetBytes
+    guard embedded <= Self.embeddedAssetLimit else {
+      throw MaterialLibrary.error(
+        "Embedded images total \(embedded / 1_048_576) MiB across all scenes, above the \(Self.embeddedAssetLimit / 1_048_576) MiB project limit. Remove or downsize maps, MaterialX images or the environment before saving."
+      )
+    }
+    do { try validate() } catch {
+      throw MaterialLibrary.error(
+        "This project could not be reopened, so it was not written: \(error.localizedDescription)")
+    }
+    let data = try JSONEncoder().encode(self)
+    guard data.count <= Self.maximumFileBytes else {
+      throw MaterialLibrary.error(
+        "This project would be \(data.count / 1_048_576) MiB, above the \(Self.maximumFileBytes / 1_048_576) MiB file limit. Reduce embedded images or geometry before saving."
+      )
+    }
+    return data
+  }
+
   func validate() throws {
     func bad() throws { throw MaterialLibrary.error("Invalid or unsupported project data.") }
     guard (1...2).contains(version), scene <= 6, strategy <= 3, sky <= 2, fog <= 1, ring <= 1,
@@ -204,7 +244,7 @@ struct ProjectDocument: Codable {
         }
       }
     }
-    guard embeddedBytes <= 512 * 1024 * 1024 else { try bad(); return }
+    guard embeddedBytes <= Self.embeddedAssetLimit else { try bad(); return }
     try graph?.validate()
     for t in triangles {
       guard
@@ -426,29 +466,39 @@ extension MaterialLibrary {
       state.maps.count <= SceneLimits.materials * 4,
       state.names.count <= SceneLimits.materials * 4
     else { throw Self.error("Scene state exceeds the material capacity.") }
-    // Build all textures before publishing a restored scene.
+    // Build all textures (maps and MaterialX images) before publishing a restored
+    // scene, and budget them together as one candidate set.
     var replacement = (0..<(SceneLimits.materials * 4)).map { defaultTexture(channel: $0 % 4) }
     for i in state.maps.indices {
       guard let bytes = state.maps[i] else { continue }
       if payloads.indices.contains(i), payloads[i] == bytes {
         replacement[i] = images[i]
+      } else if external.payloads.indices.contains(i), external.payloads[i] == bytes {
+        replacement[i] = external.images[i]
       } else {
-        replacement[i] = try texture(data: bytes, channel: i % 4)
+        replacement[i] = try texture(data: bytes, channel: i % 4, pending: replacement)
       }
       try validateCandidateTextures(images: replacement)
     }
+    let programs = state.materialX ?? [:]
+    let graph = try materialXCandidate(programs, images: replacement)
+    try validateCandidateTextures(images: replacement, graph: graph.textures)
     let oldSettings = settings, oldObjects = objects, oldPayloads = payloads, oldNames = fileNames
     let oldEmissions = emissions, oldMaterialX = materialX, oldImages = images
     let oldGraphTextures = graphTextures, oldGraphInstructions = graphInstructionBuffer
     let oldGraphHeaders = graphHeaderBuffer, oldArgument = argumentBuffer
     let oldObjectBuffer = objectBuffer, oldEmissionBuffer = emissionBuffer, oldEmitterBuffer = emitterBuffer
+    let oldBindingsDirty = bindingsDirty
     do {
       settings = state.surfaces
         + Array(repeating: SurfaceSettings(), count: SceneLimits.materials - state.surfaces.count)
       objects = state.objects
         + Array(repeating: ObjectSettings(), count: SceneLimits.materials - state.objects.count)
       emissions = state.emissions ?? [:]
-      try prepareMaterialX(state.materialX ?? [:])
+      graphInstructionBuffer = graph.instructions
+      graphHeaderBuffer = graph.headers
+      graphTextures = graph.textures
+      materialX = programs
       try rebuildArguments(replacement)
       payloads = state.maps + Array(repeating: nil, count: SceneLimits.materials * 4 - state.maps.count)
       fileNames = state.names + Array(repeating: "None", count: SceneLimits.materials * 4 - state.names.count)
@@ -458,15 +508,15 @@ extension MaterialLibrary {
       graphTextures = oldGraphTextures; graphInstructionBuffer = oldGraphInstructions
       graphHeaderBuffer = oldGraphHeaders; argumentBuffer = oldArgument
       objectBuffer = oldObjectBuffer; emissionBuffer = oldEmissionBuffer; emitterBuffer = oldEmitterBuffer
-      restoreArgumentEncoder(oldArgument)
-      bindingsDirty = false
+      // Pending object or emission edits were never uploaded; keep them pending.
+      bindingsDirty = oldBindingsDirty
       throw error
     }
   }
-  func texture(data: Data, channel: Int) throws -> MTLTexture {
-    try validateEncodedImage(data)
+  func texture(data: Data, channel: Int, pending: [MTLTexture] = []) throws -> MTLTexture {
+    try validateEncodedImage(data, pending: pending)
     let result = try decodeTexture(data, srgb: channel == 0)
-    try validateDecodedTexture(result, encodedBytes: data.count)
+    try validateDecodedTexture(result, encodedBytes: data.count, pending: pending)
     return result
   }
   // Material images always sample as RGBA. MTKTextureLoader keeps gray and gray+alpha
@@ -581,7 +631,7 @@ extension MaterialLibrary {
     return texture
   }
 
-  func environmentImportance(_ pixels: [Float], width: Int, height: Int) throws -> (MTLTexture, MTLTexture) {
+  func environmentImportance(_ pixels: UnsafeBufferPointer<Float>, width: Int, height: Int) throws -> (MTLTexture, MTLTexture) {
     guard pixels.count == width * height * 4, width > 0, height > 0 else {
       throw Self.error("Invalid environment sampling dimensions.")
     }
@@ -598,21 +648,21 @@ extension MaterialLibrary {
         columnWeights[y * width + x] = weight
       }
     }
-    func cdf(_ weights: [Float], count: Int, rows: Int) -> [Float] {
-      var result = Array(repeating: Float(0), count: weights.count)
+    // Convert weights to CDFs in place; no second full-size CPU copy.
+    func cdf(_ weights: inout [Float], count: Int, rows: Int) {
       for row in 0..<rows {
         let start = row * count
         let total = max(1e-12, weights[start..<start + count].reduce(0, +))
         var sum: Float = 0
         for index in 0..<count {
           sum += weights[start + index] / total
-          result[start + index] = index == count - 1 ? 1 : sum
+          weights[start + index] = index == count - 1 ? 1 : sum
         }
       }
-      return result
     }
-    let rows = cdf(rowWeights, count: height, rows: 1)
-    let columns = cdf(columnWeights, count: width, rows: height)
+    cdf(&rowWeights, count: height, rows: 1)
+    cdf(&columnWeights, count: width, rows: height)
+    let rows = rowWeights, columns = columnWeights
     let rowDescriptor = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: .r32Float, width: 1, height: height, mipmapped: false)
     rowDescriptor.storageMode = .shared
@@ -632,21 +682,16 @@ extension MaterialLibrary {
     return (rowTexture, columnTexture)
   }
 
-  func setEnvironment(_ bytes: Data?) throws {
-    guard let bytes else {
-      let oldTexture = environmentTexture, oldRows = environmentRows, oldColumns = environmentColumns,
-        oldData = environmentData, oldArgument = argumentBuffer
-      environmentTexture = images[0]; environmentRows = defaultEnvironmentSampling
-      environmentColumns = defaultEnvironmentSampling; environmentData = nil
-      do { try rebuildArguments(images) }
-      catch {
-        environmentTexture = oldTexture; environmentRows = oldRows; environmentColumns = oldColumns
-        environmentData = oldData; argumentBuffer = oldArgument
-        restoreArgumentEncoder(oldArgument)
-        throw error
-      }
-      return
-    }
+  // A decoded environment image followed by its row and column sampling CDFs.
+  struct EnvironmentCandidate {
+    let data: Data
+    let textures: [MTLTexture]
+  }
+
+  // Decodes without publishing, so callers may run it off the main thread.
+  // `residentBytes` is the live texture total, captured where the published
+  // library is owned; the image and both CDFs are budgeted before allocation.
+  func makeEnvironment(_ bytes: Data, residentBytes: UInt64) throws -> EnvironmentCandidate {
     guard bytes.count <= 256 * 1024 * 1024,
       let image = CIImage(data: bytes), image.extent.width > 0, image.extent.height > 0,
       image.extent.width <= 16384, image.extent.height <= 8192,
@@ -654,22 +699,21 @@ extension MaterialLibrary {
     else { throw Self.error("Could not decode the environment image (maximum 16384×8192).") }
     let w = Int(image.extent.width)
     let h = Int(image.extent.height)
-    let decodedBytes = UInt64(w).multipliedReportingOverflow(by: UInt64(h))
-    guard !decodedBytes.overflow,
-      !decodedBytes.partialValue.multipliedReportingOverflow(by: 16).overflow,
-      uniqueTextureBytes(images + graphTextures + [environmentTexture])
-        + decodedBytes.partialValue * 16 <= textureBudget
+    // RGBA32F image and R32F column CDF per pixel, plus an R32F row CDF.
+    let required = UInt64(w) * UInt64(h) * 20 + UInt64(h) * 4
+    guard residentBytes + required <= textureBudget
     else { throw Self.error("Environment image exceeds the safe GPU memory budget.") }
     var pixels = Array(repeating: Float(0), count: w * h * 4)
     let color = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
     CIContext().render(
       image, toBitmap: &pixels, rowBytes: w * 16, bounds: image.extent, format: .RGBAf,
       colorSpace: color)
-    guard pixels.allSatisfy({ $0.isFinite }) else {
-      throw Self.error("Environment pixels must be finite.")
-    }
     // Color-space conversion may produce negative RGB; radiance is nonnegative.
-    pixels = pixels.map { max(0, $0) }
+    // Clamp in place rather than making a second full-size copy.
+    for i in pixels.indices {
+      guard pixels[i].isFinite else { throw Self.error("Environment pixels must be finite.") }
+      if pixels[i] < 0 { pixels[i] = 0 }
+    }
     let desc = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
     desc.storageMode = .shared
@@ -679,18 +723,50 @@ extension MaterialLibrary {
     }
     imageTexture.replace(
       region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: w * 16)
-    let (rowSampling, columnSampling) = try environmentImportance(pixels, width: w, height: h)
-    try validateCandidateTextures(images: images, environment: imageTexture)
+    let (rowSampling, columnSampling) = try pixels.withUnsafeBufferPointer {
+      try environmentImportance($0, width: w, height: h)
+    }
+    return EnvironmentCandidate(data: bytes, textures: [imageTexture, rowSampling, columnSampling])
+  }
+
+  func publishEnvironment(_ candidate: EnvironmentCandidate) throws {
+    guard candidate.textures.count == 3 else { throw Self.error("Invalid environment sampling data.") }
+    try validateCandidateTextures(images: images, environment: candidate.textures)
     let oldTexture = environmentTexture, oldRows = environmentRows, oldColumns = environmentColumns,
       oldData = environmentData, oldArgument = argumentBuffer
-    environmentTexture = imageTexture; environmentRows = rowSampling; environmentColumns = columnSampling
-    environmentData = bytes
+    environmentTexture = candidate.textures[0]; environmentRows = candidate.textures[1]
+    environmentColumns = candidate.textures[2]
+    environmentData = candidate.data
     do { try rebuildArguments(images) }
     catch {
       environmentTexture = oldTexture; environmentRows = oldRows; environmentColumns = oldColumns
       environmentData = oldData; argumentBuffer = oldArgument
       throw error
     }
+  }
+
+  func setEnvironment(_ bytes: Data?) throws {
+    guard let bytes else {
+      let oldTexture = environmentTexture, oldRows = environmentRows, oldColumns = environmentColumns,
+        oldData = environmentData, oldArgument = argumentBuffer
+      // A dedicated placeholder, never a material map that could later be cleared.
+      environmentTexture = defaultTexture(channel: 0); environmentRows = defaultEnvironmentSampling
+      environmentColumns = defaultEnvironmentSampling; environmentData = nil
+      do { try rebuildArguments(images) }
+      catch {
+        environmentTexture = oldTexture; environmentRows = oldRows; environmentColumns = oldColumns
+        environmentData = oldData; argumentBuffer = oldArgument
+        throw error
+      }
+      return
+    }
+    if environmentData == bytes { return }
+    if external.environment.count == 3, external.environmentData == bytes {
+      try publishEnvironment(EnvironmentCandidate(data: bytes, textures: external.environment))
+      return
+    }
+    try publishEnvironment(
+      makeEnvironment(bytes, residentBytes: uniqueTextureBytes(residentTextures + external.textures)))
   }
   func setMesh(_ triangles: [MeshTriangle]) throws {
     meshBuildCount += 1
@@ -711,15 +787,14 @@ extension MaterialLibrary {
     }
     let t = try buffer(ordered)
     let n = try buffer(nodes)
-    let oldOrdered = orderedTriangles, oldTriangles = triangleBuffer, oldNodes = nodeBuffer
+    let oldTriangles = triangleBuffer, oldNodes = nodeBuffer
     let oldMesh = meshTriangles, oldNodeCount = nodeCount, oldArgument = argumentBuffer
-    orderedTriangles = ordered; triangleBuffer = t; nodeBuffer = n
+    triangleBuffer = t; nodeBuffer = n
     meshTriangles = triangles; nodeCount = nodes.count
     do { try rebuildArguments(images) }
     catch {
-      orderedTriangles = oldOrdered; triangleBuffer = oldTriangles; nodeBuffer = oldNodes
+      triangleBuffer = oldTriangles; nodeBuffer = oldNodes
       meshTriangles = oldMesh; nodeCount = oldNodeCount; argumentBuffer = oldArgument
-      restoreArgumentEncoder(oldArgument)
       throw error
     }
   }
@@ -727,45 +802,34 @@ extension MaterialLibrary {
   func setMeshBindings(_ graph: SceneGraph) throws {
     try graph.validate()
     let slots = Dictionary(uniqueKeysWithValues: graph.materials.map { ($0.id, $0.slot) })
-    func rebound(_ input: [MeshTriangle]) throws -> [MeshTriangle] {
-      try input.map { triangle in
-        var result = triangle
-        let nodeIndex = Int(result.uvc.w) - 1
-        let subset = Int(result.na.w)
-        guard graph.nodes.indices.contains(nodeIndex),
-          graph.nodes[nodeIndex].bindings.indices.contains(subset),
-          let slot = slots[graph.nodes[nodeIndex].bindings[subset]]
-        else { throw Self.error("Scene binding no longer matches flattened geometry.") }
-        result.uvc.z = Float(slot)
-        return result
-      }
+    func rebound(_ triangle: MeshTriangle) throws -> MeshTriangle {
+      var result = triangle
+      let nodeIndex = Int(result.uvc.w) - 1
+      let subset = Int(result.na.w)
+      guard graph.nodes.indices.contains(nodeIndex),
+        graph.nodes[nodeIndex].bindings.indices.contains(subset),
+        let slot = slots[graph.nodes[nodeIndex].bindings[subset]]
+      else { throw Self.error("Scene binding no longer matches flattened geometry.") }
+      result.uvc.z = Float(slot)
+      return result
     }
-    let candidateOrdered = try rebound(orderedTriangles)
-    let candidateMesh = try rebound(meshTriangles)
-    let candidateBuffer: MTLBuffer
-    if candidateOrdered.isEmpty {
-      guard let buffer = device.makeBuffer(length: 128, options: .storageModeShared) else {
-        throw Self.error("Could not allocate imported mesh bindings.")
-      }
-      candidateBuffer = buffer
-    } else {
-      guard let buffer = candidateOrdered.withUnsafeBytes({ bytes in
-        device.makeBuffer(bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared)
-      }) else { throw Self.error("Could not allocate imported mesh bindings.") }
-      candidateBuffer = buffer
-    }
-    let oldOrdered = orderedTriangles, oldMesh = meshTriangles
+    // Rebind straight from the shared buffer into its replacement; the BVH order is unchanged.
+    let ordered = orderedTriangles
+    guard let candidateBuffer = device.makeBuffer(
+      length: max(128, ordered.count * MemoryLayout<MeshTriangle>.stride), options: .storageModeShared)
+    else { throw Self.error("Could not allocate imported mesh bindings.") }
+    let target = candidateBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, ordered.count))
+    for (i, triangle) in ordered.enumerated() { target[i] = try rebound(triangle) }
+    let candidateMesh = try meshTriangles.map(rebound)
+    let oldMesh = meshTriangles
     let oldTriangleBuffer = triangleBuffer, oldArgument = argumentBuffer
-    orderedTriangles = candidateOrdered
     meshTriangles = candidateMesh
     triangleBuffer = candidateBuffer
     do { try rebuildArguments(images) }
     catch {
-      orderedTriangles = oldOrdered
       meshTriangles = oldMesh
       triangleBuffer = oldTriangleBuffer
       argumentBuffer = oldArgument
-      restoreArgumentEncoder(oldArgument)
       throw error
     }
   }

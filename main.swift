@@ -135,7 +135,7 @@ struct Uniforms {
     uint height;
     float2 jitter;         // Shared subpixel offset, in pixels, excluding the 0.5 pixel center.
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
-    uint padding;
+    uint reservoirHistoryReset; // 1 = DI/GI history reservoirs were just allocated; skip temporal reuse
     uint reservoirHistory; // Consecutive ReSTIR frames; camera moves keep it, cuts reset it.
     float4 environment; // intensity, rotation, image enabled, BVH node count
     float4 lens; // aperture radius, focus distance, scene-graph mode (see uses_scene_graph), independent sun 1 - cos(half angle)
@@ -813,6 +813,8 @@ struct SurfaceSettings {
     float normalStrength;
     uint padding;
 };
+// All 64 slots are uploaded with setBytes, whose payload limit is 4 KB.
+static_assert(sizeof(SurfaceSettings) * 64 <= 4096, "SurfaceSettings payload exceeds setBytes");
 
 
 float4 sample_material_map(constant MaterialResources &images, uint slot, uint channel,
@@ -1658,10 +1660,15 @@ kernel void restir_temporal_kernel(
     HitRecord rec;
     bool hit = trace_scene(ray, uniforms.sceneIndex, rec, materialImages, uniforms);
 
+    // Non-ReSTIR and inspection passes bind 1x1 placeholder reservoirs. They must
+    // not read or write those resources, so the host need not allocate full-size
+    // DI/GI history for these modes.
+    bool reservoirsBound = uniforms.viewportMode == 0 && uniforms.samplingMode == 0;
     if (!hit) {
         gbufferPosDepth.write(float4(0.0f, 0.0f, 0.0f, -1.0f), gid);
         gbufferNormalMat.write(float4(0.0f, 0.0f, 0.0f, -1.0f), gid);
         gbufferAlbedoRough.write(float4(0.0f), gid);
+        if (!reservoirsBound) return;
         outSamplePosDir.write(float4(0.0f), gid);
         outSampleEmitPdf.write(float4(0.0f), gid);
         outReservoirWeights.write(float4(0.0f), gid);
@@ -1681,10 +1688,7 @@ kernel void restir_temporal_kernel(
         ? (rec.front_face ? rec.mat.ior : -rec.mat.ior) : rec.mat.roughness;
     gbufferAlbedoRough.write(float4(surfaceColor, surfaceParameter), gid);
 
-    // Non-ReSTIR and inspection passes bind 1x1 placeholder reservoirs. They do
-    // not read or write those resources, so the host need not allocate full-size
-    // DI/GI history for these modes.
-    if (uniforms.viewportMode > 0 || uniforms.samplingMode != 0) return;
+    if (!reservoirsBound) return;
     if (rec.mat.type != DIFFUSE) {
         outSamplePosDir.write(float4(0.0f), gid);
         outSampleEmitPdf.write(float4(0.0f), gid);
@@ -1724,7 +1728,7 @@ kernel void restir_temporal_kernel(
     // Temporal Reprojection. Reservoir history survives camera motion; the
     // reprojected surface test below rejects disocclusions.
     float4 prevClip = uniforms.prevViewProj * float4(rec.position, 1.0f);
-    if (prevClip.w > 0.0f && uniforms.reservoirHistory > 1) {
+    if (prevClip.w > 0.0f && uniforms.reservoirHistory > 1 && uniforms.reservoirHistoryReset == 0) {
         float2 prevNDC = prevClip.xy / prevClip.w;
         float2 prevUV = prevNDC * float2(0.5f, -0.5f) + 0.5f;
         int2 prevCoord = int2(prevUV * float2(float(uniforms.width), float(uniforms.height)));
@@ -1838,7 +1842,7 @@ kernel void restir_temporal_kernel(
     // Temporal GI reservoir merge. Primary-surface reprojection defines the
     // reuse domain; the secondary point is reconnected and reweighted at x1.
     float4 giPrevClip = uniforms.prevViewProj * float4(rec.position, 1.0f);
-    if (giPrevClip.w > 0.0f && uniforms.reservoirHistory > 1) {
+    if (giPrevClip.w > 0.0f && uniforms.reservoirHistory > 1 && uniforms.reservoirHistoryReset == 0) {
         float2 prevUV = (giPrevClip.xy / giPrevClip.w) * float2(0.5f, -0.5f) + 0.5f;
         int2 prevCoord = int2(prevUV * float2(float(uniforms.width), float(uniforms.height)));
         if (all(prevUV >= 0.0f) && all(prevUV < 1.0f) && prevCoord.x >= 0 &&
@@ -2489,7 +2493,7 @@ struct Uniforms {
     var height: UInt32
     var jitter: SIMD2<Float> = .zero
     var sampleIndex: UInt32 = 1
-    var padding: UInt32 = 0
+    var reservoirHistoryReset: UInt32 = 0
     // Consecutive frames with written ReSTIR reservoirs; gates temporal reuse.
     var reservoirHistory: UInt32 = 0
     var environment = SIMD4<Float>(1, 0, 0, 0)
@@ -2567,7 +2571,7 @@ final class MetalFXDenoiser {
     let output: MTLTexture
     let exposure: MTLTexture
 
-    init(device: MTLDevice, width: Int, height: Int) throws {
+    static func descriptor(width: Int, height: Int) -> MTLFXTemporalDenoisedScalerDescriptor {
         let descriptor = MTLFXTemporalDenoisedScalerDescriptor()
         descriptor.inputWidth = width; descriptor.inputHeight = height
         descriptor.outputWidth = width; descriptor.outputHeight = height
@@ -2585,6 +2589,31 @@ final class MetalFXDenoiser {
         descriptor.isSpecularHitDistanceTextureEnabled = true
         descriptor.isAutoExposureEnabled = false
         descriptor.requiresSynchronousInitialization = false
+        return descriptor
+    }
+
+    // The scaler's opaque history/feature allocations are not exposed by MetalFX.
+    // Measure them once with the production descriptor at a small size, where
+    // fixed overhead makes the per-pixel figure conservative for larger renders
+    // (about 347 B/pixel at 192x192 versus 279-314 from 320x240 to 2560x1440 on M4).
+    // currentAllocatedSize is device-wide, so a concurrent allocation or release
+    // elsewhere can disturb one probe; implausible results are retried once and
+    // otherwise replaced by a conservative fallback.
+    static func scalerBytesPerPixel(device: MTLDevice) -> UInt64 {
+        let side = 192, pixels = UInt64(side * side), fallback: UInt64 = 384
+        for _ in 0..<2 {
+            let before = device.currentAllocatedSize
+            guard let probe = descriptor(width: side, height: side).makeTemporalDenoisedScaler(device: device) else { break }
+            let measured = device.currentAllocatedSize - before
+            withExtendedLifetime(probe) {}
+            let perPixel = measured > 0 ? (UInt64(measured) + pixels - 1) / pixels : 0
+            if (64...1024).contains(perPixel) { return perPixel }
+        }
+        return fallback
+    }
+
+    init(device: MTLDevice, width: Int, height: Int) throws {
+        let descriptor = Self.descriptor(width: width, height: height)
         guard let effect = descriptor.makeTemporalDenoisedScaler(device: device) else {
             throw NSError(domain: "MetalFX", code: 1, userInfo: [NSLocalizedDescriptionKey: "MetalFX could not create a denoiser for this render size."])
         }
@@ -2650,7 +2679,10 @@ final class MaterialLibrary {
     var environmentRows: MTLTexture!
     var environmentColumns: MTLTexture!
     var defaultEnvironmentSampling: MTLTexture!
-    var triangleBuffer: MTLBuffer!, nodeBuffer: MTLBuffer!
+    // BVH-ordered triangles live only in the shared triangleBuffer (read through
+    // orderedTriangles); meshTriangles keeps the document order for snapshots.
+    var triangleBuffer: MTLBuffer! { didSet { emittersDirty = true } }
+    var nodeBuffer: MTLBuffer!
     var meshTriangles: [MeshTriangle] = []
     var hasSceneGraph = false
     var nodeCount = 0
@@ -2659,10 +2691,27 @@ final class MaterialLibrary {
     var graphInstructionBuffer: MTLBuffer!, graphHeaderBuffer: MTLBuffer!
     var graphTextures: [MTLTexture] = []
     private var emittersDirty = true
-    private var cachedEmitterValues: [UInt32] = [0, 0]
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
-    var orderedTriangles:[MeshTriangle]=[] { didSet { emittersDirty = true } }
+    var orderedTriangles: UnsafeBufferPointer<MeshTriangle> {
+        UnsafeBufferPointer(start: meshTriangles.isEmpty ? nil
+            : triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: meshTriangles.count),
+            count: meshTriangles.count)
+    }
+    // Every resource referenced by the argument buffer. bind() declares exactly
+    // this list with useResources, which is what keeps indirectly referenced
+    // resources alive for command buffers encoded before a later swap.
+    private(set) var boundResources: [MTLResource] = []
+    // Textures of the published library that stay resident while this candidate
+    // is prepared (open, undo, scene switch, export). They count toward the
+    // replacement peak, and identical payloads are shared instead of decoded again.
+    struct ResidentTextures {
+        var images: [MTLTexture] = [], payloads: [Data?] = []
+        var graphTextures: [MTLTexture] = [], materialX: [Int: MaterialXProgram] = [:]
+        var environment: [MTLTexture] = [], environmentData: Data?
+        var textures: [MTLTexture] { images + graphTextures + environment }
+    }
+    var external = ResidentTextures()
     var meshBuildCount = 0
     let loader: MTKTextureLoader
     // Internal fault-injection point used by the native regression suite. Nil in production.
@@ -2695,7 +2744,7 @@ final class MaterialLibrary {
         }
         defaultTextures = defaults
         images = (0..<(SceneLimits.materials * 4)).map { defaults[$0 % 4 == 0 ? 0 : ($0 % 4 == 3 ? 2 : 1)] }
-        environmentTexture=images[0]
+        environmentTexture = defaults[0]
         let importanceDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
         importanceDescriptor.storageMode = .shared
@@ -2730,6 +2779,17 @@ final class MaterialLibrary {
         textureBudgetOverride ?? max(UInt64(256 * 1024 * 1024), device.recommendedMaxWorkingSetSize / 4)
     }
 
+    // Every published texture, including the environment sampling CDFs.
+    var residentTextures: [MTLTexture] {
+        images + graphTextures + [environmentTexture, environmentRows, environmentColumns]
+    }
+
+    func residentSnapshot() -> ResidentTextures {
+        ResidentTextures(images: images, payloads: payloads, graphTextures: graphTextures, materialX: materialX,
+                         environment: [environmentTexture, environmentRows, environmentColumns],
+                         environmentData: environmentData)
+    }
+
     func uniqueTextureBytes(_ textures: [MTLTexture]) -> UInt64 {
         var seen = Set<ObjectIdentifier>()
         return textures.reduce(0) { total, view in
@@ -2741,9 +2801,11 @@ final class MaterialLibrary {
         }
     }
 
+    // `pending` holds candidates decoded earlier in the same batch.
     func validateEncodedImage(_ data: Data, maximumWidth: Int = 16384,
                               maximumHeight: Int = 16384,
-                              maximumPixels: UInt64 = 67_108_864) throws {
+                              maximumPixels: UInt64 = 67_108_864,
+                              pending: [MTLTexture] = []) throws {
         guard data.count <= 128 * 1024 * 1024 else {
             throw Self.error("Texture file exceeds the 128 MiB import limit.")
         }
@@ -2759,16 +2821,20 @@ final class MaterialLibrary {
               pixels.partialValue <= maximumPixels else {
             throw Self.error("Decoded texture exceeds the supported dimensions or pixel count.")
         }
-        // RGBA16 plus a complete mip chain is a conservative predecode estimate
-        // for the formats accepted by the material loader.
-        let estimate = pixels.partialValue.multipliedReportingOverflow(by: 11)
+        // Conservative predecode estimates with a complete mip chain. Up to 16
+        // bits per channel MTKTextureLoader yields at most RGBA16 (10.75 B/pixel
+        // measured for half-float EXR); 32-bit float EXR/TIFF yields RGBA32F
+        // (21.5 B/pixel measured).
+        let isFloat = properties[kCGImagePropertyIsFloat] as? Bool ?? false
+        let depth = properties[kCGImagePropertyDepth] as? Int ?? (isFloat ? 32 : 8)
+        let estimate = pixels.partialValue.multipliedReportingOverflow(by: depth > 16 ? 22 : 11)
         guard !estimate.overflow,
-              uniqueTextureBytes(images + graphTextures + [environmentTexture]) + estimate.partialValue <= textureBudget else {
+              uniqueTextureBytes(residentTextures + external.textures + pending) + estimate.partialValue <= textureBudget else {
             throw Self.error("Scene textures exceed the safe GPU memory budget.")
         }
     }
 
-    func validateDecodedTexture(_ texture: MTLTexture, encodedBytes: Int) throws {
+    func validateDecodedTexture(_ texture: MTLTexture, encodedBytes: Int, pending: [MTLTexture] = []) throws {
         guard encodedBytes <= 128 * 1024 * 1024 else {
             throw Self.error("Texture file exceeds the 128 MiB import limit.")
         }
@@ -2776,25 +2842,23 @@ final class MaterialLibrary {
         guard texture.width <= 16384, texture.height <= 16384, pixels <= 67_108_864 else {
             throw Self.error("Decoded texture exceeds the 16,384 pixel side or 64 megapixel limit.")
         }
-        guard uniqueTextureBytes(images + graphTextures + [environmentTexture, texture]) <= textureBudget else {
+        guard uniqueTextureBytes(residentTextures + external.textures + pending + [texture]) <= textureBudget else {
             throw Self.error("Scene textures exceed the safe GPU memory budget.")
         }
     }
 
+    // `environment` is the image followed by its row and column sampling CDFs.
     func validateCandidateTextures(images candidateImages: [MTLTexture],
                                    graph candidateGraph: [MTLTexture]? = nil,
-                                   environment candidateEnvironment: MTLTexture? = nil) throws {
+                                   environment candidateEnvironment: [MTLTexture]? = nil) throws {
         let graph = candidateGraph ?? graphTextures
-        guard let environment = candidateEnvironment ?? environmentTexture,
-              let currentEnvironment = environmentTexture else {
-            throw Self.error("Material environment binding is unavailable.")
-        }
-        let candidate = candidateImages + graph + [environment]
-        let steady = uniqueTextureBytes(candidate)
+        let environment = candidateEnvironment ?? [environmentTexture, environmentRows, environmentColumns]
+        let candidate = candidateImages + graph + environment
+        let steady = uniqueTextureBytes(candidate + external.textures)
         // Old resources may remain live for already-encoded command buffers while
-        // a complete replacement is prepared and published.
-        let existing = images + graphTextures + [currentEnvironment]
-        let peak = uniqueTextureBytes(existing + candidate)
+        // a complete replacement is prepared and published, as does another
+        // published library this candidate will replace (`external`).
+        let peak = uniqueTextureBytes(residentTextures + external.textures + candidate)
         guard steady <= textureBudget, peak <= textureBudget else {
             throw Self.error("Scene textures exceed the safe GPU memory budget during replacement.")
         }
@@ -2804,28 +2868,36 @@ final class MaterialLibrary {
         guard let buffer = bindingBuffer(length: argumentEncoder.encodedLength) else {
             throw Self.error("Could not allocate material bindings.")
         }
+        // The encoder is re-targeted here on every rebuild, so a failed rebuild
+        // cannot leave stale encoder state for the next one.
         argumentEncoder.setArgumentBuffer(buffer, offset: 0)
-        for (i, texture) in replacement.enumerated() { argumentEncoder.setTexture(texture, index: i) }
-        argumentEncoder.setTexture(environmentTexture,index:256)
-        argumentEncoder.setTexture(environmentRows,index:392)
-        argumentEncoder.setTexture(environmentColumns,index:393)
-        argumentEncoder.setBuffer(triangleBuffer,offset:0,index:257)
-        argumentEncoder.setBuffer(nodeBuffer,offset:0,index:258)
+        var bound: [MTLResource] = []
+        func setTexture(_ texture: MTLTexture, _ index: Int) { argumentEncoder.setTexture(texture, index: index); bound.append(texture) }
+        func setBuffer(_ buffer: MTLBuffer, _ index: Int) { argumentEncoder.setBuffer(buffer, offset: 0, index: index); bound.append(buffer) }
+        for (i, texture) in replacement.enumerated() { setTexture(texture, i) }
+        setTexture(environmentTexture,256)
+        setTexture(environmentRows,392)
+        setTexture(environmentColumns,393)
+        setBuffer(triangleBuffer,257)
+        setBuffer(nodeBuffer,258)
         guard let objectBuffer=objects.withUnsafeBytes({ bindingBuffer(bytes:$0.baseAddress!,length:$0.count) }) else { throw Self.error("Could not allocate object settings.") }
-        argumentEncoder.setBuffer(objectBuffer,offset:0,index:259)
-        for i in 0..<SceneLimits.graphImages { argumentEncoder.setTexture(i < graphTextures.count ? graphTextures[i] : replacement[0],index:260+i) }
-        argumentEncoder.setBuffer(graphInstructionBuffer,offset:0,index:388)
-        argumentEncoder.setBuffer(graphHeaderBuffer,offset:0,index:389)
+        setBuffer(objectBuffer,259)
+        for i in 0..<SceneLimits.graphImages { setTexture(i < graphTextures.count ? graphTextures[i] : replacement[0],260+i) }
+        setBuffer(graphInstructionBuffer,388)
+        setBuffer(graphHeaderBuffer,389)
         var emissionValues=Array(repeating:SIMD4<Float>(repeating:0),count:SceneLimits.materials)
         for (slot,value) in emissions {if emissionValues.indices.contains(slot){emissionValues[slot]=SIMD4(value,0)}}
+        // Unchanged emitter lists keep their immutable buffer.
+        let rebuildEmitters = emittersDirty || emitterBuffer == nil
         let emitterValues: [UInt32]
-        if emittersDirty {
-            let indices=orderedTriangles.indices.filter { i in let slot=Int(orderedTriangles[i].uvc.z);return slot>=8 && emissions[slot].map{simd_length_squared($0)>0} == true }.map{UInt32($0)}
+        if rebuildEmitters {
+            let triangles=orderedTriangles
+            let indices=triangles.indices.filter { i in let slot=Int(triangles[i].uvc.z);return slot>=8 && emissions[slot].map{simd_length_squared($0)>0} == true }.map{UInt32($0)}
             // REFERENCES.md: PBRT2023 power light sampling. Emitters are chosen by area x
             // luminance; the shader's imported_emitter_area_pdf uses the same weights.
             var total=0.0,cumulative=[Double]()
             for i in indices {
-                let t=orderedTriangles[Int(i)],e=emissions[Int(t.uvc.z)] ?? .zero
+                let t=triangles[Int(i)],e=emissions[Int(t.uvc.z)] ?? .zero
                 let edge1=SIMD3<Double>(Double(t.b.x-t.a.x),Double(t.b.y-t.a.y),Double(t.b.z-t.a.z))
                 let edge2=SIMD3<Double>(Double(t.c.x-t.a.x),Double(t.c.y-t.a.y),Double(t.c.z-t.a.z))
                 let luminance=Double(max(1e-8,0.2126*e.x+0.7152*e.y+0.0722*e.z))
@@ -2835,25 +2907,26 @@ final class MaterialLibrary {
                 let cdf=cumulative.indices.map { $0==cumulative.count-1 ? Float(1).bitPattern : Float(cumulative[$0]/total).bitPattern }
                 emitterValues=[UInt32(indices.count)]+indices+cdf+[Float(total).bitPattern]
             } else { emitterValues=[0,0] }
-        } else { emitterValues = cachedEmitterValues }
-        guard let eb=emissionValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}),let ib=emitterValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}) else{throw Self.error("Could not allocate scene emitters.")}
-        argumentEncoder.setBuffer(eb,offset:0,index:390);argumentEncoder.setBuffer(ib,offset:0,index:391)
-        // Replace atomically; previously encoded frames retain their original buffers.
+        } else { emitterValues = [] }
+        guard let eb=emissionValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}) else{throw Self.error("Could not allocate scene emitters.")}
+        let ib: MTLBuffer
+        if !rebuildEmitters, let existing = emitterBuffer { ib = existing } else {
+            guard let buffer=emitterValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}) else{throw Self.error("Could not allocate scene emitters.")}
+            ib = buffer
+        }
+        setBuffer(eb,390);setBuffer(ib,391)
+        var seen = Set<ObjectIdentifier>()
+        bound = bound.filter { seen.insert(ObjectIdentifier($0)).inserted }
+        // Replace atomically; previously encoded frames retain their original
+        // argument buffer (setBuffer) and its resources (useResources).
+        boundResources = bound
         self.objectBuffer = objectBuffer
         emissionBuffer = eb
         emitterBuffer = ib
-        cachedEmitterValues = emitterValues
         emittersDirty = false
         argumentBuffer = buffer
         images = replacement
         bindingsDirty = false
-    }
-
-    // Rebind the encoder when a transactional rebuild fails.  The encoder is
-    // mutable state separate from `argumentBuffer`; leaving it pointed at the
-    // failed temporary buffer makes the next draw use stale bindings.
-    func restoreArgumentEncoder(_ buffer: MTLBuffer?) {
-        if let buffer { argumentEncoder.setArgumentBuffer(buffer, offset: 0) }
     }
 
     func load(url: URL, slot: Int, channel: Int) throws {
@@ -2891,13 +2964,14 @@ final class MaterialLibrary {
             do { try rebuildArguments(images) }
             catch { return false }
         }
-        encoder.useResources([environmentTexture!, environmentRows!, environmentColumns!, triangleBuffer!, nodeBuffer!, objectBuffer!, graphInstructionBuffer!, graphHeaderBuffer!, emissionBuffer!, emitterBuffer!],usage:.read)
-        encoder.useResources(graphTextures.map { $0 as MTLResource },usage:.read)
+        // Command buffers use retained references: setBuffer retains the argument
+        // buffer and useResources retains every resource it points to, so
+        // later swaps cannot free resources that encoded frames still read.
+        encoder.useResources(boundResources, usage: .read)
         settings.withUnsafeBytes { bytes in
             encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 1)
         }
         encoder.setBuffer(argumentBuffer, offset: 0, index: 2)
-        encoder.useResources(images.map { $0 as MTLResource }, usage: .read)
         return true
     }
 }
@@ -2908,13 +2982,19 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let height: Int
         let usesReSTIR: Bool
         let usesMetalFX: Bool
+        // Measured opaque MetalFX scaler allocations (see MetalFXDenoiser.scalerBytesPerPixel).
+        var metalFXScalerBytesPerPixel: UInt64 = 0
 
+        static let reservoirBytesPerPixel: UInt64 = 208
+        static let metalFXTextureBytesPerPixel: UInt64 = 55
         var bytesPerPixel: UInt64 {
             // Beauty/sample/position/OIDN accumulations: 6 RGBA32F; three
             // normal/material guides: 3 RGBA16F; resolved primary surfaces:
             // 104 B. ReSTIR adds DI (6 RGBA32F) and GI (6 RGBA32F + 2 RGBA16F).
-            // MetalFX formats total 55 B/pixel.
-            120 + PathTracerRenderer.primarySurfaceStride + (usesReSTIR ? 208 : 0) + (usesMetalFX ? 55 : 0)
+            // MetalFX formats total 55 B/pixel plus the scaler's own history and
+            // feature allocations.
+            120 + PathTracerRenderer.primarySurfaceStride + (usesReSTIR ? Self.reservoirBytesPerPixel : 0)
+                + (usesMetalFX ? Self.metalFXTextureBytesPerPixel + metalFXScalerBytesPerPixel : 0)
         }
         var bytes: UInt64? {
             guard width > 0, height > 0 else { return nil }
@@ -3032,7 +3112,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     }
     private var rejectedRenderSize: SIMD2<Int>?
     private var frameResourcesUseReSTIR: Bool?
+    // Set when only the reservoirs were reallocated; the next frame skips temporal reuse.
+    private(set) var reservoirHistoryNeedsReset = false
     var concurrentRenderBytes: UInt64 = 0
+    private var measuredMetalFXScalerBytesPerPixel: UInt64?
+    var metalFXScalerBytesPerPixel: UInt64 {
+        guard supportsMetalFX else { return 0 }
+        if let measured = measuredMetalFXScalerBytesPerPixel { return measured }
+        let measured = MetalFXDenoiser.scalerBytesPerPixel(device: device)
+        measuredMetalFXScalerBytesPerPixel = measured
+        return measured
+    }
 
     var residentFrameBytes: UInt64 {
         let textures: [MTLTexture?] = [
@@ -3047,39 +3137,48 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             [fx.color, fx.depth, fx.motion, fx.diffuse, fx.specular, fx.normal,
              fx.roughness, fx.hitDistance, fx.denoiseMask, fx.output, fx.exposure]
         } ?? []
-        return (textures + metalFXTextures).compactMap { $0 }.reduce(0) { total, texture in
+        let scalerBytes = metalFX.map { fx in
+            UInt64(fx.output.width) * UInt64(fx.output.height) * metalFXScalerBytesPerPixel
+        } ?? 0
+        return (textures + metalFXTextures).compactMap { $0 }.reduce(scalerBytes) { total, texture in
             let id = ObjectIdentifier(texture as AnyObject)
             return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
         } + UInt64(primarySurfaces?.allocatedSize ?? 0)
     }
 
     func renderMemoryError(width: Int, height: Int) -> String? {
-        let plan = FrameResourcePlan(width: width, height: height,
-            usesReSTIR: samplingMode == 0 && viewportMode == 0,
-            usesMetalFX: denoiserEnabled && supportsMetalFX && samplingMode == 0 && viewportMode == 0)
+        let usesReSTIR = samplingMode == 0 && viewportMode == 0
+        let usesMetalFX = denoiserEnabled && supportsMetalFX && usesReSTIR
+        let plan = FrameResourcePlan(width: width, height: height, usesReSTIR: usesReSTIR, usesMetalFX: usesMetalFX,
+            metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0)
         guard let frameBytes = plan.bytes else { return "Render dimensions are too large." }
-        // Include the live frame set during resize/export, scene textures, and
-        // modest command/display headroom. Opaque framework allocations remain
-        // estimates and are intentionally covered by the final 32 B/pixel.
+        // Include the live frame set during resize/export, scene textures, the
+        // measured MetalFX scaler internals, and modest command/display headroom
+        // (drawable and capture staging) in the final 32 B/pixel.
         let pixels = UInt64(width) * UInt64(height)
         let headroom = pixels.multipliedReportingOverflow(by: 32)
         guard !headroom.overflow else { return "Render dimensions are too large." }
-        let replacesExisting = accumTexture == nil || accumTexture?.width != width ||
-            accumTexture?.height != height || frameResourcesUseReSTIR != plan.usesReSTIR
-        let resident = replacesExisting ? residentFrameBytes : 0
-        let baseRequired = replacesExisting ? frameBytes : residentFrameBytes
-        let required = baseRequired.addingReportingOverflow(resident)
+        let resizes = accumTexture == nil || accumTexture?.width != width || accumTexture?.height != height
+        let resident = resizes ? residentFrameBytes : 0
+        let baseRequired = resizes ? frameBytes : residentFrameBytes
+        // A strategy or inspection change replaces only the reservoirs; the old
+        // ones stay live (in residentFrameBytes) for in-flight frames.
+        let reservoirs = pixels.multipliedReportingOverflow(by: FrameResourcePlan.reservoirBytesPerPixel)
+        let additionalReservoirs = !resizes && plan.usesReSTIR && frameResourcesUseReSTIR != true
+            ? reservoirs.partialValue : 0
+        let withResident = baseRequired.addingReportingOverflow(resident)
+        let required = withResident.partialValue.addingReportingOverflow(additionalReservoirs)
         let needsMetalFX = plan.usesMetalFX &&
             (metalFX == nil || metalFX?.output.width != width || metalFX?.output.height != height)
-        let fxPixels = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
-        let additionalFX = (!replacesExisting && needsMetalFX && !fxPixels.overflow)
-            ? fxPixels.partialValue.multipliedReportingOverflow(by: 55).partialValue : 0
+        let fx = pixels.multipliedReportingOverflow(by: FrameResourcePlan.metalFXTextureBytesPerPixel + plan.metalFXScalerBytesPerPixel)
+        let additionalFX = !resizes && needsMetalFX ? fx.partialValue : 0
         let withFX = required.partialValue.addingReportingOverflow(additionalFX)
         let withConcurrent = withFX.partialValue.addingReportingOverflow(concurrentRenderBytes)
         let withTextures = withConcurrent.partialValue.addingReportingOverflow(
-            materials.uniqueTextureBytes(materials.images + materials.graphTextures + [materials.environmentTexture]))
+            materials.uniqueTextureBytes(materials.residentTextures + materials.external.textures))
         let total = withTextures.partialValue.addingReportingOverflow(headroom.partialValue)
-        if required.overflow || withFX.overflow || withConcurrent.overflow || withTextures.overflow || total.overflow {
+        if reservoirs.overflow || fx.overflow || withResident.overflow || required.overflow || withFX.overflow
+            || withConcurrent.overflow || withTextures.overflow || total.overflow {
             return "Render dimensions are too large."
         }
         let recommended = device.recommendedMaxWorkingSetSize
@@ -3124,6 +3223,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             throw error
         }
         super.init()
+        measuredMetalFXScalerBytesPerPixel = other.flatMap {
+            $0.device.registryID == device.registryID ? $0.measuredMetalFXScalerBytesPerPixel : nil
+        }
         denoiserEnabled = supportsMetalFX
         applyPreset(.perspective)
     }
@@ -3252,6 +3354,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             lastPresentationUsedMetalFX = true
             display = fx.output
         } else {
+            // Release the scaler and its opaque history while MetalFX is unused;
+            // in-flight command buffers retain what they encoded.
+            metalFX = nil
             metalFXHistoryNeedsReset = true
         }
         // Inspection views use the progressively accumulated guides so camera
@@ -3335,8 +3440,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         if frameIndex >= 16_777_215 { resetAccumulation() }
 
         let needsReSTIR = samplingMode == 0 && viewportMode == 0
-        if accumTexture == nil || accumTexture?.width != w || accumTexture?.height != h ||
-            frameResourcesUseReSTIR != needsReSTIR {
+        let resized = accumTexture == nil || accumTexture?.width != w || accumTexture?.height != h
+        if resized || frameResourcesUseReSTIR != needsReSTIR {
             let desc32 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
             desc32.usage = [.shaderRead, .shaderWrite]
             desc32.storageMode = .private
@@ -3353,22 +3458,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private; return d
             }()
 
-            // Publish a complete set only after every allocation succeeds.
-            guard let newAccum = device.makeTexture(descriptor: desc32),
-                  let newSample = device.makeTexture(descriptor: desc32),
-                  let newPosition = device.makeTexture(descriptor: desc32),
-                  let newHistoryPosition = device.makeTexture(descriptor: desc32),
-                  let newNormal = device.makeTexture(descriptor: desc16),
-                  let newHistoryNormal = device.makeTexture(descriptor: desc16),
-                  let newAlbedo = device.makeTexture(descriptor: desc16),
+            // Only the DI/GI reservoirs depend on the strategy and inspection view;
+            // keep the accumulation, G-buffer, guides and sample count when just
+            // those change. Publish a complete set only after every allocation succeeds.
+            let frameDescriptors = resized ? [desc32, desc32, desc32, desc32, desc16, desc16, desc16, desc32, desc32] : []
+            let frame = frameDescriptors.compactMap { device.makeTexture(descriptor: $0) }
+            guard frame.count == frameDescriptors.count,
                   let newPosA = device.makeTexture(descriptor: reservoir32),
                   let newEmitA = device.makeTexture(descriptor: reservoir32),
                   let newWeightA = device.makeTexture(descriptor: reservoir32),
                   let newPosB = device.makeTexture(descriptor: reservoir32),
                   let newEmitB = device.makeTexture(descriptor: reservoir32),
                   let newWeightB = device.makeTexture(descriptor: reservoir32),
-                  let newOIDNAlbedo = device.makeTexture(descriptor: desc32),
-                  let newOIDNNormal = device.makeTexture(descriptor: desc32),
                   let newGIPosA = device.makeTexture(descriptor: reservoir32),
                   let newGINormalA = device.makeTexture(descriptor: reservoir16),
                   let newGIRadianceA = device.makeTexture(descriptor: reservoir32),
@@ -3377,21 +3478,25 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let newGINormalB = device.makeTexture(descriptor: reservoir16),
                   let newGIRadianceB = device.makeTexture(descriptor: reservoir32),
                   let newGIWeightsB = device.makeTexture(descriptor: reservoir32),
-                  let newSurfaces = device.makeBuffer(length: w * h * Int(Self.primarySurfaceStride),
-                                                      options: .storageModePrivate) else {
+                  // Primary surfaces depend only on the frame size.
+                  let newSurfaces = resized
+                    ? device.makeBuffer(length: w * h * Int(Self.primarySurfaceStride), options: .storageModePrivate)
+                    : primarySurfaceBuffer(width: w, height: h) else {
                 onError?("Could not allocate render textures. Try a smaller window.")
                 return
             }
             primarySurfaces = newSurfaces
-            accumTexture = newAccum
-            sampleTexture = newSample
-            oidnAlbedoAccum = newOIDNAlbedo
-            oidnNormalAccum = newOIDNNormal
-            gbufferPosDepth = newPosition
-            historyPosDepth = newHistoryPosition
-            gbufferNormalMat = newNormal
-            historyNormalMat = newHistoryNormal
-            gbufferAlbedoRough = newAlbedo
+            if resized {
+                accumTexture = frame[0]
+                sampleTexture = frame[1]
+                gbufferPosDepth = frame[2]
+                historyPosDepth = frame[3]
+                gbufferNormalMat = frame[4]
+                historyNormalMat = frame[5]
+                gbufferAlbedoRough = frame[6]
+                oidnAlbedoAccum = frame[7]
+                oidnNormalAccum = frame[8]
+            }
             resPosDirA = newPosA; resEmitPdfA = newEmitA; resWeightsA = newWeightA
             resPosDirB = newPosB; resEmitPdfB = newEmitB; resWeightsB = newWeightB
             giPosPdfA = newGIPosA; giNormalA = newGINormalA
@@ -3400,7 +3505,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             giRadianceB = newGIRadianceB; giWeightsB = newGIWeightsB
             frameResourcesUseReSTIR = needsReSTIR
 
-            resetAccumulation()
+            if resized {
+                reservoirHistoryNeedsReset = false
+                resetAccumulation()
+            } else {
+                // New reservoirs hold no history: disable temporal reuse for one frame.
+                reservoirHistoryNeedsReset = true
+            }
         }
 
         guard let accum = accumTexture, let samples = sampleTexture,
@@ -3455,7 +3566,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             viewportMode: viewportMode,
             width: UInt32(w),
             height: UInt32(h),
-            jitter: frameJitter(nextSample), sampleIndex: nextSample, reservoirHistory: nextHistory,
+            jitter: frameJitter(nextSample), sampleIndex: nextSample,
+            reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
             environment: SIMD4(options.environmentIntensity, options.environmentRotation * .pi / 180, materials.environmentData == nil ? 0 : 1, Float(materials.nodeCount)),
             lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,sceneIndex == 6 ? options.independentSunCone : 0),
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize)
@@ -3607,6 +3719,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         frameIndex = nextFrame
         sampleIndex = nextSample
         reservoirHistory = nextHistory
+        reservoirHistoryNeedsReset = false
         let submittedGeneration = generation
         let semaphore = inFlightFrames
         cmdBuffer.addCompletedHandler { [weak self] completedBuffer in
