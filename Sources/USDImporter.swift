@@ -317,7 +317,7 @@ extension StudioController {
           self.publishImportedUSD(imported, resources: resources, record: record)
           self.showUSDReport()
         case .failure(let error):
-          self.show(error.localizedDescription)
+          self.showError(error.localizedDescription)
           self.rebuild()
         }
       }

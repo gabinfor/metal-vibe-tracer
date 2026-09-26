@@ -18,9 +18,12 @@ final class ActionButton: NSButton {
 }
 final class ActionPopup: NSPopUpButton {
   var actionBlock: ((Int) -> Void)?
-  convenience init(_ titles: [String], selected: Int, _ action: @escaping (Int) -> Void) {
+  convenience init(
+    _ titles: [String], selected: Int, label: String? = nil, _ action: @escaping (Int) -> Void
+  ) {
     self.init(frame: .zero, pullsDown: false)
     addItems(withTitles: titles)
+    if let label { setAccessibilityLabel(label) }
     selectItem(at: selected)
     target = self
     self.action = #selector(invoke)
@@ -32,9 +35,14 @@ final class NumberControl: NSStackView {
   let field = NSTextField(), slider = NSSlider()
   var update: ((Float) -> Void)!
   var minimum: Float = 0, maximum: Float = 1
+  // Typed values may exceed the slider range up to these limits.
+  var entryMinimum: Float = 0, entryMaximum: Float = 1
+  // Text of the last published value; ending editing with it unchanged commits nothing.
+  private(set) var displayed = ""
+  var onReject: ((String) -> Void)?
   init(
     _ title: String, value: Float, range: ClosedRange<Float>, defaultValue: Float,
-    _ action: @escaping (Float) -> Void
+    entry: ClosedRange<Float>? = nil, _ action: @escaping (Float) -> Void
   ) {
     super.init(frame: .zero)
     orientation = .vertical
@@ -42,6 +50,8 @@ final class NumberControl: NSStackView {
     spacing = 3
     minimum = range.lowerBound
     maximum = range.upperBound
+    entryMinimum = min(minimum, entry?.lowerBound ?? minimum)
+    entryMaximum = max(maximum, entry?.upperBound ?? maximum)
     update = action
     let row = NSStackView()
     row.orientation = .horizontal
@@ -50,6 +60,7 @@ final class NumberControl: NSStackView {
     label.font = .systemFont(ofSize: 12)
     label.setContentHuggingPriority(.defaultLow, for: .horizontal)
     field.stringValue = String(format: "%.8g", value)
+    displayed = field.stringValue
     field.alignment = .right
     field.widthAnchor.constraint(equalToConstant: 78).isActive = true
     field.target = self
@@ -80,15 +91,33 @@ final class NumberControl: NSStackView {
       NSSound.beep()
       return
     }
-    let v = min(maximum, max(minimum, value))
+    let v = min(entryMaximum, max(entryMinimum, value))
     field.stringValue = String(format: "%.8g", v)
-    slider.floatValue = v
+    displayed = field.stringValue
+    slider.floatValue = min(maximum, max(minimum, v))
     update(v)
   }
+  // Accepts POSIX input, then the current locale (for example "0,25"), ignoring whitespace.
+  static func parse(_ text: String, locale: Locale = .current) -> Float? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let value = Float(trimmed) { return value }
+    let formatter = NumberFormatter()
+    formatter.locale = locale
+    formatter.numberStyle = .decimal
+    if let value = formatter.number(from: trimmed)?.floatValue { return value }
+    if !trimmed.contains("."), trimmed.filter({ $0 == "," }).count == 1 {
+      return Float(trimmed.replacingOccurrences(of: ",", with: "."))
+    }
+    return nil
+  }
   @objc func typed() {
-    guard let value = Float(field.stringValue), value.isFinite else {
-      field.stringValue = String(format: "%.8g", slider.floatValue)
+    // Ending editing (focus loss, inspector rebuild) re-sends the unchanged text.
+    guard field.stringValue != displayed else { return }
+    guard let value = Self.parse(field.stringValue), value.isFinite else {
+      let rejected = field.stringValue
+      field.stringValue = displayed
       NSSound.beep()
+      onReject?("“\(rejected)” is not a number.")
       return
     }
     set(value)
@@ -97,9 +126,10 @@ final class NumberControl: NSStackView {
 }
 final class ActionColor: NSColorWell {
   var update: ((NSColor) -> Void)?
-  convenience init(_ color: NSColor, _ action: @escaping (NSColor) -> Void) {
+  convenience init(_ color: NSColor, label: String? = nil, _ action: @escaping (NSColor) -> Void) {
     self.init(frame: NSRect(x: 0, y: 0, width: 80, height: 28))
     self.color = color
+    if let label { setAccessibilityLabel(label) }
     update = action
     target = self
     self.action = #selector(changed)
@@ -115,9 +145,11 @@ final class StudioController: NSViewController {
   weak var hostWindow: NSWindow?
   let viewport: InteractiveMTKView
   let sidebar = NSScrollView(), stack = TopAlignedStackView(), status = NSTextField(labelWithString: "")
+  private(set) var errorMessage: String?
+  private(set) lazy var errorButton = ActionButton("") { [weak self] in self?.showErrorDetails() }
   let history = UndoManager()
   var project = ProjectDocument()
-  var projectURL: URL?
+  var projectURL: URL? { didSet { updateWindowTitle() } }
   var importInProgress = false { didSet { busyStateChanged() } }
   // Opens (including the launch restore), saves and off-main document preparation.
   private var openInFlight = false { didSet { busyStateChanged() } }
@@ -157,12 +189,15 @@ final class StudioController: NSViewController {
   var saveTimer: Timer?
   var lastCheckpoint = Date.distantPast
   var isRestoring = false
-  var exportRenderer: PathTracerRenderer?
+  private var rebuilding = false, rebuildRequested = false
+  private var cameraRefreshPending = false
+  private var mapThumbnails: [Int: (data: Data, image: NSImage)] = [:]
+  var exportRenderer: PathTracerRenderer? { didSet { busyStateChanged() } }
   var exportOutput: MTLTexture?
   var exportURL: URL?
   var exportHDR = false, exportRaw = false, exportDenoise = true, previousPaused = false
   var exportDenoiseJob: OIDNProgress?
-  var previewDenoiseJob: OIDNProgress?
+  var previewDenoiseJob: OIDNProgress? { didSet { busyStateChanged() } }
   var oidnPreviewWasPaused = false
   var messageUntil = Date.distantPast
   static let sceneNames = [
@@ -190,13 +225,24 @@ final class StudioController: NSViewController {
     loadView()
     viewport.onBeginEdit = { [weak self] in self?.checkpoint("Camera", coalesce: true) }
     // Camera-only changes use a longer autosave debounce than document edits.
-    viewport.onUserOrbit = { [weak self] in self?.changed(reset: false, autosaveDelay: 5) }
+    viewport.onUserOrbit = { [weak self] in
+      self?.changed(reset: false, autosaveDelay: 5)
+      self?.scheduleCameraPanelRefresh()
+    }
     viewport.canEdit = { [weak self] in self?.isBusy == false }
     viewport.onPick = { [weak self] p in self?.pick(p) }
     renderer.onFrameUpdate = { [weak self] _ in self?.updateStatus() }
-    renderer.onError = { [weak self] text in self?.show(text) }
+    renderer.onError = { [weak self] text in self?.showError(text) }
+    renderer.onPausedChange = { [weak self] in self?.busyStateChanged() }
     installMenus()
+    updateWindowTitle()
     rebuild()
+  }
+  // The window names the project file (with its proxy icon); the app name is the subtitle.
+  func updateWindowTitle() {
+    hostWindow?.representedURL = projectURL
+    hostWindow?.title = projectURL?.lastPathComponent ?? "Untitled"
+    hostWindow?.subtitle = "Metal Vibe Tracer"
   }
   required init?(coder: NSCoder) { fatalError() }
   override func loadView() {
@@ -218,10 +264,7 @@ final class StudioController: NSViewController {
     bar.addArrangedSubview(pause)
     let restart = ActionButton("Restart") { [weak self] in self?.restart() }
     bar.addArrangedSubview(restart)
-    let export = ActionButton("Export…") { [weak self] in
-      self?.page = 5
-      self?.rebuild()
-    }
+    let export = ActionButton("Export…") { [weak self] in self?.showPage(5) }
     bar.addArrangedSubview(export)
     let spacer = NSView()
     bar.addArrangedSubview(spacer)
@@ -239,7 +282,13 @@ final class StudioController: NSViewController {
     sidebar.documentView = stack
     status.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
     status.lineBreakMode = .byTruncatingTail
-    for v in [bar, viewport, sidebar, status] {
+    errorButton.isBordered = false
+    errorButton.contentTintColor = .systemRed
+    errorButton.font = .systemFont(ofSize: 11)
+    errorButton.lineBreakMode = .byTruncatingTail
+    errorButton.isHidden = true
+    errorButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    for v in [bar, viewport, sidebar, status, errorButton] {
       v.translatesAutoresizingMaskIntoConstraints = false
       root.addSubview(v)
     }
@@ -252,7 +301,10 @@ final class StudioController: NSViewController {
       bar.heightAnchor.constraint(equalToConstant: 30),
       status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
       status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-      status.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+      status.trailingAnchor.constraint(equalTo: errorButton.leadingAnchor, constant: -8),
+      errorButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+      errorButton.centerYAnchor.constraint(equalTo: status.centerYAnchor),
+      errorButton.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.45),
       status.heightAnchor.constraint(equalToConstant: 22),
       sidebar.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 8),
       sidebar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -267,6 +319,9 @@ final class StudioController: NSViewController {
     ])
   }
   func add(_ v: NSView) {
+    if let control = v as? NumberControl, control.onReject == nil {
+      control.onReject = { [weak self] message in self?.show(message) }
+    }
     stack.addArrangedSubview(v)
     v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
   }
@@ -283,11 +338,12 @@ final class StudioController: NSViewController {
   }
   func number(
     _ title: String, _ value: Float, _ range: ClosedRange<Float>, _ fallback: Float,
-    reset: Bool = true, _ set: @escaping (Float) -> Void
+    reset: Bool = true, entry: ClosedRange<Float>? = nil, _ set: @escaping (Float) -> Void
   ) {
     add(
-      NumberControl(title, value: value, range: range, defaultValue: fallback) { [weak self] v in
-        guard let self, !self.isBusy else { return }
+      NumberControl(title, value: value, range: range, defaultValue: fallback, entry: entry) {
+        [weak self] v in
+        guard let self, self.acceptsEdits else { return }
         self.checkpoint(title)
         set(v)
         self.changed(reset: reset)
@@ -295,22 +351,42 @@ final class StudioController: NSViewController {
   }
   func option(
     _ title: String, _ key: WritableKeyPath<StudioOptions, Float>, _ range: ClosedRange<Float>,
-    _ fallback: Float, reset: Bool = true
+    _ fallback: Float, reset: Bool = true, entry: ClosedRange<Float>? = nil
   ) {
-    number(title, renderer.options[keyPath: key], range, fallback, reset: reset) { [weak self] in
+    number(title, renderer.options[keyPath: key], range, fallback, reset: reset, entry: entry) {
+      [weak self] in
       self?.renderer.options[keyPath: key] = $0
     }
   }
-  func popup(_ titles: [String], _ value: Int, _ action: @escaping (Int) -> Void) {
+  func popup(
+    _ titles: [String], _ value: Int, label: String? = nil, _ action: @escaping (Int) -> Void
+  ) {
     add(
-      ActionPopup(titles, selected: value) { [weak self] i in
-        guard let self, !self.isBusy else { return }
+      ActionPopup(titles, selected: value, label: label) { [weak self] i in
+        guard let self, self.acceptsEdits else { return }
         action(i)
       })
   }
   func button(_ title: String, _ action: @escaping () -> Void) { add(ActionButton(title, action)) }
+  // Inspector mutations are ignored while a document is restored or project I/O runs.
+  var acceptsEdits: Bool { !isBusy && !isRestoring }
   func rebuild() {
+    // Re-entrant requests (from callbacks fired while controls are torn down) run afterwards.
+    guard !rebuilding else {
+      rebuildRequested = true
+      return
+    }
+    rebuilding = true
+    defer {
+      rebuilding = false
+      if rebuildRequested {
+        rebuildRequested = false
+        rebuild()
+      }
+    }
     for child in stack.arrangedSubviews {
+      // End field editing without committing: removal would otherwise re-send stale text.
+      (child as? NumberControl)?.field.abortEditing()
       stack.removeArrangedSubview(child)
       child.removeFromSuperview()
     }
@@ -319,12 +395,13 @@ final class StudioController: NSViewController {
       heading("Settings")
     } else {
       popup(
-        ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page
+        ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page,
+        label: "Inspector page"
       ) { [weak self] i in
         self?.page = i
         self?.rebuild()
       }
-      popup(Self.sceneNames, Int(renderer.sceneIndex)) { [weak self] i in self?.switchScene(i) }
+      popup(Self.sceneNames, Int(renderer.sceneIndex), label: "Scene") { [weak self] i in self?.switchScene(i) }
     }
     if exportRenderer != nil {
       heading("Rendering export…")
@@ -355,7 +432,7 @@ final class StudioController: NSViewController {
   }
   func renderPanel() {
     heading("Sampling")
-    popup(Self.strategyNames, Int(renderer.samplingMode)) { [weak self] i in
+    popup(Self.strategyNames, Int(renderer.samplingMode), label: "Sampling strategy") { [weak self] i in
       guard let self else { return }
       self.checkpoint("Strategy")
       self.renderer.samplingMode = UInt32(i)
@@ -381,7 +458,7 @@ final class StudioController: NSViewController {
       text("Freezes and denoises the current accumulated samples at the preview render resolution.")
     }
     heading("Display")
-    popup(Self.viewportNames, Int(renderer.viewportMode)) { [weak self] i in
+    popup(Self.viewportNames, Int(renderer.viewportMode), label: "Viewport mode") { [weak self] i in
       guard let self else { return }
       self.checkpoint("Viewport mode")
       self.renderer.viewportMode = UInt32(i)
@@ -392,7 +469,7 @@ final class StudioController: NSViewController {
     option("White balance, cool → warm", \.whiteBalance, -1...1, 0, reset: false)
     popup(
       ["Tone map: Filmic fit", "Tone map: Reinhard", "Tone map: Linear / clip"],
-      Int(renderer.options.toneMap)
+      Int(renderer.options.toneMap), label: "Tone map"
     ) { [weak self] i in
       guard let self else { return }
       self.checkpoint("Tone map")
@@ -447,7 +524,7 @@ final class StudioController: NSViewController {
   }
 
   func setOIDN(_ name: String, _ update: (inout OIDNOptions) -> Void) {
-    guard !isBusy else { return }
+    guard acceptsEdits else { return }
     checkpoint(name)
     update(&renderer.oidnOptions)
     if renderer.offlineDenoisedPreview != nil {
@@ -458,12 +535,22 @@ final class StudioController: NSViewController {
     changed(reset: false)
     rebuild()
   }
+  // Mouse navigation refreshes the Camera page fields at most four times a second.
+  func scheduleCameraPanelRefresh() {
+    guard page == 1, sidebarVisible, !cameraRefreshPending else { return }
+    cameraRefreshPending = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+      guard let self else { return }
+      self.cameraRefreshPending = false
+      if self.page == 1, !self.isBusy { self.rebuild() }
+    }
+  }
   func cameraPanel() {
     heading("Camera")
     text(
       "Drag to orbit. Shift-drag to pan. Scroll to zoom. Click a surface to select its material/object group."
     )
-    popup(["Choose preset…", "Perspective", "Front", "Close-up", "Overhead"], 0) { [weak self] i in
+    popup(["Choose preset…", "Perspective", "Front", "Close-up", "Overhead"], 0, label: "Camera preset") { [weak self] i in
       guard let self, i > 0, let p = CameraPreset(rawValue: i - 1) else { return }
       self.checkpoint("Camera preset")
       self.renderer.applyPreset(p)
@@ -474,20 +561,23 @@ final class StudioController: NSViewController {
       self?.renderer.fov = $0
     }
     let eye = renderer.eyePosition
+    // Typed coordinates reach the full navigation range; the sliders cover ±100.
+    let reach: ClosedRange<Float> = -1_000_000...1_000_000
     for axis in 0..<3 {
-      number("Position \(["X","Y","Z"][axis])", eye[axis], -100...100, eye[axis]) { [weak self] v in
+      number("Position \(["X","Y","Z"][axis])", eye[axis], -100...100, eye[axis], entry: reach) {
+        [weak self] v in
         guard let self else { return }
         var p = self.renderer.eyePosition
         p[axis] = v
         self.renderer.setEye(p)
       }
-      number("Target \(["X","Y","Z"][axis])", renderer.target[axis], -100...100, 0) {
+      number("Target \(["X","Y","Z"][axis])", renderer.target[axis], -100...100, 0, entry: reach) {
         [weak self] v in self?.renderer.target[axis] = v
       }
     }
     heading("Depth of field")
     option("Aperture radius (0 = pinhole)", \.aperture, 0...0.5, 0)
-    option("Focus distance", \.focusDistance, 0.01...1000, 4.6)
+    option("Focus distance", \.focusDistance, 0.01...1000, 4.6, entry: 0.0001...1_000_000)
     button("Focus at camera target") { [weak self] in
       guard let self else { return }
       self.checkpoint("Focus")
@@ -499,7 +589,7 @@ final class StudioController: NSViewController {
     button("Save current view…") { [weak self] in self?.saveView() }
     let names = project.views.keys.sorted()
     if !names.isEmpty {
-      popup(["Restore view…"] + names, 0) { [weak self] i in
+      popup(["Restore view…"] + names, 0, label: "Saved views") { [weak self] i in
         guard let self, i > 0, let camera = self.project.views[names[i - 1]] else { return }
         self.checkpoint("Restore view")
         camera.apply(self.renderer)
@@ -510,7 +600,7 @@ final class StudioController: NSViewController {
   }
   func lightingPanel() {
     heading("Environment")
-    popup(["Golden Hour", "High Noon", "Twilight / Studio"], Int(renderer.skyMode)) {
+    popup(["Golden Hour", "High Noon", "Twilight / Studio"], Int(renderer.skyMode), label: "Sky preset") {
       [weak self] i in
       guard let self else { return }
       self.checkpoint("Sky preset")
@@ -535,7 +625,7 @@ final class StudioController: NSViewController {
         self.commit(record)
         self.changed()
         self.rebuild()
-      } catch { self.show(error.localizedDescription) }
+      } catch { self.showError(error.localizedDescription) }
     }
     option("Environment brightness", \.environmentIntensity, 0...100, 1)
     option("Environment rotation, degrees", \.environmentRotation, -180...180, 0)
@@ -560,11 +650,15 @@ final class StudioController: NSViewController {
       return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
     }
     let c = renderer.options.lightColor
+    text("Light color")
     add(
-      ActionColor(NSColor(srgbRed: encode(c.x), green: encode(c.y), blue: encode(c.z), alpha: 1))
-      { [weak self] c in
-        guard let self, !self.isBusy, let c = c.usingColorSpace(.sRGB) else { return }
-        self.checkpoint("Light color")
+      ActionColor(
+        NSColor(srgbRed: encode(c.x), green: encode(c.y), blue: encode(c.z), alpha: 1),
+        label: "Light color"
+      ) { [weak self] c in
+        guard let self, self.acceptsEdits, let c = c.usingColorSpace(.sRGB) else { return }
+        // A colour-panel drag sends many changes; one undo step covers the burst.
+        self.checkpoint("Light color", coalesce: true)
         self.renderer.options.lightColor = SIMD3(
           decode(c.redComponent), decode(c.greenComponent), decode(c.blueComponent))
         self.changed()
@@ -572,7 +666,7 @@ final class StudioController: NSViewController {
     text(
       "Applies to the finite lights in Cornell, Veach, and Ring scenes. Veach lights share these controls."
     )
-    popup(["Atmosphere: Clear", "Atmosphere: Fog preview"], Int(renderer.enableFog)) {
+    popup(["Atmosphere: Clear", "Atmosphere: Fog preview"], Int(renderer.enableFog), label: "Atmosphere") {
       [weak self] i in
       guard let self else { return }
       self.checkpoint("Fog")
@@ -621,10 +715,25 @@ final class StudioController: NSViewController {
         && !names[$0].contains("Studio only")
     }
     if !slots.contains(selectedSlot) { selectedSlot = slots.first ?? 0 }
-    popup(slots.map { names[$0] }, slots.firstIndex(of: selectedSlot) ?? 0) { [weak self] i in
+    popup(slots.map { names[$0] }, slots.firstIndex(of: selectedSlot) ?? 0, label: "Object") { [weak self] i in
       self?.selectedSlot = slots[i]
       self?.rebuild()
     }
+  }
+  // Small cached previews: full-resolution maps are never decoded for the inspector.
+  func mapThumbnail(_ data: Data, index: Int) -> NSImage? {
+    if let cached = mapThumbnails[index], cached.data == data { return cached.image }
+    mapThumbnails[index] = nil
+    let options: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 160,
+    ]
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    else { return nil }
+    let image = NSImage(cgImage: thumbnail, size: NSSize(width: thumbnail.width, height: thumbnail.height))
+    mapThumbnails[index] = (data, image)
+    return image
   }
   func materialPanel() {
     heading("Material")
@@ -654,19 +763,20 @@ final class StudioController: NSViewController {
       [
         "Original scene material", "Plastic", "Copper", "Coated metal", "Fabric", "Rough glass",
         "Custom OpenPBR",
-      ], material.enabled == 0 ? 0 : 6
+      ], material.enabled == 0 ? 0 : 6, label: "Material preset"
     ) { [weak self] i in self?.materialPreset(i) }
     func encode(_ c: Float) -> CGFloat {
       CGFloat(c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1 / 2.4) - 0.055)
     }
+    text("Material tint")
     add(
       ActionColor(
         NSColor(
           srgbRed: encode(material.color.x), green: encode(material.color.y),
-          blue: encode(material.color.z), alpha: 1)
+          blue: encode(material.color.z), alpha: 1), label: "Material tint"
       ) { [weak self] color in
-        guard let self, !self.isBusy, let c = color.usingColorSpace(.sRGB) else { return }
-        self.checkpoint("Material tint")
+        guard let self, self.acceptsEdits, let c = color.usingColorSpace(.sRGB) else { return }
+        self.checkpoint("Material tint", coalesce: true)
         func decode(_ c: CGFloat) -> Float {
           let x = Float(c)
           return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
@@ -703,7 +813,8 @@ final class StudioController: NSViewController {
     for channel in 0..<4 {
       text(
         MaterialLibrary.mapNames[channel] + "\n" + renderer.materials.fileNames[slot * 4 + channel])
-      if let data = renderer.materials.payloads[slot * 4 + channel], let image = NSImage(data: data)
+      if let data = renderer.materials.payloads[slot * 4 + channel],
+        let image = mapThumbnail(data, index: slot * 4 + channel)
       {
         let preview = NSImageView()
         preview.image = image
@@ -722,12 +833,13 @@ final class StudioController: NSViewController {
           self.commit(record)
           self.changed()
           self.rebuild()
-        } catch { self.show(error.localizedDescription) }
+        } catch { self.showError(error.localizedDescription) }
       }
       if channel == 1 || channel == 2 {
         popup(
           ["Channel: Red", "Channel: Green", "Channel: Blue", "Channel: Alpha"],
-          Int(renderer.materials.objects[slot].channels[channel - 1])
+          Int(renderer.materials.objects[slot].channels[channel - 1]),
+          label: "\(MaterialLibrary.mapNames[channel]) channel"
         ) { [weak self] i in
           guard let self else { return }
           self.checkpoint("Texture channel")
@@ -756,7 +868,7 @@ final class StudioController: NSViewController {
         self.commit(record)
         self.changed()
         self.rebuild()
-      } catch { self.show(error.localizedDescription) }
+      } catch { self.showError(error.localizedDescription) }
     }
   }
   func objectPanel() {
@@ -837,7 +949,7 @@ final class StudioController: NSViewController {
       "Export source: OIDN offline (configured)",
       "Export source: raw accumulation",
       "Export source: MetalFX display",
-    ], exportSource) { [weak self] i in
+    ], exportSource, label: "Export source") { [weak self] i in
       self?.exportDenoise = i == 0
       self?.exportRaw = i == 1
     }
@@ -849,9 +961,42 @@ final class StudioController: NSViewController {
     )
   }
   func show(_ message: String) {
+    status.textColor = .labelColor
     status.stringValue = message
     status.toolTip = message
     messageUntil = Date().addingTimeInterval(5)
+  }
+  // Failures stay visible as a red indicator until dismissed; the full text opens in an alert.
+  func showError(_ message: String) {
+    show(message)
+    status.textColor = .systemRed
+    errorMessage = message
+    errorButton.title = "⚠ " + (message.split(separator: "\n").first.map(String.init) ?? message)
+    errorButton.toolTip = message
+    errorButton.isHidden = false
+  }
+  func dismissError() {
+    errorMessage = nil
+    errorButton.isHidden = true
+  }
+  func showErrorDetails() {
+    guard let message = errorMessage, let window = hostWindow else { return }
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "Last error"
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 200))
+    scroll.hasVerticalScroller = true
+    let text = NSTextView(frame: scroll.bounds)
+    text.isEditable = false
+    text.string = message
+    text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    scroll.documentView = text
+    alert.accessoryView = scroll
+    alert.addButton(withTitle: "Dismiss")
+    alert.addButton(withTitle: "Keep")
+    alert.beginSheetModal(for: window) { [weak self] response in
+      if response == .alertFirstButtonReturn { self?.dismissError() }
+    }
   }
   func updateStatus() {
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
@@ -859,6 +1004,7 @@ final class StudioController: NSViewController {
     guard Date() >= messageUntil, exportRenderer == nil else { return }
     let r = renderer
     let state = r.paused ? "Paused" : r.reachedLimit ? "Complete" : "Rendering"
+    status.textColor = .labelColor
     status.stringValue = String(
       format: "%@ · %u spp · %.1f fps · %.1f ms GPU · %.1f s · %d×%d", state, r.completedSamples,
       r.framesPerSecond, r.gpuMilliseconds, r.renderElapsed, r.accumTexture?.width ?? 0,
@@ -943,7 +1089,7 @@ final class StudioController: NSViewController {
     replaceDocument(record.document, activity: "Restoring “\(record.name)”…") { [weak self] error in
       guard let self else { return }
       if let error {
-        self.show(error.localizedDescription)
+        self.showError(error.localizedDescription)
         return
       }
       // Undoing Open/New/USD open returns the previous file association too.
@@ -977,6 +1123,7 @@ final class StudioController: NSViewController {
     let enabled = !isBusy
     for button in busyButtons { button.isEnabled = enabled }
     pauseButton?.isEnabled = enabled
+    pauseButton?.title = renderer.paused ? "Resume" : "Pause"
   }
   func beginProjectActivity(_ activity: String) {
     projectActivity = activity
@@ -1183,7 +1330,7 @@ final class StudioController: NSViewController {
     replaceDocument(p, activity: "Switching scene…") { [weak self] error in
       guard let self else { return }
       if let error {
-        self.show(error.localizedDescription)
+        self.showError(error.localizedDescription)
         self.rebuild()
         return
       }
@@ -1198,7 +1345,7 @@ final class StudioController: NSViewController {
     replaceDocument(ProjectDocument(), activity: "Creating project…") { [weak self] error in
       guard let self else { return }
       if let error {
-        self.show(error.localizedDescription)
+        self.showError(error.localizedDescription)
         return
       }
       self.backUpReplacedDocument(record)
@@ -1302,7 +1449,7 @@ final class StudioController: NSViewController {
     autosaveQueue.async { [weak self] in
       guard let self, let error = self.drainAutosave() else { return }
       let message = error.localizedDescription
-      DispatchQueue.main.async { self.show("Autosave failed: \(message)") }
+      DispatchQueue.main.async { self.showError("Autosave failed: \(message)") }
     }
   }
   // The serial queue orders this snapshot after every pending periodic save, so an
@@ -1335,7 +1482,7 @@ final class StudioController: NSViewController {
     autosaveQueue.async { [weak self] in
       do { try self?.writeAutosave(document, to: url) } catch {
         let message = error.localizedDescription
-        DispatchQueue.main.async { self?.show("Recovery copy failed: \(message)") }
+        DispatchQueue.main.async { self?.showError("Recovery copy failed: \(message)") }
       }
     }
   }
@@ -1390,10 +1537,10 @@ final class StudioController: NSViewController {
         case .failure(let error):
           switch preserved {
           case .success(let moved)?:
-            self.show("Could not restore autosave: \(error.localizedDescription) It was kept as \(moved.path).")
+            self.showError("Could not restore autosave: \(error.localizedDescription) It was kept as \(moved.path).")
           case .failure(let moveError)?:
             self.autosaveSuppressed = true
-            self.show(
+            self.showError(
               "Could not restore autosave: \(error.localizedDescription) Autosave is off for this session because the file could not be kept (\(moveError.localizedDescription)).")
           case nil: break
           }
@@ -1465,7 +1612,7 @@ final class StudioController: NSViewController {
           self.commit(record)
           self.associate(url, edited: false, replaced: true)
           self.show("Opened \(url.lastPathComponent)")
-        case .failure(let error): self.show(error.localizedDescription)
+        case .failure(let error): self.showError(error.localizedDescription)
         }
         self.rebuild()
         self.finishProjectOperation()
@@ -1530,7 +1677,7 @@ final class StudioController: NSViewController {
         case .failure(let error):
           let message = "\(url.lastPathComponent): \(error.localizedDescription)"
           if self.pendingSaveFailure == nil { self.pendingSaveFailure = message }
-          self.show(error.localizedDescription)
+          self.showError(error.localizedDescription)
           completion?(false)
         }
         self.rebuild()
@@ -1539,6 +1686,7 @@ final class StudioController: NSViewController {
     }
   }
   func saveView() {
+    guard acceptsEdits, let window = hostWindow else { return }
     let alert = NSAlert()
     alert.messageText = "Name this camera view"
     alert.addButton(withTitle: "Save")
@@ -1546,7 +1694,7 @@ final class StudioController: NSViewController {
     let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
     input.stringValue = "View \(project.views.count+1)"
     alert.accessoryView = input
-    alert.beginSheetModal(for: hostWindow!) { [weak self] response in
+    alert.beginSheetModal(for: window) { [weak self] response in
       guard let self, !self.isBusy, response == .alertFirstButtonReturn else { return }
       let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !name.isEmpty else { return }
@@ -1602,7 +1750,7 @@ final class StudioController: NSViewController {
       commit(record)
       changed()
       rebuild()
-    } catch { show(error.localizedDescription) }
+    } catch { showError(error.localizedDescription) }
   }
   func saveMaterial() {
     var state = SceneState()
@@ -1621,7 +1769,7 @@ final class StudioController: NSViewController {
     document.scenes[0] = state
     chooseSave("Save material preset", name: "Material.vmat", ext: "vmat") { [weak self] url in
       do { try JSONEncoder().encode(document).write(to: url, options: .atomic) } catch {
-        self?.show(error.localizedDescription)
+        self?.showError(error.localizedDescription)
       }
     }
   }
@@ -1666,7 +1814,7 @@ final class StudioController: NSViewController {
       case .success:
         self.commit(record)
         self.changed()
-      case .failure(let error): self.show(error.localizedDescription)
+      case .failure(let error): self.showError(error.localizedDescription)
       }
     }
   }
@@ -1692,7 +1840,7 @@ final class StudioController: NSViewController {
       case .success:
         self.commit(record)
         self.changed()
-      case .failure(let error): self.show(error.localizedDescription)
+      case .failure(let error): self.showError(error.localizedDescription)
       }
     }
   }
@@ -1735,7 +1883,7 @@ final class StudioController: NSViewController {
         if skipped > 0 {
           self.show("Imported \(url.lastPathComponent); skipped \(skipped) degenerate faces.")
         }
-      case .failure(let error): self.show(error.localizedDescription)
+      case .failure(let error): self.showError(error.localizedDescription)
       }
     }
   }
@@ -1792,16 +1940,14 @@ final class StudioController: NSViewController {
         self.selectedSubset = 0
         self.selectedSlot =
           graph.materials.first(where: { $0.id == node.bindings.first })?.slot ?? 1
-        self.page = 3
-        self.rebuild()
+        self.showPage(3)
         self.show("Selected \(node.name)")
         return
       }
       guard slot < 8 else { return }
       self.selectedNode = nil
       self.selectedSlot = slot
-      self.page = 3
-      self.rebuild()
+      self.showPage(3)
       self.show("Selected \(self.objectNames()[slot])")
     }
   }
@@ -1829,6 +1975,22 @@ final class StudioController: NSViewController {
         ("Open USD Scene…", "", #selector(importUSDAction)),
         ("Export…", "e", #selector(exportAction)),
       ])
+    // Standard application and window commands go to NSApp and the key window.
+    if let app = main.items.first?.submenu {
+      let hide = NSMenuItem(title: "Hide Metal Vibe Tracer", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+      let others = NSMenuItem(
+        title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+      others.keyEquivalentModifierMask = [.command, .option]
+      let all = NSMenuItem(
+        title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+      // Inserted in order just above Quit.
+      for item in [NSMenuItem.separator(), hide, others, all, .separator()] {
+        app.insertItem(item, at: app.numberOfItems - 1)
+      }
+    }
+    main.items.last?.submenu?.addItem(.separator())
+    main.items.last?.submenu?.addItem(
+      NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
     menu("Edit", [("Undo", "z", #selector(undoAction)), ("Redo", "Z", #selector(redoAction))])
     // Standard responder-chain editing shortcuts remain available in numeric fields.
     if let edit = main.items.last?.submenu {
@@ -1853,7 +2015,18 @@ final class StudioController: NSViewController {
         viewMenu.addItem(item)
       }
     }
+    let windowItem = NSMenuItem()
+    let windowMenu = NSMenu(title: "Window")
+    windowItem.submenu = windowMenu
+    windowMenu.addItem(
+      NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+    windowMenu.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
+    windowMenu.addItem(.separator())
+    windowMenu.addItem(
+      NSMenuItem(title: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
+    main.addItem(windowItem)
     NSApp.mainMenu = main
+    NSApp.windowsMenu = windowMenu
   }
   @objc func inspectorAction() {
     sidebarVisible.toggle()
@@ -1862,8 +2035,12 @@ final class StudioController: NSViewController {
   }
   @objc func settingsAction() {
     guard !isBusy else { return }
+    showPage(6)
+  }
+  // Page switches from menus, the toolbar and picks reveal a hidden inspector.
+  func showPage(_ index: Int) {
     if !sidebarVisible { inspectorAction() }
-    page = 6
+    page = index
     rebuild()
   }
   @objc func oidnAction() { guard !isBusy else { return }; startOIDNPreview() }
@@ -1883,10 +2060,7 @@ final class StudioController: NSViewController {
   @objc func quit() { NSApp.terminate(nil) }
   @objc func openAction() { openProject() }
   @objc func saveAction() { saveProject() }
-  @objc func exportAction() {
-    page = 5
-    rebuild()
-  }
+  @objc func exportAction() { showPage(5) }
   @objc func undoAction() {
     guard !isBusy else { return }
     history.undo()

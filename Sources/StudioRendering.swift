@@ -18,8 +18,9 @@ extension PathTracerRenderer {
   func setEye(_ eye: SIMD3<Float>) {
     let delta = eye - target
     let d = simd_length(delta)
-    guard d > 0.05 else { return }
-    distance = min(1000, d)
+    // Same limits as scroll zoom and framing.
+    guard d >= 0.0001 else { return }
+    distance = min(1_000_000, d)
     pitch = asin(min(0.997, max(-0.997, delta.y / d)))
     yaw = atan2(delta.x, -delta.z)
   }
@@ -128,7 +129,7 @@ extension StudioController {
       viewport.renderer = nil
       r.onError = { [weak self] message in
         self?.cancelExport()
-        self?.show("Export failed: \(message)")
+        self?.showError("Export failed: \(message)")
       }
       let start = Date()
       r.onFrameUpdate = { [weak self, weak r] count in
@@ -149,7 +150,7 @@ extension StudioController {
       rebuild()
       show("Rendering \(out.width)×\(out.height) export…")
       r.renderFrame(output: out)
-    } catch { show("Export failed: \(error.localizedDescription)") }
+    } catch { showError("Export failed: \(error.localizedDescription)") }
   }
   func cancelExport() {
     exportDenoiseJob?.cancel()
@@ -178,7 +179,7 @@ extension StudioController {
       show("Saved \(url.lastPathComponent)")
     } catch {
       cancelExport()
-      show("Export failed: \(error.localizedDescription)")
+      showError("Export failed: \(error.localizedDescription)")
     }
   }
 
@@ -214,7 +215,7 @@ extension StudioController {
           guard let self, let r, let job, self.exportDenoiseJob === job,
             self.exportRenderer === r else { return }
           self.cancelExport()
-          self.show("Export failed: \(error.localizedDescription)")
+          self.showError("Export failed: \(error.localizedDescription)")
         }
       }
     }
@@ -228,7 +229,7 @@ extension StudioController {
         show("Saved OIDN-denoised \(url.lastPathComponent)")
       } catch {
         cancelExport()
-        show("Export failed: \(error.localizedDescription)")
+        showError("Export failed: \(error.localizedDescription)")
       }
       return
     }
@@ -236,7 +237,7 @@ extension StudioController {
       r.encodeDisplay(command, display: texture, raw: texture, output: output)
     else {
       cancelExport()
-      show("Export failed: could not tone-map the OIDN result.")
+      showError("Export failed: could not tone-map the OIDN result.")
       return
     }
     command.addCompletedHandler { [weak self, weak r] completed in
@@ -251,7 +252,7 @@ extension StudioController {
           self.show("Saved OIDN-denoised \(url.lastPathComponent)")
         } catch {
           self.cancelExport()
-          self.show("Export failed: \(error.localizedDescription)")
+          self.showError("Export failed: \(error.localizedDescription)")
         }
       }
     }
@@ -261,7 +262,7 @@ extension StudioController {
   func startOIDNPreview() {
     guard !isBusy else { return }
     guard OIDNDenoiser.isAvailable else {
-      show("Open Image Denoise is unavailable. Rebuild the app to install OIDN.")
+      showError("Open Image Denoise is unavailable. Rebuild the app to install OIDN.")
       return
     }
     guard renderer.completedSamples > 0, let color = renderer.accumTexture,
@@ -305,7 +306,7 @@ extension StudioController {
           self.renderer.paused = self.oidnPreviewWasPaused
           self.renderer.lastTick = Date()
           self.rebuild()
-          self.show("OIDN preview failed: \(error.localizedDescription)")
+          self.showError("OIDN preview failed: \(error.localizedDescription)")
         }
       }
     }
@@ -343,7 +344,7 @@ extension StudioController {
       let command = renderer.commandQueue.makeCommandBuffer(),
       renderer.presentCurrentFrame(command, output: output)
     else {
-      show("Could not capture preview.")
+      showError("Could not capture preview.")
       return
     }
     command.addCompletedHandler { [weak self] c in
@@ -353,7 +354,7 @@ extension StudioController {
           do {
             try RenderImage.write(texture: output, url: url, hdr: false)
             self?.show("Saved \(url.lastPathComponent)")
-          } catch { self?.show(error.localizedDescription) }
+          } catch { self?.showError(error.localizedDescription) }
         }
       }
     }

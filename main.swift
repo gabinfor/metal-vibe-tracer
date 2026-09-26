@@ -3105,7 +3105,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             if oldValue != viewportMode { presentationNeedsRefresh = true }
         }
     }
-    var paused = false
+    // The studio toolbar mirrors pause state changes made by exports, previews and imports.
+    var paused = false { didSet { if oldValue != paused { onPausedChange?() } } }
+    var onPausedChange: (() -> Void)?
     var renderElapsed: TimeInterval = 0
     var gpuMilliseconds: Double = 0
     var framesPerSecond: Double = 0
@@ -3734,23 +3736,31 @@ class InteractiveMTKView: MTKView {
     private var dragged=false
     private var beganEdit=false
     private var lastPos: NSPoint = .zero
+    private var downPos: NSPoint = .zero
+    // Cumulative pointer travel (points) before a press becomes a camera drag.
+    static let dragThreshold: CGFloat = 3
 
     override var acceptsFirstResponder: Bool { true }
 
     override func mouseDown(with event: NSEvent) {
         dragged=false; beganEdit=false
         lastPos = convert(event.locationInWindow, from: nil)
+        downPos = lastPos
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard canEdit?() ?? true else { return }
         let p = convert(event.locationInWindow, from: nil)
+        // Slow drags accumulate from the press location; nothing moves until the threshold.
+        if !dragged {
+            guard hypot(p.x - downPos.x, p.y - downPos.y) > Self.dragThreshold else { return }
+            dragged = true
+        }
         let dx = Float(p.x - lastPos.x)
         let dy = Float(p.y - lastPos.y)
         lastPos = p
 
-        dragged = dragged || abs(dx)+abs(dy)>1
-        if dragged && !beganEdit { beganEdit = true; onBeginEdit?() }
+        if !beganEdit { beganEdit = true; onBeginEdit?() }
         if event.modifierFlags.contains(.shift), let renderer {
             let forward=simd_normalize(renderer.target-renderer.eyePosition)
             let right=simd_normalize(simd_cross(forward,SIMD3<Float>(0,1,0))), up=simd_cross(right,forward)
@@ -3759,7 +3769,7 @@ class InteractiveMTKView: MTKView {
         }
         renderer?.yaw += dx * 0.007
         renderer?.pitch = max(-1.45, min(1.45, (renderer?.pitch ?? 0.0) - dy * 0.007))
-        if dragged { onUserOrbit?() }
+        onUserOrbit?()
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -3772,14 +3782,13 @@ class InteractiveMTKView: MTKView {
         onUserOrbit?()
     }
     override func scrollWheel(with event: NSEvent) {
-        guard canEdit?() ?? true else { return }
+        guard canEdit?() ?? true, let renderer else { return }
+        // Notched wheels report line deltas; trackpads report precise point deltas.
+        let delta = Float(event.scrollingDeltaY) * (event.hasPreciseScrollingDeltas ? 1 : 10)
+        guard delta != 0 else { return }
         onBeginEdit?()
-        let delta = Float(event.scrollingDeltaY)
-        if delta != 0 {
-            let current = renderer?.distance ?? 4.6
-            renderer?.distance = max(0.0001, min(1_000_000, current * exp(-delta * 0.015)))
-            onUserOrbit?()
-        }
+        renderer.distance = max(0.0001, min(1_000_000, renderer.distance * exp(-delta * 0.015)))
+        onUserOrbit?()
     }
 }
 

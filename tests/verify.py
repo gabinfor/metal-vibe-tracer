@@ -28,6 +28,7 @@ else:
     source += '\n' + (root / 'tests' / 'StudioChecks.swift').read_text()
     source += '\n' + (root / 'tests' / 'MaterialXChecks.swift').read_text()
 source += '\n' + (root / 'tests' / 'USDChecks.swift').read_text()
+source += '\n' + (root / 'tests' / 'Fix_integration.swift').read_text()
 source += '\n' + (root / 'tests' / 'Fix_lights.swift').read_text()
 source += '\n' + (root / 'tests' / 'Fix_geometry.swift').read_text()
 if '--studio-only' not in sys.argv and '--usd-only' not in sys.argv:
@@ -41,7 +42,7 @@ if '--studio-only' not in sys.argv and '--usd-only' not in sys.argv:
     source += '\n' + (root / 'tests' / 'Fix_presentation.swift').read_text()
 if '--usd-only' not in sys.argv:
     source += '\n' + (root / 'tests' / 'Fix_persistence.swift').read_text()
-source += '\n' + (root / 'tests' / 'Fix_integration.swift').read_text()
+    source += '\n' + (root / 'tests' / 'Fix_frontend.swift').read_text()
 with tempfile.TemporaryDirectory(prefix='vibe-tracer-tests-') as directory:
     folder = Path(directory)
     swift = folder / 'main.swift'

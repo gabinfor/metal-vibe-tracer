@@ -117,6 +117,14 @@ struct SceneGraph: Codable {
     try validate()
     return ids[source.id]!
   }
+  // Inspector edits resolve their node against the current graph, which an undo,
+  // open or restore may have replaced since the panel was built.
+  func nodeIndex(_ id: UUID) throws -> Int {
+    guard let index = nodes.firstIndex(where: { $0.id == id }) else {
+      throw MaterialLibrary.error("Object was removed.")
+    }
+    return index
+  }
   mutating func remove(_ id: UUID) {
     let family = descendants(of: id)
     // Only materials bound exclusively by the removed nodes go with them; unbound

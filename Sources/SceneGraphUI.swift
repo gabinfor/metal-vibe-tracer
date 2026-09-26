@@ -28,7 +28,7 @@ extension StudioController {
           String(repeating: "  ", count: $0.1) + ($0.0.mesh == nil ? "▸ " : "◇ ") + $0.0.name
         },
       selectedNode.flatMap { id in ordered.firstIndex(where: { $0.0.id == id }).map { $0 + 1 } }
-        ?? 0
+        ?? 0, label: "Scene object"
     ) { [weak self] i in
       guard let self else { return }
       self.selectedNode = i == 0 ? nil : ordered[i - 1].0.id
@@ -46,7 +46,7 @@ extension StudioController {
     else { return }
     if let mesh = node.mesh, let asset = graph.assets.first(where: { $0.id == mesh }) {
       selectedSubset = min(max(0, selectedSubset), asset.subsets.count - 1)
-      popup(asset.subsets.map { "Subset: " + $0 }, selectedSubset) { [weak self] i in
+      popup(asset.subsets.map { "Subset: " + $0 }, selectedSubset, label: "Material subset") { [weak self] i in
         guard let self else { return }
         self.selectedSubset = i
         self.selectedSlot = graph.materials.first(where: { $0.id == node.bindings[i] })?.slot ?? 1
@@ -55,14 +55,16 @@ extension StudioController {
       let binding = node.bindings[selectedSubset]
       selectedSlot = graph.materials.first(where: { $0.id == binding })?.slot ?? 1
       popup(
-        graph.materials.map(\.name), graph.materials.firstIndex(where: { $0.id == binding }) ?? 0
+        graph.materials.map(\.name), graph.materials.firstIndex(where: { $0.id == binding }) ?? 0,
+        label: "Subset material"
       ) { [weak self] i in
         guard let self else { return }
         let subset = self.selectedSubset
         self.editGraph("Assign material", kind: .bindings) { g in
-          if let index = g.nodes.firstIndex(where: { $0.id == node.id }) {
-            g.nodes[index].bindings[subset] = g.materials[i].id
-          }
+          let index = try g.nodeIndex(node.id)
+          guard g.nodes[index].bindings.indices.contains(subset), g.materials.indices.contains(i)
+          else { throw MaterialLibrary.error("Object was removed.") }
+          g.nodes[index].bindings[subset] = g.materials[i].id
         }
       }
     } else {
@@ -71,7 +73,7 @@ extension StudioController {
       )
       popup(
         graph.materials.map(\.name),
-        graph.materials.firstIndex(where: { $0.slot == selectedSlot }) ?? 0
+        graph.materials.firstIndex(where: { $0.slot == selectedSlot }) ?? 0, label: "Material"
       ) { [weak self] i in
         self?.selectedSlot = graph.materials[i].slot
         self?.rebuild()
@@ -82,7 +84,9 @@ extension StudioController {
       let subset = self.selectedSubset
       self.editGraph("New material", kind: .bindings) { g in
         let m = try g.addMaterial("Material \(g.materials.count+1)")
-        if let i = g.nodes.firstIndex(where: { $0.id == node.id }), !g.nodes[i].bindings.isEmpty {
+        if let i = g.nodes.firstIndex(where: { $0.id == node.id }),
+          g.nodes[i].bindings.indices.contains(subset)
+        {
           g.nodes[i].bindings[subset] = m.id
         }
         self.selectedSlot = m.slot
@@ -98,7 +102,7 @@ extension StudioController {
   }
   func editGraph(_ title: String, kind: GraphEditKind = .geometry,
                  _ edit: (inout SceneGraph) throws -> Void) {
-    guard !isBusy, var graph = project.graph else { return }
+    guard acceptsEdits, var graph = project.graph else { return }
     let previousState = renderer.materials.state()
     let previousTriangles = renderer.materials.meshTriangles
     do {
@@ -141,9 +145,9 @@ extension StudioController {
       catch { rollbackFailures.append("mesh: \(error.localizedDescription)") }
       renderer.materials.hasSceneGraph = project.graph != nil
       if rollbackFailures.isEmpty {
-        show(error.localizedDescription)
+        showError(error.localizedDescription)
       } else {
-        show("\(error.localizedDescription) Rollback also failed (\(rollbackFailures.joined(separator: "; "))).")
+        showError("\(error.localizedDescription) Rollback also failed (\(rollbackFailures.joined(separator: "; "))).")
       }
     }
   }
@@ -156,7 +160,7 @@ extension StudioController {
     if let graph = project.graph, let node = graph.nodes.first(where: { $0.id == selectedNode }) {
       let o = node.transform
       button("Rename…") { [weak self] in
-        guard let self else { return }
+        guard let self, self.acceptsEdits, let window = self.hostWindow else { return }
         let alert = NSAlert()
         alert.messageText = "Object name"
         let field = NSTextField(string: node.name)
@@ -164,11 +168,14 @@ extension StudioController {
         alert.accessoryView = field
         alert.addButton(withTitle: "Rename")
         alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn,
-          !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-          self.editGraph("Rename object", kind: .metadata) { g in
-            g.nodes[g.nodes.firstIndex(where: { $0.id == node.id })!].name = field.stringValue
+        // A sheet keeps project I/O from finishing inside a nested modal loop; editGraph
+        // re-checks busy state and resolves the node against the graph current at return.
+        alert.beginSheetModal(for: window) { [weak self] response in
+          guard response == .alertFirstButtonReturn,
+            !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          else { return }
+          self?.editGraph("Rename object", kind: .metadata) { g in
+            g.nodes[try g.nodeIndex(node.id)].name = field.stringValue
           }
         }
       }
@@ -176,10 +183,11 @@ extension StudioController {
       let parents = graph.nodes.filter { !family.contains($0.id) }
       popup(
         ["Parent: Scene root"] + parents.map { "Parent: " + $0.name },
-        node.parent.flatMap { id in parents.firstIndex(where: { $0.id == id }).map { $0 + 1 } } ?? 0
+        node.parent.flatMap { id in parents.firstIndex(where: { $0.id == id }).map { $0 + 1 } } ?? 0,
+        label: "Parent"
       ) { [weak self] i in
         self?.editGraph("Change parent") { g in
-          g.nodes[g.nodes.firstIndex(where: { $0.id == node.id })!].parent =
+          g.nodes[try g.nodeIndex(node.id)].parent =
             i == 0 ? nil : parents[i - 1].id
         }
       }
@@ -187,7 +195,7 @@ extension StudioController {
       button(o.rotationHidden.w > 0 ? "Hidden — click to show" : "Visible — click to hide") {
         [weak self] in
         self?.editGraph("Visibility") { g in
-          g.nodes[g.nodes.firstIndex(where: { $0.id == node.id })!].transform.rotationHidden.w =
+          g.nodes[try g.nodeIndex(node.id)].transform.rotationHidden.w =
             o.rotationHidden.w > 0 ? 0 : 1
         }
       }
@@ -199,7 +207,7 @@ extension StudioController {
           NumberControl(title, value: value, range: range, defaultValue: fallback) {
             [weak self] v in
             self?.editGraph(title) { g in
-              setter(&g.nodes[g.nodes.firstIndex(where: { $0.id == node.id })!].transform, v)
+              setter(&g.nodes[try g.nodeIndex(node.id)].transform, v)
             }
           })
       }
@@ -214,7 +222,7 @@ extension StudioController {
       control("Uniform scale", o.positionScale.w, 0.01...100, 1) { $0.positionScale.w = $1 }
       button("Reset transform") { [weak self] in
         self?.editGraph("Reset transform") { g in
-          g.nodes[g.nodes.firstIndex(where: { $0.id == node.id })!].transform = ObjectSettings()
+          g.nodes[try g.nodeIndex(node.id)].transform = ObjectSettings()
         }
       }
       button("Frame selection") { [weak self] in self?.frameMesh() }
@@ -237,10 +245,6 @@ extension StudioController {
     heading("Import")
     button("Open USD scene…") { [weak self] in self?.importUSD() }
     button("Import OBJ…") { [weak self] in self?.importMesh() }
-    button("Frame all imported objects") { [weak self] in
-      self?.selectedNode = nil
-      self?.frameMesh()
-    }
     text(
       "OBJ objects, groups and usemtl subsets are preserved. Imports append. Instances share mesh assets; the current GPU bridge rebuilds a flattened BVH after edits. MTL shading and concave polygon triangulation are not supported."
     )
@@ -340,7 +344,7 @@ extension StudioController {
             label, value: value[component], range: range,
             defaultValue: parameter.defaultValue?[component] ?? value[component]
           ) { [weak self] v in
-            guard let self, !self.isBusy,
+            guard let self, self.acceptsEdits,
               var next = self.renderer.materials.materialX[slot]
             else { return }
             if parameter.components == 1 {
@@ -355,7 +359,7 @@ extension StudioController {
               try self.renderer.materials.prepareMaterialX(programs)
               self.commit(record)
               self.changed()
-            } catch { self.show(error.localizedDescription) }
+            } catch { self.showError(error.localizedDescription) }
           })
       }
     }
@@ -371,7 +375,7 @@ extension StudioController {
         self.commit(record)
         self.changed()
         self.rebuild()
-      } catch { self.show(error.localizedDescription) }
+      } catch { self.showError(error.localizedDescription) }
     }
     text(
       "Supported: OpenPBR surface, constants, images, UV0, arithmetic, mix, clamp, extract, normalmap and limited convert. Unsupported nodes are reported at import. No USD or MaterialX graph export yet."
