@@ -162,6 +162,8 @@ final class StudioController: NSViewController {
     viewport.renderer = renderer
     viewport.delegate = renderer
     viewport.colorPixelFormat = .bgra8Unorm
+    // present_kernel writes sRGB-encoded values; tag the layer to match PNG export.
+    viewport.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
     viewport.framebufferOnly = false
     viewport.preferredFramesPerSecond = 60
     loadView()

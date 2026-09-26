@@ -2241,12 +2241,19 @@ kernel void shading_kernel(
 }
 
 
+// REFERENCES.md: SRGB1999. Exact piecewise sRGB OETF (IEC 61966-2-1) for
+// display-referred outputs tagged sRGB (viewport layer and PNG); input is clamped to [0, 1].
+float3 srgb_encode(float3 c) {
+    c = clamp(c, 0.0f, 1.0f);
+    return select(1.055f * pow(c, float3(1.0f / 2.4f)) - 0.055f, 12.92f * c, c <= 0.0031308f);
+}
+
 // REFERENCES.md: HILLFIT. Uses Hill's rational fit coefficients without the
 // upstream ACES color matrices; this is not a complete ACES transform.
 float3 tonemap(float3 color) {
     float3 a = color * (color + 0.0245786f) - 0.000090537f;
     float3 b = color * (0.983729f * color + 0.4329510f) + 0.238081f;
-    return pow(clamp(a / b, 0.0f, 1.0f), float3(1.0f / 2.2f));
+    return srgb_encode(a / b);
 }
 
 // Noise-free material features along an ideal specular path. These auxiliary
@@ -2321,7 +2328,8 @@ kernel void metalfx_guides_kernel(
     float4 sample = samples.read(gid), p = positions.read(gid);
     float4 n = normals.read(gid), material = materials.read(gid);
     float3 normal = float3(0, 0, 1), diffuseAlbedo = float3(0), specularAlbedo = float3(0);
-    float rough = 1.0f, z = 1.0f;
+    // Reversed Z: the sky and misses sit at the far plane, depth 0.
+    float rough = 1.0f, z = 0.0f;
     float4 currentClip, previousClip;
     if (p.w > 0.0f) {
         normal = normalize(n.xyz);
@@ -2441,7 +2449,7 @@ kernel void present_kernel(
     uint viewportMode=uint(display[0].z+0.5f);
     if(viewportMode==1) {
         float3 c=clamp(albedo.read(source).rgb,0.0f,1.0f);
-        output.write(float4(pow(c,float3(1.0f/2.2f)),1),gid); return;
+        output.write(float4(srgb_encode(c),1),gid); return;
     }
     if(viewportMode==2) {
         float4 n=normalMaterial.read(source);
@@ -2462,10 +2470,14 @@ kernel void present_kernel(
     }
     bool useRaw=display[0].w>0 && float(gid.x)/output.get_width()<display[0].w;
     float3 c=(useRaw?raw.read(source).rgb:hdr.read(source).rgb)*exp2(display[0].x)*display[1].rgb;
+    // Radiance is nonnegative: negative or NaN denoiser output must not reach
+    // the rational curves, which map negative input to bright values. Every
+    // curve saturates below the half-float limit, which also keeps +inf finite.
+    c=select(float3(0.0f),min(c,65504.0f),c>0.0f);
     if(display[0].y<0.5f) c=tonemap(c);
     // REFERENCES.md: REINHARD2002; per-channel global curve, without automatic key.
-    else if(display[0].y<1.5f) c=pow(max(c/(1+c),0.0f),float3(1.0f/2.2f));
-    else c=pow(clamp(c,0.0f,1.0f),float3(1.0f/2.2f));
+    else if(display[0].y<1.5f) c=srgb_encode(c/(1+c));
+    else c=srgb_encode(c);
     output.write(float4(c,1),gid);
 }
 
@@ -2530,15 +2542,18 @@ enum CameraPreset: Int {
     case overhead = 3
 }
 
+// Reversed-Z projection (near -> 1, far -> 0). Floating-point depth keeps
+// near-uniform relative precision across the range, which MetalFX needs for
+// distant history rejection; x/y and w are unchanged by the reversal.
 func makePerspective(fovyRadians: Float, aspect: Float, near: Float, far: Float) -> simd_float4x4 {
     let y = 1.0 / tan(fovyRadians * 0.5)
     let x = y / aspect
-    let z = far / (near - far)
+    let z = near / (far - near)
     return simd_float4x4(
         SIMD4<Float>(x, 0, 0, 0),
         SIMD4<Float>(0, y, 0, 0),
         SIMD4<Float>(0, 0, z, -1),
-        SIMD4<Float>(0, 0, z * near, 0)
+        SIMD4<Float>(0, 0, z * far, 0)
     )
 }
 
@@ -3074,7 +3089,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var target = SIMD3<Float>(0.15, -0.25, 0.70) { didSet { resetAccumulation(resetDenoiser: false) } }
     var fov: Float = 38.0 { didSet { resetAccumulation(resetDenoiser: false) } }
 
-    var options = StudioOptions()
+    // Display-only edits (exposure, white balance, tone map, divider) must repaint
+    // even while paused or complete, when draw(in:) otherwise idles.
+    var options = StudioOptions() { didSet { presentationNeedsRefresh = true } }
     var oidnOptions = OIDNOptions()
     var viewportMode: UInt32 = 0 {
         didSet {
@@ -3101,7 +3118,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var lastUniforms: Uniforms?
     var onFrameUpdate: ((UInt32) -> Void)?
     var onError: ((String) -> Void)?
-    private let inFlightFrames = DispatchSemaphore(value: 3)
+    let inFlightFrames = DispatchSemaphore(value: 3)
     private var generation: UInt64 = 0
     private var debugFrames: UInt32 = 0
     var interactionGeneration: UInt64 { generation }
@@ -3190,7 +3207,6 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
         return nil
     }
-    private var captureCallback: ((Data?) -> Void)?
 
     init(device: MTLDevice, sharing other: PathTracerRenderer? = nil) throws {
         self.device = device
@@ -3230,11 +3246,6 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         applyPreset(.perspective)
     }
 
-    func captureNextFrame(_ completion: @escaping (Data?) -> Void) {
-        guard captureCallback == nil else { completion(nil); return }
-        self.captureCallback = completion
-    }
-
     func applyPreset(_ preset: CameraPreset) {
         if sceneIndex == 0 {
             switch preset {
@@ -3272,6 +3283,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         renderElapsed = 0; lastTick = Date(); completedSamples = 0
         generation &+= 1
         frameIndex = 0
+        debugFrames = 0
+        // The last display and its uniforms describe the pre-reset scene: capture
+        // and picking wait for a newly traced frame instead of using them.
+        lastDisplay = nil
+        lastUniforms = nil
         if offlineDenoisedPreview != nil {
             offlineDenoisedPreview = nil
             paused = false
@@ -3288,6 +3304,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        // A paused or finished render keeps its accumulation and is presented
+        // scaled to the new drawable; renderFrame reallocates once tracing resumes.
+        if (paused || reachedLimit) && accumTexture != nil {
+            presentationNeedsRefresh = true
+            return
+        }
         resetAccumulation()
         accumTexture = nil
     }
@@ -3338,7 +3360,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             effect.denoiseStrengthMaskTexture = fx.denoiseMask
             effect.outputTexture = fx.output; effect.exposureTexture = fx.exposure
             effect.preExposure = 1
-            effect.isDepthReversed = false
+            effect.isDepthReversed = true
             effect.motionVectorScaleX = 1; effect.motionVectorScaleY = 1
             effect.jitterOffsetX = uniforms.jitter.x; effect.jitterOffsetY = uniforms.jitter.y
             effect.worldToViewMatrix = makeLookAt(eye: SIMD3<Float>(uniforms.cameraPos.x, uniforms.cameraPos.y, uniforms.cameraPos.z),
@@ -3397,12 +3419,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             return encodeDisplay(command,display:oidn,raw:raw,output:output)
         }
         guard let display=lastDisplay else { return false }
-        if presentationNeedsRefresh, let samples=sampleTexture, let positions=historyPosDepth,
-           let normals=historyNormalMat, let albedo=gbufferAlbedoRough, let uniforms=lastUniforms {
-            return encodePresentation(commandBuffer:command,accumulation:raw,samples:samples,
-                positions:positions,normals:normals,materials:albedo,output:output,uniforms:uniforms) != nil
-        }
-        return encodeDisplay(command,display:display,raw:raw,output:output)
+        // MetalFX is temporal and only ever receives newly traced frames: a
+        // refresh re-displays its cached output (or the raw accumulation), so it
+        // neither degrades a converged image nor consumes a pending history reset.
+        let denoised = display !== raw && denoiserEnabled && viewportMode == 0
+        lastPresentationUsedMetalFX = denoised
+        return encodeDisplay(command,display:denoised ? display : raw,raw:raw,output:output)
     }
 
     var reachedLimit: Bool {
@@ -3412,9 +3434,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         let now=Date(); defer { lastTick=now }
         guard view.drawableSize.width > 0, view.drawableSize.height > 0 else { return }
-        if (paused || reachedLimit) && !presentationNeedsRefresh { return }
-        guard let drawable=view.currentDrawable else { return }
-        if (paused || reachedLimit), accumTexture != nil, lastDisplay != nil {
+        if paused || reachedLimit {
+            // Refresh only the display while stopped; never trace another sample.
+            guard presentationNeedsRefresh, accumTexture != nil,
+                  lastDisplay != nil || offlineDenoisedPreview != nil,
+                  let drawable=view.currentDrawable else { return }
             if let command=commandQueue.makeCommandBuffer(), presentCurrentFrame(command,output:drawable.texture) {
                 presentationNeedsRefresh = false
                 command.present(drawable);command.commit()
@@ -3422,10 +3446,14 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             return
         }
         renderElapsed += max(0,now.timeIntervalSince(lastTick))
-        renderFrame(output:drawable.texture,drawable:drawable)
-    }
-    func renderFrame(output: MTLTexture, drawable: CAMetalDrawable? = nil) {
+        // Reserve an in-flight slot before currentDrawable: nextDrawable blocks
+        // the main thread while in-flight frames hold every drawable.
         guard inFlightFrames.wait(timeout: .now()) == .success else { return }
+        guard let drawable=view.currentDrawable else { inFlightFrames.signal(); return }
+        renderFrame(output:drawable.texture,drawable:drawable,reservedFrameSlot:true)
+    }
+    func renderFrame(output: MTLTexture, drawable: CAMetalDrawable? = nil, reservedFrameSlot: Bool = false) {
+        guard reservedFrameSlot || inFlightFrames.wait(timeout: .now()) == .success else { return }
         var committed = false
         defer { if !committed { inFlightFrames.signal() } }
         let w=max(1,Int(Float(output.width)*options.previewScale))
@@ -3647,64 +3675,6 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             positions: gPos, normals: gNorm, materials: gAlb, output: output,
             uniforms: uniforms) != nil else { return }
 
-        // Capture exactly the selected display (denoised when enabled).
-        // Capture Frame Blit
-        if let callback = self.captureCallback {
-            self.captureCallback = nil
-            let w=output.width, h=output.height
-            let bytesPerRow = (w * 4 + 255) & ~255
-            let totalBytes = bytesPerRow * h
-            if let stagingBuffer = device.makeBuffer(length: totalBytes, options: .storageModeShared),
-               let blitEnc = cmdBuffer.makeBlitCommandEncoder() {
-                blitEnc.label = "Capture Blit"
-                blitEnc.copy(from: output,
-                             sourceSlice: 0,
-                             sourceLevel: 0,
-                             sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                             sourceSize: MTLSize(width: w, height: h, depth: 1),
-                             to: stagingBuffer,
-                             destinationOffset: 0,
-                             destinationBytesPerRow: bytesPerRow,
-                             destinationBytesPerImage: totalBytes)
-                blitEnc.endEncoding()
-
-                cmdBuffer.addCompletedHandler { completedBuffer in
-                    guard completedBuffer.status == .completed else {
-                        DispatchQueue.main.async { callback(nil) }
-                        return
-                    }
-                    let data = Data(bytes: stagingBuffer.contents(), count: totalBytes)
-                    let colorSpace = CGColorSpaceCreateDeviceRGB()
-                    let bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue)
-                    guard let provider = CGDataProvider(data: data as CFData),
-                          let cgImage = CGImage(
-                              width: w,
-                              height: h,
-                              bitsPerComponent: 8,
-                              bitsPerPixel: 32,
-                              bytesPerRow: bytesPerRow,
-                              space: colorSpace,
-                              bitmapInfo: bitmapInfo,
-                              provider: provider,
-                              decode: nil,
-                              shouldInterpolate: false,
-                              intent: .defaultIntent
-                          ) else {
-                        DispatchQueue.main.async { callback(nil) }
-                        return
-                    }
-
-                    let rep = NSBitmapImageRep(cgImage: cgImage)
-                    let png = rep.representation(using: .png, properties: [:])
-                    DispatchQueue.main.async {
-                        callback(png)
-                    }
-                }
-            } else {
-                DispatchQueue.main.async { callback(nil) }
-            }
-        }
-
         let tmpPos = resPosDirA; resPosDirA = resPosDirB; resPosDirB = tmpPos
         let tmpEmit = resEmitPdfA; resEmitPdfA = resEmitPdfB; resEmitPdfB = tmpEmit
         let tmpWeight = resWeightsA; resWeightsA = resWeightsB; resWeightsB = tmpWeight
@@ -3719,6 +3689,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         frameIndex = nextFrame
         sampleIndex = nextSample
         reservoirHistory = nextHistory
+        // Count inspection frames by the mode they were submitted in, matching
+        // frameIndex, so frames still in flight across a switch are not misattributed.
+        if viewportMode > 0 { debugFrames &+= 1 }
         reservoirHistoryNeedsReset = false
         let submittedGeneration = generation
         let semaphore = inFlightFrames
@@ -3730,7 +3703,6 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 guard let self = self else { return }
                 if succeeded {
                     guard self.generation == submittedGeneration else { return }
-                    if self.viewportMode > 0 { self.debugFrames &+= 1 }
                     self.completedSamples=nextFrame
                     self.gpuMilliseconds=(completedBuffer.gpuEndTime-completedBuffer.gpuStartTime)*1000
                     let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)

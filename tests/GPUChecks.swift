@@ -229,7 +229,8 @@ func savePreview(_ panels: [[SIMD4<Float>]], width: Int, height: Int, name: Stri
             let color = [p.x, p.y, p.z].map { value -> UInt8 in
                 let a = value * (value + 0.0245786) - 0.000090537
                 let b = value * (0.983729 * value + 0.4329510) + 0.238081
-                return UInt8(pow(max(0, min(1, a / b)), 1 / Float(2.2)) * 255)
+                let x = max(0, min(1, a / b))
+                return UInt8((x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1 / Float(2.4)) - 0.055) * 255)
             }
             for sy in 0..<scale { for sx in 0..<scale {
                 let index = ((y * scale + sy) * totalWidth + (panel * width + x) * scale + sx) * 4
@@ -350,7 +351,8 @@ func displayPixels(_ pixels: [SIMD4<Float>]) -> [SIMD4<Float>] {
         for c in 0..<3 {
             let v = pixel[c]
             let mapped = (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081)
-            result[c] = pow(max(0, min(1, mapped)), 1 / Float(2.2))
+            let x = max(0, min(1, mapped))
+            result[c] = x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1 / Float(2.4)) - 0.055
         }
         return result
     }
