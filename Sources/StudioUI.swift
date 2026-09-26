@@ -377,7 +377,7 @@ final class StudioController: NSViewController {
       reset: false
     ) { [weak self] in self?.renderer.options.timeLimit = Double($0) }
     option("Preview resolution scale", \.previewScale, 0.1...1, 0.5)
-    option("Scattering depth", \.depth, 1...64, 16)
+    option("Path depth (1 = direct light only)", \.depth, 1...64, 16)
 
     heading("Open Image Denoise")
     popup(["Quality: Fast", "Quality: Balanced", "Quality: High"], Int(renderer.oidnOptions.quality)) {

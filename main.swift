@@ -53,6 +53,12 @@ float2 rand_f2(thread uint &seed) {
     return float2(rand_f(seed), rand_f(seed));
 }
 
+// Both ReSTIR passes seed per pixel and sample identically through lens_ray.
+// Pass 2 rehashes afterwards so its draws are independent of pass 1's.
+void decorrelate_shading_seed(thread uint &seed) {
+    seed = pcg_hash(seed ^ 0x27d4eb2fu);
+}
+
 // --- Data Types ---
 struct Ray {
     float3 origin;
@@ -113,7 +119,7 @@ struct LightSample {
 
 struct Uniforms {
     float4 cameraPos;      // xyz = pos, w = fov
-    float4 cameraTarget;   // xyz = target, w = scattering depth + 1 (delta chains excluded)
+    float4 cameraTarget;   // xyz = target, w = maximum path depth (1 = direct lighting only); see scattering_limit
     float4 cameraUp;       // xyz = up, w = 0
     float4 sunParams;      // xyz = sun direction, w = sun intensity
     float4x4 currentViewProj;
@@ -130,10 +136,15 @@ struct Uniforms {
     float2 jitter;         // Shared subpixel offset, in pixels, excluding the 0.5 pixel center.
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
     uint padding;
+    uint reservoirHistory; // Consecutive ReSTIR frames; camera moves keep it, cuts reset it.
     float4 environment; // intensity, rotation, image enabled, BVH node count
-    float4 lens; // aperture radius, focus distance, scene graph, independent sun 1 - cos(half angle)
+    float4 lens; // aperture radius, focus distance, scene-graph mode (see uses_scene_graph), independent sun 1 - cos(half angle)
     float4 light; // RGB multiplier, size multiplier
 };
+
+// lens.z = 1 renders scene 6 from the imported scene graph: per-triangle material
+// slots and emission, an identity root transform, and float-scaled ray offsets.
+bool uses_scene_graph(constant Uniforms &u) { return u.lens.z > 0; }
 
 // ============================================================================
 // Procedural Physical Sky
@@ -477,26 +488,26 @@ bool intersect_cylinder_ring(Ray r, float3 center, float radius, float height, M
 // Imported coordinates are meters, including sub-millimeter details. Keep the
 // legacy procedural tolerance while scaling imported offsets with float precision.
 float ray_epsilon(float3 p, constant Uniforms &u) {
-    return u.sceneIndex==6 && u.lens.z>0 ? max(1e-7f, 9.536743e-7f * max(abs(p.x),max(abs(p.y),abs(p.z)))) : 0.001f;
+    return u.sceneIndex==6 && uses_scene_graph(u) ? max(1e-7f, 9.536743e-7f * max(abs(p.x),max(abs(p.y),abs(p.z)))) : 0.001f;
 }
 float max_abs(float3 p) { return max(abs(p.x),max(abs(p.y),abs(p.z))); }
 // Imported-scene rounding bounds (PBRT2023 6.8): a position computed as
 // origin+t*direction rounds with |origin| and t, a barycentric one with the
 // triangle's vertex magnitudes. 2^-20 and 2^-19 keep margin for relaxed math.
 float ray_hit_error(Ray r, float t, float3 p, constant Uniforms &u) {
-    return u.sceneIndex==6 && u.lens.z>0 ? max(ray_epsilon(p,u), 9.536743e-7f*(max_abs(r.origin)+t)) : ray_epsilon(p,u);
+    return u.sceneIndex==6 && uses_scene_graph(u) ? max(ray_epsilon(p,u), 9.536743e-7f*(max_abs(r.origin)+t)) : ray_epsilon(p,u);
 }
 float mesh_hit_error(MeshTriangle tri, float3 p, constant Uniforms &u) {
-    return u.sceneIndex==6 && u.lens.z>0 ? max(1e-7f, 1.907349e-6f*max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)))) : ray_epsilon(p,u);
+    return u.sceneIndex==6 && uses_scene_graph(u) ? max(1e-7f, 1.907349e-6f*max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)))) : ray_epsilon(p,u);
 }
 // A segment ending on a surface: the blocker distance there carries the
 // rounding of both endpoints and of the segment length.
 float endpoint_tolerance(float3 origin, float3 endpoint, float d, constant Uniforms &u) {
     float legacy=2.0f*ray_epsilon(endpoint,u);
-    return u.sceneIndex==6 && u.lens.z>0 ? max(legacy, 1.907349e-6f*(max_abs(origin)+max_abs(endpoint)+d)) : legacy;
+    return u.sceneIndex==6 && uses_scene_graph(u) ? max(legacy, 1.907349e-6f*(max_abs(origin)+max_abs(endpoint)+d)) : legacy;
 }
 float ray_t_min(float3 origin, constant Uniforms &u) {
-    return u.sceneIndex==6 && u.lens.z>0 ? ray_epsilon(origin,u)*0.25f : 0.001f;
+    return u.sceneIndex==6 && uses_scene_graph(u) ? ray_epsilon(origin,u)*0.25f : 0.001f;
 }
 // error is the originating hit's HitRecord.error; it never lowers the legacy offset.
 float3 ray_origin(float3 p,float3 geometricNormal,float3 direction,constant Uniforms &u,float error=0.0f) {
@@ -668,9 +679,9 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
     bool hit=trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz,tMin);
     if(hit) { rec.objectID=rec.mat.slot; rec.error=ray_hit_error(r,rec.t,rec.position,u); }
     rec.triangle=0xffffffffu;
-    if (sceneIndex != 6 || u.environment.w < 1 || (u.lens.z==0 && images.objects[7].rotationHidden.w > 0.5f)) return hit;
+    if (sceneIndex != 6 || u.environment.w < 1 || (!uses_scene_graph(u) && images.objects[7].rotationHidden.w > 0.5f)) return hit;
     ObjectSettings o=images.objects[7];
-    if(u.lens.z>0) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
+    if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float closest=hit ? rec.t/o.positionScale.w : 1e20f;
     int stack[64]; int top=0; stack[top++]=0;
@@ -701,9 +712,9 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             rec.tangent=normalize(tangent);
             rec.bitangent=cross(rec.front_face?rec.normal:-rec.normal,rec.tangent)*(uvDet<0?-1.0f:1.0f);
             rec.uvDensity=float2(max(length(d1)/max(length(e1),1e-6f),length(d2)/max(length(e2),1e-6f)));
-            rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=u.lens.z>0 ? uint(tri.uvc.z) : 7;
-            if(u.lens.z>0 && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
-            rec.objectID=u.lens.z>0 ? 64+uint(tri.uvc.w)-1 : 7;
+            rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=uses_scene_graph(u) ? uint(tri.uvc.z) : 7;
+            if(uses_scene_graph(u) && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
+            rec.objectID=uses_scene_graph(u) ? 64+uint(tri.uvc.w)-1 : 7;
             rec.triangle=uint(node.links.z+k);
             world_hit(rec,o);
         }
@@ -717,9 +728,9 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
     float tMin=ray_t_min(r.origin,u);
     HitRecord rec;
     if(trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz,tMin) && rec.t<tMax) return true;
-    if (sceneIndex != 6 || u.environment.w < 1 || (u.lens.z==0 && images.objects[7].rotationHidden.w > 0.5f)) return false;
+    if (sceneIndex != 6 || u.environment.w < 1 || (!uses_scene_graph(u) && images.objects[7].rotationHidden.w > 0.5f)) return false;
     ObjectSettings o=images.objects[7];
-    if(u.lens.z>0) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
+    if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float nearT=tMin/o.positionScale.w, farT=tMax/o.positionScale.w;
     int stack[64]; int top=0; stack[top++]=0;
@@ -729,7 +740,7 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
         if(node.links.w==0) { push_mesh_children(node,local,stack,top); continue; }
         for(int k=0;k<node.links.w;++k) {
             MeshTriangle tri=images.triangles[node.links.z+k];
-            float t,b1,b2,slack=u.lens.z>0 ? mesh_hit_error(tri,float3(0),u) : 0.0f;
+            float t,b1,b2,slack=uses_scene_graph(u) ? mesh_hit_error(tri,float3(0),u) : 0.0f;
             if(intersect_mesh_triangle(tri,local,nearT,farT-slack,t,b1,b2)) return true;
         }
     }
@@ -1366,6 +1377,25 @@ float gi_geometry(float3 x1, float3 n1, float3 x2, float3 n2) {
     return max(0.0f, dot(n1, direction)) * max(0.0f, dot(n2, -direction)) / d2;
 }
 
+// Solid-angle Jacobian of reconnecting a source path x1q -> x2 at x1r
+// (RESTIRGI2021, Eq. 11). The area-measure target already applies it, so reuse
+// only rejects shifts outside [0.1, 10], mainly short contact-corner
+// reconnections whose heavy-tailed weights would persist in history.
+float restir_gi_jacobian(float3 x1r, float3 x1q, float3 x2, float3 n2) {
+    float3 current = x1r - x2, source = x1q - x2;
+    float currentD2 = dot(current, current), sourceD2 = dot(source, source);
+    if (currentD2 < 1e-10f || sourceD2 < 1e-10f) return 0.0f;
+    float currentCosine = max(0.0f, dot(n2, current * rsqrt(currentD2)));
+    float sourceCosine = max(0.0f, dot(n2, source * rsqrt(sourceD2)));
+    float jacobian = currentCosine * sourceD2 / (sourceCosine * currentD2);
+    return isfinite(jacobian) ? jacobian : 0.0f;
+}
+
+bool restir_gi_accepts_shift(float3 x1r, float3 x1q, float3 x2, float3 n2) {
+    float jacobian = restir_gi_jacobian(x1r, x1q, x2, n2);
+    return jacobian >= 0.1f && jacobian <= 10.0f;
+}
+
 float eval_restir_gi_target(float3 x1, float3 n1, float3 rayDir, Material mat,
                             float3 x2, float3 n2, float3 secondaryRadiance) {
     float geometry = gi_geometry(x1, n1, x2, n2);
@@ -1471,10 +1501,22 @@ float emission_weight(bool previousDelta, bool previousNEE, bool previousMIS,
     return previousMIS ? power_heuristic(bsdfPDF, lightPDF) : 0.0f;
 }
 
+// Maximum path depth follows pbrt: depth 1 is direct lighting only. Each
+// non-delta continuation consumes one scattering event; the last vertex still
+// receives NEE. Every depth-dependent decision derives from this one budget.
+int scattering_limit(float pathDepth) {
+    return max(0, int(pathDepth) - 1);
+}
+
+// ReSTIR GI estimates the x1 -> x2 -> light suffix, so it needs one continuation.
+bool restir_gi_enabled(float pathDepth) {
+    return scattering_limit(pathDepth) >= 1;
+}
+
 // A camera-primary-secondary diffuse path can sample the secondary BSDF only
 // when the scattering budget permits the second non-delta continuation.
 bool restir_gi_has_complementary_bsdf(float pathDepth) {
-    return int(pathDepth) > 2;
+    return scattering_limit(pathDepth) >= 2;
 }
 
 // Bounded, single-scatter camera fog. This preview does not model multiple scattering.
@@ -1511,6 +1553,53 @@ float3 apply_camera_fog(float3 color, Ray ray, float surfaceDistance,
     return color * exp(-sigmaT * (exitT - entry)) + scattered;
 }
 
+// Resolved camera hit, written once by pass 1 and read by the shading and
+// MetalFX guide passes instead of retracing and re-resolving the primary ray.
+// Position and distance live in gbufferPosDepth; values stay full precision.
+struct PrimarySurface {
+    packed_float3 normal; uint flags;             // type | front face << 8 | MaterialX << 9 | slot << 16
+    packed_float3 geometricNormal; float roughness;
+    packed_float3 color; float ior;               // albedo, or emission for EMISSIVE
+    packed_float3 tangent; float metalness;
+    float coat, anisotropy, fuzz, transmission;
+    float coatRoughness, specularWeight, baseWeight, diffuseRoughness;
+    uint triangle; float error;                   // HitRecord.triangle and position rounding bound
+};
+static_assert(sizeof(PrimarySurface) == 104, "Swift allocates 104-byte primary surfaces");
+
+PrimarySurface store_primary_surface(HitRecord hit) {
+    PrimarySurface s;
+    Material m = hit.mat;
+    s.normal = hit.normal; s.geometricNormal = hit.geometricNormal; s.tangent = m.tangent;
+    s.triangle = hit.triangle; s.error = hit.error;
+    s.flags = uint(m.type) | (hit.front_face ? 256u : 0u) | (m.usesMaterialX ? 512u : 0u) | (min(m.slot, 65535u) << 16);
+    s.color = m.type == EMISSIVE ? m.emission : m.albedo;
+    s.roughness = m.roughness; s.ior = m.ior; s.metalness = m.metalness;
+    s.coat = m.coat; s.anisotropy = m.anisotropy; s.fuzz = m.fuzz; s.transmission = m.transmission;
+    s.coatRoughness = m.coatRoughness; s.specularWeight = m.specularWeight;
+    s.baseWeight = m.baseWeight; s.diffuseRoughness = m.diffuseRoughness;
+    return s;
+}
+
+HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
+    HitRecord hit = {};
+    hit.t = positionDepth.w; hit.position = positionDepth.xyz;
+    hit.normal = s.normal; hit.geometricNormal = s.geometricNormal; hit.tangent = s.tangent;
+    hit.front_face = (s.flags & 256u) != 0;
+    hit.triangle = s.triangle; hit.error = s.error;
+    Material m = {};
+    m.type = MaterialType(s.flags & 255u);
+    if (m.type == EMISSIVE) m.emission = s.color; else m.albedo = s.color;
+    m.roughness = s.roughness; m.ior = s.ior; m.slot = s.flags >> 16; m.metalness = s.metalness;
+    m.coat = s.coat; m.anisotropy = s.anisotropy; m.fuzz = s.fuzz; m.transmission = s.transmission;
+    m.tangent = s.tangent; m.coatRoughness = s.coatRoughness; m.specularWeight = s.specularWeight;
+    m.baseWeight = s.baseWeight; m.diffuseRoughness = s.diffuseRoughness;
+    m.usesMaterialX = (s.flags & 512u) != 0 ? 1u : 0u;
+    m.inside = !hit.front_face; m.geometricNormal = s.geometricNormal;
+    hit.mat = m;
+    return hit;
+}
+
 // ============================================================================
 // PASS 1: G-Buffer & ReSTIR Temporal Reuse Kernel
 // Reference: RESTIR2020; local reuse approximations are documented in REFERENCES.md.
@@ -1539,6 +1628,7 @@ kernel void restir_temporal_kernel(
     constant Uniforms &uniforms [[buffer(0)]],
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
+    device PrimarySurface *primarySurfaces [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
@@ -1583,6 +1673,7 @@ kernel void restir_temporal_kernel(
     }
 
     resolve_material(rec, ray, uniforms, surfaceSettings, materialImages, rec.t * 2.0f * fov_scale / float(uniforms.height));
+    primarySurfaces[gid.y * uniforms.width + gid.x] = store_primary_surface(rec);
     gbufferPosDepth.write(float4(rec.position, rec.t), gid);
     gbufferNormalMat.write(float4(rec.normal, float(rec.mat.type)), gid);
     float3 surfaceColor = rec.mat.type == EMISSIVE ? rec.mat.emission : rec.mat.albedo;
@@ -1630,9 +1721,10 @@ kernel void restir_temporal_kernel(
         }
     }
 
-    // Temporal Reprojection
+    // Temporal Reprojection. Reservoir history survives camera motion; the
+    // reprojected surface test below rejects disocclusions.
     float4 prevClip = uniforms.prevViewProj * float4(rec.position, 1.0f);
-    if (prevClip.w > 0.0f && uniforms.frameIndex > 1) {
+    if (prevClip.w > 0.0f && uniforms.reservoirHistory > 1) {
         float2 prevNDC = prevClip.xy / prevClip.w;
         float2 prevUV = prevNDC * float2(0.5f, -0.5f) + 0.5f;
         int2 prevCoord = int2(prevUV * float2(float(uniforms.width), float(uniforms.height)));
@@ -1681,6 +1773,15 @@ kernel void restir_temporal_kernel(
     outSamplePosDir.write(float4(storeDirPos, float(selectedSample.isDirectional)), gid);
     outSampleEmitPdf.write(float4(selectedSample.emission, selectedSample.pdf), gid);
     outReservoirWeights.write(float4(weightSum, M, W, 0.0f), gid);
+
+    // Depth 1 has no indirect bounce for GI reservoirs to estimate.
+    if (!restir_gi_enabled(uniforms.cameraTarget.w)) {
+        outGIPosPdf.write(float4(0.0f), gid);
+        outGINormal.write(float4(0.0f), gid);
+        outGIRadiance.write(float4(0.0f), gid);
+        outGIWeights.write(float4(0.0f), gid);
+        return;
+    }
 
     // ReSTIR GI initial path: x0(camera) -> x1(primary diffuse) -> x2(diffuse)
     // -> sampled light. Store x2 and its one-sample outgoing direct radiance;
@@ -1737,7 +1838,7 @@ kernel void restir_temporal_kernel(
     // Temporal GI reservoir merge. Primary-surface reprojection defines the
     // reuse domain; the secondary point is reconnected and reweighted at x1.
     float4 giPrevClip = uniforms.prevViewProj * float4(rec.position, 1.0f);
-    if (giPrevClip.w > 0.0f && uniforms.frameIndex > 1) {
+    if (giPrevClip.w > 0.0f && uniforms.reservoirHistory > 1) {
         float2 prevUV = (giPrevClip.xy / giPrevClip.w) * float2(0.5f, -0.5f) + 0.5f;
         int2 prevCoord = int2(prevUV * float2(float(uniforms.width), float(uniforms.height)));
         if (all(prevUV >= 0.0f) && all(prevUV < 1.0f) && prevCoord.x >= 0 &&
@@ -1751,7 +1852,8 @@ kernel void restir_temporal_kernel(
             float4 oldGIPosPdf = histGIPosPdf.read(uint2(prevCoord));
             float4 oldGINormal = histGINormal.read(uint2(prevCoord));
             if (sameSurface && oldGIWeights.y > 0.0f && oldGIWeights.z > 0.0f &&
-                oldGIPosPdf.w > 0.0f && oldGINormal.w > 0.0f) {
+                oldGIPosPdf.w > 0.0f && oldGINormal.w > 0.0f &&
+                restir_gi_accepts_shift(rec.position, oldPos.xyz, oldGIPosPdf.xyz, oldGINormal.xyz)) {
                 float3 oldGIRadiance = histGIRadiance.read(uint2(prevCoord)).xyz;
                 float pHat = eval_restir_gi_target(rec.position, rec.normal, ray.direction, rec.mat,
                     oldGIPosPdf.xyz, oldGINormal.xyz, oldGIRadiance);
@@ -1800,6 +1902,7 @@ kernel void shading_kernel(
     constant Uniforms &uniforms [[buffer(0)]],
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
@@ -1839,17 +1942,19 @@ kernel void shading_kernel(
     primaryRay.origin = camPos;
     primaryRay.direction = normalize(forward + u * right + v * up);
     lens_ray(primaryRay,forward,right,up,uniforms,seed);
+    // Pass 1 continued this same stream into its candidates; spatial offsets
+    // must not replay them.
+    decorrelate_shading_seed(seed);
 
     if (posDepth.w <= 0.0f) {
         if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
             radiance = eval_environment(primaryRay.direction, uniforms, materialImages);
         }
     } else {
-        HitRecord primaryHit;
-        if (!trace_scene(primaryRay, uniforms.sceneIndex, primaryHit, materialImages, uniforms)) return;
+        // Pass 1 traced and resolved this exact ray; reuse its hit.
+        HitRecord primaryHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth);
         float coneSpread = 2.0f * fov_scale / float(uniforms.height);
         float pathDistance = primaryHit.t;
-        resolve_material(primaryHit, primaryRay, uniforms, surfaceSettings, materialImages, pathDistance * coneSpread);
         float3 pos = primaryHit.position;
         float3 norm = primaryHit.normal;
         Material mat = primaryHit.mat;
@@ -1925,6 +2030,8 @@ kernel void shading_kernel(
                 }
 
                 // Spatial ReSTIR GI reuse for the first indirect diffuse vertex.
+                // Pass 1 writes empty GI reservoirs when the depth excludes it.
+                bool giEnabled = restir_gi_enabled(uniforms.cameraTarget.w);
                 float4 selectedGIPosPdf = inGIPosPdf.read(gid);
                 float4 selectedGINormal = inGINormal.read(gid);
                 float3 selectedGIRadiance = inGIRadiance.read(gid).xyz;
@@ -1934,7 +2041,7 @@ kernel void shading_kernel(
                         selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
                 float giWeightSum = giTarget * currentGIWeights.z * currentGIWeights.y;
                 float giM = currentGIWeights.y;
-                for (int i = 0; i < 4; ++i) {
+                for (int i = 0; i < 4 && giEnabled; ++i) {
                     float2 offset = (rand_f2(seed) * 2.0f - 1.0f) * spatialRadius;
                     int2 nCoord = int2(gid) + int2(offset);
                     if (nCoord.x < 0 || nCoord.x >= int(uniforms.width) ||
@@ -1951,6 +2058,8 @@ kernel void shading_kernel(
                     float4 neighborNormal = inGINormal.read(uint2(nCoord));
                     if (neighborWeights.y <= 0.0f || neighborWeights.z <= 0.0f ||
                         neighborPosPdf.w <= 0.0f || neighborNormal.w <= 0.0f) continue;
+                    if (!restir_gi_accepts_shift(pos, neighborPrimary.xyz,
+                        neighborPosPdf.xyz, neighborNormal.xyz)) continue;
                     float3 neighborRadiance = inGIRadiance.read(uint2(nCoord)).xyz;
                     float neighborTarget = eval_restir_gi_target(pos, norm, primaryRay.direction,
                         mat, neighborPosPdf.xyz, neighborNormal.xyz, neighborRadiance);
@@ -1968,7 +2077,7 @@ kernel void shading_kernel(
                         selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
                 float giW = giM > 0.0f && finalGITarget > 0.0f
                     ? giWeightSum / (giM * finalGITarget) : 0.0f;
-                if (giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
+                if (giEnabled && giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
                     selectedGIPosPdf.xyz, uniforms, materialImages, primaryHit.error)) {
                     float3 direction = normalize(selectedGIPosPdf.xyz - pos);
                     float3 primaryBSDF = eval_bsdf(mat, norm, -primaryRay.direction, direction);
@@ -1982,7 +2091,9 @@ kernel void shading_kernel(
                         float cos_th = abs(dot(norm, ls.wi));
                         float bsdf_pdf;
                         float3 bsdf = eval_bsdf_with_pdf(mat, norm, -primaryRay.direction, ls.wi, bsdf_pdf);
-                        float weight = (uniforms.samplingMode <= 1) ? power_heuristic(ls.pdf, bsdf_pdf) : 1.0f;
+                        // Depth 1 has no BSDF continuation to share the direct integral.
+                        bool useMIS = uniforms.samplingMode <= 1 && scattering_limit(uniforms.cameraTarget.w) > 0;
+                        float weight = useMIS ? power_heuristic(ls.pdf, bsdf_pdf) : 1.0f;
                         radiance += bsdf * cos_th * ls.emission * (weight / ls.pdf);
                     }
                 }
@@ -2004,12 +2115,18 @@ kernel void shading_kernel(
             // Russian roulette terminates long specular chains without assigning
             // zero radiance at an arbitrary geometric depth (including closed loops).
             int scatteringDepth = 0;
-            const int scatteringLimit = max(1, int(uniforms.cameraTarget.w) - 1);
+            const int scatteringLimit = scattering_limit(uniforms.cameraTarget.w);
+            bool emissionOnly = false;
             for (int bounce = 1; ; ++bounce) {
                 float3 nextDirection, bsdfWeight;
                 float bsdfPDF;
                 bool previousDelta = is_delta(currentHit.mat);
-                if (!previousDelta && scatteringDepth >= scatteringLimit) break;
+                if (!previousDelta && scatteringDepth >= scatteringLimit) {
+                    // Other strategies light the last vertex with NEE. BSDF-only
+                    // paths take one final continuation that may only reach emission.
+                    if (uniforms.samplingMode != 3 || emissionOnly) break;
+                    emissionOnly = true;
+                }
                 if (!previousDelta) ++scatteringDepth;
                 bool previousNEE = !previousDelta && uniforms.samplingMode != 3;
                 // Primary diffuse DI reservoirs estimate the full direct integral.
@@ -2050,6 +2167,7 @@ kernel void shading_kernel(
                     radiance += throughput * weight * rec.mat.emission;
                     break;
                 }
+                if (emissionOnly) break;
 
                 bool restirGISecondary = uniforms.samplingMode == 0 && mat.type == DIFFUSE &&
                     bounce == 1 && rec.mat.type == DIFFUSE;
@@ -2193,6 +2311,7 @@ kernel void metalfx_guides_kernel(
     constant Uniforms &u [[buffer(0)]],
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= u.width || gid.y >= u.height) return;
     float4 sample = samples.read(gid), p = positions.read(gid);
@@ -2234,15 +2353,11 @@ kernel void metalfx_guides_kernel(
             }
         }
         if (int(n.w) == OPENPBR) {
-            Ray primary = { guideCamera, -wo };
-            HitRecord hit;
-            if (trace_scene(primary, u.sceneIndex, hit, materialImages, u)) {
-                resolve_material(hit, primary, u, surfaceSettings, materialImages, hit.t * 2.0f * tan(u.cameraPos.w * PI / 360.0f) / float(u.height));
-                rough = hit.mat.roughness;
-                diffuseAlbedo = hit.mat.albedo * (1.0f - hit.mat.metalness) * (1.0f - hit.mat.transmission);
-                float f0 = pow((hit.mat.ior - 1.0f) / (hit.mat.ior + 1.0f), 2.0f);
-                specularAlbedo = conductor_fresnel(mix(float3(f0), hit.mat.albedo, hit.mat.metalness), max(0.0f, dot(normal, wo)));
-            }
+            Material resolved = load_primary_surface(primarySurfaces[gid.y * u.width + gid.x], p).mat;
+            rough = resolved.roughness;
+            diffuseAlbedo = resolved.albedo * (1.0f - resolved.metalness) * (1.0f - resolved.transmission);
+            float f0 = pow((resolved.ior - 1.0f) / (resolved.ior + 1.0f), 2.0f);
+            specularAlbedo = conductor_fresnel(mix(float3(f0), resolved.albedo, resolved.metalness), max(0.0f, dot(normal, wo)));
         }
         if (int(n.w) == DIELECTRIC) {
             rough = 0.0f;
@@ -2375,9 +2490,18 @@ struct Uniforms {
     var jitter: SIMD2<Float> = .zero
     var sampleIndex: UInt32 = 1
     var padding: UInt32 = 0
+    // Consecutive frames with written ReSTIR reservoirs; gates temporal reuse.
+    var reservoirHistory: UInt32 = 0
     var environment = SIMD4<Float>(1, 0, 0, 0)
+    // Aperture radius, focus distance, scene-graph mode (sceneGraphMode), independent sun 1 - cos(half angle).
     var lens = SIMD4<Float>(0, 4, 0, 0)
     var light = SIMD4<Float>(1, 1, 1, 1)
+
+    // Mirrors MSL uses_scene_graph: scene 6 renders the imported scene graph.
+    var sceneGraphMode: Bool {
+        get { lens.z > 0 }
+        set { lens.z = newValue ? 1 : 0 }
+    }
 }
 
 // REFERENCES.md: PBRT2023; local base-2/base-3 Halton jitter with a 1,024-frame period.
@@ -2787,9 +2911,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 
         var bytesPerPixel: UInt64 {
             // Beauty/sample/position/OIDN accumulations: 6 RGBA32F; three
-            // normal/material guides: 3 RGBA16F. ReSTIR adds DI (6 RGBA32F)
-            // and GI (6 RGBA32F + 2 RGBA16F). MetalFX formats total 55 B/pixel.
-            120 + (usesReSTIR ? 208 : 0) + (usesMetalFX ? 55 : 0)
+            // normal/material guides: 3 RGBA16F; resolved primary surfaces:
+            // 104 B. ReSTIR adds DI (6 RGBA32F) and GI (6 RGBA32F + 2 RGBA16F).
+            // MetalFX formats total 55 B/pixel.
+            120 + PathTracerRenderer.primarySurfaceStride + (usesReSTIR ? 208 : 0) + (usesMetalFX ? 55 : 0)
         }
         var bytes: UInt64? {
             guard width > 0, height > 0 else { return nil }
@@ -2825,6 +2950,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var gbufferPosDepth: MTLTexture?
     var gbufferNormalMat: MTLTexture?
     var gbufferAlbedoRough: MTLTexture?
+    // MSL PrimarySurface per pixel: pass 1 writes it; shading and MetalFX guides read it.
+    static let primarySurfaceStride: UInt64 = 104
+    private(set) var primarySurfaces: MTLBuffer?
     var accumTexture: MTLTexture?
     var sampleTexture: MTLTexture?
     var oidnAlbedoAccum: MTLTexture?
@@ -2850,6 +2978,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var prevViewProj = matrix_identity_float4x4
     var frameIndex: UInt32 = 0
     private var sampleIndex: UInt32 = 0
+    // Unlike frameIndex, camera moves keep ReSTIR history; reprojection
+    // rejects disocclusions. Cuts and inspection/non-ReSTIR frames clear it.
+    private(set) var reservoirHistory: UInt32 = 0
 
     var sceneIndex: UInt32 = 0 { didSet { if oldValue != sceneIndex { applyPreset(.perspective) } } }
     var samplingMode: UInt32 = 0 { didSet { resetAccumulation() } } // 0 ReSTIR DI+GI, 1 MIS, 2 light, 3 BSDF
@@ -2919,7 +3050,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return (textures + metalFXTextures).compactMap { $0 }.reduce(0) { total, texture in
             let id = ObjectIdentifier(texture as AnyObject)
             return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
-        }
+        } + UInt64(primarySurfaces?.allocatedSize ?? 0)
     }
 
     func renderMemoryError(width: Int, height: Int) -> String? {
@@ -3043,7 +3174,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             offlineDenoisedPreview = nil
             paused = false
         }
-        if resetDenoiser { metalFXHistoryNeedsReset = true }
+        if resetDenoiser { metalFXHistoryNeedsReset = true; reservoirHistory = 0 }
+    }
+
+    // Grows only, so encoders sized for a smaller frame can share it.
+    func primarySurfaceBuffer(width: Int, height: Int) -> MTLBuffer? {
+        let length = max(1, width * height) * Int(Self.primarySurfaceStride)
+        if let buffer = primarySurfaces, buffer.length >= length { return buffer }
+        primarySurfaces = device.makeBuffer(length: length, options: .storageModePrivate)
+        return primarySurfaces
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -3071,7 +3210,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     return nil
                 }
             }
-            guard let fx = metalFX, let prepare = commandBuffer.makeComputeCommandEncoder() else { return nil }
+            guard let fx = metalFX,
+                  let surfaces = primarySurfaceBuffer(width: accumulation.width, height: accumulation.height),
+                  let prepare = commandBuffer.makeComputeCommandEncoder() else { return nil }
             prepare.label = "MetalFX surface and motion guides"
             prepare.setComputePipelineState(metalFXGuidePipeline)
             let inputs = [samples, positions, normals, materials, fx.color, fx.depth, fx.motion,
@@ -3083,6 +3224,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 return nil
             }
             prepare.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+            prepare.setBuffer(surfaces, offset: 0, index: 3)
             prepare.dispatchThreads(MTLSize(width: accumulation.width, height: accumulation.height, depth: 1), threadsPerThreadgroup: group)
             prepare.endEncoding()
 
@@ -3234,10 +3376,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let newGIPosB = device.makeTexture(descriptor: reservoir32),
                   let newGINormalB = device.makeTexture(descriptor: reservoir16),
                   let newGIRadianceB = device.makeTexture(descriptor: reservoir32),
-                  let newGIWeightsB = device.makeTexture(descriptor: reservoir32) else {
+                  let newGIWeightsB = device.makeTexture(descriptor: reservoir32),
+                  let newSurfaces = device.makeBuffer(length: w * h * Int(Self.primarySurfaceStride),
+                                                      options: .storageModePrivate) else {
                 onError?("Could not allocate render textures. Try a smaller window.")
                 return
             }
+            primarySurfaces = newSurfaces
             accumTexture = newAccum
             sampleTexture = newSample
             oidnAlbedoAccum = newOIDNAlbedo
@@ -3270,10 +3415,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
               let giPosB = giPosPdfB, let giNormB = giNormalB,
               let giRadB = giRadianceB, let giWeightB = giWeightsB,
               let oidnAlbedo = oidnAlbedoAccum, let oidnNormal = oidnNormalAccum,
+              let surfaces = primarySurfaceBuffer(width: w, height: h),
               let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
 
         let nextFrame = frameIndex + 1
         let nextSample = sampleIndex == UInt32.max ? 1 : sampleIndex + 1
+        // Inspection and non-ReSTIR frames leave reservoirs unwritten.
+        let nextHistory = needsReSTIR ? min(reservoirHistory, 1 << 24) + 1 : 0
 
         let camX = target.x + distance * cos(pitch) * sin(yaw)
         let camY = target.y + distance * sin(pitch)
@@ -3307,11 +3455,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             viewportMode: viewportMode,
             width: UInt32(w),
             height: UInt32(h),
-            jitter: frameJitter(nextSample), sampleIndex: nextSample,
+            jitter: frameJitter(nextSample), sampleIndex: nextSample, reservoirHistory: nextHistory,
             environment: SIMD4(options.environmentIntensity, options.environmentRotation * .pi / 180, materials.environmentData == nil ? 0 : 1, Float(materials.nodeCount)),
             lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,sceneIndex == 6 ? options.independentSunCone : 0),
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize)
         )
+        uniforms.sceneGraphMode = materials.hasSceneGraph
         lastUniforms=uniforms
 
         let threadsPerGroup = MTLSize(width: 8, height: 8, depth: 1)
@@ -3347,6 +3496,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 return
             }
             enc1.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+            enc1.setBuffer(surfaces, offset: 0, index: 3)
             enc1.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
             enc1.endEncoding()
         }
@@ -3376,6 +3526,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 return
             }
             enc2.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+            enc2.setBuffer(surfaces, offset: 0, index: 3)
             enc2.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
             enc2.endEncoding()
         }
@@ -3455,6 +3606,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         self.prevViewProj = currViewProj
         frameIndex = nextFrame
         sampleIndex = nextSample
+        reservoirHistory = nextHistory
         let submittedGeneration = generation
         let semaphore = inFlightFrames
         cmdBuffer.addCompletedHandler { [weak self] completedBuffer in

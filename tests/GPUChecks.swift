@@ -165,6 +165,8 @@ func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool 
         }
         accumulationFrames += 1
         u.frameIndex = accumulationFrames
+        // ReSTIR history survives orbit resets, matching renderFrame.
+        u.reservoirHistory = UInt32(frame)
         u.sampleIndex = UInt32(frame)
         u.jitter = frameJitter(u.sampleIndex)
         let cb = testRenderer.commandQueue.makeCommandBuffer()!
@@ -175,6 +177,7 @@ func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool 
         for (i, t) in first.enumerated() { e1.setTexture(t, index: i) }
         testRenderer.materials.bind(e1)
         e1.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+        e1.setBuffer(testRenderer.primarySurfaceBuffer(width: w, height: h)!, offset: 0, index: 3)
         e1.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         e1.endEncoding()
         let e2 = cb.makeComputeCommandEncoder()!
@@ -184,6 +187,7 @@ func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool 
         for (i, t) in second.enumerated() { e2.setTexture(t, index: i) }
         testRenderer.materials.bind(e2)
         e2.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+        e2.setBuffer(testRenderer.primarySurfaceBuffer(width: w, height: h)!, offset: 0, index: 3)
         e2.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         e2.endEncoding()
         display = testRenderer.encodePresentation(commandBuffer: cb, accumulation: accum, samples: noisy,
