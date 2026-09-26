@@ -10,7 +10,7 @@ root = Path(__file__).resolve().parents[1]
 subprocess.run([sys.executable, str(root / 'scripts/prepare_shaders.py')], check=True)
 subprocess.run(['/usr/bin/python3', str(root / 'scripts/prepare_usd.py')], check=True)
 subprocess.run([sys.executable, str(root / 'scripts/prepare_oidn.py')], check=True)
-subprocess.run(['/usr/bin/python3', str(root / 'tests/USDChecks.py')], check=True)
+subprocess.run(['/usr/bin/python3', str(root / 'tests/USDChecks.py')] + [a for a in sys.argv[1:] if a == '--require-reference'], check=True)
 source = (root / 'main.swift').read_text()
 # Retain production definitions, replacing only the GUI entry point.
 source = source.split('// 5. App Entry Point')[0]
@@ -43,6 +43,8 @@ if '--studio-only' not in sys.argv and '--usd-only' not in sys.argv:
 if '--usd-only' not in sys.argv:
     source += '\n' + (root / 'tests' / 'Fix_persistence.swift').read_text()
     source += '\n' + (root / 'tests' / 'Fix_frontend.swift').read_text()
+if '--studio-only' not in sys.argv:
+    source += '\n' + (root / 'tests' / 'Fix_usd.swift').read_text()
 with tempfile.TemporaryDirectory(prefix='vibe-tracer-tests-') as directory:
     folder = Path(directory)
     swift = folder / 'main.swift'
@@ -50,4 +52,4 @@ with tempfile.TemporaryDirectory(prefix='vibe-tracer-tests-') as directory:
     binary = folder / 'GPUChecks'
     subprocess.run(['xcrun', 'swiftc', '-O', '-target', platform.machine() + '-apple-macosx26.0', '-module-cache-path', str(folder / 'cache'),
                     str(swift), '-o', str(binary)], check=True)
-    sys.exit(subprocess.run([str(binary)], cwd=root).returncode)
+    sys.exit(subprocess.run([str(binary)] + [a for a in sys.argv[1:] if a == '--require-reference'], cwd=root).returncode)

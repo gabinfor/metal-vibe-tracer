@@ -40,6 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
+  func applicationWillTerminate(_ notification: Notification) {
+    // A quit during an OpenUSD import must not leave the python3 helper or its scratch folder behind.
+    studio?.usdImportJob?.cancelAndWait(timeout: 3)
+  }
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.regular)
     do {

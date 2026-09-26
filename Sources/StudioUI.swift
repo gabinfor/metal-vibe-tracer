@@ -151,6 +151,7 @@ final class StudioController: NSViewController {
   var project = ProjectDocument()
   var projectURL: URL? { didSet { updateWindowTitle() } }
   var importInProgress = false { didSet { busyStateChanged() } }
+  var usdImportJob: USDImportJob?
   // Opens (including the launch restore), saves and off-main document preparation.
   private var openInFlight = false { didSet { busyStateChanged() } }
   private var saveInFlight = false { didSet { busyStateChanged() } }

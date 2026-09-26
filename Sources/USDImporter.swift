@@ -37,6 +37,7 @@ struct USDImportSnapshot: Decodable {
   var environment: Environment?
   var sun: Sun?
   var report: [String]
+  var fallbackColors: [String: [[Float]]]?
 }
 struct USDImportResult {
   var document: ProjectDocument
@@ -65,6 +66,20 @@ final class USDImportJob: @unchecked Sendable {
     defer { lock.unlock() }
     return cancelled
   }
+  var isHelperRunning: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return process?.isRunning == true
+  }
+  private let finished = DispatchSemaphore(value: 0)
+  func finish() { finished.signal() }
+  /// Stops the helper and waits until the import has reaped it and removed its scratch folder.
+  @discardableResult func cancelAndWait(timeout: TimeInterval) -> Bool {
+    cancel()
+    guard finished.wait(timeout: .now() + timeout) == .success else { return false }
+    finished.signal()
+    return true
+  }
 }
 enum USDImporter {
   static var helperURL: URL {
@@ -77,6 +92,7 @@ enum USDImporter {
     _ url: URL, into source: ProjectDocument, frame: Double? = nil,
     job: USDImportJob = USDImportJob()
   ) throws -> USDImportResult {
+    defer { job.finish() }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
       "vibe-usd-" + UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -124,6 +140,7 @@ enum USDImporter {
     // USD opens as a complete scene; it does not merge lighting or IDs into an existing import.
     var graph = SceneGraph(assets: snapshot.assets, nodes: snapshot.nodes, materials: [])
     var state = SceneState()
+    var uncompiled = Set<UUID>()
     for material in snapshot.materials {
       let slot = 8 + graph.materials.count
       graph.materials.append(SceneMaterial(id: material.id, name: material.name, slot: slot))
@@ -135,6 +152,10 @@ enum USDImporter {
         min(1, max(0, material.color[0])), min(1, max(0, material.color[1])),
         min(1, max(0, material.color[2])), 1)
       if let e = material.emission, e.count == 3 {
+        guard e.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1e8 }) else {
+          throw MaterialLibrary.error(
+            "USD light \(material.path) emission is outside the supported range 0…1e8.")
+        }
         if state.emissions == nil { state.emissions = [:] }
         state.emissions?[slot] = SIMD3(e[0], e[1], e[2])
       }
@@ -147,12 +168,70 @@ enum USDImporter {
           state.materialX?[slot] = program
         } else {
           snapshot.report += imported.report.map { material.path + ": " + $0 }
+          uncompiled.insert(material.id)
         }
+      }
+    }
+    // A material the compiler rejects falls back to each prim's own displayColor, not the first prim's.
+    var fallbackColors: [UUID: [[Float]]] = [:]
+    for (key, colors) in snapshot.fallbackColors ?? [:] {
+      if let id = UUID(uuidString: key) { fallbackColors[id] = colors }
+    }
+    var splits: [String: UUID] = [:]
+    for n in graph.nodes.indices {
+      guard let colors = fallbackColors[graph.nodes[n].id], colors.count == graph.nodes[n].bindings.count
+      else { continue }
+      for (k, id) in graph.nodes[n].bindings.enumerated() where uncompiled.contains(id) {
+        let color = colors[k]
+        guard let base = snapshot.materials.first(where: { $0.id == id }), color != base.color,
+          color.count == 3, color.allSatisfy({ $0.isFinite })
+        else { continue }
+        let key = id.uuidString + "\(color)"
+        if splits[key] == nil {
+          let slot = 8 + graph.materials.count
+          guard slot < SceneLimits.materials else {
+            snapshot.report.append(base.path + ": too many materials to keep per-prim fallback colors")
+            continue
+          }
+          let split = SceneMaterial(name: base.name, slot: slot)
+          graph.materials.append(split)
+          state.surfaces[slot].enabled = 1
+          state.surfaces[slot].color = SIMD4(
+            min(1, max(0, color[0])), min(1, max(0, color[1])), min(1, max(0, color[2])), 1)
+          splits[key] = split.id
+        }
+        if let split = splits[key] { graph.nodes[n].bindings[k] = split }
       }
     }
     try graph.validate()
     // Validate combined transforms before replacing any active renderer resources.
-    _ = try graph.renderTriangles()
+    let sceneTriangles = try graph.renderTriangles()
+    var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+    var hi = -lo
+    for t in sceneTriangles {
+      for v in [t.a, t.b, t.c] {
+        let q = SIMD3(v.x, v.y, v.z)
+        lo = simd_min(lo, q)
+        hi = simd_max(hi, q)
+      }
+    }
+    // Orbit pivot: the first surface on the view ray, else the bounds center's depth.
+    func orbitDistance(_ eye: SIMD3<Float>, _ forward: SIMD3<Float>) -> Float {
+      var nearest = Float.greatestFiniteMagnitude
+      for t in sceneTriangles {
+        let a = SIMD3(t.a.x, t.a.y, t.a.z)
+        let e1 = SIMD3(t.b.x, t.b.y, t.b.z) - a, e2 = SIMD3(t.c.x, t.c.y, t.c.z) - a
+        let p = simd_cross(forward, e2), det = simd_dot(e1, p)
+        guard abs(det) > 1e-30 else { continue }
+        let s = eye - a, q = simd_cross(s, e1)
+        let u = simd_dot(s, p) / det, v = simd_dot(forward, q) / det, d = simd_dot(e2, q) / det
+        if u >= 0, v >= 0, u + v <= 1, d > 1e-6, d < nearest { nearest = d }
+      }
+      if nearest < .greatestFiniteMagnitude { return nearest }
+      guard lo.x <= hi.x else { return 1 }
+      let depth = simd_dot((lo + hi) / 2 - eye, forward)
+      return depth > 0 ? depth : simd_length(hi - lo)
+    }
     p.version = 2
     p.graph = graph
     p.triangles = []
@@ -205,6 +284,7 @@ enum USDImporter {
         "No supported authored lighting: neutral procedural sky used for inspection.")
     }
     var importedCamera: CameraState?
+    var importedFocus: Float?
     for camera in snapshot.cameras {
       guard camera.eye.count == 3, camera.direction.count == 3, camera.up.count == 3,
         (5...150).contains(camera.fov)
@@ -215,17 +295,21 @@ enum USDImporter {
       let eye = SIMD3(camera.eye[0], camera.eye[1], camera.eye[2])
       let forward = simd_normalize(
         SIMD3(camera.direction[0], camera.direction[1], camera.direction[2]))
-      let focus = min(1_000_000, max(0.0001, camera.focus ?? 1))
-      let target = eye + forward * focus
+      // The orbit pivot is scene-derived; optical focus stays separate and is kept only when authored.
+      let distance = min(1_000_000, max(0.0001, orbitDistance(eye, forward)))
+      let target = eye + forward * distance
       let delta = eye - target
       var c = CameraState()
       c.target = target
-      c.distance = focus
-      c.pitch = asin(min(0.997, max(-0.997, delta.y / focus)))
+      c.distance = distance
+      c.pitch = asin(min(0.997, max(-0.997, delta.y / distance)))
       c.yaw = atan2(delta.x, -delta.z)
       c.fov = camera.fov
       p.views["USD: " + camera.name] = c
-      if importedCamera == nil { importedCamera = c }
+      if importedCamera == nil {
+        importedCamera = c
+        importedFocus = camera.focus.flatMap { $0.isFinite && $0 > 0 ? min(1_000_000, max(0.0001, $0)) : nil }
+      }
       let expectedUp = simd_normalize(
         simd_cross(simd_normalize(simd_cross(forward, SIMD3<Float>(0, 1, 0))), forward))
       if simd_dot(expectedUp, SIMD3(camera.up[0], camera.up[1], camera.up[2])) < 0.999 {
@@ -235,16 +319,6 @@ enum USDImporter {
     if let camera = importedCamera {
       p.camera = camera
     } else {
-      let tris = try graph.renderTriangles()
-      var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-      var hi = -lo
-      for t in tris {
-        for v in [t.a, t.b, t.c] {
-          let q = SIMD3(v.x, v.y, v.z)
-          lo = simd_min(lo, q)
-          hi = simd_max(hi, q)
-        }
-      }
       if lo.x <= hi.x {
         p.camera.target = (lo + hi) / 2
         p.camera.distance = min(1_000_000, max(0.0001, simd_length(hi - lo) * 1.4))
@@ -253,7 +327,7 @@ enum USDImporter {
         p.camera.fov = 45
       }
     }
-    p.options.focusDistance = p.camera.distance
+    p.options.focusDistance = importedFocus ?? p.camera.distance
     p.importReport = snapshot.report
     try p.validate()
     return USDImportResult(document: p, report: snapshot.report)
@@ -293,6 +367,7 @@ extension StudioController {
       "Composing layers, resolving materials, and building the scene. This can take a few minutes."
     sheet.addButton(withTitle: "Cancel")
     importInProgress = true
+    usdImportJob = job
     renderer.paused = true
     beginProjectActivity("Importing \(url.lastPathComponent)…")
     sheet.beginSheetModal(for: window) { _ in job.cancel() }
@@ -306,6 +381,7 @@ extension StudioController {
         let cancelled = job.isCancelled
         window.endSheet(sheet.window)
         self.importInProgress = false
+        self.usdImportJob = nil
         self.renderer.paused = wasPaused
         if cancelled {
           self.show("USD import cancelled.")

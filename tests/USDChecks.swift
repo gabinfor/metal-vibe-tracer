@@ -78,6 +78,8 @@ let referenceUSD = URL(fileURLWithPath: "build/reference-scenes/ShaderBall-trian
 if FileManager.default.fileExists(atPath: referenceUSD.path) {
  let imported = try USDImporter.load(referenceUSD,into: ProjectDocument())
  print("ASWF reference: \(imported.report.joined(separator: "\n"))")
+ require(imported.report.contains("17 mesh assets, 24 nodes, 11 materials, 63882 triangles"), "ASWF reference import counts")
+ require(imported.document.scenes[6]!.emissions?.count == 5 && (imported.document.scenes[6]!.materialX?.count ?? 0) >= 3, "ASWF reference keeps five rect lights and its compiled materials")
  try controller.restore(imported.document)
  try JSONEncoder().encode(imported.document).write(to: referenceUSD.deletingLastPathComponent().appendingPathComponent("StandardShaderBall-audit.vtrace"))
  try imported.report.joined(separator: "\n").write(to: referenceUSD.deletingLastPathComponent().appendingPathComponent("import-report-audit.txt"),atomically: true,encoding: .utf8)
@@ -97,5 +99,9 @@ if FileManager.default.fileExists(atPath: referenceUSD.path) {
  require(pixels.reduce(Float(0)) { $0+$1.x+$1.y+$1.z } > 1, "ASWF reference receives authored lighting")
  savePreview([pixels],width: 192,height: 144,name: "openusd-audit-reference.png")
  print("PASS: ASWF Standard Shader Ball imported, rendered, and saved as a portable project")
+} else if CommandLine.arguments.contains("--require-reference") {
+ require(false, "ASWF reference scene is missing; run /usr/bin/python3 scripts/fetch_reference_scene.py")
+} else {
+ print("SKIP: ASWF Standard Shader Ball not downloaded (scripts/fetch_reference_scene.py); --require-reference makes this fail")
 }
 controller.saveTimer?.invalidate()

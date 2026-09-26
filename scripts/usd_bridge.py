@@ -4,8 +4,11 @@ No input file is executed. This process only loads USD's installed core plugins.
 """
 import sys, pathlib, os, json, math, uuid, hashlib, argparse, xml.etree.ElementTree as ET
 HERE=pathlib.Path(__file__).resolve().parent
+# The bundled SDK is a CPython 3.9 wheel; any other interpreter gets a concise requirement message.
+if sys.version_info[:2]!=(3,9):sys.exit('USD import failed: the bundled OpenUSD SDK requires /usr/bin/python3 CPython 3.9 (Xcode Command Line Tools); found Python '+sys.version.split()[0]+'.')
 sys.path.insert(0,str(HERE/'OpenUSD' if (HERE/'OpenUSD').exists() else HERE.parent/'build/OpenUSD'))
-from pxr import Usd, UsdGeom, UsdShade, UsdLux, Sdf, Gf, Ar
+try:from pxr import Usd, UsdGeom, UsdShade, UsdLux, Sdf, Gf, Ar
+except ImportError as e:sys.exit('USD import failed: the bundled OpenUSD SDK could not be loaded ('+str(e)+'); rebuild the app or run scripts/prepare_usd.py.')
 
 def vec(v): return [float(x) for x in v]
 def identity_settings(): return {'positionScale':[0,0,0,1],'rotationHidden':[0,0,0,0],'uvTransform':[0,0,0,0],'channels':[0,0,0,0]}
@@ -18,30 +21,53 @@ def sub(a,b): return [x-y for x,y in zip(a,b)]
 def cross(a,b): return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]
 def get(obj,name,default,time):
     a=obj.GetInput(name) if hasattr(obj,'GetInput') else obj.GetAttribute(name)
+    if a and hasattr(a,'GetValueProducingAttributes'):
+        # Interface connections resolve to the material or node-graph input that holds the value.
+        sources=a.GetValueProducingAttributes()
+        if sources and UsdShade.Output.IsOutput(sources[0]):fail('Connected '+name+' is unsupported')
+        a=sources[0] if sources else None
     v=a.Get(time) if a else None
     return default if v is None else v
 
+# Authored USD color spaces that the MaterialX compiler decodes without OCIO.
+IMAGE_SPACES={'srgb_texture':'srgb_texture','srgb_rec709_scene':'srgb_texture','sRGB':'srgb_texture','lin_rec709':'lin_rec709','lin_rec709_scene':'lin_rec709','raw':'raw','data':'raw','identity':'raw'}
+
 def triangulate(points,indices):
-    # Ear clipping in the dominant projection handles concave planar polygons.
-    if len(indices)<3: fail('Face has fewer than three vertices')
+    # Ear clipping in the dominant projection handles concave planar polygons. Tolerances scale with the
+    # polygon extent; repeated corners and zero-area faces are dropped, and non-simple remainders use a fan.
+    # Returns (corner triangles, 'ok' | 'fan' | 'degenerate').
+    ps=[vec(points[i]) for i in indices]
+    corners=[k for k in range(len(ps)) if ps[k]!=ps[k-1]]
+    span=max([max(p[a] for p in ps)-min(p[a] for p in ps) for a in range(3)]) if ps else 0
+    eps=span*span*1e-10
+    def twice(a,b,c): return math.sqrt(sum(x*x for x in cross(sub(ps[b],ps[a]),sub(ps[c],ps[a]))))
+    if len(corners)<3 or not span>0: return [],'degenerate'
     n=[0.,0.,0.]
-    for i,j in zip(indices,indices[1:]+indices[:1]):
-        a,b=points[i],points[j]
+    for i,j in zip(corners,corners[1:]+corners[:1]):
+        a,b=ps[i],ps[j]
         n[0]+=(a[1]-b[1])*(a[2]+b[2]);n[1]+=(a[2]-b[2])*(a[0]+b[0]);n[2]+=(a[0]-b[0])*(a[1]+b[1])
     drop=max(range(3),key=lambda i:abs(n[i]));axes=[i for i in range(3) if i!=drop]
-    xy=[(points[i][axes[0]],points[i][axes[1]]) for i in indices]
+    xy={k:(ps[k][axes[0]],ps[k][axes[1]]) for k in corners}
     def area(a,b,c): return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
-    orientation=1 if sum(xy[i][0]*xy[(i+1)%len(xy)][1]-xy[(i+1)%len(xy)][0]*xy[i][1] for i in range(len(xy)))>=0 else -1
-    left=list(range(len(indices)));result=[]
-    while len(left)>3:
+    signed=sum(xy[i][0]*xy[j][1]-xy[j][0]*xy[i][1] for i,j in zip(corners,corners[1:]+corners[:1]))
+    orientation=1 if signed>=0 else -1
+    left=list(corners);result=[]
+    while len(left)>3 and abs(signed)>eps:
         found=False
         for k,b in enumerate(left):
             a,c=left[k-1],left[(k+1)%len(left)]
-            if area(xy[a],xy[b],xy[c])*orientation<=1e-12: continue
-            if any(all(area(x,y,xy[p])*orientation>=-1e-12 for x,y in [(xy[a],xy[b]),(xy[b],xy[c]),(xy[c],xy[a])]) for p in left if p not in (a,b,c)): continue
+            if area(xy[a],xy[b],xy[c])*orientation<=eps: continue
+            if any(all(area(x,y,xy[p])*orientation>=-eps for x,y in [(xy[a],xy[b]),(xy[b],xy[c]),(xy[c],xy[a])]) for p in left if p not in (a,b,c)): continue
             result.append((a,b,c));left.pop(k);found=True;break
-        if not found: fail('Degenerate or self-intersecting polygon; triangulate upstream')
-    result.append(tuple(left));return result
+        if found: continue
+        # A collinear corner adds no area; otherwise the polygon is not simple.
+        flat=[k for k,b in enumerate(left) if abs(area(xy[left[k-1]],xy[b],xy[left[(k+1)%len(left)]]))<=eps]
+        if not flat: break
+        left.pop(flat[0])
+    status='fan' if len(left)>3 else 'ok'
+    result+=[(left[0],left[i],left[i+1]) for i in range(1,len(left)-1)]
+    result=[t for t in result if twice(*t)>eps]
+    return (result,status) if result else ([],'degenerate')
 
 class MaterialTranslator:
     """UsdPreviewSurface or supported MaterialX UsdShade nodes -> existing MX compiler."""
@@ -128,7 +154,15 @@ class MaterialTranslator:
                 if i.Get(self.time) is None and not i.GetConnectedSource():continue
                 t=types.get(str(i.GetTypeName()))
                 if not t:fail('Unsupported MaterialX USD type '+str(i.GetTypeName()))
-                value=self.asset(i.Get(self.time)) if t=='filename' else i.Get(self.time) if t=='string' else self.expression(i,t,0)
+                if t=='filename':
+                    raw=get(shader,str(i.GetBaseName()),None,self.time)
+                    if not raw or not raw.path:fail(str(shader.GetPath())+': image file is missing')
+                    value={'value':self.asset(raw)}
+                    # Attribute metadata, then ColorSpaceAPI on the prim and its ancestors.
+                    space=str(Usd.ColorSpaceAPI.ComputeColorSpaceName(i.GetAttr(),Usd.ColorSpaceHashCache()) or '')
+                    if space and space not in IMAGE_SPACES:fail(str(shader.GetPath())+': unsupported image color space '+space)
+                    if space:value['colorspace']=IMAGE_SPACES[space]
+                else:value=i.Get(self.time) if t=='string' else self.expression(i,t,0)
                 inputs.append((str(i.GetBaseName()),t,value))
             result=self.add(category,type,inputs)
         else:fail('Unsupported shader node '+str(ident))
@@ -161,6 +195,36 @@ class MaterialTranslator:
         self.add('open_pbr_surface','surfaceshader',inputs)
         return ET.tostring(self.root,encoding='unicode')
 
+def sphere_proxy(radius):
+    # A once-subdivided icosahedron with outward, one-sided faces, scaled to the sphere's area 4*pi*r^2.
+    t=(1+math.sqrt(5))/2
+    v=[normalize(p) for p in [(-1,t,0),(1,t,0),(-1,-t,0),(1,-t,0),(0,-1,t),(0,1,t),(0,-1,-t),(0,1,-t),(t,0,-1),(t,0,1),(-t,0,-1),(-t,0,1)]]
+    faces=[]
+    for a,b,c in [(0,11,5),(0,5,1),(0,1,7),(0,7,10),(0,10,11),(1,5,9),(5,11,4),(11,10,2),(10,7,6),(7,1,8),(3,9,4),(3,4,2),(3,2,6),(3,6,8),(3,8,9),(4,9,5),(2,4,11),(6,2,10),(8,6,7),(9,8,1)]:
+        ab,bc,ca=[normalize([(x+y)/2 for x,y in zip(v[i],v[j])]) for i,j in ((a,b),(b,c),(c,a))]
+        faces+=[(v[a],ab,ca),(ab,v[b],bc),(ca,bc,v[c]),(ab,bc,ca)]
+    unit=sum(math.sqrt(sum(x*x for x in cross(sub(b,a),sub(c,a))))/2 for a,b,c in faces)
+    scale=radius*math.sqrt(4*math.pi/unit);triangles=[]
+    for a,b,c in faces:
+        a,b,c=[[scale*x for x in p] for p in (a,b,c)]
+        n=normalize(cross(sub(b,a),sub(c,a)))
+        if sum(x*y for x,y in zip(n,a))<0:b,c,n=c,b,[-x for x in n]
+        triangles.append(dict(a=a+[1],b=b+[1],c=c+[1],na=n+[0],nb=n+[0],nc=n+[0],uvab=[.5,.5,.5,.5],uvc=[.5,.5,0,0]))
+    return triangles
+
+def constant_environment(directory,color):
+    # A uniform latlong Radiance HDR (RGBE) image carries an untextured dome's linear color.
+    def rgbe(rgb):
+        m=max(rgb)
+        if not m>1e-32:return bytes(4)
+        f,e=math.frexp(m);s=f*256/m
+        return bytes([min(255,int(x*s)) for x in rgb]+[e+128])
+    color=[max(0.,float(x)) for x in color]
+    if not all(math.isfinite(x) for x in color):fail('Non-finite dome color')
+    data=b'#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 4 +X 8\n'+rgbe(color)*32
+    dest=directory/('dome-'+hashlib.sha256(data).hexdigest()[:16]+'.hdr')
+    dest.write_bytes(data);return str(dest)
+
 def import_stage(filename,directory,frame=None):
     stage=Usd.Stage.Open(filename,load=Usd.Stage.LoadAll)
     if not stage:fail('Could not open USD stage')
@@ -174,21 +238,43 @@ def import_stage(filename,directory,frame=None):
     conversion=Gf.Matrix4d().SetScale(UsdGeom.GetStageMetersPerUnit(stage))*conversion
     cache=UsdGeom.XformCache(time); nodes=[];assets=[];materials=[];materialIndex={};assetCache={};cameras=[];environment=None;sun=None
     rootID=uid();nodes.append({'id':rootID,'name':pathlib.Path(filename).name,'transform':identity_settings(),'bindings':[]})
-    nodeIDs={};worlds={};rendered=0
+    nodeIDs={};worlds={};rendered=0;translations={};collapsed=set();fallbackColors={}
     def get_material(prim):
         material,_=UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
         path=str(material.GetPath()) if material else ''
         color=UsdGeom.Gprim(prim).GetDisplayColorPrimvar().ComputeFlattened(time) if prim.IsA(UsdGeom.Gprim) else None
         if color is not None and len(color)>1:report.append(str(prim.GetPath())+': varying displayColor reduced to its first value')
         color=vec(color[0]) if color is not None and len(color) else [.7]*3
-        key=path or 'display:'+str(color)
-        if key in materialIndex:return materialIndex[key]
+        if material and path not in translations:
+            try:translations[path]=(MaterialTranslator(stage,time,directory,report).material(material),None)
+            except Exception as e:translations[path]=(None,str(e))
+        mtlx,error=translations.get(path,(None,None))
+        if error:report.append(str(prim.GetPath())+': material '+path+' fallback to displayColor — '+error)
+        # A failed translation falls back per displayColor, so prims sharing it keep their own colors.
+        key=path if mtlx else path+'|display:'+str(color)
+        if key in materialIndex:return materialIndex[key],color
+        if len(materials)>=56 and path in materialIndex:
+            report.append(str(prim.GetPath())+': material limit reached; shares the first displayColor fallback of '+path)
+            return materialIndex[path],color
         item={'id':uid(),'name':material.GetPrim().GetName() if material else 'Display color','color':color,'path':path}
-        if material:
-            try:item['mtlx']=MaterialTranslator(stage,time,directory,report).material(material)
-            except Exception as e:report.append(path+': material fallback to displayColor — '+str(e))
+        if mtlx:item['mtlx']=mtlx
         if len(materials)>=56:fail('Stage exceeds 56 imported materials')
-        materials.append(item);materialIndex[key]=item['id'];return item['id']
+        materials.append(item);materialIndex[key]=item['id']
+        if path:materialIndex.setdefault(path,item['id'])
+        return item['id'],color
+    def singular(m):
+        # Mirrors the Swift flattening limits: a collapsed basis cannot be rendered or inverted.
+        return abs(m.GetDeterminant3())<1e-18 or Gf.Vec3d(m[0][0],m[0][1],m[0][2]).GetLength()<1e-6
+    def attach(prim,world):
+        # Local matrices come from the XformCache, so a singular ancestor is never inverted.
+        parent=prim.GetParent()
+        while parent and str(parent.GetPath()) not in nodeIDs:parent=parent.GetParent()
+        pp=str(parent.GetPath()) if parent else None
+        if pp not in worlds:return pp,rootID,world
+        local,reset=cache.ComputeRelativeTransform(prim,parent)
+        if not reset:return pp,nodeIDs[pp],local
+        if singular(worlds[pp]):return pp,rootID,world
+        return pp,nodeIDs[pp],world*worlds[pp].GetInverse()
     with Ar.ResolverContextBinder(stage.GetPathResolverContext()):
         for prim in Usd.PrimRange.Stage(stage,Usd.TraverseInstanceProxies()):
             if not prim.IsActive() or not prim.IsDefined():continue
@@ -201,25 +287,28 @@ def import_stage(filename,directory,frame=None):
             if prim.HasAPI(UsdLux.LightAPI) and imageable and imageable.ComputeVisibility(time)=='invisible':continue
             if prim.IsA(UsdGeom.Mesh) or prim.IsA(UsdGeom.Xform):
                 world=cache.GetLocalToWorldTransform(prim)*conversion
-                parent=prim.GetParent()
-                while parent and str(parent.GetPath()) not in nodeIDs:parent=parent.GetParent()
-                pp=str(parent.GetPath()) if parent else None
-                local=world*(worlds[pp].GetInverse() if pp in worlds else Gf.Matrix4d(1))
-                node={'id':uid(),'name':str(prim.GetName()),'parent':nodeIDs.get(pp,rootID),'transform':identity_settings(),'bindings':[],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]}
+                pp,parentID,local=attach(prim,world)
+                node={'id':uid(),'name':str(prim.GetName()),'parent':parentID,'transform':identity_settings(),'bindings':[],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]}
                 # Gf uses row vectors; its row-major array is a column-major matrix for Swift.
                 if imageable and imageable.ComputeVisibility(time)=='invisible':node['transform']['rotationHidden'][3]=1
+                if singular(world):
+                    node['transform']['rotationHidden'][3]=1
+                    if pp not in collapsed:report.append(path+': zero or singular world scale; subtree hidden')
+                    collapsed.add(path)
                 nodes.append(node);nodeIDs[path]=node['id'];worlds[path]=world
                 if len(nodes)>256:fail('Stage exceeds 256 imported hierarchy nodes')
                 if not prim.IsA(UsdGeom.Mesh):continue
+                if prim.HasAPI(UsdLux.MeshLightAPI):report.append(path+': MeshLightAPI emission not applied; mesh imported as a surface')
                 mesh=UsdGeom.Mesh(prim);points=mesh.GetPointsAttr().Get(time);counts=mesh.GetFaceVertexCountsAttr().Get(time);indices=mesh.GetFaceVertexIndicesAttr().Get(time)
+                if any(v is None or not len(v) for v in (points,counts,indices)):report.append(path+': mesh without points or topology skipped');continue
                 valid,reason=UsdGeom.Mesh.ValidateTopology(indices,counts,len(points))
                 if not valid:fail(path+': '+reason)
                 if str(mesh.GetSubdivisionSchemeAttr().Get())!='none':report.append(path+': subdivision represented by its polygon control cage')
                 if len(counts) and max(counts)>4096:fail('Polygon exceeds 4096 corners')
-                default=get_material(prim);bindings=[default];subsetNames=['Default'];faceSlots=[0]*len(counts)
+                default,color=get_material(prim);bindings=[default];colors=[color];subsetNames=['Default'];faceSlots=[0]*len(counts)
                 assigned=set()
                 for subset in UsdShade.MaterialBindingAPI(prim).GetMaterialBindSubsets():
-                    materialID=get_material(subset.GetPrim());slot=len(bindings);bindings.append(materialID);subsetNames.append(str(subset.GetPrim().GetName()))
+                    materialID,color=get_material(subset.GetPrim());slot=len(bindings);bindings.append(materialID);colors.append(color);subsetNames.append(str(subset.GetPrim().GetName()))
                     for face in subset.GetIndicesAttr().Get(time) or []:
                         if face<0 or face>=len(counts) or face in assigned:fail(path+': invalid or overlapping material subsets')
                         assigned.add(face);faceSlots[face]=slot
@@ -230,27 +319,35 @@ def import_stage(filename,directory,frame=None):
                     index={'constant':0,'uniform':face,'vertex':vertex,'varying':vertex,'faceVarying':corner}.get(str(interp))
                     if index is None or index>=len(values):fail(path+': invalid primvar interpolation/count')
                     return vec(values[index])
-                holes=set(mesh.GetHoleIndicesAttr().Get(time) or []);offset=0;triangles=[];left=str(mesh.GetOrientationAttr().Get(time))=='leftHanded'
+                holes=set(mesh.GetHoleIndicesAttr().Get(time) or []);offset=0;triangles=[];left=str(mesh.GetOrientationAttr().Get(time))=='leftHanded';dropped=fanned=0
                 for face,count in enumerate(counts):
                     faceIndices=list(indices[offset:offset+count]);base=offset;offset+=count
                     if face in holes:continue
-                    for corners in triangulate(points,faceIndices):
+                    faceTriangles,status=triangulate(points,faceIndices);dropped+=status=='degenerate';fanned+=status=='fan'
+                    for corners in faceTriangles:
                         if left:corners=(corners[0],corners[2],corners[1])
                         ps=[vec(points[faceIndices[i]]) for i in corners];ng=normalize(cross(sub(ps[1],ps[0]),sub(ps[2],ps[0])))
                         ns=[normalize(sample(normals,normalInterp,face,base+i,faceIndices[i],ng)) for i in corners]
                         uvs=[sample(uv,uvInterp,face,base+i,faceIndices[i],[0,0]) for i in corners]
                         triangles.append(dict(a=ps[0]+[1],b=ps[1]+[1],c=ps[2]+[1],na=ns[0]+[0],nb=ns[1]+[0],nc=ns[2]+[0],uvab=[uvs[0][0],1-uvs[0][1],uvs[1][0],1-uvs[1][1]],uvc=[uvs[2][0],1-uvs[2][1],faceSlots[face],0]))
+                if dropped:report.append(path+': '+str(dropped)+' degenerate faces dropped')
+                if fanned:report.append(path+': '+str(fanned)+' non-simple polygons fan-triangulated')
+                if not triangles:report.append(path+': mesh has no renderable faces; skipped');continue
                 rendered+=len(triangles)
                 if rendered>500000:fail('Stage exceeds 500,000 rendered triangles')
                 key=hashlib.sha256(json.dumps({'triangles':triangles,'subsets':subsetNames},separators=(',',':')).encode()).hexdigest()
                 if key not in assetCache:
                     asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':subsetNames};assets.append(asset);assetCache[key]=asset['id']
                 node['mesh']=assetCache[key];node['bindings']=bindings
+                # Per-binding displayColors let Swift split a material its compiler rejects.
+                fallbackColors[node['id']]=colors
             elif prim.IsA(UsdGeom.Camera):
                 camera=UsdGeom.Camera(prim).GetCamera(time)
                 if camera.projection!=Gf.Camera.Perspective:report.append(path+': orthographic camera skipped');continue
                 world=cache.GetLocalToWorldTransform(prim)*conversion;eye=world.Transform(Gf.Vec3d(0));forward=normalize(vec(world.TransformDir(Gf.Vec3d(0,0,-1))));up=normalize(vec(world.TransformDir(Gf.Vec3d(0,1,0))))
-                cameras.append({'name':str(prim.GetName()),'eye':vec(eye),'direction':forward,'up':up,'fov':float(camera.GetFieldOfView(Gf.Camera.FOVVertical)),'focus':float(UsdGeom.Camera(prim).GetFocusDistanceAttr().Get(time))*UsdGeom.GetStageMetersPerUnit(stage)})
+                # The schema fallback 0 means an unauthored focus; Swift then focuses where the view meets the scene.
+                focus=UsdGeom.Camera(prim).GetFocusDistanceAttr().Get(time)
+                cameras.append({'name':str(prim.GetName()),'eye':vec(eye),'direction':forward,'up':up,'fov':float(camera.GetFieldOfView(Gf.Camera.FOVVertical)),'focus':float(focus)*UsdGeom.GetStageMetersPerUnit(stage) if focus and math.isfinite(focus) and focus>0 else None})
             elif prim.IsA(UsdLux.RectLight) or prim.IsA(UsdLux.DiskLight) or prim.IsA(UsdLux.SphereLight):
                 if imageable and imageable.ComputeVisibility(time)=='invisible':continue
                 is_rect=prim.IsA(UsdLux.RectLight);is_disk=prim.IsA(UsdLux.DiskLight)
@@ -265,48 +362,61 @@ def import_stage(filename,directory,frame=None):
                 if light.GetEnableColorTemperatureAttr().Get(time):report.append(path+': light color temperature is not applied')
                 if is_rect and light.GetTextureFileAttr().Get(time):report.append(path+': textured area light imported with constant color')
                 if prim.HasAPI(UsdLux.ShapingAPI) or light.GetFiltersRel().GetTargets() or light.GetDiffuseAttr().Get(time)!=1 or light.GetSpecularAttr().Get(time)!=1:report.append(path+': light shaping, filters and diffuse/specular weights are not applied')
-                area=Gf.Cross(world.TransformDir(Gf.Vec3d(width,0,0)),world.TransformDir(Gf.Vec3d(0,height,0))).GetLength()
-                if area<1e-12:report.append(path+': degenerate area light skipped');continue
-                if light.GetNormalizeAttr().Get(time):strength/=area
-                material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':[max(0,x*strength) for x in color]}
-                if len(materials)>=56:fail('Stage exceeds 56 materials including lights')
-                materials.append(material)
                 if is_disk:
-                    ps=[[0,0,0]]+[[radius*math.cos(2*math.pi*i/8),radius*math.sin(2*math.pi*i/8),0] for i in range(8)]
+                    # An equal-area octagon keeps the disk's area pi*r^2, and with it the emitted power.
+                    r=radius*math.sqrt(math.pi/(2*math.sqrt(2)))
+                    ps=[[0,0,0]]+[[r*math.cos(2*math.pi*i/8),r*math.sin(2*math.pi*i/8),0] for i in range(8)]
                     triangles=[]
                     for i in range(8):
                         a,b=1+i,1+(i+1)%8
                         triangles.append(dict(a=ps[0]+[1],b=ps[b]+[1],c=ps[a]+[1],na=[0,0,-1,0],nb=[0,0,-1,0],nc=[0,0,-1,0],uvab=[.5,.5,.5,.5],uvc=[.5+.5*math.cos(2*math.pi*i/8),.5+.5*math.sin(2*math.pi*i/8),0,0]))
-                else:
+                elif is_rect:
                     ps=[[-width/2,-height/2,0],[-width/2,height/2,0],[width/2,height/2,0],[width/2,-height/2,0]];triangles=[]
                     for a,b,c in [(0,1,2),(0,2,3)]:triangles.append(dict(a=ps[a]+[1],b=ps[b]+[1],c=ps[c]+[1],na=[0,0,-1,0],nb=[0,0,-1,0],nc=[0,0,-1,0],uvab=[0,0,0,1],uvc=[1,1,0,0]))
+                else:triangles=sphere_proxy(radius)
+                # USD normalization divides by the world-space area of the emitter actually built.
+                area=sum(0.5*Gf.Cross(world.TransformDir(Gf.Vec3d(*sub(t['b'][:3],t['a'][:3]))),world.TransformDir(Gf.Vec3d(*sub(t['c'][:3],t['a'][:3])))).GetLength() for t in triangles)
+                if area<1e-12:report.append(path+': degenerate area light skipped');continue
+                if light.GetNormalizeAttr().Get(time):strength/=area
+                emission=[max(0,x*strength) for x in color]
+                if not all(math.isfinite(x) for x in emission):fail(path+': non-finite light intensity')
+                if max(emission)>1e8:
+                    report.append(path+': emission %.3g exceeds the supported 1e8 and was scaled down'%max(emission))
+                    emission=[x*(1e8/max(emission)) for x in emission]
+                material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':emission}
+                if len(materials)>=56:fail('Stage exceeds 56 materials including lights')
+                materials.append(material)
                 asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':['Emission']};assets.append(asset)
-                parent=prim.GetParent()
-                while parent and str(parent.GetPath()) not in nodeIDs:parent=parent.GetParent()
-                pp=str(parent.GetPath()) if parent else None
-                local=world*(worlds[pp].GetInverse() if pp in worlds else Gf.Matrix4d(1))
-                nodes.append({'id':uid(),'name':str(prim.GetName()),'parent':nodeIDs.get(pp,rootID),'mesh':asset['id'],'transform':identity_settings(),'bindings':[material['id']],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]})
+                pp,parentID,local=attach(prim,world)
+                nodes.append({'id':uid(),'name':str(prim.GetName()),'parent':parentID,'mesh':asset['id'],'transform':identity_settings(),'bindings':[material['id']],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]})
                 rendered+=len(triangles)
-                if is_disk: report.append(path+': disk light imported as an eight-sided emissive polygon')
-                elif not is_rect: report.append(path+': sphere light imported as a rectangular emitter approximation')
+                if is_disk: report.append(path+': disk light imported as an equal-area eight-sided emissive polygon')
+                elif not is_rect: report.append(path+': sphere light imported as an equal-area 80-face emissive polyhedron approximation')
             elif prim.IsA(UsdLux.DomeLight):
                 light=UsdLux.DomeLight(prim);asset=light.GetTextureFileAttr().Get(time)
+                if environment:report.append(path+': additional dome light skipped');continue
+                intensity=float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time))
+                layout=str(light.GetTextureFormatAttr().Get(time) or 'automatic')
                 if asset and asset.path:
-                    if environment:report.append(path+': additional dome light skipped');continue
-                    environment={'file':MaterialTranslator(stage,time,directory,report).asset(asset),'intensity':float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time))}
+                    if layout not in ('automatic','latlong'):report.append(path+': dome texture format '+layout+' is unsupported (latlong only); dome skipped');continue
+                    environment={'file':MaterialTranslator(stage,time,directory,report).asset(asset),'intensity':intensity}
                     report.append(path+': dome texture imported; dome transform/color not applied')
+                else:
+                    environment={'file':constant_environment(directory,vec(light.GetColorAttr().Get(time))),'intensity':intensity}
+                    report.append(path+': untextured dome imported as a constant-color environment')
             elif prim.IsA(UsdLux.DistantLight):
                 light=UsdLux.DistantLight(prim)
                 if sun:report.append(path+': additional distant light skipped');continue
                 direction=normalize(vec((cache.GetLocalToWorldTransform(prim)*conversion).TransformDir(Gf.Vec3d(0,0,1))))
                 sun={'direction':direction,'intensity':float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time)),'angle':float(light.GetAngleAttr().Get(time)),'normalize':bool(light.GetNormalizeAttr().Get(time))}
                 report.append(path+': distant light imported as directional sun with its angle; tint not applied')
+            elif prim.HasAPI(UsdLux.VolumeLightAPI):report.append(path+': VolumeLightAPI emission and volume geometry '+prim.GetTypeName()+' are not imported')
             elif prim.HasAPI(UsdLux.LightAPI):report.append(path+': unsupported light type '+prim.GetTypeName())
             elif prim.IsA(UsdGeom.Gprim) or prim.GetTypeName() in ('PointInstancer','Volume'):report.append(path+': unsupported geometry '+prim.GetTypeName())
     if len(nodes)>256 or rendered>500000:fail('Stage exceeds renderer capacity including lights')
     if not assets:fail('No supported meshes were found')
     report.insert(1,f'{len(assets)} mesh assets, {len(nodes)} nodes, {len(materials)} materials, {rendered} triangles')
-    return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report}
+    return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report,'fallbackColors':fallbackColors}
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('input');parser.add_argument('output');parser.add_argument('--frame',type=float);args=parser.parse_args()
