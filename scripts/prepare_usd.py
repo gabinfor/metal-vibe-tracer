@@ -2,29 +2,33 @@
 """Prepare and atomically publish the pinned OpenUSD runtime."""
 
 import fcntl
-import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
+
+from buildsupport import build_directory, replace_directory, sha256_file
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 VERSION = "26.8"
 EXPECTED = "f5bd2691fb18461b600e9d106d0101a713851dfe3f7f06c59ae61704563bdf87"
-BUILD = ROOT / "build"
+BUILD = build_directory(ROOT)
 DEST = BUILD / "OpenUSD"
 RUNTIME = BUILD / f"OpenUSD-{VERSION}-cp39-{EXPECTED[:12]}"
 MANIFEST = "VIBE_RUNTIME.json"
-REQUIRED = (
-    "pxr/Usd/__init__.py",
-    "pxr/UsdGeom/__init__.py",
-    "pxr/UsdShade/__init__.py",
-    "pxr/Usd/_usd.so",
-)
+WHEEL_PATTERN = f"usd_core-{VERSION}-cp39-*.whl"
+# Validate exactly the modules the bridge imports, so the runtime cannot drift from it.
+_BRIDGE_IMPORT = re.search(r"^from pxr import (.+)$", (ROOT / "scripts/usd_bridge.py").read_text(), re.M)
+if not _BRIDGE_IMPORT:
+    raise SystemExit("scripts/usd_bridge.py no longer has a 'from pxr import' line")
+MODULES = tuple(name.strip() for name in _BRIDGE_IMPORT.group(1).split(","))
+REQUIRED = tuple(f"pxr/{name}/__init__.py" for name in MODULES) + ("pxr/Usd/_usd.so",)
 
 
 def state_valid(path: pathlib.Path, smoke: bool = False) -> bool:
@@ -46,7 +50,8 @@ def state_valid(path: pathlib.Path, smoke: bool = False) -> bool:
             }
             result = subprocess.run(
                 [sys.executable, "-I", "-c",
-                 "import sys;sys.path.insert(0,sys.argv[1]);from pxr import Usd,UsdGeom,UsdShade;assert Usd.Stage.CreateInMemory()",
+                 "import sys;sys.path.insert(0,sys.argv[1]);from pxr import " + ",".join(MODULES)
+                 + ";assert Usd.Stage.CreateInMemory()",
                  str(path)],
                 env=environment,
                 stdout=subprocess.DEVNULL,
@@ -62,7 +67,22 @@ def state_valid(path: pathlib.Path, smoke: bool = False) -> bool:
 if sys.version_info[:2] != (3, 9):
     raise SystemExit("OpenUSD bundle requires /usr/bin/python3 (CPython 3.9).")
 
-BUILD.mkdir(parents=True, exist_ok=True)
+
+def fetch_wheel(wheels: pathlib.Path) -> list:
+    subprocess.run(
+        [sys.executable, "-m", "pip", "download", "--only-binary=:all:", "--no-deps",
+         "--dest", str(wheels), "usd-core==" + VERSION], check=True)
+    return list(wheels.glob(WHEEL_PATTERN))
+
+
+def reject_wheel(wheel: pathlib.Path) -> pathlib.Path:
+    rejected = wheel.parent / "rejected"
+    rejected.mkdir(exist_ok=True)
+    target = rejected / f"{wheel.name}.{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    os.replace(wheel, target)
+    return target
+
+
 with (BUILD / "openusd-prepare.lock").open("a+") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     if DEST.exists() and state_valid(DEST, smoke=True):
@@ -71,18 +91,23 @@ with (BUILD / "openusd-prepare.lock").open("a+") as lock:
 
     wheels = BUILD / "usd-wheel"
     wheels.mkdir(parents=True, exist_ok=True)
-    found = list(wheels.glob("usd_core-26.8-cp39-*.whl"))
+    found = list(wheels.glob(WHEEL_PATTERN))
     if not found:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "download", "--only-binary=:all:", "--no-deps",
-             "--dest", str(wheels), "usd-core==" + VERSION], check=True)
-        found = list(wheels.glob("usd_core-26.8-cp39-*.whl"))
+        found = fetch_wheel(wheels)
     if len(found) != 1:
-        raise SystemExit("Expected the OpenUSD 26.8 CPython 3.9 macOS wheel. Run with /usr/bin/python3.")
+        raise SystemExit(f"Expected one OpenUSD {VERSION} CPython 3.9 macOS wheel in {wheels}. Run with /usr/bin/python3.")
     wheel = found[0]
-    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    digest = sha256_file(wheel)
     if digest != EXPECTED:
-        raise SystemExit("OpenUSD wheel checksum mismatch")
+        # A truncated or tampered cached wheel is set aside and fetched again once.
+        print(f"OpenUSD wheel checksum mismatch; moved {wheel} to {reject_wheel(wheel)}", file=sys.stderr)
+        found = fetch_wheel(wheels)
+        if len(found) != 1:
+            raise SystemExit(f"Expected one OpenUSD {VERSION} CPython 3.9 macOS wheel in {wheels}.")
+        wheel = found[0]
+        digest = sha256_file(wheel)
+        if digest != EXPECTED:
+            raise SystemExit(f"OpenUSD wheel checksum mismatch after download; moved {wheel} to {reject_wheel(wheel)}")
 
     if not state_valid(RUNTIME, smoke=True):
         with tempfile.TemporaryDirectory(prefix="openusd-stage-", dir=BUILD) as temporary:
@@ -103,9 +128,7 @@ with (BUILD / "openusd-prepare.lock").open("a+") as lock:
             }, indent=2) + "\n")
             if not state_valid(stage, smoke=True):
                 raise SystemExit("Prepared OpenUSD runtime failed validation")
-            if RUNTIME.exists():
-                shutil.rmtree(RUNTIME)
-            os.replace(stage, RUNTIME)
+            replace_directory(stage, RUNTIME)
 
     link = BUILD / f".OpenUSD-link-{os.getpid()}"
     if link.exists() or link.is_symlink():

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import platform
+import os
 root = Path(__file__).resolve().parents[1]
 previous = Path(sys.argv[1]).read_text()
 source = (root / 'main.swift').read_text().split('// 5. App Entry Point')[0]
@@ -70,5 +71,5 @@ with tempfile.TemporaryDirectory(prefix='vibe-benchmark-') as directory:
     folder = Path(directory)
     (folder / 'main.swift').write_text(source + helpers + benchmark)
     (folder / 'before.metal').write_text(old_shader)
-    subprocess.run(['xcrun','swiftc','-O','-target',platform.machine()+'-apple-macosx26.0',str(folder/'main.swift'),'-o',str(folder/'benchmark')],check=True)
-    sys.exit(subprocess.run([str(folder/'benchmark'),str(folder/'before.metal')],cwd=root).returncode)
+    subprocess.run(['xcrun','swiftc','-O','-D','VIBE_TESTING','-target',platform.machine()+'-apple-macosx26.0',str(folder/'main.swift'),'-o',str(folder/'benchmark')],check=True)
+    sys.exit(subprocess.run([str(folder/'benchmark'),str(folder/'before.metal')],cwd=root,env={**os.environ,'VIBE_TRACER_REPOSITORY':str(root)}).returncode)

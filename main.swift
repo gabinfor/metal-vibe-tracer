@@ -12,12 +12,30 @@ import ImageIO
 // 1. Metal Shading Language: ReSTIR DI/GI and Path Tracing
 // ============================================================================
 
+/// Unbundled test builds (compiled with -D VIBE_TESTING) name the repository explicitly.
+func runtimeRepositoryRoot() -> String? {
+#if VIBE_TESTING
+    return ProcessInfo.processInfo.environment["VIBE_TRACER_REPOSITORY"]
+#else
+    return nil
+#endif
+}
+
+/// Resolves a shader, helper script or library inside the application bundle. Only test builds
+/// may fall back to an absolute repository path; the working directory is never consulted.
+func runtimeResourceURL(bundled: URL?, repositoryPath: String,
+                        repository: String? = runtimeRepositoryRoot()) -> URL? {
+    let manager = FileManager.default
+    if let bundled, manager.fileExists(atPath: bundled.path) { return bundled }
+    guard let repository, repository.hasPrefix("/") else { return nil }
+    let url = URL(fileURLWithPath: repository, isDirectory: true).appendingPathComponent(repositoryPath)
+    return manager.fileExists(atPath: url.path) ? url : nil
+}
+
 func loadOpenPBRSource() -> String {
-    let candidates = [Bundle.main.resourceURL?.appendingPathComponent("OpenPBR.metal"),
-        URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("build/ShaderResources/OpenPBR.metal")]
-    for url in candidates.compactMap({ $0 }) {
-        if let text = try? String(contentsOf: url, encoding: .utf8) { return text }
-    }
+    if let url = runtimeResourceURL(bundled: Bundle.main.resourceURL?.appendingPathComponent("OpenPBR.metal"),
+                                    repositoryPath: "build/ShaderResources/OpenPBR.metal"),
+       let text = try? String(contentsOf: url, encoding: .utf8) { return text }
     return "#error Missing OpenPBR.metal. Build with build.sh before running.\n"
 }
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Exercise the real SDK bridge with composed layers, packages and schemas."""
-import sys,pathlib,json,importlib.util,zipfile
+import sys,pathlib,json,importlib.util,zipfile,re
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 runtime=ROOT/'build/OpenUSD'
 manifest=json.loads((runtime/'VIBE_RUNTIME.json').read_text())
-assert manifest['version']=='26.8' and manifest['python']=='cp39' and len(manifest['sha256'])==64
+version=re.search(r'^VERSION = "([^"]+)"$',(ROOT/'scripts/prepare_usd.py').read_text(),re.M).group(1)
+assert manifest['version']==version and manifest['python']=='cp39' and len(manifest['sha256'])==64
 assert runtime.is_dir() and (runtime/'pxr/Usd/_usd.so').is_file()
 sys.path.insert(0,str(ROOT/'build/OpenUSD'))
 from pxr import Usd,UsdGeom,UsdShade,UsdLux,UsdUtils,Gf,Sdf

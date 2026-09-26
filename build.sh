@@ -1,27 +1,30 @@
 #!/bin/zsh
 set -eu
 cd -- "$(dirname -- "$0")"
+# One architecture for the executable and the bundled OIDN runtime.
+arch="$(uname -m)"
 python3 scripts/prepare_shaders.py
 /usr/bin/python3 scripts/prepare_usd.py
-python3 scripts/prepare_oidn.py
+python3 scripts/prepare_oidn.py --arch "$arch"
 app="build/MetalVibeTracer.app"
-mkdir -p "$app/Contents/Resources"
-cp build/ShaderResources/OpenPBR.metal "$app/Contents/Resources/"
-cp Vendor/OpenPBR/LICENSE "$app/Contents/Resources/OpenPBR-LICENSE"
-cp Vendor/OpenPBR/UPSTREAM.md "$app/Contents/Resources/OpenPBR-UPSTREAM.md"
-cp THIRD_PARTY_NOTICES.md "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
-cp scripts/usd_bridge.py "$app/Contents/Resources/"
-rm -rf "$app/Contents/Resources/OpenUSD"
-cp -RL build/OpenUSD "$app/Contents/Resources/OpenUSD"
-cp Vendor/OpenUSD/UPSTREAM.md "$app/Contents/Resources/OpenUSD-UPSTREAM.md"
-mkdir -p "$app/Contents/Frameworks"
-rm -rf "$app/Contents/Frameworks/OIDN"
-cp -R build/OIDN "$app/Contents/Frameworks/OIDN"
-cp Vendor/OIDN/UPSTREAM.md "$app/Contents/Resources/OIDN-UPSTREAM.md"
-cp REFERENCES.md "$app/Contents/Resources/REFERENCES.md"
-mkdir -p "$app/Contents/MacOS" build/module-cache
-xcrun swiftc -O -target "$(uname -m)-apple-macosx26.0" -module-cache-path build/module-cache main.swift Sources/*.swift -o "$app/Contents/MacOS/MetalVibeTracer"
-cat > "$app/Contents/Info.plist" <<'PLIST'
+# Assemble a staging bundle (compile first) and swap it in only once it is complete and checked.
+stage="build/.MetalVibeTracer.app.stage-$$"
+retired="build/.MetalVibeTracer.app.retired-$$"
+trap 'rm -rf -- "$stage" "$retired"' EXIT
+rm -rf -- "$stage"
+mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources" "$stage/Contents/Frameworks" build/module-cache
+xcrun swiftc -O -target "$arch-apple-macosx26.0" -module-cache-path build/module-cache main.swift Sources/*.swift -o "$stage/Contents/MacOS/MetalVibeTracer"
+cp build/ShaderResources/OpenPBR.metal "$stage/Contents/Resources/"
+cp Vendor/OpenPBR/LICENSE "$stage/Contents/Resources/OpenPBR-LICENSE"
+cp Vendor/OpenPBR/UPSTREAM.md "$stage/Contents/Resources/OpenPBR-UPSTREAM.md"
+cp THIRD_PARTY_NOTICES.md "$stage/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp scripts/usd_bridge.py "$stage/Contents/Resources/"
+cp -RL build/OpenUSD "$stage/Contents/Resources/OpenUSD"
+cp Vendor/OpenUSD/UPSTREAM.md "$stage/Contents/Resources/OpenUSD-UPSTREAM.md"
+cp -RH build/OIDN "$stage/Contents/Frameworks/OIDN"
+cp Vendor/OIDN/UPSTREAM.md "$stage/Contents/Resources/OIDN-UPSTREAM.md"
+cp REFERENCES.md "$stage/Contents/Resources/REFERENCES.md"
+cat > "$stage/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -35,4 +38,10 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
     <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+/usr/bin/python3 scripts/check_bundle.py "$stage" "$arch"
+if [[ -e "$app" ]]; then mv -- "$app" "$retired"; fi
+if ! mv -- "$stage" "$app"; then
+    [[ -e "$retired" ]] && mv -- "$retired" "$app"
+    exit 1
+fi
 printf 'Built %s\n' "$PWD/$app"

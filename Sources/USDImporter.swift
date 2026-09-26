@@ -82,11 +82,10 @@ final class USDImportJob: @unchecked Sendable {
   }
 }
 enum USDImporter {
-  static var helperURL: URL {
-    let bundled = Bundle.main.resourceURL?.appendingPathComponent("usd_bridge.py")
-    if let bundled, FileManager.default.fileExists(atPath: bundled.path) { return bundled }
-    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-      .appendingPathComponent("scripts/usd_bridge.py")
+  static var helperURL: URL? {
+    runtimeResourceURL(
+      bundled: Bundle.main.resourceURL?.appendingPathComponent("usd_bridge.py"),
+      repositoryPath: "scripts/usd_bridge.py")
   }
   static func load(
     _ url: URL, into source: ProjectDocument, frame: Double? = nil,
@@ -104,7 +103,10 @@ enum USDImporter {
     defer { try? logHandle.close() }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-    process.arguments = ["-I", helperURL.path, url.path, output.path]
+    guard let helper = helperURL else {
+      throw MaterialLibrary.error("The OpenUSD bridge is missing from this application bundle. Rebuild the app.")
+    }
+    process.arguments = ["-I", helper.path, url.path, output.path]
     if let frame { process.arguments! += ["--frame", String(frame)] }
     process.standardOutput = logHandle
     process.standardError = logHandle

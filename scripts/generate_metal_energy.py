@@ -5,10 +5,12 @@ Uses the pinned Adobe VNDF and Smith G1 functions, 129x129 nodes (sqrt cosine),
 for the average complement. Build consumes the checked-in artifact, not a GPU.
 """
 from pathlib import Path
+import platform
 import subprocess
+import sys
 import tempfile
+from buildsupport import atomic_write_text
 root=Path(__file__).resolve().parents[1]
-subprocess.run(['python3',str(root/'scripts/prepare_shaders.py'),'--upstream-only'],check=True)
 shader=r'''
 kernel void bake_energy(device float *out [[buffer(0)]], uint2 id [[thread_position_in_grid]]) {
     if (id.x > 128 || id.y > 128) return;
@@ -30,8 +32,7 @@ kernel void bake_energy(device float *out [[buffer(0)]], uint2 id [[thread_posit
 swift=r'''
 import Foundation
 import Metal
-let root=URL(fileURLWithPath:CommandLine.arguments[1])
-let code=try String(contentsOf:root.appendingPathComponent("build/ShaderResources/OpenPBR.metal"),encoding:.utf8)
+let code=try String(contentsOfFile:CommandLine.arguments[1],encoding:.utf8)
 let extra=try String(contentsOfFile:CommandLine.arguments[2],encoding:.utf8)
 guard let device=MTLCreateSystemDefaultDevice() else { fatalError("Metal GPU required") }
 let opts=MTLCompileOptions();opts.mathMode = .safe
@@ -47,8 +48,10 @@ try Data(bytes:out.contents(),count:129*129*4).write(to:URL(fileURLWithPath:Comm
 '''
 with tempfile.TemporaryDirectory(prefix='vibe-energy-') as d:
     folder=Path(d);(folder/'main.swift').write_text(swift);(folder/'bake.metal').write_text(shader)
-    subprocess.run(['xcrun','swiftc','-O','-target','arm64-apple-macosx26.0',str(folder/'main.swift'),'-o',str(folder/'bake')],check=True)
-    subprocess.run([str(folder/'bake'),str(root),str(folder/'bake.metal'),str(folder/'table.bin')],check=True)
+    # The unadapted upstream shader stays private to this run; build/ShaderResources is never replaced by it.
+    subprocess.run([sys.executable,str(root/'scripts/prepare_shaders.py'),'--upstream-only','--output',str(folder/'upstream.metal')],check=True)
+    subprocess.run(['xcrun','swiftc','-O','-target',platform.machine()+'-apple-macosx26.0',str(folder/'main.swift'),'-o',str(folder/'bake')],check=True)
+    subprocess.run([str(folder/'bake'),str(folder/'upstream.metal'),str(folder/'bake.metal'),str(folder/'table.bin')],check=True)
     import struct
     values=struct.unpack('<'+str(129*129)+'f',(folder/'table.bin').read_bytes())
 averages=[]
@@ -80,6 +83,6 @@ float vibe_metal_average_energy(float alpha) {
     return mix(vibeMetalAverageEnergy[ix],vibeMetalAverageEnergy[ix+1],x-float(ix));
 }
 '''
-(root/'Shaders/MetalEnergy.metal').write_text(code)
+atomic_write_text(root/'Shaders/MetalEnergy.metal',code)
 print('Generated dense metal energy table')
-subprocess.run(['python3',str(root/'scripts/prepare_shaders.py')],check=True)
+subprocess.run([sys.executable,str(root/'scripts/prepare_shaders.py')],check=True)

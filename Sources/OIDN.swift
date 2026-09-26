@@ -115,14 +115,9 @@ final class OIDNDenoiser {
     let executeFilter: ExecuteFilter
 
     init() throws {
-      let manager = FileManager.default
-      var candidates: [URL] = []
-      if let frameworks = Bundle.main.privateFrameworksURL {
-        candidates.append(frameworks.appendingPathComponent("OIDN/lib/libOpenImageDenoise.2.dylib"))
-      }
-      candidates.append(URL(fileURLWithPath: manager.currentDirectoryPath)
-        .appendingPathComponent("build/OIDN/lib/libOpenImageDenoise.2.dylib"))
-      guard let path = candidates.first(where: { manager.fileExists(atPath: $0.path) }) else {
+      guard let path = runtimeResourceURL(
+        bundled: Bundle.main.privateFrameworksURL?.appendingPathComponent("OIDN/lib/libOpenImageDenoise.2.dylib"),
+        repositoryPath: "build/OIDN/lib/libOpenImageDenoise.2.dylib") else {
         throw MaterialLibrary.error("Open Image Denoise is not installed in this application bundle. Rebuild the app to prepare OIDN.")
       }
       guard let library = dlopen(path.path, RTLD_NOW | RTLD_LOCAL) else {
