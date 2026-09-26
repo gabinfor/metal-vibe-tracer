@@ -288,7 +288,10 @@ func fixGeometryChecks() throws {
     u.cameraTarget = SIMD4(p, 16)
     let inputs = [texture(SIMD4(0, 0, 0, 1)), texture(SIMD4(p, 3)), texture(SIMD4(shading, 1)), texture(SIMD4(0.9, 0.9, 0.9, 0))]
     let outputs = (0..<9).map { _ in texture(.zero) }
-    _ = try dispatch("metalfx_guides_kernel", u, grid: MTLSize(width: 1, height: 1, depth: 1), bytes: 16, textures: inputs + outputs)
+    // buffer(3) is the kernel's primary-surface cache (integrator): one 104-byte
+    // PrimarySurface per pixel, read only for OpenPBR hits (this G-buffer is glossy).
+    _ = try dispatch("metalfx_guides_kernel", u, grid: MTLSize(width: 1, height: 1, depth: 1),
+      bytes: Int(PathTracerRenderer.primarySurfaceStride), textures: inputs + outputs)
     return [readTexture(outputs[3])[0], readTexture(outputs[4])[0]]
   }
   let onPlane = try guide(0), belowPlane = try guide(-2e-7)

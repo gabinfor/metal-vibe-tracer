@@ -131,6 +131,8 @@ func fixGPUMemoryChecks() throws {
       for (i, t) in bound.enumerated() { encoder.setTexture(t, index: i) }
       renderer.materials.bind(encoder)
       encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+      // The temporal pass also writes the integrator's primary-surface cache.
+      encoder.setBuffer(renderer.primarySurfaceBuffer(width: w, height: h)!, offset: 0, index: 3)
       encoder.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
       encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
       require(command.status == .completed, "placeholder-mode temporal pass completes")
