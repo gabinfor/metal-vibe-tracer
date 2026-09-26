@@ -288,7 +288,7 @@ bool intersect_sphere_local(Ray r, float3 center, float radius, Material mat, fl
             rec.mat = mat;
             rec.uv = float2(atan2(out_norm.z, out_norm.x) / TWO_PI + 0.5f, acos(clamp(out_norm.y, -1.0f, 1.0f)) / PI);
             rec.tangent = normalize(float3(-out_norm.z, 0, out_norm.x) + float3(1e-8f, 0, 0));
-            rec.bitangent = cross(rec.normal, rec.tangent);
+            rec.bitangent = cross(out_norm, rec.tangent);
             rec.uvDensity = float2(1.0f / (TWO_PI * radius * max(0.02f, length(out_norm.xz))), 1.0f / (PI * radius));
             rec.geometricNormal = rec.normal;
             return true;
@@ -303,7 +303,7 @@ bool intersect_sphere_local(Ray r, float3 center, float radius, Material mat, fl
             rec.mat = mat;
             rec.uv = float2(atan2(out_norm.z, out_norm.x) / TWO_PI + 0.5f, acos(clamp(out_norm.y, -1.0f, 1.0f)) / PI);
             rec.tangent = normalize(float3(-out_norm.z, 0, out_norm.x) + float3(1e-8f, 0, 0));
-            rec.bitangent = cross(rec.normal, rec.tangent);
+            rec.bitangent = cross(out_norm, rec.tangent);
             rec.uvDensity = float2(1.0f / (TWO_PI * radius * max(0.02f, length(out_norm.xz))), 1.0f / (PI * radius));
             rec.geometricNormal = rec.normal;
             return true;
@@ -699,7 +699,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             tangent-=rec.normal*dot(tangent,rec.normal);
             if(dot(tangent,tangent)<1e-12f) tangent=cross(rec.normal,abs(rec.normal.y)<0.9f?float3(0,1,0):float3(1,0,0));
             rec.tangent=normalize(tangent);
-            rec.bitangent=cross(rec.normal,rec.tangent)*(uvDet<0?-1.0f:1.0f);
+            rec.bitangent=cross(rec.front_face?rec.normal:-rec.normal,rec.tangent)*(uvDet<0?-1.0f:1.0f);
             rec.uvDensity=float2(max(length(d1)/max(length(e1),1e-6f),length(d2)/max(length(e2),1e-6f)));
             rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=u.lens.z>0 ? uint(tri.uvc.z) : 7;
             if(u.lens.z>0 && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
@@ -814,6 +814,13 @@ float4 sample_material_map(constant MaterialResources &images, uint slot, uint c
 }
 
 
+// Tangent-space normal, +Y toward the image top: stored uv.y and the bitangent
+// point down the image, so green follows -bitangent. Primitives keep T and B on
+// the outward side; a back face sees the negated perturbed normal.
+float3 tangent_space_normal(thread const HitRecord &hit, float3 m) {
+    return normalize((hit.front_face ? 1.0f : -1.0f) * (hit.tangent * m.x - hit.bitangent * m.y) + hit.normal * m.z);
+}
+
 // REFERENCES.md: MATERIALX. Bounded, topologically sorted graph expressions.
 void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, float footprint) {
     GraphHeader h=images.graphHeaders[hit.mat.slot]; if(h.info.y==0) return;
@@ -839,7 +846,7 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         case 6:v=float4(a[uint(n.value.x)]);d=float2(max(da.x,da.y));break;
         case 7:v=clamp(a,b,c);d=da+db+dc;break;
         case 8:{float3 normal=dot(a.xyz,a.xyz)==0?float3(0,0,1):a.xyz*2.0f-1.0f;normal.xy*=n.value.xy;
-            v=float4(normalize(hit.tangent*normal.x-hit.bitangent*normal.y+hit.normal*normal.z),0);break;}
+            v=float4(tangent_space_normal(hit,normal),0);break;}
         case 9:v=a-b;d=da+db;break;
         case 10:{float angle=n.value.x;v=float4(cos(angle)*a.x-sin(angle)*a.y,sin(angle)*a.x+cos(angle)*a.y,0,0);d=float2(max(da.x,da.y)*1.414214f);break;}
         case 11:v=a;d=da;break;
@@ -899,16 +906,22 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
     // Isotropic ray-cone footprint, enlarged at grazing incidence. Rough
     // secondary rays expand the cone in shading_kernel; mirror chains preserve it.
     footprint /= max(0.05f, abs(dot(ray.direction, hit.geometricNormal)));
+    // Roughness and metalness maps promote an original scene material to OpenPBR.
+    // Keep its metal or glass lobe; a matte surface takes the inspector roughness.
+    if ((config.mapMask & 6) && hit.mat.type != OPENPBR && (hit.mat.type != GLOSSY || (config.mapMask & 4))) {
+        hit.mat.metalness = hit.mat.type == GLOSSY ? 1.0f : 0.0f;
+        hit.mat.transmission = hit.mat.type == DIELECTRIC ? 1.0f : 0.0f;
+        if (hit.mat.type != DIELECTRIC) hit.mat.ior = config.detail.y;
+        if (hit.mat.type == DIFFUSE) hit.mat.roughness = config.surface.x;
+        hit.mat.type = OPENPBR;
+    }
     if (config.mapMask & 1) hit.mat.albedo *= sample_material_map(images, slot, 0, uv, density, footprint).rgb;
     if (config.mapMask & 2) hit.mat.roughness = clamp(sample_material_map(images, slot, 1, uv, density, footprint)[min(object.channels.x,3u)], 0.03f, 1.0f);
-    if (config.mapMask & 4) {
-        if (hit.mat.type != OPENPBR) { hit.mat.type = OPENPBR; hit.mat.ior = 1.5f; }
-        hit.mat.metalness = clamp(sample_material_map(images, slot, 2, uv, density, footprint)[min(object.channels.y,3u)], 0.0f, 1.0f);
-    }
+    if (config.mapMask & 4) hit.mat.metalness = clamp(sample_material_map(images, slot, 2, uv, density, footprint)[min(object.channels.y,3u)], 0.0f, 1.0f);
     if (config.mapMask & 8) {
         float3 map = sample_material_map(images, slot, 3, uv, density, footprint).xyz * 2.0f - 1.0f;
         map.xy *= config.normalStrength;
-        float3 mapped = normalize(hit.tangent * map.x + hit.bitangent * map.y + hit.geometricNormal * max(0.05f, map.z));
+        float3 mapped = tangent_space_normal(hit, float3(map.xy, max(0.05f, map.z)));
         // Keep the shading frame facing the ray and within the geometric surface.
         // Geometry normals remain separate for offsets and visibility.
         for (int i = 0; i < 8 && (dot(mapped, hit.geometricNormal) < 0.2f || dot(mapped, -ray.direction) < 0.01f); ++i)
@@ -1397,26 +1410,37 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
                  thread uint &seed, thread float3 &direction,
                  thread float3 &weight, thread float &pdf) {
     pdf = 0.0f;
+    // A perturbed shading normal can send a delta event across the geometric
+    // surface; repeat such an event about the geometric normal instead.
+    float3 geometric = dot(mat.geometricNormal, mat.geometricNormal) > 0.5f ? mat.geometricNormal : normal;
     if (mat.type == DIELECTRIC) {
         float eta = frontFace ? 1.0f / mat.ior : mat.ior;
-        float cosI = clamp(dot(-incoming, normal), 0.0f, 1.0f);
-        float sin2T = eta * eta * (1.0f - cosI * cosI);
         float r0 = (1.0f - mat.ior) / (1.0f + mat.ior);
-        float fresnel = r0 * r0 + (1.0f - r0 * r0) * pow(1.0f - cosI, 5.0f);
-        if (sin2T >= 1.0f || rand_f(seed) < fresnel) {
-            direction = reflect(incoming, normal);
-            weight = mat.albedo;
-        } else {
-            direction = normalize(eta * incoming + (eta * cosI - sqrt(1.0f - sin2T)) * normal);
-            weight = mat.albedo * (eta * eta);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            float3 m = attempt == 0 ? normal : geometric;
+            float cosI = clamp(dot(-incoming, m), 0.0f, 1.0f);
+            float sin2T = eta * eta * (1.0f - cosI * cosI);
+            // Schlick takes the cosine on the less dense side: cosT when exiting.
+            float cosine = eta > 1.0f && sin2T < 1.0f ? sqrt(1.0f - sin2T) : cosI;
+            float fresnel = r0 * r0 + (1.0f - r0 * r0) * pow(1.0f - cosine, 5.0f);
+            bool reflected = sin2T >= 1.0f || rand_f(seed) < fresnel;
+            if (reflected) {
+                direction = reflect(incoming, m);
+                weight = mat.albedo;
+            } else {
+                direction = normalize(eta * incoming + (eta * cosI - sqrt(1.0f - sin2T)) * m);
+                weight = mat.albedo * (eta * eta);
+            }
+            if ((dot(direction, geometric) > 0.0f) == reflected) return true;
         }
-        return true;
+        return false;
     }
     if (is_delta(mat)) {
-        direction = reflect(incoming, normal);
-        float cosI = clamp(dot(-incoming, normal), 0.0f, 1.0f);
+        float3 m = dot(reflect(incoming, normal), geometric) > 0.0f ? normal : geometric;
+        direction = reflect(incoming, m);
+        float cosI = clamp(dot(-incoming, m), 0.0f, 1.0f);
         weight = mat.albedo + (1.0f - mat.albedo) * pow(1.0f - cosI, 5.0f);
-        return true;
+        return dot(direction, geometric) > 0.0f;
     }
     if (mat.type == DIFFUSE) {
         // Keep three draws like the generic sampler, including its lobe choice.

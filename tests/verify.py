@@ -30,6 +30,8 @@ else:
 source += '\n' + (root / 'tests' / 'USDChecks.swift').read_text()
 source += '\n' + (root / 'tests' / 'Fix_lights.swift').read_text()
 source += '\n' + (root / 'tests' / 'Fix_geometry.swift').read_text()
+if '--studio-only' not in sys.argv and '--usd-only' not in sys.argv:
+    source += '\n' + (root / 'tests' / 'Fix_bsdf-legacy.swift').read_text()
 with tempfile.TemporaryDirectory(prefix='vibe-tracer-tests-') as directory:
     folder = Path(directory)
     swift = folder / 'main.swift'

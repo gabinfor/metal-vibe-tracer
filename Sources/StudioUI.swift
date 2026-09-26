@@ -509,14 +509,22 @@ final class StudioController: NSViewController {
     heading("Scene lights")
     option("Light intensity", \.lightIntensity, 0...100, 1)
     option("Light size multiplier", \.lightSize, 0.05...4, 1)
+    // Light color is linear, like material tint; the well shows sRGB.
+    func encode(_ c: Float) -> CGFloat {
+      CGFloat(c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1 / 2.4) - 0.055)
+    }
+    func decode(_ c: CGFloat) -> Float {
+      let x = Float(c)
+      return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
+    }
     let c = renderer.options.lightColor
     add(
-      ActionColor(NSColor(srgbRed: CGFloat(c.x), green: CGFloat(c.y), blue: CGFloat(c.z), alpha: 1))
+      ActionColor(NSColor(srgbRed: encode(c.x), green: encode(c.y), blue: encode(c.z), alpha: 1))
       { [weak self] c in
         guard let self, let c = c.usingColorSpace(.sRGB) else { return }
         self.checkpoint("Light color")
         self.renderer.options.lightColor = SIMD3(
-          Float(c.redComponent), Float(c.greenComponent), Float(c.blueComponent))
+          decode(c.redComponent), decode(c.greenComponent), decode(c.blueComponent))
         self.changed()
       })
     text(
