@@ -51,6 +51,19 @@ struct StudioOptions: Codable {
   var lightColor = SIMD3<Float>(repeating: 1)
   var lightIntensity: Float = 1, lightSize: Float = 1
   var aperture: Float = 0, focusDistance: Float = 4.6
+  // Angular diameter, in degrees, of an imported UsdLux DistantLight. When set, the
+  // Imported Mesh Studio sun is a directional emitter independent of the environment
+  // and sunIntensity is its irradiance at normal incidence; nil keeps the sky's disc.
+  var sunAngle: Float?
+}
+extension StudioOptions {
+  static let sunAngleRange: ClosedRange<Float> = 0.1...90
+  // 1 - cos(half angle) for Uniforms.lens.w, formed as 2 sin^2(angle/4); 0 = procedural sun.
+  var independentSunCone: Float {
+    guard let sunAngle else { return 0 }
+    let s = sin(Double(sunAngle) * .pi / 720)
+    return Float(2 * s * s)
+  }
 }
 struct OIDNOptions: Codable, Equatable {
   // UI indices map to OIDN FAST (4), BALANCED (5), and HIGH (6).
@@ -102,6 +115,7 @@ struct ProjectDocument: Codable {
       (0...100).contains(options.lightIntensity), (0...10000).contains(options.sunIntensity),
       options.sunAzimuth.isFinite, options.sunElevation.isFinite,
       options.environmentRotation.isFinite,
+      options.sunAngle.map({ StudioOptions.sunAngleRange.contains($0) }) ?? true,
       triangles.count <= 500_000
     else {
       try bad()

@@ -298,8 +298,8 @@ def import_stage(filename,directory,frame=None):
                 light=UsdLux.DistantLight(prim)
                 if sun:report.append(path+': additional distant light skipped');continue
                 direction=normalize(vec((cache.GetLocalToWorldTransform(prim)*conversion).TransformDir(Gf.Vec3d(0,0,1))))
-                sun={'direction':direction,'intensity':float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time))}
-                report.append(path+': distant light mapped to existing sun; source angle and tint not applied')
+                sun={'direction':direction,'intensity':float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time)),'angle':float(light.GetAngleAttr().Get(time)),'normalize':bool(light.GetNormalizeAttr().Get(time))}
+                report.append(path+': distant light imported as directional sun with its angle; tint not applied')
             elif prim.HasAPI(UsdLux.LightAPI):report.append(path+': unsupported light type '+prim.GetTypeName())
             elif prim.IsA(UsdGeom.Gprim) or prim.GetTypeName() in ('PointInstancer','Volume'):report.append(path+': unsupported geometry '+prim.GetTypeName())
     if len(nodes)>256 or rendered>500000:fail('Stage exceeds renderer capacity including lights')

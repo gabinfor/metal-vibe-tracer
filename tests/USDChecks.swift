@@ -30,7 +30,7 @@ kernel void usd_checks(constant Uniforms &u [[buffer(0)]], constant SurfaceSetti
   LightSample ls=sample_direct_light(p,n,u,seed,images);
   if(ls.isDirectional>=2) {
    ++count;Material m={};m.slot=uint(images.triangles[ls.isDirectional-2].uvc.z);
-   float pdf=eval_light_pdf(p,ls.position,m,u,images);
+   float pdf=eval_light_pdf(p,ls.position,m,u,images,ls.isDirectional-2);
    error=max(error,abs(pdf-ls.pdf)/max(ls.pdf,1e-10f));
   } else envError=max(envError,abs(ls.pdf-eval_environment_pdf(ls.wi,n,u,images)));
  }

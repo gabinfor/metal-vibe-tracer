@@ -480,6 +480,7 @@ final class StudioController: NSViewController {
       self.renderer.options.sunAzimuth = p[i].x
       self.renderer.options.sunElevation = p[i].y
       self.renderer.options.sunIntensity = p[i].z
+      self.renderer.options.sunAngle = nil
       self.changed()
       self.rebuild()
     }
@@ -502,6 +503,9 @@ final class StudioController: NSViewController {
     text(
       "Sky/HDRI lighting is used in the Pavilion and Imported Mesh Studio. Sun controls apply to the procedural sky."
     )
+    if let angle = renderer.options.sunAngle {
+      text(String(format: "Imported distant light: %.2f° sun, intensity is irradiance, independent of the environment. A sky preset restores the procedural sun.", angle))
+    }
     heading("Scene lights")
     option("Light intensity", \.lightIntensity, 0...100, 1)
     option("Light size multiplier", \.lightSize, 0.05...4, 1)

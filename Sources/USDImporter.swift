@@ -27,6 +27,8 @@ struct USDImportSnapshot: Decodable {
   struct Sun: Decodable {
     var direction: [Float]
     var intensity: Float
+    var angle: Float?
+    var normalize: Bool?
   }
   var nodes: [SceneNode]
   var assets: [MeshAsset]
@@ -164,6 +166,7 @@ enum USDImporter {
     p.environmentName = "Procedural sky"
     p.options.environmentIntensity = 0
     p.options.sunIntensity = 0
+    p.options.sunAngle = nil
     // The reference file supplies its own ground; the procedural studio floor is hidden.
     p.scenes[6]!.objects[1].rotationHidden.w = 1
     if let environment = snapshot.environment {
@@ -175,7 +178,23 @@ enum USDImporter {
       let d = simd_normalize(SIMD3(sun.direction[0], sun.direction[1], sun.direction[2]))
       p.options.sunAzimuth = atan2(d.x, d.z) * 180 / .pi
       p.options.sunElevation = asin(min(1, max(-1, d.y))) * 180 / .pi
-      p.options.sunIntensity = min(10000, max(0, sun.intensity))
+      // REFERENCES.md: OPENUSD. UsdLux radiance is intensity x 2^exposure, divided by
+      // sizeFactor when normalized; the renderer stores the normal-incidence
+      // irradiance, radiance x sizeFactor, and renders an independent sun cone.
+      let angle = min(180, max(0, sun.angle ?? 0.53))
+      let half = Double(angle) * .pi / 360, s2 = pow(sin(half), 2)
+      let sizeFactor = half == 0 ? 1 : .pi * (half <= .pi / 2 ? s2 : 2 - s2)
+      let irradiance = Double(max(0, sun.intensity)) * (sun.normalize == true ? 1 : sizeFactor)
+      p.options.sunIntensity = Float(min(10000, irradiance))
+      p.options.sunAngle = min(StudioOptions.sunAngleRange.upperBound, max(StudioOptions.sunAngleRange.lowerBound, angle))
+      if irradiance > 10000 {
+        snapshot.report.append(String(format: "Distant light irradiance %.4g clamped to 10000.", irradiance))
+      }
+      if p.options.sunAngle != sun.angle ?? 0.53 {
+        snapshot.report.append(String(
+          format: "Distant light angle %.3g degrees rendered as %.3g degrees at the same irradiance.",
+          sun.angle ?? 0.53, p.options.sunAngle ?? 0))
+      }
     }
     if snapshot.environment == nil && snapshot.sun == nil && state.emissions?.isEmpty != false {
       p.options.environmentIntensity = 1

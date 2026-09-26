@@ -98,6 +98,7 @@ struct HitRecord {
     float2 uvDensity;
     float3 geometricNormal;
     uint objectID;
+    uint triangle; // Mesh triangle index; 0xffffffff for analytic primitives.
 };
 
 struct LightSample {
@@ -129,13 +130,33 @@ struct Uniforms {
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
     uint padding;
     float4 environment; // intensity, rotation, image enabled, BVH node count
-    float4 lens; // aperture radius, focus distance, reserved
+    float4 lens; // aperture radius, focus distance, scene graph, independent sun 1 - cos(half angle)
     float4 light; // RGB multiplier, size multiplier
 };
 
 // ============================================================================
 // Procedural Physical Sky
 // ============================================================================
+
+// Sun cones test sin^2 through a cross product: 1 - cos is below float
+// resolution near one for sub-degree suns (the UsdLux default is 0.53 degrees).
+bool in_sun_cone(float3 d, float3 sunDir, float oneMinusCos) {
+    float3 c = cross(d, sunDir);
+    return dot(d, sunDir) > 0.0f && dot(c, c) <= oneMinusCos * (2.0f - oneMinusCos);
+}
+// One disc size per preset, shared by emission, cone sampling and its PDF.
+float procedural_sun_one_minus_cos(uint skyMode) {
+    return skyMode == 0 ? 8e-4f : (skyMode == 1 ? 7e-4f : 9e-4f);
+}
+// lens.w > 0: an imported directional sun (UsdLux DistantLight) evaluated
+// outside the environment; sunParams.w is its irradiance at normal incidence.
+float sun_one_minus_cos(constant Uniforms &u) {
+    return u.lens.w > 0.0f ? u.lens.w : procedural_sun_one_minus_cos(u.skyMode);
+}
+float3 independent_sun_radiance(float3 d, constant Uniforms &u) {
+    if (u.lens.w <= 0.0f || u.sunParams.w <= 0.0f || !in_sun_cone(d, normalize(u.sunParams.xyz), u.lens.w)) return float3(0.0f);
+    return float3(u.sunParams.w / (PI * u.lens.w * (2.0f - u.lens.w)));
+}
 
 float3 eval_procedural_sky(float3 d, float4 sunParams, uint skyMode) {
     float3 sunDir = normalize(sunParams.xyz);
@@ -152,7 +173,7 @@ float3 eval_procedural_sky(float3 d, float4 sunParams, uint skyMode) {
             col = mix(horizon, zenith, pow(y, 0.40f));
             float mie = max(0.0f, sunCos);
             col += float3(1.0f, 0.70f, 0.30f) * pow(mie, 6.0f) * 3.0f;
-            if (sunCos > 0.9992f) {
+            if (in_sun_cone(d, sunDir, procedural_sun_one_minus_cos(skyMode))) {
                 col += float3(1.0f, 0.78f, 0.45f) * (sunParams.w * 0.45f);
             }
         } else {
@@ -169,7 +190,7 @@ float3 eval_procedural_sky(float3 d, float4 sunParams, uint skyMode) {
             col = mix(horizon, zenith, pow(y, 0.48f));
             float mie = max(0.0f, sunCos);
             col += float3(1.0f, 0.98f, 0.92f) * pow(mie, 12.0f) * 2.2f;
-            if (sunCos > 0.9993f) {
+            if (in_sun_cone(d, sunDir, procedural_sun_one_minus_cos(skyMode))) {
                 col += float3(1.0f, 0.98f, 0.94f) * (sunParams.w * 0.40f);
             }
         } else {
@@ -186,7 +207,7 @@ float3 eval_procedural_sky(float3 d, float4 sunParams, uint skyMode) {
             col = mix(horizon, zenith, pow(y, 0.55f));
             float mie = max(0.0f, sunCos);
             col += float3(0.95f, 0.65f, 0.75f) * pow(mie, 10.0f) * 1.8f;
-            if (sunCos > 0.9991f) {
+            if (in_sun_cone(d, sunDir, procedural_sun_one_minus_cos(skyMode))) {
                 col += float3(1.0f, 0.85f, 0.78f) * (sunParams.w * 0.35f);
             }
         } else {
@@ -591,6 +612,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
 bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant MaterialResources &images, constant Uniforms &u) {
     bool hit=trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz);
     if(hit) rec.objectID=rec.mat.slot;
+    rec.triangle=0xffffffffu;
     if (sceneIndex != 6 || u.environment.w < 1 || (u.lens.z==0 && images.objects[7].rotationHidden.w > 0.5f)) return hit;
     ObjectSettings o=images.objects[7];
     if(u.lens.z>0) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
@@ -633,16 +655,19 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=u.lens.z>0 ? uint(tri.uvc.z) : 7;
             if(u.lens.z>0 && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
             rec.objectID=u.lens.z>0 ? 64+uint(tri.uvc.w)-1 : 7;
+            rec.triangle=uint(node.links.z+k);
             world_hit(rec,o);
         }
     }
     return hit;
 }
-uint environment_cdf_index(texture2d<float> cdf, uint count, uint row, float value) {
+// The marginal row CDF is a 1 x H texture; each conditional column CDF is a row
+// of the W x H texture. `marginal` selects the axis explicitly, so 1-wide maps work.
+uint environment_cdf_index(texture2d<float> cdf, uint count, uint row, float value, bool marginal) {
     uint low = 0, high = max(1u, count) - 1;
     for (uint iteration = 0; iteration < 16 && low < high; ++iteration) {
         uint middle = (low + high) / 2;
-        float cumulative = cdf.read(uint2(cdf.get_width() == 1 ? 0 : middle, row), 0).x;
+        float cumulative = cdf.read(marginal ? uint2(0, middle) : uint2(middle, row), 0).x;
         if (cumulative >= value) high = middle; else low = middle + 1;
     }
     return low;
@@ -652,19 +677,24 @@ float environment_cdf_value(texture2d<float> cdf, uint x, uint y) {
     return cdf.read(uint2(x, y), 0).x;
 }
 
-float environment_image_pdf(float3 wi, constant Uniforms &u, constant MaterialResources &images) {
+// Solid-angle density of a lat-long texel; the sampler uses its chosen cell.
+float environment_cell_pdf(uint x, uint y, float sinTheta, constant MaterialResources &images) {
     uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
-    float theta = acos(clamp(wi.y, -1.0f, 1.0f));
-    float sinTheta = max(1e-5f, sin(theta));
-    float2 uv = float2(atan2(wi.z, wi.x) / TWO_PI + 0.5f + u.environment.y / TWO_PI, theta / PI);
-    uv.x = fract(uv.x); uv.y = clamp(uv.y, 0.0f, 1.0f - 1e-7f);
-    uint x = min(width - 1, uint(uv.x * float(width))), y = min(height - 1, uint(uv.y * float(height)));
     float row = environment_cdf_value(images.environmentRows, 0, y);
     float previousRow = y == 0 ? 0.0f : environment_cdf_value(images.environmentRows, 0, y - 1);
     float column = environment_cdf_value(images.environmentColumns, x, y);
     float previousColumn = x == 0 ? 0.0f : environment_cdf_value(images.environmentColumns, x - 1, y);
     float cellProbability = max(0.0f, row - previousRow) * max(0.0f, column - previousColumn);
-    return cellProbability * float(width * height) / (2.0f * PI * PI * sinTheta);
+    return cellProbability * float(width * height) / (2.0f * PI * PI * max(1e-5f, sinTheta));
+}
+
+float environment_image_pdf(float3 wi, constant Uniforms &u, constant MaterialResources &images) {
+    uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
+    float theta = acos(clamp(wi.y, -1.0f, 1.0f));
+    float2 uv = float2(atan2(wi.z, wi.x) / TWO_PI + 0.5f + u.environment.y / TWO_PI, theta / PI);
+    uv.x = fract(uv.x); uv.y = clamp(uv.y, 0.0f, 1.0f - 1e-7f);
+    uint x = min(width - 1, uint(uv.x * float(width))), y = min(height - 1, uint(uv.y * float(height)));
+    return environment_cell_pdf(x, y, sin(theta), images);
 }
 
 // REFERENCES.md: PBRT2023. Lat-long lookup with luminance-weighted image sampling.
@@ -675,8 +705,9 @@ float3 eval_environment(float3 d, constant Uniforms &u, constant MaterialResourc
         float2 uv=float2(atan2(d.z,d.x)/TWO_PI+0.5f+u.environment.y/TWO_PI,acos(clamp(d.y,-1.0f,1.0f))/PI);
         uv.y=clamp(uv.y,0.5f/images.environmentMap.get_height(),1.0f-0.5f/images.environmentMap.get_height());
         result=images.environmentMap.sample(env,uv).rgb;
-    } else result=eval_procedural_sky(d,u.sunParams,u.skyMode);
-    return result*u.environment.x;
+    } else result=eval_procedural_sky(d,u.lens.w>0 ? float4(u.sunParams.xyz,0) : u.sunParams,u.skyMode);
+    // An imported sun is its own directional emitter, independent of environment brightness.
+    return result*u.environment.x+independent_sun_radiance(d,u);
 }
 // REFERENCES.md: PBRT2023. Thin-lens focus-plane construction; uniform disk sampling.
 void lens_ray(thread Ray &ray, float3 forward, float3 right, float3 up, constant Uniforms &u, thread uint &seed) {
@@ -905,85 +936,102 @@ float3 eval_bsdf_with_pdf(Material mat, float3 n, float3 wo, float3 wi, thread f
     return openpbr_get_sum_of_diffuse_specular(openpbr_eval(prepared, wi)) / cosine;
 }
 
-float eval_environment_pdf(float3 wi, float3 n, constant Uniforms &u) {
-    float sunProbability=(u.environment.x>0 && u.environment.z<0.5f && u.sunParams.w>0) ? 0.60f:0.0f;
-    float sunPDF = dot(wi, normalize(u.sunParams.xyz)) >= 0.9993f
-        ? 1.0f / (TWO_PI * (1.0f - 0.9993f)) : 0.0f;
-    return sunProbability * sunPDF + (1.0f-sunProbability) * max(0.0f, dot(n, wi)) / PI;
+// 1 - cos(theta_max) of a sphere's cone for x = r^2/d^2, without the
+// cancellation of 1 - sqrt(1 - x) for small or distant spheres.
+float sphere_cone_one_minus_cos(float x) {
+    return x / (1.0f + sqrt(max(0.0f, 1.0f - x)));
+}
+// Probability of the sun-cone proposal within the environment mixture. The
+// procedural disc is emitted only above the horizon; an imported sun is not.
+float environment_sun_probability(constant Uniforms &u) {
+    if (u.sunParams.w <= 0.0f) return 0.0f;
+    if (u.lens.w > 0.0f) return u.environment.x > 0.0f ? 0.60f : 1.0f;
+    float w = procedural_sun_one_minus_cos(u.skyMode);
+    return u.environment.x > 0.0f && u.environment.z < 0.5f &&
+        normalize(u.sunParams.xyz).y >= -sqrt(w * (2.0f - w)) ? 0.60f : 0.0f;
+}
+float environment_mixture_pdf(float3 wi, float3 n, float imagePdf, constant Uniforms &u) {
+    float sunProbability = environment_sun_probability(u);
+    float w = sun_one_minus_cos(u);
+    float sunPDF = in_sun_cone(wi, normalize(u.sunParams.xyz), w) ? 1.0f / (TWO_PI * w) : 0.0f;
+    float rest = u.environment.z > 0.5f ? imagePdf : max(0.0f, dot(n, wi)) / PI;
+    return sunProbability * sunPDF + (1.0f - sunProbability) * rest;
 }
 
-// OPENUSD/PBRT2023: uniform triangle-area emitter proposal, mixed with the environment.
+// OPENUSD/PBRT2023: power-weighted triangle emitter proposal, mixed with the environment.
 float imported_light_probability(constant Uniforms &u,constant MaterialResources &images) {
     if(u.sceneIndex!=6 || images.emitters[0]==0) return 0.0f;
-    return u.environment.x>0 ? 0.5f:1.0f;
+    return u.environment.x>0 || (u.lens.w>0 && u.sunParams.w>0) ? 0.5f:1.0f;
 }
 float imported_geometry(float3 p,float3 position,uint index,constant MaterialResources &images) {
     MeshTriangle t=images.triangles[index];float3 d=position-p;float d2=dot(d,d);
     float3 n=cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz);
     return d2>1e-12f && dot(n,n)>1e-20f ? max(0.0f,dot(normalize(n),-d*rsqrt(d2)))/d2:0;
 }
+// emitters = [count, triangle indices, cumulative area x luminance (float bits), total].
+// A triangle's area density is its luminance divided by the total power.
+float imported_emitter_area_pdf(uint index,constant MaterialResources &images) {
+    uint count=images.emitters[0];
+    if(count==0) return 0.0f;
+    float total=as_type<float>(images.emitters[2*count+1]);uint slot=uint(images.triangles[index].uvc.z);
+    if(slot<8 || !(total>0)) return 0.0f;
+    return max(1e-8f,dot(images.emissions[slot].rgb,float3(0.2126f,0.7152f,0.0722f)))/total;
+}
 float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant MaterialResources &images) {
-    float pdf = u.environment.z > 0.5f ? environment_image_pdf(wi,u,images) : eval_environment_pdf(wi,n,u);
-    return (1.0f-imported_light_probability(u,images))*pdf;
+    float image = u.environment.z > 0.5f ? environment_image_pdf(wi,u,images) : 0.0f;
+    return (1.0f-imported_light_probability(u,images))*environment_mixture_pdf(wi,n,image,u);
 }
 // Both proposals sample the same environment, with their full mixture PDF.
 LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread uint &seed, constant MaterialResources &materialImages) {
     LightSample ls = {};
     float importedProbability=imported_light_probability(u,materialImages);
     if(importedProbability>0 && rand_f(seed)<importedProbability) {
-        uint count=materialImages.emitters[0];uint index=materialImages.emitters[1+min(uint(rand_f(seed)*count),count-1)];
+        uint count=materialImages.emitters[0],low=0,high=count-1;float value=rand_f(seed);
+        while(low<high) {uint middle=(low+high)/2;if(as_type<float>(materialImages.emitters[1+count+middle])>=value) high=middle; else low=middle+1;}
+        uint index=materialImages.emitters[1+low];
         MeshTriangle t=materialImages.triangles[index];float2 r=rand_f2(seed);float root=sqrt(r.x);
         ls.position=(1-root)*t.a.xyz+root*(1-r.y)*t.b.xyz+root*r.y*t.c.xyz;
         float3 delta=ls.position-p;ls.dist=length(delta);ls.wi=delta/max(ls.dist,1e-8f);
-        float area=0.5f*length(cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz));float geometry=imported_geometry(p,ls.position,index,materialImages);
+        float geometry=imported_geometry(p,ls.position,index,materialImages);
         ls.emission=materialImages.emissions[uint(t.uvc.z)].rgb;ls.isDirectional=index+2;
-        ls.pdf=geometry>1e-12f ? importedProbability/(float(count)*area*geometry):0;
+        ls.pdf=geometry>1e-12f ? importedProbability*imported_emitter_area_pdf(index,materialImages)/geometry:0;
         return ls;
     }
-    if ((u.sceneIndex == 0 || u.sceneIndex == 6) && u.environment.z > 0.5f) {
-        uint width = materialImages.environmentMap.get_width(), height = materialImages.environmentMap.get_height();
-        uint y = environment_cdf_index(materialImages.environmentRows, height, 0, rand_f(seed));
-        uint x = environment_cdf_index(materialImages.environmentColumns, width, y, rand_f(seed));
-        float2 uv = (float2(float(x) + rand_f(seed), float(y) + rand_f(seed))) / float2(width, height);
-        float theta = uv.y * PI, phi = (uv.x - 0.5f - u.environment.y / TWO_PI) * TWO_PI;
-        float sinTheta = sin(theta);
-        ls.wi = normalize(float3(sinTheta * cos(phi), cos(theta), sinTheta * sin(phi)));
-        ls.position = p + ls.wi * 1e6f;
-        ls.dist = 1e6f;
-        ls.isDirectional = 1;
-        ls.pdf = eval_environment_pdf(ls.wi, n, u, materialImages);
-        ls.emission = eval_environment(ls.wi, u, materialImages);
-    } else if ((u.sceneIndex == 0 || u.sceneIndex == 6)) {
-        float sunProbability=(u.environment.x>0 && u.environment.z<0.5f && u.sunParams.w>0) ? 0.60f:0.0f;
-        if (rand_f(seed) < sunProbability) {
-            // Direct Sun Disc Cone Sampling (60%)
+    if ((u.sceneIndex == 0 || u.sceneIndex == 6)) {
+        float sunProbability = environment_sun_probability(u);
+        float imagePdf = 0.0f;
+        if (sunProbability > 0.0f && rand_f(seed) < sunProbability) {
+            // Sun cone sampling; sin^2 is formed from 1 - cos for sub-degree suns.
             float3 sun_d = normalize(u.sunParams.xyz);
-            float cos_max = 0.9993f;
             float2 r = rand_f2(seed);
-            float cos_th = 1.0f - r.x + r.x * cos_max;
-            float sin_th = sqrt(max(0.0f, 1.0f - cos_th * cos_th));
+            float oneMinusCos = r.x * sun_one_minus_cos(u);
+            float cos_th = 1.0f - oneMinusCos;
+            float sin_th = sqrt(max(0.0f, oneMinusCos * (2.0f - oneMinusCos)));
             float phi = TWO_PI * r.y;
             float3 su, sv;
             make_basis(sun_d, su, sv);
             ls.wi = normalize(su * (cos(phi) * sin_th) + sv * (sin(phi) * sin_th) + sun_d * cos_th);
-            ls.position = p + ls.wi * 1e6f;
-            ls.dist = 1e6f;
-            ls.pdf = (1.0f / (TWO_PI * (1.0f - cos_max))) * sunProbability;
-            ls.isDirectional = 1;
-
-
+            if (u.environment.z > 0.5f) imagePdf = environment_image_pdf(ls.wi, u, materialImages);
+        } else if (u.environment.z > 0.5f) {
+            uint width = materialImages.environmentMap.get_width(), height = materialImages.environmentMap.get_height();
+            uint y = environment_cdf_index(materialImages.environmentRows, height, 0, rand_f(seed), true);
+            uint x = environment_cdf_index(materialImages.environmentColumns, width, y, rand_f(seed), false);
+            // Keep the in-texel offset inside the chosen cell and use that cell's
+            // probability; re-deriving it from the direction can pick a neighbour.
+            float2 size = float2(width, height), cell = float2(x, y);
+            float2 uv = min(cell / size + rand_f2(seed) / size, nextafter((cell + 1.0f) / size, float2(0.0f)));
+            float theta = uv.y * PI, phi = (uv.x - 0.5f - u.environment.y / TWO_PI) * TWO_PI;
+            float sinTheta = sin(theta);
+            ls.wi = normalize(float3(sinTheta * cos(phi), cos(theta), sinTheta * sin(phi)));
+            imagePdf = environment_cell_pdf(x, y, sinTheta, materialImages);
         } else {
-            // Ambient Sky Hemisphere Sampling (40%) -> Illuminates shadows & cylinder interior
-            float3 sky_d = sample_cosine_hemisphere(n, seed);
-            ls.wi = sky_d;
-            ls.position = p + ls.wi * 1e6f;
-            ls.dist = 1e6f;
-            ls.pdf = (max(0.0f, dot(n, sky_d)) / PI) * (1.0f-sunProbability);
-            ls.isDirectional = 1;
-
+            // Ambient sky cosine hemisphere sampling -> illuminates shadows & cylinder interior
+            ls.wi = sample_cosine_hemisphere(n, seed);
         }
-
-        ls.pdf = eval_environment_pdf(ls.wi, n, u,materialImages);
+        ls.position = p + ls.wi * 1e6f;
+        ls.dist = 1e6f;
+        ls.isDirectional = 1;
+        ls.pdf = (1.0f - importedProbability) * environment_mixture_pdf(ls.wi, n, imagePdf, u);
         ls.emission = eval_environment(ls.wi, u, materialImages);
     } else if (u.sceneIndex == 1 || u.sceneIndex == 3 || u.sceneIndex == 4) {
         float3 corner = (u.sceneIndex == 3) ? float3(-0.2f, 0.999f, -0.2f) : float3(-0.25f, 0.999f, -0.25f);
@@ -1040,21 +1088,27 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
         if (d2 > radius * radius) {
             float d = sqrt(d2);
             float3 d_c = d_vec / d;
-            float cos_th_max = sqrt(max(0.0f, 1.0f - (radius * radius) / d2));
+            float oneMinusCosMax = sphere_cone_one_minus_cos(radius * radius / d2);
             float2 r = rand_f2(seed);
-            float cos_th = 1.0f - r.x + r.x * cos_th_max;
-            float sin_th = sqrt(max(0.0f, 1.0f - cos_th * cos_th));
+            float oneMinusCos = r.x * oneMinusCosMax;
+            float cos_th = 1.0f - oneMinusCos;
+            float sin_th = sqrt(max(0.0f, oneMinusCos * (2.0f - oneMinusCos)));
             float phi = TWO_PI * r.y;
             float3 su, sv;
             make_basis(d_c, su, sv);
             ls.wi = normalize(su * (cos(phi) * sin_th) + sv * (sin(phi) * sin_th) + d_c * cos_th);
-            // Store an actual point on the emitter, also valid during reuse.
-            float b = dot(p - center, ls.wi);
-            float c = d2 - radius * radius;
-            ls.dist = -b - sqrt(max(0.0f, b * b - c));
-            ls.position = p + ls.wi * ls.dist;
-            ls.emission = emits[pick];
-            ls.pdf = 0.25f / (TWO_PI * (1.0f - cos_th_max));
+            // Store an actual point on the emitter, also valid during reuse. The
+            // perpendicular form of the discriminant avoids b^2 - c cancellation.
+            float3 oc = p - center;
+            float b = dot(oc, ls.wi);
+            float3 perpendicular = oc - b * ls.wi;
+            float disc = radius * radius - dot(perpendicular, perpendicular);
+            if (disc >= -1e-3f * radius * radius) {
+                ls.dist = -b - sqrt(max(0.0f, disc));
+                ls.position = p + ls.wi * ls.dist;
+                ls.emission = emits[pick];
+                ls.pdf = 0.25f / (TWO_PI * oneMinusCosMax);
+            }
         }
     }
     if(u.sceneIndex!=0 && u.sceneIndex!=6) ls.emission*=u.light.xyz;
@@ -1080,28 +1134,21 @@ float eval_light_pdf(float3 p, float3 hit_pos, Material mat, constant Uniforms &
         for (int i = 0; i < 4; ++i) {
             float3 c = float3(xs[i], 1.8f, 1.2f);
             if (length(hit_pos - c) < radii[i]*u.light.w + 0.01f) {
-                float d_vec2 = dot(c - p, c - p);
-                float cos_th_max = sqrt(max(0.0f, 1.0f - (radii[i] * radii[i] * u.light.w * u.light.w) / d_vec2));
-                return 0.25f / (TWO_PI * (1.0f - cos_th_max));
+                float d_vec2 = dot(c - p, c - p), r2 = radii[i] * radii[i] * u.light.w * u.light.w;
+                return d_vec2 > r2 ? 0.25f / (TWO_PI * sphere_cone_one_minus_cos(r2 / d_vec2)) : 0.0f;
             }
         }
     }
     return 0.0f;
 }
 
-float eval_light_pdf(float3 p,float3 hit_pos,Material mat,constant Uniforms &u,constant MaterialResources &images) {
+// Imported emitters use the BSDF hit's triangle directly: exact at any
+// coordinate magnitude and O(1) in the number of emissive triangles.
+float eval_light_pdf(float3 p,float3 hit_pos,Material mat,constant Uniforms &u,constant MaterialResources &images,uint triangle) {
     if(u.sceneIndex!=6) return eval_light_pdf(p,hit_pos,mat,u);
-    uint count=images.emitters[0];float pdf=0;
-    for(uint i=0;i<count;++i) {
-        uint index=images.emitters[i+1];MeshTriangle t=images.triangles[index];if(uint(t.uvc.z)!=mat.slot) continue;
-        float3 e1=t.b.xyz-t.a.xyz,e2=t.c.xyz-t.a.xyz,d=hit_pos-t.a.xyz,n=cross(e1,e2);
-        float nn=dot(n,n);if(nn<1e-20f || abs(dot(d,n))>sqrt(nn)*1e-5f) continue;
-        float b=dot(cross(d,e2),n)/nn,c=dot(cross(e1,d),n)/nn;
-        if(b<0 || c<0 || b+c>1) continue;
-        float g=imported_geometry(p,hit_pos,index,images);
-        if(g>1e-12f) pdf+=imported_light_probability(u,images)/(float(count)*0.5f*sqrt(nn)*g);
-    }
-    return pdf;
+    if(triangle==0xffffffffu || images.emitters[0]==0) return 0.0f;
+    float g=imported_geometry(p,hit_pos,triangle,images);
+    return g>1e-12f ? imported_light_probability(u,images)*imported_emitter_area_pdf(triangle,images)/g : 0.0f;
 }
 
 // Artistic ring-caustic approximation. This is not an unbiased SMS estimator:
@@ -1902,7 +1949,7 @@ kernel void shading_kernel(
                     break;
                 }
                 if (rec.mat.type == EMISSIVE) {
-                    float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms,materialImages);
+                    float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms,materialImages,rec.triangle);
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
                     radiance += throughput * weight * rec.mat.emission;
                     break;
@@ -2379,7 +2426,7 @@ final class MaterialLibrary {
     var graphInstructionBuffer: MTLBuffer!, graphHeaderBuffer: MTLBuffer!
     var graphTextures: [MTLTexture] = []
     private var emittersDirty = true
-    private var cachedEmitterIndices: [UInt32] = []
+    private var cachedEmitterValues: [UInt32] = [0, 0]
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
     var orderedTriangles:[MeshTriangle]=[] { didSet { emittersDirty = true } }
@@ -2536,18 +2583,31 @@ final class MaterialLibrary {
         argumentEncoder.setBuffer(graphHeaderBuffer,offset:0,index:389)
         var emissionValues=Array(repeating:SIMD4<Float>(repeating:0),count:SceneLimits.materials)
         for (slot,value) in emissions {if emissionValues.indices.contains(slot){emissionValues[slot]=SIMD4(value,0)}}
-        let indices: [UInt32]
+        let emitterValues: [UInt32]
         if emittersDirty {
-            indices=orderedTriangles.indices.filter { i in let slot=Int(orderedTriangles[i].uvc.z);return slot>=8 && emissions[slot].map{simd_length_squared($0)>0} == true }.map{UInt32($0)}
-        } else { indices = cachedEmitterIndices }
-        let emitterValues=[UInt32(indices.count)]+indices
+            let indices=orderedTriangles.indices.filter { i in let slot=Int(orderedTriangles[i].uvc.z);return slot>=8 && emissions[slot].map{simd_length_squared($0)>0} == true }.map{UInt32($0)}
+            // REFERENCES.md: PBRT2023 power light sampling. Emitters are chosen by area x
+            // luminance; the shader's imported_emitter_area_pdf uses the same weights.
+            var total=0.0,cumulative=[Double]()
+            for i in indices {
+                let t=orderedTriangles[Int(i)],e=emissions[Int(t.uvc.z)] ?? .zero
+                let edge1=SIMD3<Double>(Double(t.b.x-t.a.x),Double(t.b.y-t.a.y),Double(t.b.z-t.a.z))
+                let edge2=SIMD3<Double>(Double(t.c.x-t.a.x),Double(t.c.y-t.a.y),Double(t.c.z-t.a.z))
+                let luminance=Double(max(1e-8,0.2126*e.x+0.7152*e.y+0.0722*e.z))
+                total+=0.5*simd_length(simd_cross(edge1,edge2))*luminance;cumulative.append(total)
+            }
+            if total>0 && total.isFinite {
+                let cdf=cumulative.indices.map { $0==cumulative.count-1 ? Float(1).bitPattern : Float(cumulative[$0]/total).bitPattern }
+                emitterValues=[UInt32(indices.count)]+indices+cdf+[Float(total).bitPattern]
+            } else { emitterValues=[0,0] }
+        } else { emitterValues = cachedEmitterValues }
         guard let eb=emissionValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}),let ib=emitterValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}) else{throw Self.error("Could not allocate scene emitters.")}
         argumentEncoder.setBuffer(eb,offset:0,index:390);argumentEncoder.setBuffer(ib,offset:0,index:391)
         // Replace atomically; previously encoded frames retain their original buffers.
         self.objectBuffer = objectBuffer
         emissionBuffer = eb
         emitterBuffer = ib
-        cachedEmitterIndices = indices
+        cachedEmitterValues = emitterValues
         emittersDirty = false
         argumentBuffer = buffer
         images = replacement
@@ -3143,7 +3203,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             height: UInt32(h),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             environment: SIMD4(options.environmentIntensity, options.environmentRotation * .pi / 180, materials.environmentData == nil ? 0 : 1, Float(materials.nodeCount)),
-            lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,0),
+            lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,sceneIndex == 6 ? options.independentSunCone : 0),
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize)
         )
         lastUniforms=uniforms
