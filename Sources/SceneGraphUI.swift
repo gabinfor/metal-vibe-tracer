@@ -88,6 +88,12 @@ extension StudioController {
         self.selectedSlot = m.slot
       }
     }
+    // Object deletion keeps unassigned materials; this removes them explicitly.
+    if graph.materials.contains(where: { m in !graph.nodes.contains { $0.bindings.contains(m.id) } }) {
+      button("Remove unused materials") { [weak self] in
+        self?.editGraph("Remove unused materials", kind: .bindings) { g in g.pruneUnusedMaterials() }
+      }
+    }
     text("Material edits are shared by all subsets assigned to the same material.")
   }
   func editGraph(_ title: String, kind: GraphEditKind = .geometry,
@@ -100,7 +106,8 @@ extension StudioController {
       try edit(&graph)
       try graph.validate()
       let triangles = kind == .geometry ? try graph.renderTriangles() : nil
-      checkpoint(title)
+      // Registered only after the resources and document are published.
+      let record = undoRecord(title)
       let remaining = Set(graph.materials.map(\.id))
       let removedSlots = previousMaterials.filter { !remaining.contains($0.id) }.map(\.slot)
       if !removedSlots.isEmpty {
@@ -121,6 +128,7 @@ extension StudioController {
       else if kind == .bindings { try renderer.materials.setMeshBindings(graph) }
       renderer.materials.hasSceneGraph = true
       project.graph = graph
+      commit(record)
       changed(reset: kind != .metadata)
       rebuild()
     } catch {
@@ -246,61 +254,72 @@ extension StudioController {
   }
   func importMaterialX() {
     chooseOpen("Import MaterialX material", extensions: ["mtlx"]) { [weak self] url in
-      guard let self else { return }
-      do {
-        let imported = try MaterialXImporter.load(url)
-        self.materialXReport = imported.report.joined(separator: "\n")
-        guard !imported.materials.isEmpty else {
-          self.showMaterialXReport()
-          return
-        }
-        var programs = self.renderer.materials.materialX
-        var graph = self.project.graph
-        let useLibrary = self.renderer.sceneIndex == 6 && graph != nil && self.selectedNode != nil
-        var firstSlot: Int?
-        var firstID: UUID?
-        for (i, program) in imported.materials.enumerated() {
-          let slot: Int
-          if useLibrary {
-            let material = try graph!.addMaterial(program.name)
-            slot = material.slot
-            if i == 0 { firstID = material.id }
-          } else {
-            if i > 0 {
-              self.materialXReport +=
-                "\n\(program.name): choose an imported scene node to import multiple materials."
-              continue
-            }
-            slot = self.selectedSlot
+      self?.beginImportMaterialX(from: url)
+    }
+  }
+  // Parsing, graph compilation and image decoding run on projectIOQueue. The candidate
+  // reuses the live maps and mesh, so a new binding only rebinds triangle slots.
+  func beginImportMaterialX(from url: URL) {
+    guard !isBusy else { return }
+    struct NoMaterials: Error { let report: String }
+    let record = undoRecord("Import MaterialX")
+    var document = snapshot()
+    let scene = Int(renderer.sceneIndex)
+    let selectedNode = self.selectedNode, selectedSubset = self.selectedSubset
+    let selectedSlot = self.selectedSlot
+    let useLibrary = scene == 6 && document.graph != nil && selectedNode != nil
+    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { () -> (ProjectDocument, (String, Int?)) in
+      let imported = try MaterialXImporter.load(url)
+      var report = imported.report.joined(separator: "\n")
+      guard !imported.materials.isEmpty else { throw NoMaterials(report: report) }
+      var state = document.scenes[scene] ?? SceneState()
+      var programs = state.materialX ?? [:]
+      var graph = document.graph
+      var firstSlot: Int?
+      var firstID: UUID?
+      for (i, program) in imported.materials.enumerated() {
+        let slot: Int
+        if useLibrary, var library = graph {
+          let material = try library.addMaterial(program.name)
+          graph = library
+          slot = material.slot
+          if i == 0 { firstID = material.id }
+        } else {
+          if i > 0 {
+            report += "\n\(program.name): choose an imported scene node to import multiple materials."
+            continue
           }
-          if firstSlot == nil { firstSlot = slot }
-          programs[slot] = program
+          slot = selectedSlot
         }
-        if let id = firstID,
-          let index = graph?.nodes.firstIndex(where: { $0.id == self.selectedNode }),
-          !graph!.nodes[index].bindings.isEmpty
-        {
-          graph!.nodes[index].bindings[
-            min(self.selectedSubset, graph!.nodes[index].bindings.count - 1)] = id
-        }
-        let triangles = try graph?.renderTriangles()
-        self.checkpoint("Import MaterialX")
-        // Restore a candidate document so image/graph failures leave the current scene intact.
-        var p = self.snapshot()
-        var state = self.renderer.materials.state()
-        state.materialX = programs
-        p.scenes[Int(self.renderer.sceneIndex)] = state
-        p.graph = graph
-        _ = triangles
-        try self.restore(p)
+        if firstSlot == nil { firstSlot = slot }
+        programs[slot] = program
+      }
+      if let id = firstID, var library = graph,
+        let index = library.nodes.firstIndex(where: { $0.id == selectedNode }),
+        !library.nodes[index].bindings.isEmpty
+      {
+        library.nodes[index].bindings[min(selectedSubset, library.nodes[index].bindings.count - 1)] = id
+        graph = library
+      }
+      state.materialX = programs
+      document.scenes[scene] = state
+      document.graph = graph
+      return (document, (report, firstSlot))
+    }) { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .success(let (report, firstSlot)):
+        self.materialXReport = report
+        self.commit(record)
         self.selectedSlot = firstSlot ?? self.selectedSlot
         self.changed()
         self.rebuild()
-        self.showMaterialXReport()
-      } catch {
+      case .failure(let empty as NoMaterials):
+        self.materialXReport = empty.report
+      case .failure(let error):
         self.materialXReport += "\nImport failed: " + error.localizedDescription
-        self.showMaterialXReport()
       }
+      self.showMaterialXReport()
     }
   }
   func materialXPanel(_ program: MaterialXProgram, slot: Int) {
@@ -332,8 +351,9 @@ extension StudioController {
             var programs = self.renderer.materials.materialX
             programs[slot] = next
             do {
-              self.checkpoint("MaterialX parameter")
+              let record = self.undoRecord("MaterialX parameter")
               try self.renderer.materials.prepareMaterialX(programs)
+              self.commit(record)
               self.changed()
             } catch { self.show(error.localizedDescription) }
           })
@@ -342,12 +362,13 @@ extension StudioController {
     button("Save material preset…") { [weak self] in self?.saveMaterial() }
     button("Load material preset…") { [weak self] in self?.loadMaterial() }
     button("Remove graph and use manual material") { [weak self] in
-      guard let self else { return }
+      guard let self, !self.isBusy else { return }
       var programs = self.renderer.materials.materialX
       programs.removeValue(forKey: slot)
       do {
-        self.checkpoint("Remove MaterialX")
+        let record = self.undoRecord("Remove MaterialX")
         try self.renderer.materials.prepareMaterialX(programs)
+        self.commit(record)
         self.changed()
         self.rebuild()
       } catch { self.show(error.localizedDescription) }

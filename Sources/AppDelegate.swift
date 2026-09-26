@@ -9,17 +9,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard let studio else { return .terminateNow }
-    do {
-      try studio.flushAutosave()
-      return .terminateNow
-    } catch {
+    // An explicit Save (or Open) still running on the project queue finishes first.
+    if studio.projectOperationInProgress {
+      studio.whenProjectOperationsFinish { [weak self] failure in
+        let quit = self?.finishTermination(studio, saveFailure: failure) ?? true
+        if !quit { studio.terminationRequested = false }
+        sender.reply(toApplicationShouldTerminate: quit)
+      }
+      return .terminateLater
+    }
+    return finishTermination(studio, saveFailure: nil) ? .terminateNow : .terminateCancel
+  }
+
+  private func finishTermination(_ studio: StudioController, saveFailure: String?) -> Bool {
+    func confirm(_ title: String, _ detail: String) -> Bool {
       let alert = NSAlert()
       alert.alertStyle = .critical
-      alert.messageText = "The final autosave failed"
-      alert.informativeText = error.localizedDescription
+      alert.messageText = title
+      alert.informativeText = detail
       alert.addButton(withTitle: "Cancel Quit")
       alert.addButton(withTitle: "Quit Anyway")
-      return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+      return alert.runModal() == .alertSecondButtonReturn
+    }
+    if let saveFailure, !confirm("The project could not be saved", saveFailure) { return false }
+    do {
+      try studio.flushAutosave()
+      return true
+    } catch {
+      return confirm("The final autosave failed", error.localizedDescription)
     }
   }
 

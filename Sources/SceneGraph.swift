@@ -45,7 +45,8 @@ struct SceneGraph: Codable {
     return try addOBJ(text, name: name, skipped: &skipped)
   }
   mutating func addOBJ(_ text: String, name: String, skipped: inout Int) throws -> UUID {
-    let parts = try OBJMesh.parts(text, skipped: &skipped)
+    // The root node is created below; each object and part adds one more.
+    let parts = try OBJMesh.parts(text, skipped: &skipped, nodeBudget: SceneLimits.nodes - nodes.count - 1)
     let root = SceneNode(name: name)
     nodes.append(root)
     var parents: [String: UUID] = [:]
@@ -118,10 +119,34 @@ struct SceneGraph: Codable {
   }
   mutating func remove(_ id: UUID) {
     let family = descendants(of: id)
+    // Only materials bound exclusively by the removed nodes go with them; unbound
+    // library materials (MaterialX imports, "New material") are kept.
+    let removedBindings = Set(nodes.filter { family.contains($0.id) }.flatMap(\.bindings))
     nodes.removeAll { family.contains($0.id) }
     let used = Set(nodes.compactMap(\.mesh))
     assets.removeAll { !used.contains($0.id) }
-    pruneUnusedMaterials()
+    let bound = Set(nodes.flatMap(\.bindings))
+    materials.removeAll { removedBindings.contains($0.id) && !bound.contains($0.id) }
+  }
+  // Structural comparisons that let undo and scene switches reuse the flattened
+  // mesh and BVH without encoding mesh payloads. Names never affect GPU data.
+  func sameGeometry(as other: SceneGraph) -> Bool {
+    guard assets.count == other.assets.count, nodes.count == other.nodes.count else { return false }
+    for (a, b) in zip(assets, other.assets) {
+      guard a.id == b.id, a.subsets.count == b.subsets.count, sameBytes(a.triangles, b.triangles)
+      else { return false }
+    }
+    for (a, b) in zip(nodes, other.nodes) {
+      guard a.id == b.id, a.parent == b.parent, a.mesh == b.mesh, a.matrix == b.matrix,
+        sameBytes([a.transform], [b.transform])
+      else { return false }
+    }
+    return true
+  }
+  func sameBindings(as other: SceneGraph) -> Bool {
+    materials.count == other.materials.count
+      && zip(materials, other.materials).allSatisfy { $0.id == $1.id && $0.slot == $1.slot }
+      && zip(nodes, other.nodes).allSatisfy { $0.bindings == $1.bindings }
   }
   mutating func pruneUnusedMaterials() {
     let used = Set(nodes.flatMap(\.bindings))

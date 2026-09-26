@@ -158,6 +158,8 @@ enum USDImporter {
     p.triangles = []
     p.scene = 6
     p.meshName = url.lastPathComponent
+    // A USD scene opens as a new untitled document: earlier saved views do not carry over.
+    p.views = [:]
     p.scenes[6] = state
     p.options.aperture = 0
     p.fog = 0
@@ -272,47 +274,65 @@ extension StudioController {
     alert.runModal()
   }
   func importUSD() {
-    chooseOpen("Open OpenUSD scene", extensions: ["usd", "usda", "usdc", "usdz"]) {
-      [weak self] url in
-      guard let self, !self.isBusy else { return }
-      let source = self.snapshot()
-      let job = USDImportJob()
-      let wasPaused = self.renderer.paused
-      let sheet = NSAlert()
-      sheet.messageText = "Importing OpenUSD scene"
-      sheet.informativeText =
-        "Composing layers, resolving materials, and building the scene. This can take a few minutes."
-      sheet.addButton(withTitle: "Cancel")
-      guard let window = self.hostWindow else { return }
-      self.importInProgress = true
-      self.renderer.paused = true
-      sheet.beginSheetModal(for: window) { _ in job.cancel() }
-      DispatchQueue.global(qos: .userInitiated).async {
-        let result = Result { try USDImporter.load(url, into: source, job: job) }
-        DispatchQueue.main.async {
-          let cancelled = job.isCancelled
-          window.endSheet(sheet.window)
-          self.importInProgress = false
-          self.renderer.paused = wasPaused
-          if cancelled {
-            self.show("USD import cancelled.")
-            return
-          }
-          switch result {
-          case .success(let imported):
-            do {
-              self.checkpoint("Open USD scene")
-              try self.restore(imported.document)
-              self.selectedNode = imported.document.graph?.nodes.first?.id
-              self.page = 4
-              self.changed()
-              self.rebuild()
-              self.showUSDReport()
-            } catch { self.show(error.localizedDescription) }
-          case .failure(let error): self.show(error.localizedDescription)
-          }
+    confirmDiscardingChanges { [weak self] in
+      self?.chooseOpen("Open OpenUSD scene", extensions: ["usd", "usda", "usdc", "usdz"]) {
+        [weak self] url in self?.beginImportUSD(from: url)
+      }
+    }
+  }
+  func beginImportUSD(from url: URL) {
+    guard !isBusy, let window = hostWindow else { return }
+    let record = undoRecord("Open USD scene", replacesDocument: true)
+    let source = snapshot()
+    let reuse = renderer.materials.reusableResources(graph: project.graph)
+    let job = USDImportJob()
+    let wasPaused = renderer.paused
+    let sheet = NSAlert()
+    sheet.messageText = "Importing OpenUSD scene"
+    sheet.informativeText =
+      "Composing layers, resolving materials, and building the scene. This can take a few minutes."
+    sheet.addButton(withTitle: "Cancel")
+    importInProgress = true
+    renderer.paused = true
+    beginProjectActivity("Importing \(url.lastPathComponent)…")
+    sheet.beginSheetModal(for: window) { _ in job.cancel() }
+    DispatchQueue.global(qos: .userInitiated).async {
+      // Resources are prepared off the main thread, reusing unchanged live resources.
+      let result = Result { () -> (USDImportResult, MaterialLibrary) in
+        let imported = try USDImporter.load(url, into: source, job: job)
+        return (imported, try self.prepareResources(imported.document, reuse: reuse))
+      }
+      DispatchQueue.main.async {
+        let cancelled = job.isCancelled
+        window.endSheet(sheet.window)
+        self.importInProgress = false
+        self.renderer.paused = wasPaused
+        if cancelled {
+          self.show("USD import cancelled.")
+          self.rebuild()
+          return
+        }
+        switch result {
+        case .success(let (imported, resources)):
+          self.publishImportedUSD(imported, resources: resources, record: record)
+          self.showUSDReport()
+        case .failure(let error):
+          self.show(error.localizedDescription)
+          self.rebuild()
         }
       }
     }
+  }
+  // The imported scene replaces the document as a new, unsaved, untitled project.
+  func publishImportedUSD(_ imported: USDImportResult, resources: MaterialLibrary, record: UndoRecord?) {
+    prepareGeneration &+= 1
+    backUpReplacedDocument(record)
+    applyProject(imported.document, resources: resources)
+    commit(record)
+    associate(nil, edited: true, replaced: true)
+    selectedNode = imported.document.graph?.nodes.first?.id
+    page = 4
+    changed()
+    rebuild()
   }
 }

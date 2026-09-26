@@ -118,16 +118,37 @@ final class StudioController: NSViewController {
   let history = UndoManager()
   var project = ProjectDocument()
   var projectURL: URL?
-  var importInProgress = false
-  var projectOperationInProgress = false
+  var importInProgress = false { didSet { busyStateChanged() } }
+  // Opens (including the launch restore), saves and off-main document preparation.
+  private var openInFlight = false { didSet { busyStateChanged() } }
+  private var saveInFlight = false { didSet { busyStateChanged() } }
+  private var preparationInFlight: UInt64? { didSet { busyStateChanged() } }
+  var projectOperationInProgress: Bool { openInFlight || saveInFlight || preparationInFlight != nil }
   var isBusy: Bool {
     exportRenderer != nil || previewDenoiseJob != nil || importInProgress || projectOperationInProgress
   }
   var pauseButton: NSButton?
+  private var busyButtons: [NSButton] = []
+  private var projectActivity = ""
   private let autosaveQueue = DispatchQueue(label: "VibeTracer.autosave", qos: .utility)
   private let projectIOQueue = DispatchQueue(label: "VibeTracer.project-io", qos: .userInitiated)
   private var documentRevision: UInt64 = 0
-  private var projectOperationGeneration: UInt64 = 0
+  var openGeneration: UInt64 = 0, saveGeneration: UInt64 = 0, prepareGeneration: UInt64 = 0
+  // Changes whenever another document replaces the current one; saves bind to it.
+  private var documentIdentity: UInt64 = 0
+  private(set) var documentEdited = false {
+    didSet { hostWindow?.isDocumentEdited = documentEdited }
+  }
+  // Quit waits for pending project I/O; the first failed save is reported before quitting.
+  var terminationRequested = false
+  private var idleWaiters: [(String?) -> Void] = []
+  private var pendingSaveFailure: String?
+  // Tests redirect the recovery files; production uses Application Support.
+  var autosaveURL = StudioController.defaultAutosaveURL
+  private var autosaveSuppressed = false
+  private let autosaveLock = NSLock()
+  private var queuedAutosave: PendingAutosave?  // guarded by autosaveLock
+  private var writtenAutosave: (revision: UInt64, url: URL)?  // guarded by autosaveLock
   var selectedSlot = 1, page = 0, sidebarVisible = true
   var selectedNode: UUID?
   var selectedSubset = 0
@@ -168,7 +189,9 @@ final class StudioController: NSViewController {
     viewport.preferredFramesPerSecond = 60
     loadView()
     viewport.onBeginEdit = { [weak self] in self?.checkpoint("Camera", coalesce: true) }
-    viewport.onUserOrbit = { [weak self] in self?.changed(reset: false) }
+    // Camera-only changes use a longer autosave debounce than document edits.
+    viewport.onUserOrbit = { [weak self] in self?.changed(reset: false, autosaveDelay: 5) }
+    viewport.canEdit = { [weak self] in self?.isBusy == false }
     viewport.onPick = { [weak self] p in self?.pick(p) }
     renderer.onFrameUpdate = { [weak self] _ in self?.updateStatus() }
     renderer.onError = { [weak self] text in self?.show(text) }
@@ -186,20 +209,25 @@ final class StudioController: NSViewController {
       self?.inspectorAction()
     }
     bar.addArrangedSubview(toggle)
-    bar.addArrangedSubview(ActionButton("Open…") { [weak self] in self?.openProject() })
-    bar.addArrangedSubview(ActionButton("Save") { [weak self] in self?.saveProject() })
+    let open = ActionButton("Open…") { [weak self] in self?.openProject() }
+    let save = ActionButton("Save") { [weak self] in self?.saveProject() }
+    bar.addArrangedSubview(open)
+    bar.addArrangedSubview(save)
     let pause = ActionButton("Pause") { [weak self] in self?.pause() }
     pauseButton = pause
     bar.addArrangedSubview(pause)
-    bar.addArrangedSubview(ActionButton("Restart") { [weak self] in self?.restart() })
-    bar.addArrangedSubview(
-      ActionButton("Export…") { [weak self] in
-        self?.page = 5
-        self?.rebuild()
-      })
+    let restart = ActionButton("Restart") { [weak self] in self?.restart() }
+    bar.addArrangedSubview(restart)
+    let export = ActionButton("Export…") { [weak self] in
+      self?.page = 5
+      self?.rebuild()
+    }
+    bar.addArrangedSubview(export)
     let spacer = NSView()
     bar.addArrangedSubview(spacer)
-    bar.addArrangedSubview(ActionButton("Settings…") { [weak self] in self?.settingsAction() })
+    let settings = ActionButton("Settings…") { [weak self] in self?.settingsAction() }
+    bar.addArrangedSubview(settings)
+    busyButtons = [open, save, restart, export, settings]
     sidebar.hasVerticalScroller = true
     sidebar.drawsBackground = true
     stack.orientation = .vertical
@@ -274,7 +302,11 @@ final class StudioController: NSViewController {
     }
   }
   func popup(_ titles: [String], _ value: Int, _ action: @escaping (Int) -> Void) {
-    add(ActionPopup(titles, selected: value, action))
+    add(
+      ActionPopup(titles, selected: value) { [weak self] i in
+        guard let self, !self.isBusy else { return }
+        action(i)
+      })
   }
   func button(_ title: String, _ action: @escaping () -> Void) { add(ActionButton(title, action)) }
   func rebuild() {
@@ -304,6 +336,11 @@ final class StudioController: NSViewController {
       heading("OIDN preview…")
       text("The current accumulation is frozen while OIDN denoises it.")
       button("Cancel OIDN Preview") { [weak self] in self?.cancelOIDNPreview() }
+      return
+    }
+    if projectOperationInProgress || importInProgress {
+      heading(projectActivity.isEmpty ? "Working…" : projectActivity)
+      text("Editing resumes when the project operation finishes.")
       return
     }
     switch page {
@@ -489,13 +526,16 @@ final class StudioController: NSViewController {
     text(project.environmentName)
     button("Load HDRI / environment image…") { [weak self] in self?.loadEnvironment() }
     button("Use procedural sky") { [weak self] in
-      guard let self else { return }
-      self.checkpoint("Clear environment")
-      try? self.renderer.materials.setEnvironment(nil)
-      self.project.environmentData = nil
-      self.project.environmentName = "Procedural sky"
-      self.changed()
-      self.rebuild()
+      guard let self, !self.isBusy else { return }
+      let record = self.undoRecord("Clear environment")
+      do {
+        try self.renderer.materials.setEnvironment(nil)
+        self.project.environmentData = nil
+        self.project.environmentName = "Procedural sky"
+        self.commit(record)
+        self.changed()
+        self.rebuild()
+      } catch { self.show(error.localizedDescription) }
     }
     option("Environment brightness", \.environmentIntensity, 0...100, 1)
     option("Environment rotation, degrees", \.environmentRotation, -180...180, 0)
@@ -523,7 +563,7 @@ final class StudioController: NSViewController {
     add(
       ActionColor(NSColor(srgbRed: encode(c.x), green: encode(c.y), blue: encode(c.z), alpha: 1))
       { [weak self] c in
-        guard let self, let c = c.usingColorSpace(.sRGB) else { return }
+        guard let self, !self.isBusy, let c = c.usingColorSpace(.sRGB) else { return }
         self.checkpoint("Light color")
         self.renderer.options.lightColor = SIMD3(
           decode(c.redComponent), decode(c.greenComponent), decode(c.blueComponent))
@@ -625,7 +665,7 @@ final class StudioController: NSViewController {
           srgbRed: encode(material.color.x), green: encode(material.color.y),
           blue: encode(material.color.z), alpha: 1)
       ) { [weak self] color in
-        guard let self, let c = color.usingColorSpace(.sRGB) else { return }
+        guard let self, !self.isBusy, let c = color.usingColorSpace(.sRGB) else { return }
         self.checkpoint("Material tint")
         func decode(_ c: CGFloat) -> Float {
           let x = Float(c)
@@ -675,10 +715,11 @@ final class StudioController: NSViewController {
         [weak self] in self?.loadMap(slot, channel)
       }
       button("Clear map") { [weak self] in
-        guard let self else { return }
+        guard let self, !self.isBusy else { return }
         do {
-          self.checkpoint("Clear texture")
+          let record = self.undoRecord("Clear texture")
           try self.renderer.materials.clear(slot: slot, channel: channel)
+          self.commit(record)
           self.changed()
           self.rebuild()
         } catch { self.show(error.localizedDescription) }
@@ -701,11 +742,18 @@ final class StudioController: NSViewController {
     button("Save material preset…") { [weak self] in self?.saveMaterial() }
     button("Load material preset…") { [weak self] in self?.loadMaterial() }
     button("Reset material and maps") { [weak self] in
-      guard let self else { return }
-      self.checkpoint("Reset material")
-      self.renderer.materials.settings[slot] = SurfaceSettings()
+      guard let self, !self.isBusy else { return }
+      let record = self.undoRecord("Reset material")
+      // Publish settings and all four maps in one transactional restore.
+      var state = self.renderer.materials.state()
+      state.surfaces[slot] = SurfaceSettings()
+      for c in 0..<4 {
+        state.maps[slot * 4 + c] = nil
+        state.names[slot * 4 + c] = "None"
+      }
       do {
-        for c in 0..<4 { try self.renderer.materials.clear(slot: slot, channel: c) }
+        try self.renderer.materials.restore(state)
+        self.commit(record)
         self.changed()
         self.rebuild()
       } catch { self.show(error.localizedDescription) }
@@ -766,13 +814,7 @@ final class StudioController: NSViewController {
     heading("Project")
     text(projectURL?.lastPathComponent ?? "Untitled project")
     button("New project") { [weak self] in
-      guard let self else { return }
-      self.checkpoint("New project")
-      do {
-        try self.restore(ProjectDocument())
-        self.projectURL = nil
-        self.changed(reset: false)
-      } catch { self.show(error.localizedDescription) }
+      self?.confirmDiscardingChanges { self?.newProject() }
     }
     button("Open project…") { [weak self] in self?.openProject() }
     button("Save project") { [weak self] in self?.saveProject() }
@@ -813,7 +855,7 @@ final class StudioController: NSViewController {
   }
   func updateStatus() {
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
-    pauseButton?.isEnabled = !isBusy
+    busyStateChanged()
     guard Date() >= messageUntil, exportRenderer == nil else { return }
     let r = renderer
     let state = r.paused ? "Paused" : r.reachedLimit ? "Complete" : "Rendering"
@@ -856,75 +898,280 @@ final class StudioController: NSViewController {
     p.environmentData = renderer.materials.environmentData
     p.version = 2
     p.triangles = p.graph == nil ? renderer.materials.meshTriangles : []
+    p.recovery = nil
     return p
+  }
+  // An undo step is captured before an action and registered only once it succeeds.
+  struct UndoRecord {
+    let name: String
+    let document: ProjectDocument
+    // Set for actions that replace the document (Open, New, USD open).
+    let association: DocumentAssociation?
+  }
+  struct DocumentAssociation {
+    var url: URL?
+    var edited: Bool
+  }
+  func undoRecord(_ name: String, replacesDocument: Bool = false) -> UndoRecord? {
+    guard !isRestoring, !isBusy else { return nil }
+    return UndoRecord(
+      name: name, document: snapshot(),
+      association: replacesDocument ? DocumentAssociation(url: projectURL, edited: documentEdited) : nil)
+  }
+  func commit(_ record: UndoRecord?) {
+    guard let record else { return }
+    lastCheckpoint = Date()
+    history.levelsOfUndo = 40
+    history.registerUndo(withTarget: self) { target in target.applyUndo(record) }
+    history.setActionName(record.name)
   }
   func checkpoint(_ name: String, coalesce: Bool = false) {
     guard !isRestoring, !isBusy else { return }
     if coalesce && Date().timeIntervalSince(lastCheckpoint) < 0.5 { return }
-    lastCheckpoint = Date()
-    let old = snapshot()
-    history.levelsOfUndo = 40
-    history.registerUndo(withTarget: self) { target in target.applyUndo(old, name: name) }
-    history.setActionName(name)
+    commit(undoRecord(name))
   }
-  func applyUndo(_ document: ProjectDocument, name: String) {
-    let current = snapshot()
-    do {
-      try restore(document)
-      history.registerUndo(withTarget: self) { $0.applyUndo(current, name: name) }
-      history.setActionName(name)
-      changed(reset: false)
-    } catch { show(error.localizedDescription) }
+  func applyUndo(_ record: UndoRecord) {
+    // Register the inverse synchronously so UndoManager files it on the redo (or undo)
+    // stack even when the document is prepared off the main thread.
+    let inverse = UndoRecord(
+      name: record.name, document: snapshot(),
+      association: record.association.map { _ in
+        DocumentAssociation(url: projectURL, edited: documentEdited)
+      })
+    history.registerUndo(withTarget: self) { $0.applyUndo(inverse) }
+    history.setActionName(record.name)
+    replaceDocument(record.document, activity: "Restoring “\(record.name)”…") { [weak self] error in
+      guard let self else { return }
+      if let error {
+        self.show(error.localizedDescription)
+        return
+      }
+      // Undoing Open/New/USD open returns the previous file association too.
+      if let association = record.association {
+        self.associate(association.url, edited: true, replaced: true)
+      }
+      self.changed(reset: false)
+    }
   }
-  func changed(reset: Bool = true) {
+  func changed(reset: Bool = true, autosaveDelay: TimeInterval = 1) {
     documentRevision &+= 1
-    hostWindow?.isDocumentEdited = true
+    documentEdited = true
     if reset { renderer.resetAccumulation() }
+    scheduleAutosave(after: autosaveDelay)
+  }
+  private func scheduleAutosave(after delay: TimeInterval = 1) {
     saveTimer?.invalidate()
-    saveTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in
+    saveTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
       self?.autosave()
     }
   }
-  // `resident` is the published library's snapshot, taken on the main thread. It
-  // stays live until applyProject, so the candidate budgets and shares against it.
-  private func prepareResources(_ p: ProjectDocument, resident: MaterialLibrary.ResidentTextures) throws
-    -> MaterialLibrary
-  {
+  // Records the file association after open/save/new and refreshes the recovery metadata.
+  func associate(_ url: URL?, edited: Bool, replaced: Bool) {
+    projectURL = url
+    if replaced { documentIdentity &+= 1 }
+    documentEdited = edited
+    documentRevision &+= 1
+    scheduleAutosave()
+  }
+  private func busyStateChanged() {
+    let enabled = !isBusy
+    for button in busyButtons { button.isEnabled = enabled }
+    pauseButton?.isEnabled = enabled
+  }
+  func beginProjectActivity(_ activity: String) {
+    projectActivity = activity
+    show(activity)
+    rebuild()
+  }
+  // Runs quit continuations once no project I/O remains.
+  private func finishProjectOperation() {
+    guard !projectOperationInProgress else { return }
+    let waiters = idleWaiters, failure = pendingSaveFailure
+    idleWaiters = []
+    pendingSaveFailure = nil
+    for waiter in waiters { waiter(failure) }
+  }
+  // Calls `body` when pending opens, saves and preparations have finished, with the
+  // first failed save (if any), so quitting never discards an explicit Save.
+  func whenProjectOperationsFinish(_ body: @escaping (String?) -> Void) {
+    terminationRequested = true
+    idleWaiters.append(body)
+    finishProjectOperation()
+  }
+  // Validates and prepares a complete candidate library. With `reuse`, unchanged maps,
+  // MaterialX images, the environment and the flattened mesh and BVH are adopted from
+  // the live library instead of being decoded or rebuilt. Safe on projectIOQueue.
+  // `resident` (default: the snapshot in `reuse`) is the published library's texture
+  // set, taken on the main thread. It stays live until applyProject, so the candidate
+  // budgets and shares against it.
+  func prepareResources(
+    _ p: ProjectDocument, reuse: ReusableResources? = nil, resident: MaterialLibrary.ResidentTextures? = nil
+  ) throws -> MaterialLibrary {
     try p.validate()
     let resources = try MaterialLibrary(
       device: renderer.device, function: renderer.materialFunction)
-    resources.external = resident
+    resources.external = resident ?? reuse?.resident ?? MaterialLibrary.ResidentTextures()
+    if let reuse { resources.adopt(reuse) }
     try resources.restore(p.scenes[Int(p.scene)] ?? SceneState())
     try resources.setEnvironment(p.environmentData)
-    try resources.setMesh(p.graph?.renderTriangles() ?? p.triangles)
+    if let reuse, let graph = p.graph, reuse.hasSceneGraph, let live = reuse.graph,
+      graph.sameGeometry(as: live)
+    {
+      if !graph.sameBindings(as: live) { try resources.setMeshBindings(graph) }
+    } else if let reuse, p.graph == nil, !reuse.hasSceneGraph,
+      sameBytes(p.triangles, reuse.meshTriangles)
+    {
+      // The adopted flattened mesh and BVH are already bound.
+    } else {
+      try resources.setMesh(p.graph?.renderTriangles() ?? p.triangles)
+    }
     resources.hasSceneGraph = p.graph != nil
     return resources
   }
-  private func applyProject(_ p: ProjectDocument, resources: MaterialLibrary) {
+  // Only radiance-affecting differences restart accumulation. Display-only state
+  // (exposure, white balance, tone map, divider, MetalFX, viewport mode, limits,
+  // export settings, saved views) keeps the accumulated samples and OIDN preview.
+  func applyProject(_ p: ProjectDocument, resources: MaterialLibrary?, resourcesChanged: Bool = true) {
     isRestoring = true
     defer { isRestoring = false }
-    renderer.materials = resources
-    resources.external = MaterialLibrary.ResidentTextures()
+    let r = renderer
+    let radianceChanged =
+      resourcesChanged || r.sceneIndex != p.scene || r.samplingMode != p.strategy
+      || r.skyMode != p.sky || r.enableFog != p.fog || r.enableSMS != p.ring
+      || !r.options.sameRadiance(as: p.options)
+    let oidn = p.oidn ?? OIDNOptions()
+    if oidn != r.oidnOptions, r.offlineDenoisedPreview != nil {
+      r.offlineDenoisedPreview = nil
+      r.paused = oidnPreviewWasPaused
+    }
+    if let resources {
+      r.materials = resources
+      resources.external = MaterialLibrary.ResidentTextures()
+    }
     project = p
-    renderer.sceneIndex = p.scene
-    renderer.samplingMode = p.strategy
-    renderer.skyMode = p.sky
-    renderer.enableFog = p.fog
-    renderer.enableSMS = p.ring
-    renderer.denoiserEnabled = p.denoise && renderer.supportsMetalFX
-    renderer.oidnOptions = p.oidn ?? OIDNOptions()
-    renderer.viewportMode = p.viewportMode ?? 0
-    renderer.options = p.options
-    p.camera.apply(renderer)
-    renderer.resetAccumulation()
+    r.sceneIndex = p.scene
+    r.samplingMode = p.strategy
+    r.skyMode = p.sky
+    r.enableFog = p.fog
+    r.enableSMS = p.ring
+    r.denoiserEnabled = p.denoise && r.supportsMetalFX
+    r.oidnOptions = oidn
+    r.viewportMode = p.viewportMode ?? 0
+    r.options = p.options
+    // Camera properties reset accumulation (keeping MetalFX history) only when they change.
+    p.camera.apply(r)
+    if radianceChanged { r.resetAccumulation() }
+    r.presentationNeedsRefresh = true
     rebuild()
   }
   func restore(_ p: ProjectDocument) throws {
+    prepareGeneration &+= 1
     applyProject(p, resources: try prepareResources(p, resident: renderer.materials.residentSnapshot()))
   }
-  func switchScene(_ i: Int) {
+  private enum ResourceChange { case none, inPlace, prepare }
+  private func resourceChange(to p: ProjectDocument) -> ResourceChange {
+    let live = renderer.materials
+    let current = live.state(), target = p.scenes[Int(p.scene)] ?? SceneState()
+    guard p.environmentData == live.environmentData, current.hasImages(of: target) else {
+      return .prepare
+    }
+    let sameMesh: Bool
+    if let graph = p.graph {
+      sameMesh =
+        live.hasSceneGraph
+        && project.graph.map { graph.sameGeometry(as: $0) && graph.sameBindings(as: $0) } == true
+    } else {
+      sameMesh = !live.hasSceneGraph && sameBytes(p.triangles, live.meshTriangles)
+    }
+    return sameMesh && current.sameResources(as: target) ? .none : .inPlace
+  }
+  // Updates the live library like the forward edits do; no image is decoded because
+  // resourceChange(to:) verified every map and graph image is already resident.
+  private func applyInPlace(_ p: ProjectDocument) throws {
+    let live = renderer.materials
+    let previous = live.state(), target = p.scenes[Int(p.scene)] ?? SceneState()
+    let materialsChanged = !previous.sameResources(as: target)
+    if materialsChanged { try live.restore(target) }
+    do {
+      if let graph = p.graph, live.hasSceneGraph, let current = project.graph,
+        graph.sameGeometry(as: current)
+      {
+        if !graph.sameBindings(as: current) { try live.setMeshBindings(graph) }
+      } else if p.graph != nil || live.hasSceneGraph || !sameBytes(p.triangles, live.meshTriangles) {
+        try live.setMesh(p.graph?.renderTriangles() ?? p.triangles)
+      }
+    } catch {
+      if materialsChanged {
+        do { try live.restore(previous) } catch let rollback {
+          throw MaterialLibrary.error(
+            "\(error.localizedDescription) Rollback also failed (\(rollback.localizedDescription)).")
+        }
+      }
+      throw error
+    }
+    live.hasSceneGraph = p.graph != nil
+  }
+  // Publishes a replacement document (undo/redo, scene switch, New). Camera, option and
+  // display-only differences apply directly and resource edits that need no decoding
+  // update the live library in place; anything else is prepared on projectIOQueue.
+  // `completion` runs on the main thread, synchronously for the first two cases.
+  func replaceDocument(_ p: ProjectDocument, activity: String, completion: @escaping (Error?) -> Void) {
+    switch resourceChange(to: p) {
+    case .none:
+      prepareGeneration &+= 1
+      applyProject(p, resources: nil, resourcesChanged: false)
+      completion(nil)
+    case .inPlace:
+      prepareGeneration &+= 1
+      do {
+        try applyInPlace(p)
+        applyProject(p, resources: nil)
+        completion(nil)
+      } catch { completion(error) }
+    case .prepare:
+      beginDocumentChange(activity, build: { (p, ()) }) { result in
+        if case .failure(let error) = result { completion(error) } else { completion(nil) }
+      }
+    }
+  }
+  // Builds a candidate document (parsing imports) and prepares its resources on
+  // projectIOQueue, then publishes it unless a newer replacement superseded it.
+  func beginDocumentChange<Extra>(
+    _ activity: String, build: @escaping () throws -> (ProjectDocument, Extra),
+    completion: @escaping (Result<Extra, Error>) -> Void
+  ) {
+    prepareGeneration &+= 1
+    let generation = prepareGeneration
+    let reuse = renderer.materials.reusableResources(graph: project.graph)
+    preparationInFlight = generation
+    beginProjectActivity(activity)
+    projectIOQueue.async { [weak self] in
+      guard let self else { return }
+      let result = Result { () -> (ProjectDocument, Extra, MaterialLibrary) in
+        let (document, extra) = try build()
+        return (document, extra, try self.prepareResources(document, reuse: reuse))
+      }
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        if self.preparationInFlight == generation { self.preparationInFlight = nil }
+        guard generation == self.prepareGeneration else {
+          self.finishProjectOperation()
+          return
+        }
+        switch result {
+        case .success(let (document, extra, resources)):
+          self.applyProject(document, resources: resources)
+          completion(.success(extra))
+        case .failure(let error): completion(.failure(error))
+        }
+        self.rebuild()
+        self.finishProjectOperation()
+      }
+    }
+  }
+  func switchScene(_ i: Int, then: (() -> Void)? = nil) {
     guard !isBusy, UInt32(i) != renderer.sceneIndex else { return }
-    checkpoint("Scene")
+    let record = undoRecord("Scene")
     var p = snapshot()
     p.scene = UInt32(i)
     let oldCamera = CameraState(renderer)
@@ -933,52 +1180,230 @@ final class StudioController: NSViewController {
     p.camera = CameraState(renderer)
     renderer.sceneIndex = oldScene
     oldCamera.apply(renderer)
-    do {
-      try restore(p)
-      changed(reset: false)
-    } catch { show(error.localizedDescription) }
+    replaceDocument(p, activity: "Switching scene…") { [weak self] error in
+      guard let self else { return }
+      if let error {
+        self.show(error.localizedDescription)
+        self.rebuild()
+        return
+      }
+      self.commit(record)
+      self.changed(reset: false)
+      then?()
+    }
   }
-  var autosaveURL: URL {
-    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+  func newProject() {
+    guard !isBusy else { return }
+    let record = undoRecord("New project", replacesDocument: true)
+    replaceDocument(ProjectDocument(), activity: "Creating project…") { [weak self] error in
+      guard let self else { return }
+      if let error {
+        self.show(error.localizedDescription)
+        return
+      }
+      self.backUpReplacedDocument(record)
+      self.commit(record)
+      self.associate(nil, edited: false, replaced: true)
+      self.rebuild()
+    }
+  }
+  // Standard Save / Don't Save / Cancel prompt before Open, New and USD open replace
+  // an edited document.
+  func confirmDiscardingChanges(_ proceed: @escaping () -> Void) {
+    guard !isBusy else { return }
+    guard documentEdited, let window = hostWindow else {
+      proceed()
+      return
+    }
+    let alert = NSAlert()
+    alert.messageText =
+      "Do you want to save the changes made to “\(projectURL?.lastPathComponent ?? "Untitled project")”?"
+    alert.informativeText =
+      "If you don't save, the current version is kept only as a recovery copy (\(previousAutosaveURL.lastPathComponent))."
+    alert.addButton(withTitle: "Save")
+    let discard = alert.addButton(withTitle: "Don't Save")
+    discard.keyEquivalent = "d"
+    discard.keyEquivalentModifierMask = .command
+    alert.addButton(withTitle: "Cancel")
+    alert.beginSheetModal(for: window) { [weak self] response in
+      // Present any follow-up sheet after this one has been ordered out.
+      DispatchQueue.main.async { self?.resolveUnsavedChanges(response, proceed) }
+    }
+  }
+  func resolveUnsavedChanges(_ response: NSApplication.ModalResponse, _ proceed: @escaping () -> Void) {
+    switch response {
+    case .alertFirstButtonReturn:
+      saveProject { [weak self] saved in
+        if saved, self?.terminationRequested == false { proceed() }
+      }
+    case .alertSecondButtonReturn: proceed()
+    default: break
+    }
+  }
+  static var defaultAutosaveURL: URL {
+    (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+      ?? FileManager.default.temporaryDirectory)
       .appendingPathComponent("VibeTracer/Autosave.vtrace")
+  }
+  // Recovery copy of the document replaced by Open, New or USD open while edited.
+  var previousAutosaveURL: URL {
+    autosaveURL.deletingLastPathComponent().appendingPathComponent("Autosave-previous.vtrace")
+  }
+  struct PendingAutosave {
+    var document: ProjectDocument
+    var revision: UInt64
+    var url: URL
+  }
+  private func autosaveSnapshot() -> ProjectDocument {
+    var document = snapshot()
+    document.recovery = AutosaveRecovery(projectPath: projectURL?.path, edited: documentEdited)
+    return document
+  }
+  // autosaveQueue only: writes the newest queued snapshot.
+  private func drainAutosave() -> Error? {
+    autosaveLock.lock()
+    let item = queuedAutosave
+    queuedAutosave = nil
+    autosaveLock.unlock()
+    guard let item else { return nil }
+    return writeAutosave(item)
   }
   private func writeAutosave(_ document: ProjectDocument, to url: URL) throws {
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     try document.encodeForSaving().write(to: url, options: .atomic)
   }
+  // autosaveQueue only: skips a revision that is already on disk at that location.
+  private func writeAutosave(_ item: PendingAutosave) -> Error? {
+    autosaveLock.lock()
+    let written = writtenAutosave
+    autosaveLock.unlock()
+    if let written, written.revision == item.revision, written.url == item.url { return nil }
+    do { try writeAutosave(item.document, to: item.url) } catch { return error }
+    autosaveLock.lock()
+    writtenAutosave = (item.revision, item.url)
+    autosaveLock.unlock()
+    return nil
+  }
+  private func markAutosaved() {
+    autosaveLock.lock()
+    writtenAutosave = (documentRevision, autosaveURL)
+    autosaveLock.unlock()
+  }
   func autosave() {
-    guard !isRestoring else { return }
-    let document = snapshot(), url = autosaveURL
-    // Serialize immutable snapshots in order, off the UI/render scheduling thread.
+    guard !isRestoring, !autosaveSuppressed else { return }
+    let item = PendingAutosave(
+      document: autosaveSnapshot(), revision: documentRevision, url: autosaveURL)
+    autosaveLock.lock()
+    let scheduled = queuedAutosave != nil
+    queuedAutosave = item
+    autosaveLock.unlock()
+    // Coalesce: an already queued write picks up this newer snapshot.
+    guard !scheduled else { return }
     autosaveQueue.async { [weak self] in
-      do {
-        try self?.writeAutosave(document, to: url)
-      } catch {
-        let message = error.localizedDescription
-        DispatchQueue.main.async { self?.show("Autosave failed: \(message)") }
-      }
+      guard let self, let error = self.drainAutosave() else { return }
+      let message = error.localizedDescription
+      DispatchQueue.main.async { self.show("Autosave failed: \(message)") }
     }
   }
   // The serial queue orders this snapshot after every pending periodic save, so an
   // older snapshot can never replace the final state during application shutdown.
+  // Nothing is rewritten when the current revision is already on disk.
   func flushAutosave(to destination: URL? = nil) throws {
-    guard !isRestoring else { return }
+    guard !isRestoring, !autosaveSuppressed else { return }
     saveTimer?.invalidate()
     saveTimer = nil
-    let document = snapshot(), url = destination ?? autosaveURL
-    var result: Result<Void, Error> = .success(())
+    let item = PendingAutosave(
+      document: autosaveSnapshot(), revision: documentRevision, url: destination ?? autosaveURL)
+    var failure: Error?
     autosaveQueue.sync {
-      do { try writeAutosave(document, to: url) }
-      catch { result = .failure(error) }
+      autosaveLock.lock()
+      if queuedAutosave?.url == item.url { queuedAutosave = nil }
+      autosaveLock.unlock()
+      _ = drainAutosave()
+      failure = writeAutosave(item)
     }
-    try result.get()
+    if let failure { throw failure }
   }
+  // Keeps the document replaced by Open/New/USD open when it had unsaved changes.
+  func backUpReplacedDocument(_ record: UndoRecord?) {
+    guard let record, let association = record.association, association.edited,
+      !autosaveSuppressed
+    else { return }
+    var document = record.document
+    document.recovery = AutosaveRecovery(projectPath: association.url?.path, edited: true)
+    let url = previousAutosaveURL
+    autosaveQueue.async { [weak self] in
+      do { try self?.writeAutosave(document, to: url) } catch {
+        let message = error.localizedDescription
+        DispatchQueue.main.async { self?.show("Recovery copy failed: \(message)") }
+      }
+    }
+  }
+  // Moves an autosave that cannot be restored aside so no later autosave can overwrite it.
+  static func preserveUnrestorableAutosave(_ url: URL) throws -> URL {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    let folder = url.deletingLastPathComponent()
+    let base = url.deletingPathExtension().lastPathComponent + "-unrestorable-" + formatter.string(from: Date())
+    var target = folder.appendingPathComponent(base + ".vtrace")
+    var suffix = 2
+    while FileManager.default.fileExists(atPath: target.path) {
+      target = folder.appendingPathComponent("\(base)-\(suffix).vtrace")
+      suffix += 1
+    }
+    try FileManager.default.moveItem(at: url, to: target)
+    return target
+  }
+  // Reads, decodes and prepares the autosave off the main thread. A failed restore
+  // keeps the file under a new name and nothing is autosaved until the next edit.
   func restoreAutosave() {
-    guard FileManager.default.fileExists(atPath: autosaveURL.path) else { return }
-    do {
-      try restore(JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: autosaveURL)))
-      show("Restored autosaved project")
-    } catch { show("Could not restore autosave: \(error.localizedDescription)") }
+    let url = autosaveURL
+    guard FileManager.default.fileExists(atPath: url.path), !isBusy else { return }
+    openGeneration &+= 1
+    let generation = openGeneration
+    let reuse = renderer.materials.reusableResources(graph: project.graph)
+    openInFlight = true
+    beginProjectActivity("Restoring autosaved project…")
+    projectIOQueue.async { [weak self] in
+      guard let self else { return }
+      let result = Result { () -> (ProjectDocument, MaterialLibrary) in
+        let data = try self.readBounded(url, maximum: 768 * 1024 * 1024)
+        let document = try JSONDecoder().decode(ProjectDocument.self, from: data)
+        return (document, try self.prepareResources(document, reuse: reuse))
+      }
+      var preserved: Result<URL, Error>?
+      if case .failure = result { preserved = Result { try Self.preserveUnrestorableAutosave(url) } }
+      DispatchQueue.main.async { [weak self] in
+        guard let self, generation == self.openGeneration else { return }
+        self.openInFlight = false
+        switch result {
+        case .success(let (document, resources)):
+          self.prepareGeneration &+= 1
+          self.applyProject(document, resources: resources)
+          // Recovered work keeps its file association and unsaved state.
+          let path = document.recovery?.projectPath.map { URL(fileURLWithPath: $0) }
+          self.projectURL = path.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+          self.documentIdentity &+= 1
+          self.documentEdited = document.recovery?.edited ?? true
+          self.show("Restored autosaved project")
+        case .failure(let error):
+          switch preserved {
+          case .success(let moved)?:
+            self.show("Could not restore autosave: \(error.localizedDescription) It was kept as \(moved.path).")
+          case .failure(let moveError)?:
+            self.autosaveSuppressed = true
+            self.show(
+              "Could not restore autosave: \(error.localizedDescription) Autosave is off for this session because the file could not be kept (\(moveError.localizedDescription)).")
+          case nil: break
+          }
+        }
+        // The file on disk (or its preserved copy) already holds this state.
+        self.markAutosaved()
+        self.rebuild()
+        self.finishProjectOperation()
+      }
+    }
   }
   func chooseOpen(_ title: String, extensions: [String], _ action: @escaping (URL) -> Void) {
     guard !isBusy else { return }
@@ -991,48 +1416,59 @@ final class StudioController: NSViewController {
       if response == .OK, let url = panel.url { action(url) }
     }
   }
-  func chooseSave(_ title: String, name: String, ext: String, _ action: @escaping (URL) -> Void) {
+  func chooseSave(
+    _ title: String, name: String, ext: String, cancelled: (() -> Void)? = nil,
+    _ action: @escaping (URL) -> Void
+  ) {
     let panel = NSSavePanel()
     panel.title = title
     panel.nameFieldStringValue = name
     panel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .data]
-    guard let window = hostWindow else { return }
+    guard let window = hostWindow else {
+      cancelled?()
+      return
+    }
     panel.beginSheetModal(for: window) { response in
-      if response == .OK, let url = panel.url { action(url) }
+      if response == .OK, let url = panel.url { action(url) } else { cancelled?() }
     }
   }
   func openProject() {
-    chooseOpen("Open Metal Vibe Tracer project", extensions: ["vtrace", "json"]) { [weak self] url in
-      self?.beginOpenProject(url)
+    confirmDiscardingChanges { [weak self] in
+      self?.chooseOpen("Open Metal Vibe Tracer project", extensions: ["vtrace", "json"]) {
+        [weak self] url in self?.beginOpenProject(url)
+      }
     }
   }
   func beginOpenProject(_ url: URL) {
-    projectOperationGeneration &+= 1
-    let generation = projectOperationGeneration
-    projectOperationInProgress = true
-    show("Opening \(url.lastPathComponent)…")
-    let resident = renderer.materials.residentSnapshot()
+    guard !isBusy else { return }
+    let record = undoRecord("Open project", replacesDocument: true)
+    openGeneration &+= 1
+    let generation = openGeneration
+    let reuse = renderer.materials.reusableResources(graph: project.graph)
+    openInFlight = true
+    beginProjectActivity("Opening \(url.lastPathComponent)…")
     projectIOQueue.async { [weak self] in
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, MaterialLibrary) in
         let data = try self.readBounded(url, maximum: ProjectDocument.maximumFileBytes)
         let document = try JSONDecoder().decode(ProjectDocument.self, from: data)
-        return (document, try self.prepareResources(document, resident: resident))
+        return (document, try self.prepareResources(document, reuse: reuse))
       }
       DispatchQueue.main.async { [weak self] in
-        guard let self, generation == self.projectOperationGeneration else { return }
-        self.projectOperationInProgress = false
+        guard let self, generation == self.openGeneration else { return }
+        self.openInFlight = false
         switch result {
         case .success(let (document, resources)):
-          self.checkpoint("Open project")
+          self.prepareGeneration &+= 1
+          self.backUpReplacedDocument(record)
           self.applyProject(document, resources: resources)
-          self.projectURL = url
-          self.documentRevision &+= 1
-          self.hostWindow?.isDocumentEdited = false
+          self.commit(record)
+          self.associate(url, edited: false, replaced: true)
           self.show("Opened \(url.lastPathComponent)")
         case .failure(let error): self.show(error.localizedDescription)
         }
         self.rebuild()
+        self.finishProjectOperation()
       }
     }
   }
@@ -1047,41 +1483,58 @@ final class StudioController: NSViewController {
     }
     return data
   }
-  func saveProject(asNew: Bool = false) {
-    guard exportRenderer == nil, previewDenoiseJob == nil, !importInProgress else { return }
+  // `completion` reports whether the document was written (false when busy, cancelled or failed).
+  func saveProject(asNew: Bool = false, completion: ((Bool) -> Void)? = nil) {
+    guard !isBusy else {
+      completion?(false)
+      return
+    }
     let write: (URL) -> Void = { [weak self] url in
-      self?.beginSaveProject(url)
+      self?.beginSaveProject(url, completion: completion)
     }
     if let url = projectURL, !asNew {
       write(url)
     } else {
       chooseSave(
         "Save project", name: projectURL?.lastPathComponent ?? "Untitled.vtrace", ext: "vtrace",
-        write)
+        cancelled: { completion?(false) }, write)
     }
   }
-  func beginSaveProject(_ url: URL) {
+  func beginSaveProject(_ url: URL, completion: ((Bool) -> Void)? = nil) {
+    guard !isBusy else {
+      completion?(false)
+      return
+    }
     let document = snapshot()
-    let revision = documentRevision
-    projectOperationGeneration &+= 1
-    let generation = projectOperationGeneration
-    projectOperationInProgress = true
-    show("Saving \(url.lastPathComponent)…")
+    let revision = documentRevision, identity = documentIdentity
+    saveGeneration &+= 1
+    let generation = saveGeneration
+    saveInFlight = true
+    beginProjectActivity("Saving \(url.lastPathComponent)…")
     projectIOQueue.async { [weak self] in
       let result = Result {
         try document.encodeForSaving().write(to: url, options: .atomic)
       }
       DispatchQueue.main.async { [weak self] in
-        guard let self, generation == self.projectOperationGeneration else { return }
-        self.projectOperationInProgress = false
+        guard let self, generation == self.saveGeneration else { return }
+        self.saveInFlight = false
         switch result {
         case .success:
-          self.projectURL = url
-          if self.documentRevision == revision { self.hostWindow?.isDocumentEdited = false }
+          // Bind the file only to the document that was saved.
+          if self.documentIdentity == identity {
+            self.associate(
+              url, edited: self.documentEdited && self.documentRevision != revision, replaced: false)
+          }
           self.show("Saved \(url.lastPathComponent)")
-        case .failure(let error): self.show(error.localizedDescription)
+          completion?(true)
+        case .failure(let error):
+          let message = "\(url.lastPathComponent): \(error.localizedDescription)"
+          if self.pendingSaveFailure == nil { self.pendingSaveFailure = message }
+          self.show(error.localizedDescription)
+          completion?(false)
         }
         self.rebuild()
+        self.finishProjectOperation()
       }
     }
   }
@@ -1094,7 +1547,7 @@ final class StudioController: NSViewController {
     input.stringValue = "View \(project.views.count+1)"
     alert.accessoryView = input
     alert.beginSheetModal(for: hostWindow!) { [weak self] response in
-      guard let self, response == .alertFirstButtonReturn else { return }
+      guard let self, !self.isBusy, response == .alertFirstButtonReturn else { return }
       let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !name.isEmpty else { return }
       self.checkpoint("Save view")
@@ -1136,18 +1589,20 @@ final class StudioController: NSViewController {
   func loadMap(_ slot: Int, _ channel: Int) {
     chooseOpen(
       "Load texture image", extensions: ["png", "jpg", "jpeg", "tif", "tiff", "heic", "exr"]
-    ) { [weak self] url in
-      guard let self else { return }
-      do {
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-        let old = self.renderer.materials.payloads[slot * 4 + channel]?.count ?? 0
-        try self.requireEmbeddedCapacity(self.snapshot().embeddedAssetBytes - old + size)
-        self.checkpoint("Load texture")
-        try self.renderer.materials.load(url: url, slot: slot, channel: channel)
-        self.changed()
-        self.rebuild()
-      } catch { self.show(error.localizedDescription) }
-    }
+    ) { [weak self] url in self?.loadTexture(from: url, slot: slot, channel: channel) }
+  }
+  func loadTexture(from url: URL, slot: Int, channel: Int) {
+    guard !isBusy else { return }
+    let record = undoRecord("Load texture")
+    do {
+      let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+      let old = renderer.materials.payloads[slot * 4 + channel]?.count ?? 0
+      try requireEmbeddedCapacity(snapshot().embeddedAssetBytes - old + size)
+      try renderer.materials.load(url: url, slot: slot, channel: channel)
+      commit(record)
+      changed()
+      rebuild()
+    } catch { show(error.localizedDescription) }
   }
   func saveMaterial() {
     var state = SceneState()
@@ -1173,70 +1628,71 @@ final class StudioController: NSViewController {
   func loadMaterial() {
     let slot = selectedSlot
     chooseOpen("Load material preset", extensions: ["vmat"]) { [weak self] url in
+      self?.beginLoadMaterial(from: url, slot: slot)
+    }
+  }
+  // Presets are decoded, merged and prepared on projectIOQueue.
+  func beginLoadMaterial(from url: URL, slot: Int) {
+    guard !isBusy else { return }
+    let record = undoRecord("Load material")
+    var document = snapshot()
+    let scene = Int(renderer.sceneIndex)
+    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, Void) in
+      guard let self else { throw MaterialLibrary.error("Material preset load cancelled.") }
+      let p = try JSONDecoder().decode(
+        ProjectDocument.self, from: self.readBounded(url, maximum: ProjectDocument.maximumFileBytes))
+      try p.validate()
+      // Padding keeps short (legacy or hand-written) presets within bounds.
+      guard let source = p.scenes[0]?.padded else {
+        throw MaterialLibrary.error("Empty material preset.")
+      }
+      var state = (document.scenes[scene] ?? SceneState()).padded
+      var graphs = state.materialX ?? [:]
+      graphs[slot] = source.materialX?[1]
+      state.materialX = graphs
+      state.surfaces[slot] = source.surfaces[1]
+      state.objects[slot].uvTransform = source.objects[1].uvTransform
+      state.objects[slot].channels = source.objects[1].channels
+      for c in 0..<4 {
+        state.maps[slot * 4 + c] = source.maps[4 + c]
+        state.names[slot * 4 + c] = source.names[4 + c]
+      }
+      document.scenes[scene] = state
+      try self.requireEmbeddedCapacity(document.embeddedAssetBytes)
+      return (document, ())
+    }) { [weak self] result in
       guard let self else { return }
-      do {
-        let p = try JSONDecoder().decode(
-          ProjectDocument.self, from: self.readBounded(url, maximum: ProjectDocument.maximumFileBytes))
-        try p.validate()
-        guard let source = p.scenes[0] else {
-          throw MaterialLibrary.error("Empty material preset.")
-        }
-        var state = self.renderer.materials.state()
-        var graphs = state.materialX ?? [:]
-        graphs[slot] = source.materialX?[1]
-        state.materialX = graphs
-        state.surfaces[slot] = source.surfaces[1]
-        state.objects[slot].uvTransform = source.objects[1].uvTransform
-        state.objects[slot].channels = source.objects[1].channels
-        for c in 0..<4 {
-          state.maps[slot * 4 + c] = source.maps[4 + c]
-          state.names[slot * 4 + c] = source.names[4 + c]
-        }
-        var candidate = self.snapshot()
-        candidate.scenes[Int(self.renderer.sceneIndex)] = state
-        try self.requireEmbeddedCapacity(candidate.embeddedAssetBytes)
-        self.checkpoint("Load material")
-        try self.renderer.materials.restore(state)
+      switch result {
+      case .success:
+        self.commit(record)
         self.changed()
-        self.rebuild()
-      } catch { self.show(error.localizedDescription) }
+      case .failure(let error): self.show(error.localizedDescription)
+      }
     }
   }
   func loadEnvironment() {
     chooseOpen(
       "Load equirectangular environment", extensions: ["hdr", "exr", "png", "jpg", "tif", "tiff"]
-    ) { [weak self] url in
-      guard let self, !self.isBusy else { return }
-      // Decode off the main thread against the live texture total; budget
-      // again and publish on the main thread, where the library is owned.
-      let materials = self.renderer.materials
-      let residentBytes = materials.uniqueTextureBytes(materials.residentTextures + materials.external.textures)
-      self.importInProgress = true
-      self.show("Loading \(url.lastPathComponent)…")
-      self.projectIOQueue.async { [weak self] in
-        guard let self else { return }
-        let result = Result { () -> MaterialLibrary.EnvironmentCandidate in
-          let bytes = try self.readBounded(url, maximum: 256 * 1024 * 1024)
-          return try materials.makeEnvironment(bytes, residentBytes: residentBytes)
-        }
-        DispatchQueue.main.async { [weak self] in
-          guard let self else { return }
-          self.importInProgress = false
-          do {
-            let candidate = try result.get()
-            guard self.renderer.materials === materials else {
-              throw MaterialLibrary.error("The project changed while the environment was loading.")
-            }
-            try self.requireEmbeddedCapacity(
-              self.snapshot().embeddedAssetBytes - (materials.environmentData?.count ?? 0) + candidate.data.count)
-            self.checkpoint("Environment image")
-            try materials.publishEnvironment(candidate)
-            self.project.environmentName = url.lastPathComponent
-            self.changed()
-            self.show("Loaded \(url.lastPathComponent)")
-          } catch { self.show(error.localizedDescription) }
-          self.rebuild()
-        }
+    ) { [weak self] url in self?.beginLoadEnvironment(from: url) }
+  }
+  // HDRI conversion and importance CDFs are built on projectIOQueue.
+  func beginLoadEnvironment(from url: URL) {
+    guard !isBusy else { return }
+    let record = undoRecord("Environment image")
+    var document = snapshot()
+    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, Void) in
+      guard let self else { throw MaterialLibrary.error("Environment load cancelled.") }
+      document.environmentData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
+      document.environmentName = url.lastPathComponent
+      try self.requireEmbeddedCapacity(document.embeddedAssetBytes)
+      return (document, ())
+    }) { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .success:
+        self.commit(record)
+        self.changed()
+      case .failure(let error): self.show(error.localizedDescription)
       }
     }
   }
@@ -1250,31 +1706,45 @@ final class StudioController: NSViewController {
   }
   func importMesh() {
     chooseOpen("Import OBJ mesh", extensions: ["obj"]) { [weak self] url in
+      self?.beginImportOBJ(from: url)
+    }
+  }
+  // Reading, parsing and resource preparation run on projectIOQueue.
+  func beginImportOBJ(from url: URL) {
+    guard !isBusy else { return }
+    let record = undoRecord("Import OBJ")
+    var document = snapshot()
+    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, (UUID, Int, Int)) in
+      guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
+      let objData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
+      guard let objText = String(data: objData, encoding: .utf8) else {
+        throw MaterialLibrary.error("OBJ must be UTF-8 text.")
+      }
+      var skipped = 0
+      let root = try document.appendOBJ(objText, name: url.lastPathComponent, skipped: &skipped)
+      return (document, (root, document.graph?.materials.last?.slot ?? 1, skipped))
+    }) { [weak self] result in
       guard let self else { return }
-      do {
-        var p = self.snapshot()
-        let objData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
-        guard let objText = String(data: objData, encoding: .utf8) else {
-          throw MaterialLibrary.error("OBJ must be UTF-8 text.")
-        }
-        var skipped = 0
-        let root = try p.appendOBJ(
-          objText, name: url.lastPathComponent, skipped: &skipped)
-        self.checkpoint("Import OBJ")
-        try self.restore(p)
+      switch result {
+      case .success(let (root, slot, skipped)):
+        self.commit(record)
         self.selectedNode = root
-        self.selectedSlot = p.graph?.materials.last?.slot ?? 1
+        self.selectedSlot = slot
         self.frameMesh(recordUndo: false)
         self.changed()
-        self.rebuild()
         if skipped > 0 {
           self.show("Imported \(url.lastPathComponent); skipped \(skipped) degenerate faces.")
         }
-      } catch { self.show(error.localizedDescription) }
+      case .failure(let error): self.show(error.localizedDescription)
+      }
     }
   }
   func frameMesh(recordUndo: Bool = true) {
-    if renderer.sceneIndex != 6 { switchScene(6) }
+    if renderer.sceneIndex != 6 {
+      // The switch may prepare scene resources off the main thread; frame afterwards.
+      switchScene(6) { [weak self] in self?.frameMesh(recordUndo: recordUndo) }
+      return
+    }
     let tris = renderer.materials.meshTriangles
     guard !tris.isEmpty else { return }
     if recordUndo { checkpoint("Frame mesh") }

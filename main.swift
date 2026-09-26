@@ -2907,12 +2907,12 @@ final class MaterialLibrary {
         let emitterValues: [UInt32]
         if rebuildEmitters {
             let triangles=orderedTriangles
-            let indices=triangles.indices.filter { i in let slot=Int(triangles[i].uvc.z);return slot>=8 && emissions[slot].map{simd_length_squared($0)>0} == true }.map{UInt32($0)}
+            let indices=triangles.indices.filter { i in let slot=Int(exactly:triangles[i].uvc.z) ?? -1;return slot>=8 && emissions[slot].map{simd_length_squared($0)>0} == true }.map{UInt32($0)}
             // REFERENCES.md: PBRT2023 power light sampling. Emitters are chosen by area x
             // luminance; the shader's imported_emitter_area_pdf uses the same weights.
             var total=0.0,cumulative=[Double]()
             for i in indices {
-                let t=triangles[Int(i)],e=emissions[Int(t.uvc.z)] ?? .zero
+                let t=triangles[Int(i)],e=Int(exactly:t.uvc.z).flatMap { emissions[$0] } ?? .zero
                 let edge1=SIMD3<Double>(Double(t.b.x-t.a.x),Double(t.b.y-t.a.y),Double(t.b.z-t.a.z))
                 let edge2=SIMD3<Double>(Double(t.c.x-t.a.x),Double(t.c.y-t.a.y),Double(t.c.z-t.a.z))
                 let luminance=Double(max(1e-8,0.2126*e.x+0.7152*e.y+0.0722*e.z))
@@ -3078,16 +3078,16 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     private(set) var reservoirHistory: UInt32 = 0
 
     var sceneIndex: UInt32 = 0 { didSet { if oldValue != sceneIndex { applyPreset(.perspective) } } }
-    var samplingMode: UInt32 = 0 { didSet { resetAccumulation() } } // 0 ReSTIR DI+GI, 1 MIS, 2 light, 3 BSDF
-    var enableSMS: UInt32 = 0 { didSet { resetAccumulation() } }
-    var skyMode: UInt32 = 0 { didSet { resetAccumulation() } }
-    var enableFog: UInt32 = 0 { didSet { resetAccumulation() } }
+    var samplingMode: UInt32 = 0 { didSet { if oldValue != samplingMode { resetAccumulation() } } } // 0 ReSTIR DI+GI, 1 MIS, 2 light, 3 BSDF
+    var enableSMS: UInt32 = 0 { didSet { if oldValue != enableSMS { resetAccumulation() } } }
+    var skyMode: UInt32 = 0 { didSet { if oldValue != skyMode { resetAccumulation() } } }
+    var enableFog: UInt32 = 0 { didSet { if oldValue != enableFog { resetAccumulation() } } }
 
-    var yaw: Float = 0.42 { didSet { resetAccumulation(resetDenoiser: false) } }
-    var pitch: Float = 0.22 { didSet { resetAccumulation(resetDenoiser: false) } }
-    var distance: Float = 4.6 { didSet { resetAccumulation(resetDenoiser: false) } }
-    var target = SIMD3<Float>(0.15, -0.25, 0.70) { didSet { resetAccumulation(resetDenoiser: false) } }
-    var fov: Float = 38.0 { didSet { resetAccumulation(resetDenoiser: false) } }
+    var yaw: Float = 0.42 { didSet { if oldValue != yaw { resetAccumulation(resetDenoiser: false) } } }
+    var pitch: Float = 0.22 { didSet { if oldValue != pitch { resetAccumulation(resetDenoiser: false) } } }
+    var distance: Float = 4.6 { didSet { if oldValue != distance { resetAccumulation(resetDenoiser: false) } } }
+    var target = SIMD3<Float>(0.15, -0.25, 0.70) { didSet { if oldValue != target { resetAccumulation(resetDenoiser: false) } } }
+    var fov: Float = 38.0 { didSet { if oldValue != fov { resetAccumulation(resetDenoiser: false) } } }
 
     // Display-only edits (exposure, white balance, tone map, divider) must repaint
     // even while paused or complete, when draw(in:) otherwise idles.
@@ -3729,6 +3729,8 @@ class InteractiveMTKView: MTKView {
     var onUserOrbit: (() -> Void)?
     var onBeginEdit: (() -> Void)?
     var onPick: ((SIMD2<Float>) -> Void)?
+    // Camera gestures are ignored while this returns false (busy project I/O, export).
+    var canEdit: (() -> Bool)?
     private var dragged=false
     private var beganEdit=false
     private var lastPos: NSPoint = .zero
@@ -3741,6 +3743,7 @@ class InteractiveMTKView: MTKView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard canEdit?() ?? true else { return }
         let p = convert(event.locationInWindow, from: nil)
         let dx = Float(p.x - lastPos.x)
         let dy = Float(p.y - lastPos.y)
@@ -3760,13 +3763,16 @@ class InteractiveMTKView: MTKView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard canEdit?() ?? true else { return }
         if !dragged {
             let p=convert(event.locationInWindow,from:nil)
             onPick?(SIMD2(Float(p.x/bounds.width),Float(1-p.y/bounds.height)))
+            return  // A click selects; it does not edit the camera or mark the document edited.
         }
         onUserOrbit?()
     }
     override func scrollWheel(with event: NSEvent) {
+        guard canEdit?() ?? true else { return }
         onBeginEdit?()
         let delta = Float(event.scrollingDeltaY)
         if delta != 0 {

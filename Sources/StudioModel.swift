@@ -65,6 +65,18 @@ extension StudioOptions {
     return Float(2 * s * s)
   }
 }
+extension StudioOptions {
+  // Sample and time limits, output/export settings, exposure, white balance, tone map
+  // and the divider are display- or output-only; every other option changes radiance.
+  func sameRadiance(as o: StudioOptions) -> Bool {
+    previewScale == o.previewScale && depth == o.depth && sunAzimuth == o.sunAzimuth
+      && sunElevation == o.sunElevation && sunIntensity == o.sunIntensity
+      && environmentIntensity == o.environmentIntensity
+      && environmentRotation == o.environmentRotation && lightColor == o.lightColor
+      && lightIntensity == o.lightIntensity && lightSize == o.lightSize && aperture == o.aperture
+      && focusDistance == o.focusDistance
+  }
+}
 struct OIDNOptions: Codable, Equatable {
   // UI indices map to OIDN FAST (4), BALANCED (5), and HIGH (6).
   var quality: UInt32 = 2
@@ -81,6 +93,10 @@ struct SceneState: Codable {
   var names = Array(repeating: "None", count: SceneLimits.materials * 4)
   var materialX: [Int: MaterialXProgram]?
   var emissions: [Int: SIMD3<Float>]?
+}
+struct AutosaveRecovery: Codable {
+  var projectPath: String?
+  var edited: Bool
 }
 struct ProjectDocument: Codable {
   var version = 2
@@ -99,6 +115,8 @@ struct ProjectDocument: Codable {
   // Optional so version 1/2 projects written before these controls remain readable.
   var oidn: OIDNOptions?
   var viewportMode: UInt32?
+  // Written only into autosaves: the document's file association and unsaved state.
+  var recovery: AutosaveRecovery?
 
   // Aggregate embedded asset bytes (maps, MaterialX images, environment) across all scenes.
   static let embeddedAssetLimit = 512 * 1024 * 1024
@@ -246,11 +264,13 @@ struct ProjectDocument: Codable {
     }
     guard embeddedBytes <= Self.embeddedAssetLimit else { try bad(); return }
     try graph?.validate()
+    // Legacy meshes use the scene-graph bounds; uvc.z is converted to an integer slot.
     for t in triangles {
       guard
         [t.a, t.b, t.c, t.na, t.nb, t.nc, t.uvab, t.uvc].allSatisfy({ x in
-          (0..<4).allSatisfy { x[$0].isFinite }
-        })
+          (0..<4).allSatisfy { x[$0].isFinite && abs(x[$0]) < 1e8 }
+        }),
+        t.uvc.z >= 0, t.uvc.z < Float(SceneLimits.materials), t.uvc.z.rounded() == t.uvc.z
       else {
         try bad()
         return
@@ -267,7 +287,9 @@ enum OBJMesh {
     return try parts(text, skipped: &skipped)
   }
   // skipped counts faces left out because their edges are (numerically) collinear.
-  static func parts(_ text: String, skipped: inout Int) throws -> [OBJPart] {
+  // `nodeBudget` bounds the scene nodes the parts create (one per object, one per
+  // object/group part) so oversized hierarchies fail before the whole file is parsed.
+  static func parts(_ text: String, skipped: inout Int, nodeBudget: Int = Int.max) throws -> [OBJPart] {
     var positions: [SIMD3<Float>] = []
     var normals: [SIMD3<Float>] = []
     var uvs: [SIMD2<Float>] = []
@@ -280,6 +302,11 @@ enum OBJMesh {
     func failure(_ message: String) -> Error {
       MaterialLibrary.error("\(message.dropLast()) on line \(lineNumber).")
     }
+    // Part and subset lookups stay constant-time for group-heavy files.
+    var partIndices: [String: [String: Int]] = [:]
+    var subsetIndices: [[String: Int]] = []
+    var objects = Set<String>()
+    var current: (part: Int, subset: Int)?
     func number(_ s: Substring) throws -> Float {
       guard let n = Float(s), n.isFinite, abs(n) < 1e8 else {
         throw failure("OBJ contains an invalid number.")
@@ -314,14 +341,17 @@ enum OBJMesh {
       if kind == "o" {
         object = fields.dropFirst().joined(separator: " ")
         group = "Mesh"
+        current = nil
         continue
       }
       if kind == "g" {
         group = fields.dropFirst().joined(separator: " ")
+        current = nil
         continue
       }
       if kind == "usemtl" {
         material = fields.dropFirst().joined(separator: " ")
+        current = nil
         continue
       }
       if kind == "v" || kind == "vn" {
@@ -368,12 +398,34 @@ enum OBJMesh {
             continue
           }
           let n = simd_normalize(cross)
-          if !result.contains(where: { $0.object == object && $0.group == group }) {
-            result.append(OBJPart(object: object, group: group))
+          let part: Int, subset: Int
+          if let current {
+            (part, subset) = current
+          } else {
+            if let existing = partIndices[object]?[group] {
+              part = existing
+            } else {
+              let newObject = !objects.contains(object)
+              guard objects.count + result.count + (newObject ? 2 : 1) <= nodeBudget else {
+                throw failure(
+                  "OBJ has too many objects and groups: the scene holds at most \(SceneLimits.nodes) nodes (\(max(0, nodeBudget)) available). Merge groups before importing."
+                )
+              }
+              objects.insert(object)
+              part = result.count
+              result.append(OBJPart(object: object, group: group))
+              subsetIndices.append([:])
+              partIndices[object, default: [:]][group] = part
+            }
+            if let existing = subsetIndices[part][material] {
+              subset = existing
+            } else {
+              subset = result[part].subsets.count
+              result[part].subsets.append(material)
+              subsetIndices[part][material] = subset
+            }
+            current = (part, subset)
           }
-          let part = result.firstIndex(where: { $0.object == object && $0.group == group })!
-          if !result[part].subsets.contains(material) { result[part].subsets.append(material) }
-          let subset = result[part].subsets.firstIndex(of: material)!
           result[part].triangles.append(
             MeshTriangle(
               a: SIMD4(a.0, 1), b: SIMD4(b.0, 1), c: SIMD4(c.0, 1), na: SIMD4(a.2 ?? n, 0),
@@ -454,7 +506,115 @@ enum OBJMesh {
 
 }
 
+// Immutable GPU resources captured from the live library on the main thread. A
+// candidate library prepared off the main thread adopts them, so unchanged maps,
+// MaterialX images, the environment and the flattened mesh are reused rather than
+// decoded, converted or rebuilt again.
+struct ReusableResources {
+  var payloads: [Data?]
+  var images: [MTLTexture]
+  var materialX: [Int: MaterialXProgram]
+  var graphTextures: [MTLTexture]
+  var environmentData: Data?
+  var environment: (texture: MTLTexture, rows: MTLTexture, columns: MTLTexture)?
+  var meshTriangles: [MeshTriangle]
+  // BVH-ordered triangles live only in triangleBuffer (MaterialLibrary.orderedTriangles).
+  var triangleBuffer: MTLBuffer
+  var nodeBuffer: MTLBuffer
+  var nodeCount: Int
+  var hasSceneGraph: Bool
+  var graph: SceneGraph?
+  // The published texture set, which stays live while the candidate is prepared;
+  // it becomes the candidate's `external` budget and sharing source.
+  var resident: MaterialLibrary.ResidentTextures
+}
+func sameBytes<T>(_ a: [T], _ b: [T]) -> Bool {
+  guard a.count == b.count else { return false }
+  return a.withUnsafeBytes { x in
+    b.withUnsafeBytes { y in
+      guard let p = x.baseAddress, let q = y.baseAddress else { return true }
+      return p == q || memcmp(p, q, x.count) == 0
+    }
+  }
+}
+extension SceneState {
+  // Legacy eight-slot states compare and restore as full-capacity states.
+  var padded: SceneState {
+    var s = self
+    s.surfaces += Array(repeating: SurfaceSettings(), count: max(0, SceneLimits.materials - s.surfaces.count))
+    s.objects += Array(repeating: ObjectSettings(), count: max(0, SceneLimits.materials - s.objects.count))
+    s.maps += Array(repeating: nil, count: max(0, SceneLimits.materials * 4 - s.maps.count))
+    s.names += Array(repeating: "None", count: max(0, SceneLimits.materials * 4 - s.names.count))
+    return s
+  }
+  // True when publishing `other` needs no image decoding: every map and MaterialX
+  // image of `other` is already resident in this state at the same index.
+  func hasImages(of other: SceneState) -> Bool {
+    let a = padded, b = other.padded
+    for i in b.maps.indices where b.maps[i] != nil && b.maps[i] != a.maps[i] { return false }
+    for (slot, program) in b.materialX ?? [:] where !program.images.isEmpty {
+      guard let old = a.materialX?[slot], old.images.count >= program.images.count else { return false }
+      for (i, image) in program.images.enumerated()
+      where old.images[i].srgb != image.srgb || old.images[i].data != image.data {
+        return false
+      }
+    }
+    return true
+  }
+  func sameResources(as other: SceneState) -> Bool {
+    let a = padded, b = other.padded
+    guard sameBytes(a.surfaces, b.surfaces), sameBytes(a.objects, b.objects), a.names == b.names,
+      a.maps == b.maps, (a.emissions ?? [:]) == (b.emissions ?? [:])
+    else { return false }
+    let x = a.materialX ?? [:], y = b.materialX ?? [:]
+    guard Set(x.keys) == Set(y.keys) else { return false }
+    return x.allSatisfy { slot, program in y[slot].map { program.sameProgram(as: $0) } ?? false }
+  }
+}
+extension MaterialXProgram {
+  func sameProgram(as other: MaterialXProgram) -> Bool {
+    guard name == other.name, source == other.source, roots == other.roots,
+      diffuseRoughness == other.diffuseRoughness, sameBytes(instructions, other.instructions),
+      images.count == other.images.count, parameters.count == other.parameters.count,
+      zip(images, other.images).allSatisfy({ $0.name == $1.name && $0.srgb == $1.srgb && $0.data == $1.data })
+    else { return false }
+    return zip(parameters, other.parameters).allSatisfy {
+      $0.name == $1.name && $0.instruction == $1.instruction && $0.components == $1.components
+        && $0.defaultValue == $1.defaultValue
+    }
+  }
+}
+
 extension MaterialLibrary {
+  func reusableResources(graph: SceneGraph?) -> ReusableResources {
+    ReusableResources(
+      payloads: payloads, images: images, materialX: materialX, graphTextures: graphTextures,
+      environmentData: environmentData,
+      environment: environmentData == nil
+        ? nil : (environmentTexture, environmentRows, environmentColumns),
+      meshTriangles: meshTriangles,
+      triangleBuffer: triangleBuffer, nodeBuffer: nodeBuffer, nodeCount: nodeCount,
+      hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
+  }
+  // Seed a freshly created candidate. It is published only after restore,
+  // setEnvironment and the mesh step have rebuilt its bindings.
+  func adopt(_ r: ReusableResources) {
+    payloads = r.payloads
+    images = r.images
+    materialX = r.materialX
+    graphTextures = r.graphTextures
+    if let environment = r.environment {
+      environmentData = r.environmentData
+      environmentTexture = environment.texture
+      environmentRows = environment.rows
+      environmentColumns = environment.columns
+    }
+    meshTriangles = r.meshTriangles
+    triangleBuffer = r.triangleBuffer
+    nodeBuffer = r.nodeBuffer
+    nodeCount = r.nodeCount
+    hasSceneGraph = r.hasSceneGraph
+  }
   func state() -> SceneState {
     SceneState(
       surfaces: settings, objects: objects, maps: payloads, names: fileNames, materialX: materialX,
