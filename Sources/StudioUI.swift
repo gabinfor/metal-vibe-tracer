@@ -1,6 +1,7 @@
 import Cocoa
 import CoreImage
 import MetalKit
+import Synchronization
 import UniformTypeIdentifiers
 import simd
 
@@ -179,9 +180,12 @@ final class StudioController: NSViewController {
   // Tests redirect the recovery files; production uses Application Support.
   var autosaveURL = StudioController.defaultAutosaveURL
   private var autosaveSuppressed = false
-  private let autosaveLock = NSLock()
-  private var queuedAutosave: PendingAutosave?  // guarded by autosaveLock
-  private var writtenAutosave: (revision: UInt64, url: URL)?  // guarded by autosaveLock
+  // Shared with autosaveQueue: the newest queued snapshot and the revision last written.
+  private struct AutosaveState {
+    var queued: PendingAutosave?
+    var written: (revision: UInt64, url: URL)?
+  }
+  private let autosaveState = Mutex(AutosaveState())
   var selectedSlot = 1, page = 0, sidebarVisible = true
   var selectedNode: UUID?
   var selectedSubset = 0
@@ -1108,8 +1112,9 @@ final class StudioController: NSViewController {
   }
   private func scheduleAutosave(after delay: TimeInterval = 1) {
     saveTimer?.invalidate()
+    // Scheduled on the main run loop, so the timer fires on the main actor.
     saveTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-      self?.autosave()
+      MainActor.assumeIsolated { self?.autosave() }
     }
   }
   // Records the file association after open/save/new and refreshes the recovery metadata.
@@ -1152,7 +1157,7 @@ final class StudioController: NSViewController {
   // `resident` (default: the snapshot in `reuse`) is the published library's texture
   // set, taken on the main thread. It stays live until applyProject, so the candidate
   // budgets and shares against it.
-  func prepareResources(
+  nonisolated func prepareResources(
     _ p: ProjectDocument, reuse: ReusableResources? = nil, resident: MaterialLibrary.ResidentTextures? = nil
   ) throws -> MaterialLibrary {
     try p.validate()
@@ -1284,9 +1289,9 @@ final class StudioController: NSViewController {
   }
   // Builds a candidate document (parsing imports) and prepares its resources on
   // projectIOQueue, then publishes it unless a newer replacement superseded it.
-  func beginDocumentChange<Extra>(
-    _ activity: String, build: @escaping () throws -> (ProjectDocument, Extra),
-    completion: @escaping (Result<Extra, Error>) -> Void
+  func beginDocumentChange<Extra: Sendable>(
+    _ activity: String, build: @escaping @Sendable () throws -> (ProjectDocument, Extra),
+    completion: @escaping @MainActor (Result<Extra, Error>) -> Void
   ) {
     prepareGeneration &+= 1
     let generation = prepareGeneration
@@ -1408,43 +1413,40 @@ final class StudioController: NSViewController {
     return document
   }
   // autosaveQueue only: writes the newest queued snapshot.
-  private func drainAutosave() -> Error? {
-    autosaveLock.lock()
-    let item = queuedAutosave
-    queuedAutosave = nil
-    autosaveLock.unlock()
+  nonisolated private func drainAutosave() -> Error? {
+    let item = autosaveState.withLock { state -> PendingAutosave? in
+      let item = state.queued
+      state.queued = nil
+      return item
+    }
     guard let item else { return nil }
     return writeAutosave(item)
   }
-  private func writeAutosave(_ document: ProjectDocument, to url: URL) throws {
+  nonisolated private func writeAutosave(_ document: ProjectDocument, to url: URL) throws {
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     try document.encodeForSaving().write(to: url, options: .atomic)
   }
   // autosaveQueue only: skips a revision that is already on disk at that location.
-  private func writeAutosave(_ item: PendingAutosave) -> Error? {
-    autosaveLock.lock()
-    let written = writtenAutosave
-    autosaveLock.unlock()
+  nonisolated private func writeAutosave(_ item: PendingAutosave) -> Error? {
+    let written = autosaveState.withLock { $0.written }
     if let written, written.revision == item.revision, written.url == item.url { return nil }
     do { try writeAutosave(item.document, to: item.url) } catch { return error }
-    autosaveLock.lock()
-    writtenAutosave = (item.revision, item.url)
-    autosaveLock.unlock()
+    autosaveState.withLock { $0.written = (item.revision, item.url) }
     return nil
   }
   private func markAutosaved() {
-    autosaveLock.lock()
-    writtenAutosave = (documentRevision, autosaveURL)
-    autosaveLock.unlock()
+    let written = (revision: documentRevision, url: autosaveURL)
+    autosaveState.withLock { $0.written = written }
   }
   func autosave() {
     guard !isRestoring, !autosaveSuppressed else { return }
     let item = PendingAutosave(
       document: autosaveSnapshot(), revision: documentRevision, url: autosaveURL)
-    autosaveLock.lock()
-    let scheduled = queuedAutosave != nil
-    queuedAutosave = item
-    autosaveLock.unlock()
+    let scheduled = autosaveState.withLock { state -> Bool in
+      let scheduled = state.queued != nil
+      state.queued = item
+      return scheduled
+    }
     // Coalesce: an already queued write picks up this newer snapshot.
     guard !scheduled else { return }
     autosaveQueue.async { [weak self] in
@@ -1464,9 +1466,9 @@ final class StudioController: NSViewController {
       document: autosaveSnapshot(), revision: documentRevision, url: destination ?? autosaveURL)
     var failure: Error?
     autosaveQueue.sync {
-      autosaveLock.lock()
-      if queuedAutosave?.url == item.url { queuedAutosave = nil }
-      autosaveLock.unlock()
+      autosaveState.withLock { state in
+        if state.queued?.url == item.url { state.queued = nil }
+      }
       _ = drainAutosave()
       failure = writeAutosave(item)
     }
@@ -1477,9 +1479,9 @@ final class StudioController: NSViewController {
     guard let record, let association = record.association, association.edited,
       !autosaveSuppressed
     else { return }
-    var document = record.document
-    document.recovery = AutosaveRecovery(projectPath: association.url?.path, edited: true)
-    let url = previousAutosaveURL
+    var copy = record.document
+    copy.recovery = AutosaveRecovery(projectPath: association.url?.path, edited: true)
+    let document = copy, url = previousAutosaveURL
     autosaveQueue.async { [weak self] in
       do { try self?.writeAutosave(document, to: url) } catch {
         let message = error.localizedDescription
@@ -1488,7 +1490,7 @@ final class StudioController: NSViewController {
     }
   }
   // Moves an autosave that cannot be restored aside so no later autosave can overwrite it.
-  static func preserveUnrestorableAutosave(_ url: URL) throws -> URL {
+  nonisolated static func preserveUnrestorableAutosave(_ url: URL) throws -> URL {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.dateFormat = "yyyyMMdd-HHmmss"
@@ -1620,7 +1622,7 @@ final class StudioController: NSViewController {
       }
     }
   }
-  func readBounded(_ url: URL, maximum: Int) throws -> Data {
+  nonisolated func readBounded(_ url: URL, maximum: Int) throws -> Data {
     let values = try url.resourceValues(forKeys: [.fileSizeKey])
     if let size = values.fileSize, size > maximum {
       throw MaterialLibrary.error("\(url.lastPathComponent) exceeds the supported file-size limit.")
@@ -1632,7 +1634,7 @@ final class StudioController: NSViewController {
     return data
   }
   // `completion` reports whether the document was written (false when busy, cancelled or failed).
-  func saveProject(asNew: Bool = false, completion: ((Bool) -> Void)? = nil) {
+  func saveProject(asNew: Bool = false, completion: (@MainActor (Bool) -> Void)? = nil) {
     guard !isBusy else {
       completion?(false)
       return
@@ -1648,7 +1650,7 @@ final class StudioController: NSViewController {
         cancelled: { completion?(false) }, write)
     }
   }
-  func beginSaveProject(_ url: URL, completion: ((Bool) -> Void)? = nil) {
+  func beginSaveProject(_ url: URL, completion: (@MainActor (Bool) -> Void)? = nil) {
     guard !isBusy else {
       completion?(false)
       return
@@ -1784,10 +1786,11 @@ final class StudioController: NSViewController {
   func beginLoadMaterial(from url: URL, slot: Int) {
     guard !isBusy else { return }
     let record = undoRecord("Load material")
-    var document = snapshot()
+    let document = snapshot()
     let scene = Int(renderer.sceneIndex)
     beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, Void) in
       guard let self else { throw MaterialLibrary.error("Material preset load cancelled.") }
+      var document = document  // The build runs on projectIOQueue with its own copy.
       let p = try JSONDecoder().decode(
         ProjectDocument.self, from: self.readBounded(url, maximum: ProjectDocument.maximumFileBytes))
       try p.validate()
@@ -1828,9 +1831,10 @@ final class StudioController: NSViewController {
   func beginLoadEnvironment(from url: URL) {
     guard !isBusy else { return }
     let record = undoRecord("Environment image")
-    var document = snapshot()
+    let document = snapshot()
     beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, Void) in
       guard let self else { throw MaterialLibrary.error("Environment load cancelled.") }
+      var document = document  // The build runs on projectIOQueue with its own copy.
       document.environmentData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
       document.environmentName = url.lastPathComponent
       try self.requireEmbeddedCapacity(document.embeddedAssetBytes)
@@ -1846,7 +1850,7 @@ final class StudioController: NSViewController {
     }
   }
   // Keeps edits within the aggregate embedded-asset limit that open enforces.
-  func requireEmbeddedCapacity(_ total: Int) throws {
+  nonisolated func requireEmbeddedCapacity(_ total: Int) throws {
     guard total <= ProjectDocument.embeddedAssetLimit else {
       throw MaterialLibrary.error(
         "Embedded images would total \(total / 1_048_576) MiB across all scenes, above the \(ProjectDocument.embeddedAssetLimit / 1_048_576) MiB project limit. Remove or downsize other maps, MaterialX images or the environment first."
@@ -1862,9 +1866,10 @@ final class StudioController: NSViewController {
   func beginImportOBJ(from url: URL) {
     guard !isBusy else { return }
     let record = undoRecord("Import OBJ")
-    var document = snapshot()
+    let document = snapshot()
     beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, (UUID, Int, Int)) in
       guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
+      var document = document  // The build runs on projectIOQueue with its own copy.
       let objData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
       guard let objText = String(data: objData, encoding: .utf8) else {
         throw MaterialLibrary.error("OBJ must be UTF-8 text.")

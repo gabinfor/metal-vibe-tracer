@@ -170,7 +170,7 @@ let mxKernel = """
 let mxLibrary = try gpu.makeLibrary(source: metalSource + mxKernel, options: shaderCompileOptions())
 let mxPipeline = try gpu.makeComputePipelineState(
   function: mxLibrary.makeFunction(name: "materialx_checks")!)
-func evaluateMX() -> [SIMD4<Float>] {
+@MainActor func evaluateMX() -> [SIMD4<Float>] {
   var u = makeUniforms(scene: 6, mode: 0, width: 1, height: 1)
   u.environment.w = Float(testRenderer.materials.nodeCount)
   u.lens.z = 1

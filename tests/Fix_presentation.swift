@@ -1,6 +1,6 @@
 // Regression checks for presentation, idle behaviour and display encoding
 // (R-14, R-15, R-16, R-46, R-61, R-63, R-84, R-123, R-124).
-func fixPresentationChecks() throws {
+@MainActor func fixPresentationChecks() throws {
   let renderer = testRenderer
   final class ProbeView: MTKView {
     var drawableRequests = 0

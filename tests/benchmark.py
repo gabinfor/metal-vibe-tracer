@@ -37,7 +37,7 @@ root = harness.ROOT
 source = harness.production_source()
 source = harness.replace_once(source, 'let metalSource = loadOpenPBRSource()', 'var metalSource = loadOpenPBRSource()', 'main.swift')
 source = harness.replace_once(source, 'options.mathMode = .relaxed', 'options.mathMode = benchmarkSafeMath ? .safe : .relaxed', 'main.swift')
-source = harness.replace_once(source, 'func shaderCompileOptions()', 'var benchmarkSafeMath = false\nfunc shaderCompileOptions()', 'main.swift')
+source = harness.replace_once(source, 'func shaderCompileOptions()', 'var benchmarkSafeMath = false\n@MainActor func shaderCompileOptions()', 'main.swift')
 helpers = harness.replace_once(harness.gpu_helpers(), 'let testRenderer = try PathTracerRenderer(device: gpu)',
                                'var testRenderer = try PathTracerRenderer(device: gpu)', 'tests/GPUChecks.swift')
 baseline_shader, baseline_safe = '', False
@@ -128,7 +128,7 @@ for i in 0..<rings { for j in 0..<segments {
 let mesh = try OBJMesh.load(obj)
 let scenarios: [(String, UInt32, UInt32)] = [("Default Pavilion", 0, 0), ("Pavilion with coated OpenPBR floor", 0, 0),
     ("Cornell box", 1, 0), ("Imported mesh (scene 6, \(mesh.count) triangles)", 6, 0), ("Default Pavilion, MIS", 0, 1)]
-func prepare(_ renderer: PathTracerRenderer, _ scenario: Int) throws {
+@MainActor func prepare(_ renderer: PathTracerRenderer, _ scenario: Int) throws {
     renderer.materials.settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
     if scenario == 1 {
         var coated = SurfaceSettings(); coated.enabled = 1
@@ -137,7 +137,7 @@ func prepare(_ renderer: PathTracerRenderer, _ scenario: Int) throws {
     }
     try renderer.materials.setMesh(scenarios[scenario].1 == 6 ? mesh : [])
 }
-func view(_ scenario: Int) -> Uniforms {
+@MainActor func view(_ scenario: Int) -> Uniforms {
     var u = makeUniforms(scene: scenarios[scenario].1, mode: scenarios[scenario].2, width: 640, height: 480)
     u.environment.w = Float(testRenderer.materials.nodeCount)
     return u

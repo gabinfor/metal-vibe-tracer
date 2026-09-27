@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='vibe-energy-') as d:
     folder=Path(d);(folder/'main.swift').write_text(swift);(folder/'bake.metal').write_text(shader)
     # The unadapted upstream shader stays private to this run; build/ShaderResources is never replaced by it.
     subprocess.run([sys.executable,str(root/'scripts/prepare_shaders.py'),'--upstream-only','--output',str(folder/'upstream.metal')],check=True)
-    subprocess.run(['xcrun','swiftc','-O','-target',platform.machine()+'-apple-macosx26.0',str(folder/'main.swift'),'-o',str(folder/'bake')],check=True)
+    subprocess.run(['xcrun','swiftc','-O','-swift-version','6','-target',platform.machine()+'-apple-macosx26.0',str(folder/'main.swift'),'-o',str(folder/'bake')],check=True)
     subprocess.run([str(folder/'bake'),str(folder/'upstream.metal'),str(folder/'bake.metal'),str(folder/'table.bin')],check=True)
     import struct
     values=struct.unpack('<'+str(129*129)+'f',(folder/'table.bin').read_bytes())

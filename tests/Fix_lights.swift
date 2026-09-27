@@ -1,6 +1,6 @@
 // Light sampling regressions: HDRI importance sampling and PDFs, sun cones, sphere
 // cones, imported emitter PDFs/power sampling, and imported UsdLux distant lights.
-func fixLightsChecks() throws {
+@MainActor func fixLightsChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("lights", isDirectory: true)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
   let kernels = """

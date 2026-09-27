@@ -2,52 +2,58 @@ import Darwin
 import Foundation
 import Metal
 import simd
+import Synchronization
 
 /// Cancellation and progress state retained for the duration of one offline OIDN filter.
-final class OIDNProgress {
-  private let lock = NSLock()
-  private var cancelled = false
-  private var lastReported = -1.0
-  var onProgress: ((Double) -> Void)?
+/// Shared by the main thread, the denoising worker and OIDN's progress callback.
+final class OIDNProgress: Sendable {
+  private struct State {
+    var cancelled = false
+    var lastReported = -1.0
+    var onProgress: (@Sendable (Double) -> Void)?
+  }
+  private let state = Mutex(State())
+  // Called on the denoising thread; hop to the main actor for UI updates.
+  var onProgress: (@Sendable (Double) -> Void)? {
+    get { state.withLock { $0.onProgress } }
+    set { state.withLock { $0.onProgress = newValue } }
+  }
 
   func cancel() {
-    lock.lock()
-    cancelled = true
-    lock.unlock()
+    state.withLock { $0.cancelled = true }
   }
 
   fileprivate func update(_ fraction: Double) -> Bool {
-    lock.lock()
-    let shouldContinue = !cancelled
-    let report = shouldContinue && (fraction >= 1 || fraction - lastReported >= 0.01)
-    if report { lastReported = fraction }
-    let callback = onProgress
-    lock.unlock()
-    if report { callback?(fraction) }
+    let (shouldContinue, callback) = state.withLock { s -> (Bool, (@Sendable (Double) -> Void)?) in
+      let shouldContinue = !s.cancelled
+      let report = shouldContinue && (fraction >= 1 || fraction - s.lastReported >= 0.01)
+      if report { s.lastReported = fraction }
+      return (shouldContinue, report ? s.onProgress : nil)
+    }
+    callback?(fraction)
     return shouldContinue
   }
 }
 
 /// Set by any worker of a parallel preprocessing pass once cancellation is observed.
-private final class OIDNCancelFlag: @unchecked Sendable {
-  private let lock = NSLock()
-  private var value = false
-  var isSet: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return value
-  }
-  func set() {
-    lock.lock()
-    value = true
-    lock.unlock()
-  }
+private final class OIDNCancelFlag: Sendable {
+  private let value = Atomic(false)
+  var isSet: Bool { value.load(ordering: .relaxed) }
+  func set() { value.store(true, ordering: .relaxed) }
 }
 
-private let oidnProgressMonitor: @convention(c) (UnsafeMutableRawPointer?, Double) -> Bool = {
+nonisolated private let oidnProgressMonitor: @convention(c) (UnsafeMutableRawPointer?, Double) -> Bool = {
   pointer, fraction in
   guard let pointer else { return true }
   return Unmanaged<OIDNProgress>.fromOpaque(pointer).takeUnretainedValue().update(fraction)
+}
+
+/// The accumulated beauty and guide textures one offline OIDN filter reads on a worker thread.
+/// @unchecked: Metal textures may be referenced from any thread. The worker reads them only
+/// through `readback`'s blit, encoded on the command queue that rendered them, so Metal orders
+/// it after every frame already submitted; the CPU never accesses their contents.
+struct OIDNInput: @unchecked Sendable {
+  let color: MTLTexture, albedo: MTLTexture, normal: MTLTexture
 }
 
 struct OIDNImage {
@@ -158,7 +164,9 @@ final class OIDNDenoiser {
     deinit { dlclose(library) }
   }
 
-  private struct Readback {
+  // @unchecked: `buffer` is shared storage the GPU finished writing (readback waits for
+  // the blit) before any worker reads it, and nothing writes it afterwards.
+  private struct Readback: @unchecked Sendable {
     let buffer: MTLBuffer
     let rowBytes: Int
     let pixelBytes: Int
@@ -332,7 +340,7 @@ final class OIDNDenoiser {
     // any spatial denoiser. Estimate exposure robustly and suppress only isolated
     // outliers on locally compatible diffuse surfaces; raw accumulation is untouched.
     let sampleStride = max(1, pixelCount / 65_536)
-    var sourceLuminance = [Float](repeating: 0, count: pixelCount)
+    let sourceLuminance = (0..<pixelCount).map { luminance(colorData, $0) }
     var luminanceSamples: [Float] = []
     luminanceSamples.reserveCapacity((pixelCount + sampleStride - 1) / sampleStride)
     // Optional exposure key: OIDN's log-average convention (0.18 / geometric
@@ -340,7 +348,6 @@ final class OIDNDenoiser {
     // background or a large emitter cannot set the key. Zero radiance is floored
     // relative to the brightest counted surface, not by an absolute constant.
     var keyLuminance: [Float] = []
-    for index in 0..<pixelCount { sourceLuminance[index] = luminance(colorData, index) }
     for index in Swift.stride(from: 0, to: pixelCount, by: sampleStride) {
       luminanceSamples.append(sourceLuminance[index])
       let material = reads[2].pixel(index, width: width).w
@@ -363,6 +370,7 @@ final class OIDNDenoiser {
       // Rows are independent: each writes only its own center pixels and reads
       // the unmodified luminance snapshot.
       let cancelled = OIDNCancelFlag()
+      let output = DisjointWrites(base: colorData) // Each row writes only its own pixels.
       DispatchQueue.concurrentPerform(iterations: height - 2) { row in
         let y = row + 1
         if row % 32 == 0, !progress.update(0) { cancelled.set() }
@@ -393,9 +401,9 @@ final class OIDNDenoiser {
           let cap = max(robustLuminance * 4, secondLargest * 8)
           if compatible >= 4 && center > cap && cap > 0 {
             let scale = cap / center
-            colorData[index * 3] *= scale
-            colorData[index * 3 + 1] *= scale
-            colorData[index * 3 + 2] *= scale
+            output.base[index * 3] *= scale
+            output.base[index * 3 + 1] *= scale
+            output.base[index * 3 + 2] *= scale
           }
         }
       }

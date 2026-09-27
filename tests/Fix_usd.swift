@@ -1,5 +1,5 @@
 // Regression checks for the OpenUSD import fixes (fixtures are written by tests/USDChecks.py).
-func fixUSDChecks() throws {
+@MainActor func fixUSDChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("usd", isDirectory: true)
   func close(_ a: Float, _ b: Float, _ tolerance: Float = 0.001) -> Bool { abs(a - b) <= tolerance * max(1, abs(b)) }
 

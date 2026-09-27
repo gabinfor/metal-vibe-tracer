@@ -51,11 +51,14 @@ extension PathTracerRenderer {
         MTLSize(width: 1, height: 1, depth: 1),
         threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
       encoder.endEncoding()
-      command.addCompletedHandler { c in
+      // Metal calls the handler on its own thread; the result is read on the main actor.
+      let finish: @MainActor (Bool) -> Void = { completed in
         let value = result.contents().load(as: UInt32.self)
-        DispatchQueue.main.async {
-          completion(c.status == .completed && value < UInt32(SceneLimits.nodes + SceneLimits.materials) ? Int(value) : nil)
-        }
+        completion(completed && value < UInt32(SceneLimits.nodes + SceneLimits.materials) ? Int(value) : nil)
+      }
+      command.addCompletedHandler { c in
+        let completed = c.status == .completed
+        DispatchQueue.main.async { finish(completed) }
       }
       command.commit()
 
@@ -214,13 +217,16 @@ extension StudioController {
       }
     }
     status.stringValue = "Preparing OIDN offline denoising…"
+    // The worker gets snapshots; renderer state is only read on the main actor.
+    let input = OIDNInput(color: color, albedo: albedo, normal: normal)
+    let queue = r.commandQueue, options = r.oidnOptions
     DispatchQueue.global(qos: .userInitiated).async { [weak self, weak r, weak job] in
-      guard let self, let r, let job else { return }
+      guard self != nil, r != nil, let job else { return }
       do {
         let image = try OIDNDenoiser.denoise(
-          color: color, albedo: albedo, normal: normal, commandQueue: r.commandQueue,
-          progress: job, options: r.oidnOptions, residentBytes: residentBytes)
-        let texture = try image.makeTexture(device: r.device)
+          color: input.color, albedo: input.albedo, normal: input.normal, commandQueue: queue,
+          progress: job, options: options, residentBytes: residentBytes)
+        let texture = try image.makeTexture(device: queue.device)
         DispatchQueue.main.async { [weak self, weak r, weak job] in
           guard let self, let r, let job, self.exportDenoiseJob === job,
             self.exportRenderer === r else { return }
@@ -256,21 +262,24 @@ extension StudioController {
       showError("Export failed: could not tone-map the OIDN result.")
       return
     }
-    command.addCompletedHandler { [weak self, weak r] completed in
-      DispatchQueue.main.async {
-        guard let self, let r, self.exportRenderer === r else { return }
-        do {
-          guard completed.status == .completed else {
-            throw MaterialLibrary.error(completed.error?.localizedDescription ?? "OIDN tone mapping failed.")
-          }
-          try RenderImage.write(texture: output, url: url, hdr: false)
-          self.cancelExport()
-          self.show("Saved OIDN-denoised \(url.lastPathComponent)")
-        } catch {
-          self.cancelExport()
-          self.showError("Export failed: \(error.localizedDescription)")
+    // Metal calls the handler on its own thread; the output is written on the main actor.
+    let finish: @MainActor (Bool, String?) -> Void = { [weak self, weak r] completed, failure in
+      guard let self, let r, self.exportRenderer === r else { return }
+      do {
+        guard completed else {
+          throw MaterialLibrary.error(failure ?? "OIDN tone mapping failed.")
         }
+        try RenderImage.write(texture: output, url: url, hdr: false)
+        self.cancelExport()
+        self.show("Saved OIDN-denoised \(url.lastPathComponent)")
+      } catch {
+        self.cancelExport()
+        self.showError("Export failed: \(error.localizedDescription)")
       }
+    }
+    command.addCompletedHandler { completed in
+      let succeeded = completed.status == .completed, failure = completed.error?.localizedDescription
+      DispatchQueue.main.async { finish(succeeded, failure) }
     }
     command.commit()
   }
@@ -315,13 +324,16 @@ extension StudioController {
     }
     rebuild()
     status.stringValue = "Preparing OIDN preview of \(samples) spp…"
+    // The worker gets snapshots; renderer state is only read on the main actor.
+    let input = OIDNInput(color: color, albedo: albedo, normal: normal)
+    let queue = renderer.commandQueue, options = renderer.oidnOptions
     DispatchQueue.global(qos: .userInitiated).async { [weak self, weak job] in
-      guard let self, let job else { return }
+      guard self != nil, let job else { return }
       do {
         let image = try OIDNDenoiser.denoise(
-          color: color, albedo: albedo, normal: normal, commandQueue: self.renderer.commandQueue,
-          progress: job, options: self.renderer.oidnOptions, residentBytes: residentBytes)
-        let texture = try image.makeTexture(device: self.renderer.device)
+          color: input.color, albedo: input.albedo, normal: input.normal, commandQueue: queue,
+          progress: job, options: options, residentBytes: residentBytes)
+        let texture = try image.makeTexture(device: queue.device)
         DispatchQueue.main.async { [weak self, weak job] in
           guard let self, let job, self.previewDenoiseJob === job else { return }
           self.previewDenoiseJob = nil
@@ -390,16 +402,18 @@ extension StudioController {
       showError("Could not capture preview.")
       return
     }
-    command.addCompletedHandler { [weak self] c in
-      DispatchQueue.main.async {
-        guard let self, c.status == .completed else { return }
-        self.chooseSave("Capture preview", name: "Preview.png", ext: "png") { [weak self] url in
-          do {
-            try RenderImage.write(texture: output, url: url, hdr: false)
-            self?.show("Saved \(url.lastPathComponent)")
-          } catch { self?.showError(error.localizedDescription) }
-        }
+    // Metal calls the handler on its own thread; the copy is saved on the main actor.
+    let finish: @MainActor () -> Void = { [weak self] in
+      self?.chooseSave("Capture preview", name: "Preview.png", ext: "png") { [weak self] url in
+        do {
+          try RenderImage.write(texture: output, url: url, hdr: false)
+          self?.show("Saved \(url.lastPathComponent)")
+        } catch { self?.showError(error.localizedDescription) }
       }
+    }
+    command.addCompletedHandler { c in
+      guard c.status == .completed else { return }
+      DispatchQueue.main.async { finish() }
     }
     command.commit()
   }
@@ -442,6 +456,13 @@ enum RenderImage {
     // Atomic replacement, including existing destinations chosen by NSSavePanel.
     try Data(contentsOf: temporary).write(to: url, options: .atomic)
   }
+}
+
+/// Lets DispatchQueue.concurrentPerform workers write disjoint elements of one buffer.
+/// @unchecked: Swift cannot prove that the workers' elements are disjoint; each use states
+/// its partition, and concurrentPerform returns only after every worker has finished.
+struct DisjointWrites<Element>: @unchecked Sendable {
+  let base: UnsafeMutablePointer<Element>
 }
 
 // REFERENCES.md: OPENEXRLAYOUT. Single-part scanline OpenEXR with FLOAT (32-bit) R, G, B
@@ -488,23 +509,23 @@ enum OpenEXRFloat {
     let chunkCount = (height + linesPerChunk - 1) / linesPerChunk
     var chunks = [Data](repeating: Data(), count: chunkCount)
     chunks.withUnsafeMutableBufferPointer { output in
-      pixels.withUnsafeBufferPointer { source in
-        DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
-          let first = chunk * linesPerChunk, lines = min(linesPerChunk, height - first)
-          var raw = [Float](repeating: 0, count: lines * width * 3)
-          for line in 0..<lines {
-            for channel in 0..<3 { // B, G, R planes per scanline
-              let plane = (line * 3 + channel) * width, row = (first + line) * width
-              for x in 0..<width { raw[plane + x] = source[row + x][2 - channel] }
-            }
+      guard let base = output.baseAddress else { return }
+      let output = DisjointWrites(base: base) // Each worker writes only its own chunk.
+      DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+        let first = chunk * linesPerChunk, lines = min(linesPerChunk, height - first)
+        var raw = [Float](repeating: 0, count: lines * width * 3)
+        for line in 0..<lines {
+          for channel in 0..<3 { // B, G, R planes per scanline
+            let plane = (line * 3 + channel) * width, row = (first + line) * width
+            for x in 0..<width { raw[plane + x] = pixels[row + x][2 - channel] }
           }
-          let packed = raw.withUnsafeBytes { zipChunk(Array($0)) }
-          var block = Data()
-          append(Int32(first), to: &block)
-          append(Int32(packed.count), to: &block)
-          block.append(contentsOf: packed)
-          output[chunk] = block
         }
+        let packed = raw.withUnsafeBytes { zipChunk(Array($0)) }
+        var block = Data()
+        append(Int32(first), to: &block)
+        append(Int32(packed.count), to: &block)
+        block.append(contentsOf: packed)
+        output.base[chunk] = block
       }
     }
     var offset = UInt64(header.count + chunkCount * 8)

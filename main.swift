@@ -3009,6 +3009,7 @@ final class MaterialLibrary {
     }
 }
 
+@MainActor
 class PathTracerRenderer: NSObject, MTKViewDelegate {
     struct FrameResourcePlan {
         let width: Int
@@ -3064,7 +3065,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var gbufferNormalMat: MTLTexture?
     var gbufferAlbedoRough: MTLTexture?
     // MSL PrimarySurface per pixel: pass 1 writes it; shading and MetalFX guides read it.
-    static let primarySurfaceStride: UInt64 = 104
+    nonisolated static let primarySurfaceStride: UInt64 = 104
     private(set) var primarySurfaces: MTLBuffer?
     var accumTexture: MTLTexture?
     var sampleTexture: MTLTexture?
@@ -3729,12 +3730,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             semaphore.signal()
             let errorMessage = completedBuffer.error?.localizedDescription
             let succeeded = completedBuffer.status == .completed
+            let gpuMilliseconds = (completedBuffer.gpuEndTime - completedBuffer.gpuStartTime) * 1000
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if succeeded {
                     guard self.generation == submittedGeneration else { return }
                     self.completedSamples=nextFrame
-                    self.gpuMilliseconds=(completedBuffer.gpuEndTime-completedBuffer.gpuStartTime)*1000
+                    self.gpuMilliseconds=gpuMilliseconds
                     let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)
                     self.framesPerSecond=interval>0 ? 1/interval : 0; self.lastCompletion=now
                     self.onFrameUpdate?(nextFrame)
@@ -3824,7 +3826,10 @@ class InteractiveMTKView: MTKView {
 // 5. App Entry Point
 // ============================================================================
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+// Top-level code runs on the main thread; stating it keeps a Swift 5 mode typecheck valid.
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.run()
+}

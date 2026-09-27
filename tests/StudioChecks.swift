@@ -51,7 +51,7 @@ kernel void studio_checks(constant Uniforms &u [[buffer(0)]],constant MaterialRe
 """
 let studioLibrary=try gpu.makeLibrary(source:metalSource+studioKernels,options:shaderCompileOptions())
 let studioPipeline=try gpu.makeComputePipelineState(function:studioLibrary.makeFunction(name:"studio_checks")!)
-func checkStudio(_ input:Uniforms)->[SIMD4<Float>] {
+@MainActor func checkStudio(_ input:Uniforms)->[SIMD4<Float>] {
     var u=input
     let buffer=gpu.makeBuffer(length:64,options:.storageModeShared)!,command=testRenderer.commandQueue.makeCommandBuffer()!,encoder=command.makeComputeCommandEncoder()!
     encoder.setComputePipelineState(studioPipeline);testRenderer.materials.bind(encoder)

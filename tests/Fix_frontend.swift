@@ -1,5 +1,5 @@
 // Regression checks for inspector editing, viewport input, menus, errors and window state.
-func fixFrontendChecks() throws {
+@MainActor func fixFrontendChecks() throws {
   let folder = studioDirectory.absoluteURL.appendingPathComponent("fix-frontend", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

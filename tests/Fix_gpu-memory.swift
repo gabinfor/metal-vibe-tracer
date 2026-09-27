@@ -1,6 +1,6 @@
 // Regression checks for the GPU resource allocation and budgeting fixes
 // (R-04, R-17..R-21, R-37, R-58..R-62, R-100, R-101, R-125, R-128).
-func fixGPUMemoryChecks() throws {
+@MainActor func fixGPUMemoryChecks() throws {
   let renderer = testRenderer
   let folder = testOutputDirectory.appendingPathComponent("fix-gpu-memory", isDirectory: true)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

@@ -82,7 +82,8 @@ def compile_swift(source: str, folder: Path, name: str) -> Path:
     swift = folder / 'main.swift'
     swift.write_text(source)
     binary = folder / name
-    subprocess.run(['xcrun', 'swiftc', '-O', '-D', 'VIBE_TESTING', '-target', platform.machine() + '-apple-macosx26.0',
+    # Swift 6 language mode, like build.sh: data-race safety is checked at compile time.
+    subprocess.run(['xcrun', 'swiftc', '-O', '-swift-version', '6', '-D', 'VIBE_TESTING', '-target', platform.machine() + '-apple-macosx26.0',
                     '-module-cache-path', str(folder / 'cache'), str(swift), '-o', str(binary)], check=True)
     return binary
 

@@ -1,5 +1,5 @@
 // Appended last by verify.py (full suite): legacy material path and delta BSDF regressions.
-func fixBsdfLegacyChecks() throws {
+@MainActor func fixBsdfLegacyChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("fix-bsdf-legacy", isDirectory: true)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
   func fixture(_ name: String, _ pixel: [UInt8]) throws -> URL {

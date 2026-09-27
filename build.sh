@@ -13,7 +13,8 @@ retired="build/.MetalVibeTracer.app.retired-$$"
 trap 'rm -rf -- "$stage" "$retired"' EXIT
 rm -rf -- "$stage"
 mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources" "$stage/Contents/Frameworks" build/module-cache
-xcrun swiftc -O -target "$arch-apple-macosx26.0" -module-cache-path build/module-cache main.swift Sources/*.swift -o "$stage/Contents/MacOS/MetalVibeTracer"
+# Swift 6 language mode: actor isolation and Sendable violations are compile errors.
+xcrun swiftc -O -swift-version 6 -target "$arch-apple-macosx26.0" -module-cache-path build/module-cache main.swift Sources/*.swift -o "$stage/Contents/MacOS/MetalVibeTracer"
 cp build/ShaderResources/OpenPBR.metal "$stage/Contents/Resources/"
 cp Vendor/OpenPBR/LICENSE "$stage/Contents/Resources/OpenPBR-LICENSE"
 cp Vendor/OpenPBR/UPSTREAM.md "$stage/Contents/Resources/OpenPBR-UPSTREAM.md"

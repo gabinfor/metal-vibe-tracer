@@ -1,7 +1,7 @@
 // Geometry regressions: imported-scene ray tolerances and P1-02 microgeometry
 // (R-03, R-51, R-119), bounded visibility traversal (R-97), MetalFX guide
 // offsets (R-57), procedural UV orientation (R-50) and OBJ parsing (R-33, R-130).
-func fixGeometryChecks() throws {
+@MainActor func fixGeometryChecks() throws {
   // OBJ: relative degeneracy test, skipped-face count, line numbers, "vt u", continuations.
   var patch = ""
   let cells = 40

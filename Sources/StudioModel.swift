@@ -20,14 +20,14 @@ struct CameraState: Codable {
   var yaw: Float = 0.42, pitch: Float = 0.22, distance: Float = 4.6, fov: Float = 38
   var target = SIMD3<Float>(0.15, -0.25, 0.7)
   init() {}
-  init(_ r: PathTracerRenderer) {
+  @MainActor init(_ r: PathTracerRenderer) {
     yaw = r.yaw
     pitch = r.pitch
     distance = r.distance
     fov = r.fov
     target = r.target
   }
-  func apply(_ r: PathTracerRenderer) {
+  @MainActor func apply(_ r: PathTracerRenderer) {
     r.yaw = yaw
     r.pitch = pitch
     r.distance = distance
@@ -511,7 +511,10 @@ enum OBJMesh {
 // candidate library prepared off the main thread adopts them, so unchanged maps,
 // MaterialX images, the environment and the flattened mesh are reused rather than
 // decoded, converted or rebuilt again.
-struct ReusableResources {
+// @unchecked Sendable: Metal objects may be referenced from any thread, and these are
+// never written by the CPU once published (edits allocate replacement textures and
+// buffers), so the preparing thread and the main thread only ever read them.
+struct ReusableResources: @unchecked Sendable {
   var payloads: [Data?]
   var images: [MTLTexture]
   var materialX: [Int: MaterialXProgram]

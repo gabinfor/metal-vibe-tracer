@@ -1,6 +1,7 @@
 import Cocoa
 import Metal
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
   var window: NSWindow!
   var studio: StudioController!

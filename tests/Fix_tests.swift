@@ -1,7 +1,7 @@
 // Verification-gap checks (R-105, R-107, R-116, R-117, R-118): motion/jitter/depth
 // conventions, the MetalFX-unavailable fallback, multi-frame inspection renders, edit
 // invalidation, project I/O guards, quit, preflight alongside live frames and mip filtering.
-func fixTestsChecks() throws {
+@MainActor func fixTestsChecks() throws {
   let r = testRenderer
   let folder = testOutputDirectory.appendingPathComponent("fix-tests", isDirectory: true)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

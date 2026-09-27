@@ -1,5 +1,5 @@
 // Regression checks for project IO, autosave, undo, busy guards and the quit flow.
-func fixPersistenceChecks() throws {
+@MainActor func fixPersistenceChecks() throws {
   // Absolute, like panel URLs, so restored associations compare equal.
   let folder = studioDirectory.absoluteURL.appendingPathComponent("fix-persistence", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)

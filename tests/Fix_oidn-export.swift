@@ -1,6 +1,6 @@
 // Regression checks for the oidn-export fix package (R-40, R-41, R-79..R-83, R-106).
 import ImageIO
-func fixOIDNExportChecks() throws {
+@MainActor func fixOIDNExportChecks() throws {
   func texture(_ pixels: [SIMD4<Float>], width: Int, height: Int) -> MTLTexture {
     let descriptor = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)

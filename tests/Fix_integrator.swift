@@ -1,5 +1,5 @@
 // Appended after the full suite by verify.py: ReSTIR DI/GI and path-integrator regressions.
-func fixIntegratorChecks() throws {
+@MainActor func fixIntegratorChecks() throws {
     let kernels = """
     kernel void fix_integrator_units(device float4 *out [[buffer(0)]], constant Uniforms &u [[buffer(1)]],
         constant Uniforms &graph [[buffer(2)]]) {

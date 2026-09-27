@@ -43,6 +43,8 @@ struct USDImportResult {
   var document: ProjectDocument
   var report: [String]
 }
+// @unchecked Sendable: the UI thread cancels while the import thread runs the helper;
+// every mutable property is read and written only while holding `lock`.
 final class USDImportJob: @unchecked Sendable {
   private let lock = NSLock()
   private var process: Process?

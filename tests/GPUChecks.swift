@@ -61,7 +61,7 @@ kernel void regression_checks(device uint *results [[buffer(0)]], constant Unifo
 """
 // Direct kernel dispatches use the production defaults: StudioOptions' sun and the
 // renderer's clip planes (the projection MetalFX receives), not a test-only projection.
-func makeUniforms(scene: UInt32, mode: UInt32, width: Int, height: Int, fog: UInt32 = 0) -> Uniforms {
+@MainActor func makeUniforms(scene: UInt32, mode: UInt32, width: Int, height: Int, fog: UInt32 = 0) -> Uniforms {
     testRenderer.sceneIndex = scene
     let r = testRenderer, defaults = StudioOptions(), clip = r.cameraClipPlanes()
     let eye = r.target + SIMD3<Float>(r.distance * cos(r.pitch) * sin(r.yaw),
@@ -109,7 +109,7 @@ var lastRenderUniforms: Uniforms?
 let testOutputDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.environment["VIBE_TEST_OUTPUT"] ?? "build/checks",
     isDirectory: true)
 
-func readTexture(_ texture: MTLTexture) -> [SIMD4<Float>] {
+@MainActor func readTexture(_ texture: MTLTexture) -> [SIMD4<Float>] {
     let half: Bool, channels: Int
     switch texture.pixelFormat {
     case .rgba16Float: half = true; channels = 4
@@ -143,7 +143,7 @@ func readTexture(_ texture: MTLTexture) -> [SIMD4<Float>] {
 
 // A test view (Uniforms fields) becomes production renderer state: camera, strategy,
 // scene toggles and StudioOptions. renderFrame then derives the frame uniforms itself.
-func applyTestView(_ u: Uniforms) {
+@MainActor func applyTestView(_ u: Uniforms) {
     let r = testRenderer
     r.sceneIndex = u.sceneIndex
     r.samplingMode = u.samplingMode; r.enableSMS = u.enableSMS; r.skyMode = u.skyMode; r.enableFog = u.enableFog
@@ -176,7 +176,7 @@ var renderOutputs = [SIMD2<Int>: MTLTexture]()
 // Renders `samples` frames of a view through PathTracerRenderer.renderFrame, starting
 // from a reset accumulation and the first jitter/seed of the sequence, and reads back
 // the raw accumulation (returned), display, G-buffer, samples, GI reservoirs and motion.
-func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool = false) -> [SIMD4<Float>] {
+@MainActor func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool = false) -> [SIMD4<Float>] {
     let r = testRenderer
     let camera = (r.yaw, r.pitch, r.distance, r.target, r.fov)
     let modes = (r.samplingMode, r.enableSMS, r.skyMode, r.enableFog, r.viewportMode)
