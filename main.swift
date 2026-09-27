@@ -3094,6 +3094,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // Unlike frameIndex, camera moves keep ReSTIR history; reprojection
     // rejects disocclusions. Cuts and inspection/non-ReSTIR frames clear it.
     private(set) var reservoirHistory: UInt32 = 0
+#if VIBE_TESTING
+    // GPU checks replay one jitter/seed sequence to compare renders of a view, and
+    // exercise the unsupported-device presentation path on MetalFX-capable GPUs.
+    func restartSampleSequence() { sampleIndex = 0 }
+    static var simulateUnsupportedMetalFX = false
+#endif
 
     var sceneIndex: UInt32 = 0 { didSet { if oldValue != sceneIndex { applyPreset(.perspective) } } }
     var samplingMode: UInt32 = 0 { didSet { if oldValue != samplingMode { resetAccumulation() } } } // 0 ReSTIR DI+GI, 1 MIS, 2 light, 3 BSDF
@@ -3230,7 +3236,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 
     init(device: MTLDevice, sharing other: PathTracerRenderer? = nil) throws {
         self.device = device
-        self.supportsMetalFX = MTLFXTemporalDenoisedScalerDescriptor.supportsDevice(device)
+        var metalFXSupported = MTLFXTemporalDenoisedScalerDescriptor.supportsDevice(device)
+#if VIBE_TESTING
+        if Self.simulateUnsupportedMetalFX { metalFXSupported = false }
+#endif
+        self.supportsMetalFX = metalFXSupported
         guard let queue = device.makeCommandQueue() else {
             throw NSError(domain: "PathTracer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not create a Metal command queue."])
         }

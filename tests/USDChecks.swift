@@ -1,5 +1,5 @@
 // Exercise the production SDK process, snapshot decoder, persistence and GPU emitters.
-let usdFolder = URL(fileURLWithPath: "build/checks/usd", isDirectory: true)
+let usdFolder = testOutputDirectory.appendingPathComponent("usd", isDirectory: true)
 let usdResult = try USDImporter.load(usdFolder.appendingPathComponent("scene.usdz"), into: ProjectDocument())
 let usdGraph = usdResult.document.graph!
 let usdTriangles = try usdGraph.renderTriangles()
@@ -81,8 +81,8 @@ if FileManager.default.fileExists(atPath: referenceUSD.path) {
  require(imported.report.contains("17 mesh assets, 24 nodes, 11 materials, 63882 triangles"), "ASWF reference import counts")
  require(imported.document.scenes[6]!.emissions?.count == 5 && (imported.document.scenes[6]!.materialX?.count ?? 0) >= 3, "ASWF reference keeps five rect lights and its compiled materials")
  try controller.restore(imported.document)
- try JSONEncoder().encode(imported.document).write(to: referenceUSD.deletingLastPathComponent().appendingPathComponent("StandardShaderBall-audit.vtrace"))
- try imported.report.joined(separator: "\n").write(to: referenceUSD.deletingLastPathComponent().appendingPathComponent("import-report-audit.txt"),atomically: true,encoding: .utf8)
+ try JSONEncoder().encode(imported.document).write(to: usdFolder.appendingPathComponent("StandardShaderBall-audit.vtrace"))
+ try imported.report.joined(separator: "\n").write(to: usdFolder.appendingPathComponent("import-report-audit.txt"),atomically: true,encoding: .utf8)
  var view = makeUniforms(scene: 6,mode: 1,width: 192,height: 144)
  view.environment.w = Float(testRenderer.materials.nodeCount)
  view.environment.x = imported.document.options.environmentIntensity

@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Exercise the real SDK bridge with composed layers, packages and schemas."""
-import sys,pathlib,json,importlib.util,zipfile,re
+import sys,pathlib,json,importlib.util,zipfile,re,os
+def check(condition,message):
+ # Explicit failures: unlike assert, these still run under python -O / PYTHONOPTIMIZE.
+ if not condition:sys.exit('FAIL: USDChecks.py: '+str(message))
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 runtime=ROOT/'build/OpenUSD'
 manifest=json.loads((runtime/'VIBE_RUNTIME.json').read_text())
 version=re.search(r'^VERSION = "([^"]+)"$',(ROOT/'scripts/prepare_usd.py').read_text(),re.M).group(1)
-assert manifest['version']==version and manifest['python']=='cp39' and len(manifest['sha256'])==64
-assert runtime.is_dir() and (runtime/'pxr/Usd/_usd.so').is_file()
+check(manifest['version']==version and manifest['python']=='cp39' and len(manifest['sha256'])==64,"manifest['version']==version and manifest['python']=='cp39' and len(manifest['sha256'])==64")
+check(runtime.is_dir() and (runtime/'pxr/Usd/_usd.so').is_file(),"runtime.is_dir() and (runtime/'pxr/Usd/_usd.so').is_file()")
 sys.path.insert(0,str(ROOT/'build/OpenUSD'))
 from pxr import Usd,UsdGeom,UsdShade,UsdLux,UsdUtils,Gf,Sdf
 spec=importlib.util.spec_from_file_location('usd_bridge',ROOT/'scripts/usd_bridge.py');bridge=importlib.util.module_from_spec(spec);spec.loader.exec_module(bridge)
-out=ROOT/'build/checks/usd';out.mkdir(parents=True,exist_ok=True)
+# Per-run directory from verify.py (VIBE_TEST_OUTPUT), so concurrent runs never share fixtures.
+out=pathlib.Path(os.environ.get('VIBE_TEST_OUTPUT',ROOT/'build/checks'))/'usd';out.mkdir(parents=True,exist_ok=True)
 for name in ['asset.usda','scene.usda','scene.usdc','scene.usdz','details.usda']:
  (out/name).unlink(missing_ok=True)
 asset=Usd.Stage.CreateNew(str(out/'asset.usda'));UsdGeom.SetStageMetersPerUnit(asset,1)
@@ -29,21 +33,21 @@ camera=UsdGeom.Camera.Define(stage,'/Camera');camera.AddTranslateOp().Set((100,-
 sun=UsdLux.DistantLight.Define(stage,'/Sun');sun.CreateIntensityAttr(2)
 stage.GetRootLayer().Save()
 result=bridge.import_stage(str(out/'scene.usda'),out)
-assert len(result['assets'])==1 and sum(bool(n.get('mesh')) for n in result['nodes'])==2,result['report']
-assert len(result['assets'][0]['triangles'])==3,'concave face triangulation'
-assert len(result['cameras'])==1 and result['sun'] is not None
-assert all(m.get('mtlx') for m in result['materials'])
+check(len(result['assets'])==1 and sum(bool(n.get('mesh')) for n in result['nodes'])==2,result['report'])
+check(len(result['assets'][0]['triangles'])==3,'concave face triangulation')
+check(len(result['cameras'])==1 and result['sun'] is not None,"len(result['cameras'])==1 and result['sun'] is not None")
+check(all(m.get('mtlx') for m in result['materials']),"all(m.get('mtlx') for m in result['materials'])")
 (out/'snapshot.json').write_text(json.dumps(result))
 # Binary USD and USDZ are parsed by the SDK, including references within the package.
 stage.Export(str(out/'scene.usdc'))
-assert bridge.import_stage(str(out/'scene.usdc'),out)['assets']
-assert UsdUtils.CreateNewUsdzPackage(Sdf.AssetPath(str(out/'scene.usda')),str(out/'scene.usdz'))
-assert bridge.import_stage(str(out/'scene.usdz'),out)['assets']
+check(bridge.import_stage(str(out/'scene.usdc'),out)['assets'],"bridge.import_stage(str(out/'scene.usdc'),out)['assets']")
+check(UsdUtils.CreateNewUsdzPackage(Sdf.AssetPath(str(out/'scene.usda')),str(out/'scene.usdz')),"UsdUtils.CreateNewUsdzPackage(Sdf.AssetPath(str(out/'scene.usda')),str(out/'scene.usdz'))")
+check(bridge.import_stage(str(out/'scene.usdz'),out)['assets'],"bridge.import_stage(str(out/'scene.usdz'),out)['assets']")
 # Holes, indexed primvars, inherited bindings, reset stacks and invisibility.
 plain=Usd.Stage.CreateNew(str(out/'details.usda'));UsdGeom.SetStageMetersPerUnit(plain,1)
 m=UsdGeom.Mesh.Define(plain,'/M');m.CreatePointsAttr([(0,0,0),(1,0,0),(1,1,0),(0,1,0)]);m.CreateFaceVertexCountsAttr([3,3]);m.CreateFaceVertexIndicesAttr([0,1,2,0,2,3]);m.CreateSubdivisionSchemeAttr('none');m.CreateHoleIndicesAttr([1]);st=UsdGeom.PrimvarsAPI(m).CreatePrimvar('st',Sdf.ValueTypeNames.TexCoord2fArray,'faceVarying');st.Set([(0,0),(1,0),(1,1),(0,1)]);st.SetIndices([0,1,2,0,2,3]);m.CreateVisibilityAttr('invisible')
 plain.GetRootLayer().Save();detail=bridge.import_stage(str(out/'details.usda'),out)
-assert len(detail['assets'][0]['triangles'])==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1
+check(len(detail['assets'][0]['triangles'])==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1,"len(detail['assets'][0]['triangles'])==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1")
 print('PASS: USD composition, instances, units/up-axis matrices, concave triangulation, primvars/holes, bindings, camera/sun, USDC and USDZ')
 # A small authored area-lit scene supports a meaningful GPU PDF/energy test.
 lightFile=out/'area.usda';lightFile.unlink(missing_ok=True)
@@ -56,14 +60,17 @@ disk=UsdLux.DiskLight.Define(coverage,'/Disk');disk.CreateRadiusAttr(.5);disk.Cr
 sphere=UsdLux.SphereLight.Define(coverage,'/Sphere');sphere.CreateRadiusAttr(.25);sphere.CreateIntensityAttr(2);sphere.AddTranslateOp().Set((1,1,0))
 coverage.GetRootLayer().Save()
 coverage_result=bridge.import_stage(str(out/'light-coverage.usda'),out)
-assert len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8
-assert any('disk light imported' in line for line in coverage_result['report'])
-assert any('sphere light imported' in line for line in coverage_result['report'])
+check(len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8,"len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8")
+check(any('disk light imported' in line for line in coverage_result['report']),"any('disk light imported' in line for line in coverage_result['report'])")
+check(any('sphere light imported' in line for line in coverage_result['report']),"any('sphere light imported' in line for line in coverage_result['report'])")
 # Reference scene override is separate; upstream files and notices remain unchanged.
 reference=ROOT/'build/reference-scenes/StandardShaderBall'
 if reference.exists():
  override=reference.parent/'ShaderBall-triangulated.usda'
- override.write_bytes((ROOT/'Examples/OpenUSD/ShaderBall-triangulated.usda').read_bytes())
+ data=(ROOT/'Examples/OpenUSD/ShaderBall-triangulated.usda').read_bytes()
+ # Shared with other checkouts' runs: publish atomically and only when it changed.
+ if not override.is_file() or override.read_bytes()!=data:
+  staged=override.with_name(override.name+'.%d.partial'%os.getpid());staged.write_bytes(data);os.replace(staged,override)
  print('Reference override:',override)
 elif '--require-reference' in sys.argv:sys.exit('FAIL: ASWF Standard Shader Ball is missing; run /usr/bin/python3 scripts/fetch_reference_scene.py')
 else:print('SKIP: ASWF Standard Shader Ball not downloaded (scripts/fetch_reference_scene.py); --require-reference makes this fail')
@@ -97,27 +104,27 @@ cam=UsdGeom.Camera.Define(robust,'/Cam');cam.AddTranslateOp().Set((.5,.5,5))
 robust.GetRootLayer().Save()
 rb=bridge.import_stage(str(out/'robust.usda'),out);report='\n'.join(rb['report'])
 byName={n['name']:n for n in rb['nodes']};assetOf={a['id']:a for a in rb['assets']}
-assert len(assetOf[byName['Good']['mesh']]['triangles'])==5,report
-assert '/Good: 3 degenerate faces dropped' in report and '/Good: 1 non-simple polygons fan-triangulated' in report,report
-assert '/Empty: mesh without points or topology skipped' in report and 'mesh' not in byName['Empty'],report
-assert byName['Zero']['transform']['rotationHidden'][3]==1 and report.count('zero or singular world scale')==1,report
-assert byName['Child']['matrix']==[1.0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],'child local matrix must not invert a singular parent'
-assert byName['Reset']['parent']==rb['nodes'][0]['id'] and byName['Reset']['matrix'][12]==5 and byName['Reset']['transform']['rotationHidden'][3]==0
-assert '/Lamp: MeshLightAPI emission not applied' in report and '/Fog: VolumeLightAPI emission' in report,report
-fallbacks=[m for m in rb['materials'] if m['path']=='/Looks/Bad'];assert sorted(m['color'] for m in fallbacks)==[[0,0,1],[1,0,0]] and not any(m.get('mtlx') for m in fallbacks)
-assert '/Red: material /Looks/Bad fallback to displayColor' in report and '/Blue: material /Looks/Bad fallback to displayColor' in report,report
+check(len(assetOf[byName['Good']['mesh']]['triangles'])==5,report)
+check('/Good: 3 degenerate faces dropped' in report and '/Good: 1 non-simple polygons fan-triangulated' in report,report)
+check('/Empty: mesh without points or topology skipped' in report and 'mesh' not in byName['Empty'],report)
+check(byName['Zero']['transform']['rotationHidden'][3]==1 and report.count('zero or singular world scale')==1,report)
+check(byName['Child']['matrix']==[1.0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],'child local matrix must not invert a singular parent')
+check(byName['Reset']['parent']==rb['nodes'][0]['id'] and byName['Reset']['matrix'][12]==5 and byName['Reset']['transform']['rotationHidden'][3]==0,"byName['Reset']['parent']==rb['nodes'][0]['id'] and byName['Reset']['matrix'][12]==5 and byName['Reset']['transform']['rotationHidden'][3]==0")
+check('/Lamp: MeshLightAPI emission not applied' in report and '/Fog: VolumeLightAPI emission' in report,report)
+fallbacks=[m for m in rb['materials'] if m['path']=='/Looks/Bad'];check(sorted(m['color'] for m in fallbacks)==[[0,0,1],[1,0,0]] and not any(m.get('mtlx') for m in fallbacks),"sorted(m['color'] for m in fallbacks)==[[0,0,1],[1,0,0]] and not any(m.get('mtlx') for m in fallbacks)")
+check('/Red: material /Looks/Bad fallback to displayColor' in report and '/Blue: material /Looks/Bad fallback to displayColor' in report,report)
 # Per-color fallbacks never push a stage past the material limit; the overflow shares the first fallback.
 many=Usd.Stage.CreateNew(str(out/'many-colors.usda'));badMany=UsdShade.Material.Define(many,'/Looks/Bad');badMany.CreateSurfaceOutput().ConnectToSource(UsdShade.Shader.Define(many,'/Looks/Bad/S').ConnectableAPI(),'surface')
 for i in range(60):
  m=quad(many,'/Q%d'%i,(2*i,0,0));m.CreateDisplayColorAttr([(i/60,0,1)]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(badMany)
 many.GetRootLayer().Save();mc=bridge.import_stage(str(out/'many-colors.usda'),out)
-assert len(mc['materials'])==56 and sum('material limit reached' in l for l in mc['report'])==4,mc['report'][:3]
+check(len(mc['materials'])==56 and sum('material limit reached' in l for l in mc['report'])==4,mc['report'][:3])
 env=pathlib.Path(rb['environment']['file']).read_bytes();texel=env[-4:];scale=2.0**(texel[3]-136)
-assert rb['environment']['intensity']==2 and env.startswith(b'#?RADIANCE') and [round(c*scale,3) for c in texel[:3]]==[.25,.5,1],texel
-assert '/Dome: untextured dome imported as a constant-color environment' in report and rb['cameras'][0]['focus'] is None
+check(rb['environment']['intensity']==2 and env.startswith(b'#?RADIANCE') and [round(c*scale,3) for c in texel[:3]]==[.25,.5,1],texel)
+check('/Dome: untextured dome imported as a constant-color environment' in report and rb['cameras'][0]['focus'] is None,"'/Dome: untextured dome imported as a constant-color environment' in report and rb['cameras'][0]['focus'] is None")
 focused=Usd.Stage.CreateNew(str(out/'focus.usda'));UsdGeom.SetStageMetersPerUnit(focused,1);quad(focused,'/Target')
 fc=UsdGeom.Camera.Define(focused,'/Cam');fc.AddTranslateOp().Set((.5,.5,5));fc.CreateFocusDistanceAttr(2);focused.GetRootLayer().Save()
-assert bridge.import_stage(str(out/'focus.usda'),out)['cameras'][0]['focus']==2
+check(bridge.import_stage(str(out/'focus.usda'),out)['cameras'][0]['focus']==2,"bridge.import_stage(str(out/'focus.usda'),out)['cameras'][0]['focus']==2")
 # Emitted power: sum(area * radiance) equals intensity for normalized lights, or radiance * true area otherwise.
 power=Usd.Stage.CreateNew(str(out/'power.usda'));UsdGeom.SetStageMetersPerUnit(power,1)
 for name,kind,radius,normalized in [('Disk',UsdLux.DiskLight,.5,False),('DiskN',UsdLux.DiskLight,.5,True),('Sphere',UsdLux.SphereLight,.25,False),('SphereN',UsdLux.SphereLight,.25,True)]:
@@ -129,13 +136,13 @@ for node in pw['nodes'][1:]:
  tris=powerAssets[node['mesh']]['triangles'];path='/'+node['name']
  radiantArea=sum(triangle_area(t) for t in tris)*emission[path]
  expected={'/Disk':3*math.pi*.25,'/DiskN':3,'/Sphere':3*4*math.pi*.0625,'/SphereN':3}.get(path)
- if expected:assert abs(radiantArea/expected-1)<1e-6,(path,radiantArea,expected)
+ if expected:check(abs(radiantArea/expected-1)<1e-6,(path,radiantArea,expected))
  if path.startswith('/Sphere'):
-  assert len(tris)==80 and all(sum(n*x for n,x in zip(cross3(t),t['a'][:3]))>0 for t in tris),'outward sphere proxy'
-  assert max(abs(sum(cross3(t)[i] for t in tris)) for i in range(3))<1e-9,'closed sphere proxy'
-assert emission['/Tiny']==1e8 and '/Tiny: emission 1e+09 exceeds the supported 1e8' in '\n'.join(pw['report']),pw['report']
+  check(len(tris)==80 and all(sum(n*x for n,x in zip(cross3(t),t['a'][:3]))>0 for t in tris),'outward sphere proxy')
+  check(max(abs(sum(cross3(t)[i] for t in tris)) for i in range(3))<1e-9,'closed sphere proxy')
+check(emission['/Tiny']==1e8 and '/Tiny: emission 1e+09 exceeds the supported 1e8' in '\n'.join(pw['report']),pw['report'])
 fmt=Usd.Stage.CreateNew(str(out/'dome-format.usda'));quad(fmt,'/Q');d=UsdLux.DomeLight.Define(fmt,'/Dome');d.CreateTextureFileAttr('probe.exr');d.CreateTextureFormatAttr('mirroredBall');fmt.GetRootLayer().Save()
-df=bridge.import_stage(str(out/'dome-format.usda'),out);assert df['environment'] is None and any('dome texture format mirroredBall is unsupported' in l for l in df['report']),df['report']
+df=bridge.import_stage(str(out/'dome-format.usda'),out);check(df['environment'] is None and any('dome texture format mirroredBall is unsupported' in l for l in df['report']),df['report'])
 # MaterialX image color spaces come from USD metadata; unsupported spaces fall back with the prim path.
 png(out/'texel.png',(128,64,255))
 cs=Usd.Stage.CreateNew(str(out/'colorspace.usda'));UsdGeom.SetStageMetersPerUnit(cs,1)
@@ -150,9 +157,9 @@ for name,color,x in [('GlowRed',(1,0,0),4),('GlowBlue',(0,0,1),6)]:
  m=quad(cs,'/'+name,(x,0,0));m.CreateDisplayColorAttr([color]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(glow)
 cs.GetRootLayer().Save();cr=bridge.import_stage(str(out/'colorspace.usda'),out)
 glowID=next(m['id'] for m in cr['materials'] if m['path']=='/Looks/Glow');glowNodes=[n for n in cr['nodes'] if n['name'].startswith('Glow')]
-assert all(n['bindings']==[glowID] for n in glowNodes) and sorted(cr['fallbackColors'][n['id']] for n in glowNodes)==[[[0,0,1]],[[1,0,0]]]
-srgb=next(m for m in cr['materials'] if m['path']=='/Looks/Srgb');assert 'colorspace="srgb_texture"' in srgb['mtlx'],srgb['mtlx']
-assert any('/Looks/Aces/Image: unsupported image color space acescg' in l for l in cr['report']),cr['report']
+check(all(n['bindings']==[glowID] for n in glowNodes) and sorted(cr['fallbackColors'][n['id']] for n in glowNodes)==[[[0,0,1]],[[1,0,0]]],"all(n['bindings']==[glowID] for n in glowNodes) and sorted(cr['fallbackColors'][n['id']] for n in glowNodes)==[[[0,0,1]],[[1,0,0]]]")
+srgb=next(m for m in cr['materials'] if m['path']=='/Looks/Srgb');check('colorspace="srgb_texture"' in srgb['mtlx'],srgb['mtlx'])
+check(any('/Looks/Aces/Image: unsupported image color space acescg' in l for l in cr['report']),cr['report'])
 # A varname connected to the material interface is resolved before the st-only check.
 vn=Usd.Stage.CreateNew(str(out/'varname.usda'));UsdGeom.SetStageMetersPerUnit(vn,1)
 for name,uvset,x in [('Uv','uv',0),('St','st',2)]:
@@ -162,12 +169,12 @@ for name,uvset,x in [('Uv','uv',0),('St','st',2)]:
  surf.CreateInput('diffuseColor',Sdf.ValueTypeNames.Color3f).ConnectToSource(tex.ConnectableAPI(),'rgb');mat.CreateSurfaceOutput().ConnectToSource(surf.ConnectableAPI(),'surface')
  UsdShade.MaterialBindingAPI.Apply(quad(vn,'/'+name,(x,0,0)).GetPrim()).Bind(mat)
 vn.GetRootLayer().Save();vr=bridge.import_stage(str(out/'varname.usda'),out)
-assert any('fallback to displayColor — Only the st UV set is supported: uv' in l for l in vr['report']),vr['report']
-assert next(m for m in vr['materials'] if m['path']=='/Looks/St').get('mtlx')
+check(any('fallback to displayColor — Only the st UV set is supported: uv' in l for l in vr['report']),vr['report'])
+check(next(m for m in vr['materials'] if m['path']=='/Looks/St').get('mtlx'),"next(m for m in vr['materials'] if m['path']=='/Looks/St').get('mtlx')")
 # The bridge refuses other interpreters with a concise requirement instead of a pxr traceback.
 other=next((c for c in [sys.executable,shutil.which('python3',path='/opt/homebrew/bin:/usr/local/bin')] if c and subprocess.run([c,'-c','import sys;sys.exit(sys.version_info[:2]==(3,9))']).returncode==0),None)
 if other:
  run=subprocess.run([other,'-I',str(ROOT/'scripts/usd_bridge.py'),str(out/'robust.usda'),str(out/'unused.json')],capture_output=True,text=True)
- assert run.returncode==1 and 'requires /usr/bin/python3 CPython 3.9' in run.stderr and 'Traceback' not in run.stderr,run.stderr
+ check(run.returncode==1 and 'requires /usr/bin/python3 CPython 3.9' in run.stderr and 'Traceback' not in run.stderr,run.stderr)
 else:print('SKIP: no non-3.9 python3 found for the interpreter guard check')
 print('PASS: USD degenerate faces, placeholder meshes, zero-scale subtrees, light APIs/power/clamp, fallback colors, constant dome, focus, color spaces, varname, interpreter guard')

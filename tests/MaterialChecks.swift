@@ -60,7 +60,7 @@ for i in 0..<7 {
 }
 
 // Generated fixture files exercise the image loader, including sRGB mip generation.
-let fixtureDirectory = URL(fileURLWithPath: "build/checks/material-fixtures", isDirectory: true)
+let fixtureDirectory = testOutputDirectory.appendingPathComponent("material-fixtures", isDirectory: true)
 try FileManager.default.createDirectory(at: fixtureDirectory, withIntermediateDirectories: true)
 func materialFixture(_ name: String, _ pixel: (Int, Int) -> [UInt8]) throws -> URL {
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 64, pixelsHigh: 32,
@@ -130,8 +130,10 @@ testRenderer.materials.settings[2] = copperSettings
 let materialRaw = render(materialView, samples: 32, denoise: true)
 let materialFiltered = lastDisplay
 require(lastNormals.contains { Int($0.w) == 4 }, "OpenPBR materials reach the primary G-buffer")
-let materialGuides = readTexture(testRenderer.metalFX!.diffuse)
-require(materialGuides.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }, "finite textured MetalFX guides")
+if let fx = testRenderer.metalFX {
+    let materialGuides = readTexture(fx.diffuse)
+    require(materialGuides.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }, "finite textured MetalFX guides")
+}
 savePreview([materialBaseline, materialRaw, materialFiltered], width: 240, height: 180, name: "openpbr-textures.png")
 
 // Parameter coverage through production kernels, plus transmitting surfaces.

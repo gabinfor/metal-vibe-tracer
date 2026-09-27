@@ -160,9 +160,10 @@ func fixIntegratorChecks() throws {
     let cacheSamples = 3
     let lensImage = render(cacheView, samples: cacheSamples, denoise: true)
     require(mean(lensImage) > 0.01, "cached primary hits shade the thin-lens OpenPBR view")
-    var lastFrame = cacheView
-    lastFrame.frameIndex = UInt32(cacheSamples); lastFrame.reservoirHistory = UInt32(cacheSamples)
-    lastFrame.sampleIndex = UInt32(cacheSamples); lastFrame.jitter = frameJitter(lastFrame.sampleIndex)
+    // The production uniforms renderFrame used for the final frame.
+    var lastFrame = lastRenderUniforms!
+    require(lastFrame.sampleIndex == UInt32(cacheSamples) && lastFrame.lens.x == cacheView.lens.x,
+        "primary-cache check replays the final rendered frame")
     var positions = lastPositions
     let positionBuffer = gpu.makeBuffer(bytes: &positions, length: positions.count * 16, options: .storageModeShared)!
     let counts = gpu.makeBuffer(length: 12, options: .storageModeShared)!

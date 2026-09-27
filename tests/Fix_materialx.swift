@@ -1,7 +1,7 @@
 // Regression checks for MaterialX import/compilation and material image decoding
 // (R-23..R-28, R-73, R-74, R-129, R-130). Locally authored synthetic fixtures only.
 func fixMaterialXChecks() throws {
-  let folder = URL(fileURLWithPath: "build/checks/fix-materialx", isDirectory: true)
+  let folder = testOutputDirectory.appendingPathComponent("fix-materialx", isDirectory: true)
   let docs = folder.appendingPathComponent("docs", isDirectory: true)
   try FileManager.default.createDirectory(at: docs, withIntermediateDirectories: true)
   // Uniform 2×2 PNGs; 16-bit samples use v*257 so their byte order is irrelevant.

@@ -2,7 +2,7 @@
 // (R-04, R-17..R-21, R-37, R-58..R-62, R-100, R-101, R-125, R-128).
 func fixGPUMemoryChecks() throws {
   let renderer = testRenderer
-  let folder = URL(fileURLWithPath: "build/checks/fix-gpu-memory", isDirectory: true)
+  let folder = testOutputDirectory.appendingPathComponent("fix-gpu-memory", isDirectory: true)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
   func png(_ width: Int, _ height: Int, _ rgba: [UInt8]) -> Data {
     let rep = NSBitmapImageRep(

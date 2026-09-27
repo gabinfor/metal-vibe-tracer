@@ -2,7 +2,7 @@
 require(
   MemoryLayout<GraphInstruction>.stride == 64 && MemoryLayout<GraphHeader>.stride == 64,
   "graph CPU/GPU layouts")
-let mxFolder = URL(fileURLWithPath: "build/checks/materialx", isDirectory: true)
+let mxFolder = testOutputDirectory.appendingPathComponent("materialx", isDirectory: true)
 try FileManager.default.createDirectory(at: mxFolder, withIntermediateDirectories: true)
 let multiOBJ = """
   v -1 0 0
@@ -288,10 +288,12 @@ for type in [1, 2] {
     mask.count > 10 && difference > 0.005,
     "MaterialX reaches \(type==1 ? "reflected":"refracted") surfaces")
 }
-let reflectedGuides = readTexture(testRenderer.metalFX!.diffuse)
-require(
-  reflectedGuides.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite },
-  "finite MaterialX reflected/transmitted MetalFX guides")
+if let fx = testRenderer.metalFX {
+  let reflectedGuides = readTexture(fx.diffuse)
+  require(
+    reflectedGuides.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite },
+    "finite MaterialX reflected/transmitted MetalFX guides")
+}
 savePreview(
   [reflectedBefore, reflectedAfter, lastDisplay], width: 96, height: 72,
   name: "materialx-secondary.png")

@@ -59,15 +59,18 @@ kernel void regression_checks(device uint *results [[buffer(0)]], constant Unifo
     results[8] = depth1 && depth2 && restir_gi_has_complementary_bsdf(terminal.cameraTarget.w);
 }
 """
+// Direct kernel dispatches use the production defaults: StudioOptions' sun and the
+// renderer's clip planes (the projection MetalFX receives), not a test-only projection.
 func makeUniforms(scene: UInt32, mode: UInt32, width: Int, height: Int, fog: UInt32 = 0) -> Uniforms {
     testRenderer.sceneIndex = scene
-    let r = testRenderer
+    let r = testRenderer, defaults = StudioOptions(), clip = r.cameraClipPlanes()
     let eye = r.target + SIMD3<Float>(r.distance * cos(r.pitch) * sin(r.yaw),
         r.distance * sin(r.pitch), -r.distance * cos(r.pitch) * cos(r.yaw))
-    let vp = makePerspective(fovyRadians: r.fov * .pi / 180, aspect: Float(width) / Float(height), near: 0.05, far: 100)
+    let vp = makePerspective(fovyRadians: r.fov * .pi / 180, aspect: Float(width) / Float(height), near: clip.near, far: clip.far)
         * makeLookAt(eye: eye, target: r.target, up: SIMD3<Float>(0, 1, 0))
-    return Uniforms(cameraPos: SIMD4<Float>(eye, r.fov), cameraTarget: SIMD4<Float>(r.target, 16),
-        cameraUp: SIMD4<Float>(0, 1, 0, 0), sunParams: SIMD4<Float>(0.65, 0.45, -0.60, 850),
+    let az = defaults.sunAzimuth * .pi / 180, el = defaults.sunElevation * .pi / 180
+    return Uniforms(cameraPos: SIMD4<Float>(eye, r.fov), cameraTarget: SIMD4<Float>(r.target, defaults.depth),
+        cameraUp: SIMD4<Float>(0, 1, 0, 0), sunParams: SIMD4<Float>(sin(az) * cos(el), sin(el), cos(az) * cos(el), defaults.sunIntensity),
         currentViewProj: vp, prevViewProj: vp, frameIndex: 1, sceneIndex: scene, samplingMode: mode,
         enableSMS: 0, skyMode: 0, enableFog: fog, viewportMode: 0, width: UInt32(width), height: UInt32(height))
 }
@@ -98,6 +101,13 @@ var lastMotion = [SIMD4<Float>]()
 var lastGIWeights = [SIMD4<Float>]()
 var lastResets = [Bool]()
 var lastDenoiseMilliseconds = 0.0
+// GPU command-buffer time of every frame render() traced (tests/benchmark.py reads it).
+var frameMilliseconds = [Double]()
+// Production uniforms of the final frame of the last render().
+var lastRenderUniforms: Uniforms?
+// Fixtures, previews and exports go to the per-run directory verify.py passes in.
+let testOutputDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.environment["VIBE_TEST_OUTPUT"] ?? "build/checks",
+    isDirectory: true)
 
 func readTexture(_ texture: MTLTexture) -> [SIMD4<Float>] {
     let half: Bool, channels: Int
@@ -131,91 +141,133 @@ func readTexture(_ texture: MTLTexture) -> [SIMD4<Float>] {
     }
 }
 
+// A test view (Uniforms fields) becomes production renderer state: camera, strategy,
+// scene toggles and StudioOptions. renderFrame then derives the frame uniforms itself.
+func applyTestView(_ u: Uniforms) {
+    let r = testRenderer
+    r.sceneIndex = u.sceneIndex
+    r.samplingMode = u.samplingMode; r.enableSMS = u.enableSMS; r.skyMode = u.skyMode; r.enableFog = u.enableFog
+    r.viewportMode = u.viewportMode
+    let eye = SIMD3<Float>(u.cameraPos.x, u.cameraPos.y, u.cameraPos.z)
+    let target = SIMD3<Float>(u.cameraTarget.x, u.cameraTarget.y, u.cameraTarget.z)
+    let offset = eye - target, distance = simd_length(offset)
+    require(distance > 0 && abs(offset.y) < distance * 0.99999, "test view is an orbit camera (not straight up/down)")
+    r.target = target; r.distance = distance; r.fov = u.cameraPos.w
+    r.pitch = asin(offset.y / distance); r.yaw = atan2(offset.x, -offset.z)
+    var o = StudioOptions()
+    o.previewScale = 1; o.depth = u.cameraTarget.w
+    let sun = SIMD3<Float>(u.sunParams.x, u.sunParams.y, u.sunParams.z)
+    if simd_length(sun) > 0 {
+        o.sunElevation = asin(sun.y / simd_length(sun)) * 180 / .pi
+        o.sunAzimuth = atan2(sun.x, sun.z) * 180 / .pi
+    }
+    o.sunIntensity = u.sunParams.w
+    o.sunAngle = u.lens.w > 0 ? Float(720 / Double.pi * asin((Double(u.lens.w) / 2).squareRoot())) : nil
+    o.environmentIntensity = u.environment.x; o.environmentRotation = u.environment.y * 180 / .pi
+    o.aperture = u.lens.x; o.focusDistance = u.lens.y
+    o.lightColor = SIMD3<Float>(u.light.x, u.light.y, u.light.z); o.lightIntensity = 1; o.lightSize = u.light.w
+    r.options = o
+    require((u.environment.z > 0.5) == (r.materials.environmentData != nil),
+        "test view environment flag matches the loaded environment")
+    require(u.sceneIndex != 6 || u.sceneGraphMode == r.materials.hasSceneGraph,
+        "test view scene-graph flag matches the loaded library")
+}
+var renderOutputs = [SIMD2<Int>: MTLTexture]()
+// Renders `samples` frames of a view through PathTracerRenderer.renderFrame, starting
+// from a reset accumulation and the first jitter/seed of the sequence, and reads back
+// the raw accumulation (returned), display, G-buffer, samples, GI reservoirs and motion.
 func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool = false) -> [SIMD4<Float>] {
-    testRenderer.resetAccumulation()
-    testRenderer.denoiserEnabled = denoise
+    let r = testRenderer
+    let camera = (r.yaw, r.pitch, r.distance, r.target, r.fov)
+    let modes = (r.samplingMode, r.enableSMS, r.skyMode, r.enableFog, r.viewportMode)
+    let savedOptions = r.options, savedFrameUpdate = r.onFrameUpdate, savedError = r.onError
+    // Run main-queue work queued before this render (e.g. controller publication), so it
+    // cannot reset the accumulation while a frame is in flight.
+    var drained = false
+    DispatchQueue.main.async { drained = true }
+    while !drained { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    applyTestView(input)
+    r.denoiserEnabled = denoise
+    r.resetAccumulation()
+    r.restartSampleSequence()
     lastResets = []
-    var u = input
-    var accumulationFrames: UInt32 = 0
-    let w = Int(u.width), h = Int(u.height)
-    func texture(_ format: MTLPixelFormat) -> MTLTexture {
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: w, height: h, mipmapped: false)
-        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .shared
+    var completed = 0, failure: String?
+    r.onFrameUpdate = { _ in completed += 1 }
+    r.onError = { failure = $0 }
+    let w = Int(input.width), h = Int(input.height)
+    let output = renderOutputs[SIMD2(w, h)] ?? {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h, mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
         return gpu.makeTexture(descriptor: d)!
-    }
-    var pos = texture(.rgba32Float), previousPos = texture(.rgba32Float)
-    var normal = texture(.rgba16Float), previousNormal = texture(.rgba16Float)
-    let albedo = texture(.rgba16Float), accum = texture(.rgba32Float), noisy = texture(.rgba32Float), output = texture(.rgba32Float)
-    var current = (0..<3).map { _ in texture(.rgba32Float) }
-    var history = (0..<3).map { _ in texture(.rgba32Float) }
-    var giCurrent = [texture(.rgba32Float), texture(.rgba16Float), texture(.rgba32Float), texture(.rgba32Float)]
-    var giHistory = [texture(.rgba32Float), texture(.rgba16Float), texture(.rgba32Float), texture(.rgba32Float)]
-    let oidnAlbedo = texture(.rgba32Float), oidnNormal = texture(.rgba32Float)
-    var display = accum
+    }()
+    renderOutputs[SIMD2(w, h)] = output
+    let usesMetalFX = denoise && input.samplingMode == 0 && input.viewportMode == 0
+    var eye = SIMD3<Float>(input.cameraPos.x, input.cameraPos.y, input.cameraPos.z)
+    let label = "scene \(input.sceneIndex), strategy \(input.samplingMode), view \(input.viewportMode)"
     for frame in 1...samples {
-        u.prevViewProj = u.currentViewProj
         if orbit && frame > 1 {
-            u.cameraPos.x += 0.025
-            let eye = SIMD3<Float>(u.cameraPos.x, u.cameraPos.y, u.cameraPos.z)
-            let target = SIMD3<Float>(u.cameraTarget.x, u.cameraTarget.y, u.cameraTarget.z)
-            u.currentViewProj = makePerspective(fovyRadians: u.cameraPos.w * .pi / 180,
-                aspect: Float(w) / Float(h), near: 0.05, far: 100) * makeLookAt(eye: eye, target: target, up: SIMD3<Float>(0, 1, 0))
-            accumulationFrames = 0
-            testRenderer.resetAccumulation(resetDenoiser: false)
+            // Production camera controls reset accumulation but keep MetalFX and ReSTIR history.
+            eye.x += 0.025
+            let offset = eye - r.target
+            r.distance = simd_length(offset); r.pitch = asin(offset.y / r.distance); r.yaw = atan2(offset.x, -offset.z)
         }
-        accumulationFrames += 1
-        u.frameIndex = accumulationFrames
-        // ReSTIR history survives orbit resets, matching renderFrame.
-        u.reservoirHistory = UInt32(frame)
-        u.sampleIndex = UInt32(frame)
-        u.jitter = frameJitter(u.sampleIndex)
-        let cb = testRenderer.commandQueue.makeCommandBuffer()!
-        let e1 = cb.makeComputeCommandEncoder()!
-        e1.setComputePipelineState(testRenderer.restirTemporalPipeline)
-        let first = [pos, normal, albedo] + current + history + [previousPos, previousNormal]
-            + giCurrent + giHistory
-        for (i, t) in first.enumerated() { e1.setTexture(t, index: i) }
-        testRenderer.materials.bind(e1)
-        e1.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-        e1.setBuffer(testRenderer.primarySurfaceBuffer(width: w, height: h)!, offset: 0, index: 3)
-        e1.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-        e1.endEncoding()
-        let e2 = cb.makeComputeCommandEncoder()!
-        e2.setComputePipelineState(testRenderer.shadingPipeline)
-        let second = [pos, normal, albedo] + current + [accum, noisy] + giCurrent
-            + [oidnAlbedo, oidnNormal]
-        for (i, t) in second.enumerated() { e2.setTexture(t, index: i) }
-        testRenderer.materials.bind(e2)
-        e2.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-        e2.setBuffer(testRenderer.primarySurfaceBuffer(width: w, height: h)!, offset: 0, index: 3)
-        e2.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-        e2.endEncoding()
-        display = testRenderer.encodePresentation(commandBuffer: cb, accumulation: accum, samples: noisy,
-            positions: pos, normals: normal, materials: albedo, output: output, uniforms: u)!
-        if denoise && u.samplingMode == 0 {
-            require(testRenderer.lastPresentationUsedMetalFX, "native MetalFX is used, not a fallback")
-            lastResets.append(testRenderer.lastMetalFXReset)
+        let target = completed + 1, submitted = r.frameIndex, generation = r.interactionGeneration
+        r.renderFrame(output: output)
+        require(r.frameIndex == submitted + 1, "\(label): renderFrame did not submit a frame")
+        if usesMetalFX && r.supportsMetalFX {
+            require(r.lastPresentationUsedMetalFX, "native MetalFX is used, not a fallback (\(label))")
+            lastResets.append(r.lastMetalFXReset)
+        } else if usesMetalFX {
+            require(!r.lastPresentationUsedMetalFX && r.lastDisplay === r.accumTexture, "MetalFX-unavailable fallback shows the raw render")
         }
-        cb.commit(); cb.waitUntilCompleted()
-        require(cb.status == .completed, "scene \(u.sceneIndex), strategy \(u.samplingMode): \(String(describing: cb.error))")
-        lastDenoiseMilliseconds = (cb.gpuEndTime - cb.gpuStartTime) * 1000
-        swap(&pos, &previousPos); swap(&normal, &previousNormal); swap(&current, &history)
-        swap(&giCurrent, &giHistory)
+        let deadline = Date().addingTimeInterval(60)
+        while completed < target && failure == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+        require(failure == nil && completed >= target, "\(label): \(failure ?? "renderFrame did not complete a frame")"
+            + (r.interactionGeneration != generation ? " (accumulation was reset while the frame was in flight)" : ""))
+        lastDenoiseMilliseconds = r.gpuMilliseconds
+        frameMilliseconds.append(r.gpuMilliseconds)
     }
-    lastDisplay = readTexture(display)
-    lastMaterials = readTexture(albedo)
-    lastNormals = readTexture(previousNormal)
-    lastPositions = readTexture(previousPos)
-    lastSamples = readTexture(noisy)
-    lastGIWeights = readTexture(giHistory[3])
-    if denoise && u.samplingMode == 0 { lastMotion = readTexture(testRenderer.metalFX!.motion) }
+    require(simd_length(SIMD3(r.lastUniforms!.cameraPos.x, r.lastUniforms!.cameraPos.y, r.lastUniforms!.cameraPos.z) - eye)
+        < 1e-4 * max(1, r.distance), "production camera reproduces the test view")
+    lastRenderUniforms = r.lastUniforms
+    lastDisplay = readTexture(r.lastDisplay!)
+    lastMaterials = readTexture(r.gbufferAlbedoRough!)
+    // renderFrame swaps G-buffer and GI reservoirs after encoding: the "history" and
+    // "B" textures hold what the final frame wrote.
+    lastNormals = readTexture(r.historyNormalMat!)
+    lastPositions = readTexture(r.historyPosDepth!)
+    lastSamples = readTexture(r.sampleTexture!)
+    lastGIWeights = readTexture(r.giWeightsB!)
+    if usesMetalFX, let fx = r.metalFX { lastMotion = readTexture(fx.motion) }
     require(lastDisplay.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }, "finite denoised image")
-    let pixels = readTexture(accum)
+    let pixels = readTexture(r.accumTexture!)
     require(pixels.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite && $0.x >= 0 && $0.y >= 0 && $0.z >= 0 }, "finite nonnegative pixels")
+    r.onFrameUpdate = savedFrameUpdate; r.onError = savedError
+    (r.samplingMode, r.enableSMS, r.skyMode, r.enableFog, r.viewportMode) = modes
+    (r.yaw, r.pitch, r.distance, r.target, r.fov) = camera
+    r.options = savedOptions
     return pixels
 }
 func mean(_ pixels: [SIMD4<Float>]) -> Float {
     pixels.reduce(Float(0)) { $0 + ($1.x + $1.y + $1.z) / 3 } / Float(pixels.count)
+}
+// Mean and cluster-robust standard error of a - b (channel mean) over `pixels`, with
+// `block`x`block` tiles as clusters so that correlated neighbours (ReSTIR spatial reuse)
+// are not treated as independent samples; `reference` is the mean of b.
+func pairedDifference(_ a: [SIMD4<Float>], _ b: [SIMD4<Float>], width: Int, pixels: [Int], block: Int = 4)
+    -> (mean: Float, se: Float, reference: Float) {
+    var tiles = [Int: (difference: Double, reference: Double, count: Double)]()
+    for i in pixels {
+        let x = Double(a[i].x + a[i].y + a[i].z) / 3, y = Double(b[i].x + b[i].y + b[i].z) / 3
+        let key = (i / width / block) * 65536 + (i % width) / block
+        let t = tiles[key] ?? (0, 0, 0)
+        tiles[key] = (t.difference + x - y, t.reference + y, t.count + 1)
+    }
+    let n = Double(pixels.count), k = Double(tiles.count)
+    require(k > 10, "paired comparison has enough independent tiles")
+    let mean = tiles.values.reduce(0) { $0 + $1.difference } / n
+    let variance = k / (k - 1) * tiles.values.reduce(0) { $0 + pow($1.difference - mean * $1.count, 2) } / (n * n)
+    return (Float(mean), Float(variance.squareRoot()), Float(tiles.values.reduce(0) { $0 + $1.reference } / n))
 }
 func savePreview(_ panels: [[SIMD4<Float>]], width: Int, height: Int, name: String) {
     let scale = 3, totalWidth = width * panels.count * scale
@@ -238,11 +290,11 @@ func savePreview(_ panels: [[SIMD4<Float>]], width: Int, height: Int, name: Stri
             }}
         }}
     }
-    let directory = URL(fileURLWithPath: "build/checks", isDirectory: true)
+    let directory = testOutputDirectory
     try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     try! rep.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent(name))
 }
-
+// verify.py: end of shared GPU helpers
 for scene in UInt32(0)...5 {
     for mode in UInt32(0)...3 {
         let pixels = render(makeUniforms(scene: scene, mode: mode, width: 49, height: 33), samples: 8)
@@ -252,23 +304,32 @@ for scene in UInt32(0)...5 {
 print("PASS: all six scenes and four strategies at a non-threadgroup-aligned size")
 var lightView = makeUniforms(scene: 1, mode: 1, width: 3, height: 3)
 lightView.cameraPos = SIMD4<Float>(0, 0.5, 0, 10)
-lightView.cameraTarget = SIMD4<Float>(0, 0.999, 0, 16)
-lightView.cameraUp = SIMD4<Float>(0, 0, 1, 0)
+// Nearly vertical: production orbit cameras keep +Y up.
+lightView.cameraTarget = SIMD4<Float>(0, 0.999, 0.01, 16)
 let lightPixels = render(lightView, samples: 1)
 require(abs(lightPixels[4].x - 18) < 0.02 && abs(lightPixels[4].y - 15) < 0.02, "primary visible emission survives G-buffer")
 let clear = render(makeUniforms(scene: 4, mode: 1, width: 49, height: 33), samples: 16)
 let fog = render(makeUniforms(scene: 4, mode: 1, width: 49, height: 33, fog: 1), samples: 16)
 require(abs(mean(clear) - mean(fog)) > 0.001, "fog toggle changes rendered output")
 print("PASS: visible emitter radiance and fog toggle")
-var energy = [Float]()
+// Strategies must agree within Monte Carlo error. Directly visible emitters (identical
+// in every strategy) are excluded rather than diluting the comparison, and each estimate
+// is paired per pixel against MIS with a tile-clustered standard error (SE). Unbiased
+// pairs must agree within 4 SE, and 512 samples keep 4 SE below 5% of the mean, so a
+// few-percent MIS/weighting regression fails. ReSTIR's approximate reuse measured
+// +1.2% (±0.2%) here; it may deviate by up to 3% beyond 4 SE.
+var strategyImages = [[SIMD4<Float>]]()
 for mode in UInt32(0)...3 {
-    energy.append(mean(render(makeUniforms(scene: 1, mode: mode, width: 48, height: 32), samples: 128)))
+    strategyImages.append(render(makeUniforms(scene: 1, mode: mode, width: 48, height: 32), samples: 512))
 }
-print("Cornell mean radiance (ReSTIR, MIS, NEE, BSDF): \(energy)")
-require(abs(energy[1] - energy[2]) / energy[1] < 0.12, "MIS and NEE agree in mean radiance")
-require(abs(energy[1] - energy[3]) / energy[1] < 0.18, "MIS and BSDF agree in mean radiance")
-// ReSTIR uses approximate reuse; guard against major energy regressions.
-require(abs(energy[0] - energy[1]) / energy[1] < 0.25, "ReSTIR energy sanity")
+let strategyPixels = lastPositions.indices.filter { lastPositions[$0].w > 0 && Int(lastNormals[$0].w) != 3 }
+print("Cornell mean radiance (ReSTIR, MIS, NEE, BSDF): \(strategyImages.map(mean))")
+for (other, name) in [(2, "NEE"), (3, "BSDF"), (0, "ReSTIR")] {
+    let d = pairedDifference(strategyImages[other], strategyImages[1], width: 48, pixels: strategyPixels)
+    print("Cornell \(name) - MIS over \(strategyPixels.count) non-emitter pixels: \(d.mean) ± \(d.se) (MIS \(d.reference))")
+    require(4 * d.se < 0.05 * d.reference, "\(name)/MIS comparison resolves a 5% energy difference")
+    require(abs(d.mean) < 4 * d.se + (other == 0 ? 0.03 * d.reference : 0), "\(name) and MIS agree in mean radiance")
+}
 print("PASS: sampling strategy energy checks")
 
 // White-furnace integration catches angular energy loss that scene averages miss.
@@ -280,7 +341,7 @@ kernel void furnace_check(device float4 *results [[buffer(0)]], uint id [[thread
     Material white = { GLOSSY, float3(1), float3(0), roughness, 1 };
     float3 wo = float3(sqrt(1.0f - cosine * cosine), 0, cosine), normal = float3(0, 0, 1);
     uint seed = pcg_hash(id + 19);
-    float sum = 0, maxWeight = 0, oldSum = 0, quadrature = 0;
+    float sum = 0, maxWeight = 0, quadrature = 0;
     for (int i = 0; i < 65536; ++i) {
         float3 direction, weight; float pdf;
         if (sample_bsdf(white, normal, -wo, true, seed, direction, weight, pdf)) {
@@ -292,17 +353,8 @@ kernel void furnace_check(device float4 *results [[buffer(0)]], uint id [[thread
         float z = r.x, phi = TWO_PI * r.y;
         float3 wi = float3(sqrt(1.0f - z*z) * cos(phi), sqrt(1.0f - z*z) * sin(phi), z);
         quadrature += eval_bsdf(white, normal, wo, wi).x * z * TWO_PI;
-        // Previous normalized Phong model, for a direct grazing-angle regression.
-        float exponent = max(0.0f, 2.0f / (roughness * roughness + 1e-5f) - 2.0f);
-        float cosTheta = pow(1.0f - rand_f(seed), 1.0f / (exponent + 1.0f));
-        float azimuth = TWO_PI * rand_f(seed);
-        float3 reflection = reflect(-wo, normal), t, b;
-        make_basis(reflection, t, b);
-        float3 oldDirection = t * cos(azimuth) * sqrt(1.0f - cosTheta*cosTheta) +
-            b * sin(azimuth) * sqrt(1.0f - cosTheta*cosTheta) + reflection * cosTheta;
-        oldSum += (exponent + 2.0f) / (exponent + 1.0f) * max(0.0f, oldDirection.z);
     }
-    results[id] = float4(sum / 65536.0f, maxWeight, oldSum / 65536.0f, quadrature / 65536.0f);
+    results[id] = float4(sum / 65536.0f, maxWeight, 0, quadrature / 65536.0f);
 }
 """
 let furnaceLibrary = try gpu.makeLibrary(source: metalSource + furnaceSource, options: shaderCompileOptions())
@@ -320,20 +372,28 @@ for i in 0..<20 {
     print("OpenPBR furnace \(i): mean=\(r.x), maximum sample=\(r.y), independent=\(r.w)")
     require(r.x.isFinite && abs(r.x - 1) < 0.015, "OpenPBR white-metal furnace retains unit energy, case \(i)")
     if i >= 10 { require(abs(r.x - r.w) < 0.035, "independent BRDF integration agrees with VNDF sampling, case \(i)") }
-    if i == 8 {
-        print("White furnace, roughness 0.1 at N·V=0.05: old=\(r.z), GGX=\(r.x)")
-        require(r.x > 0.85 && r.z < 0.12, "grazing black-rim regression")
-    }
+    // Grazing cases (N·V down to 0.02) are covered by the production unit-energy bound above.
+    if i == 8 { print("White furnace, roughness 0.1 at N·V=0.05: GGX=\(r.x)") }
 }
 print("PASS: 20 angular/roughness energy cases and independent BRDF integration")
 
+// MetalFX checks run only where the device supports it; the fallback path (raw
+// accumulation) is covered by Fix_tests.swift on every device.
+let metalFXAvailable = testRenderer.supportsMetalFX
+if !metalFXAvailable { print("SKIP: MetalFX checks (\(gpu.name) does not support the temporal denoised scaler)") }
+// Region-mean MetalFX output versus the raw accumulation of the same frames.
+func metalFXEnergyRatio(_ output: [SIMD4<Float>], _ raw: [SIMD4<Float>], _ pixels: [Int]) -> Float {
+    mean(pixels.map { output[$0] }) / max(1e-6, mean(pixels.map { raw[$0] }))
+}
 let denoiseUniforms = makeUniforms(scene: 1, mode: 0, width: 128, height: 96)
 let lowSamples = render(denoiseUniforms, samples: 4)
 require(lastGIWeights.contains { $0.y > 0 && $0.z > 0 }, "first-bounce ReSTIR GI produces valid reservoirs")
 let rawDisplay = lastDisplay
 let lowWithFilter = render(denoiseUniforms, samples: 4, denoise: true)
-require(lastResets == [true, false, false, false], "stationary MetalFX temporal history")
-require(lastMotion.allSatisfy { abs($0.x) < 0.001 && abs($0.y) < 0.001 }, "jitter is excluded from static motion vectors")
+if metalFXAvailable {
+    require(lastResets == [true, false, false, false], "stationary MetalFX temporal history")
+    require(lastMotion.allSatisfy { abs($0.x) < 0.001 && abs($0.y) < 0.001 }, "jitter is excluded from static motion vectors")
+}
 let filtered = lastDisplay
 require(lowSamples == lowWithFilter && rawDisplay == lowSamples, "denoise does not alter raw accumulation")
 let reference = render(denoiseUniforms, samples: 256)
@@ -363,9 +423,21 @@ print("Display-space MSE: raw=\(displayRawError), denoised=\(displayFilteredErro
 // MetalFX reconstructs subpixel coverage and is a biased display estimator.
 // Track linear error too; gate the quality of the actual tone-mapped display.
 require(filteredError.isFinite, "finite MetalFX linear image error")
-print("MetalFX display error ratio: \(displayFilteredError / displayRawError)")
-require(displayFilteredError < displayRawError * 0.8, "MetalFX reduces low-sample displayed image error")
+if metalFXAvailable {
+    print("MetalFX display error ratio: \(displayFilteredError / displayRawError)")
+    require(displayFilteredError < displayRawError * 0.8, "MetalFX reduces low-sample displayed image error")
+}
 savePreview([lowSamples, filtered, reference], width: 128, height: 96, name: "denoiser-check.png")
+if metalFXAvailable {
+    // Diffuse Cornell radiance: MetalFX region means track the raw accumulation within 8%.
+    let cornell32 = render(denoiseUniforms, samples: 32, denoise: true)
+    let cornellTypes = lastNormals.map { Int($0.w) }
+    let cornellSurfaces = cornellTypes.indices.filter { cornellTypes[$0] != 3 && lastPositions[$0].w > 0 }
+    let cornellEmitters = cornellTypes.indices.filter { cornellTypes[$0] == 3 }
+    let cornellRatio = metalFXEnergyRatio(lastDisplay, cornell32, cornellSurfaces)
+    print("Cornell 32-frame MetalFX/raw energy: surfaces \(cornellRatio), visible emitters \(metalFXEnergyRatio(lastDisplay, cornell32, cornellEmitters))")
+    require(abs(cornellRatio - 1) < 0.08, "MetalFX preserves diffuse Cornell radiance within 8%")
+}
 let bypass = render(makeUniforms(scene: 0, mode: 1, width: 47, height: 31), samples: 2, denoise: true)
 require(bypass == lastDisplay, "non-ReSTIR denoiser bypass")
 _ = render(makeUniforms(scene: 0, mode: 0, width: 64, height: 48), samples: 2, denoise: true)
@@ -373,8 +445,10 @@ print("PASS: raw invariance, non-ReSTIR bypass, and resize")
 
 // Check the motion/history contract while the camera moves, then an explicit cut.
 _ = render(makeUniforms(scene: 0, mode: 0, width: 128, height: 96), samples: 4, denoise: true, orbit: true)
-require(lastResets == [true, false, false, false], "orbit preserves MetalFX history")
-require(lastMotion.contains { abs($0.x) + abs($0.y) > 0.01 }, "camera movement produces pixel motion vectors")
+if metalFXAvailable {
+    require(lastResets == [true, false, false, false], "orbit preserves MetalFX history")
+    require(lastMotion.contains { abs($0.x) + abs($0.y) > 0.01 }, "camera movement produces pixel motion vectors")
+}
 testRenderer.resetAccumulation()
 require(testRenderer.metalFXHistoryNeedsReset, "scene cut clears history")
 testRenderer.denoiserEnabled = false; testRenderer.denoiserEnabled = true
@@ -386,9 +460,6 @@ var pavilion = makeUniforms(scene: 0, mode: 0, width: 320, height: 240)
 let previewEye = SIMD3<Float>(1.2, 0.6, -0.9), previewTarget = SIMD3<Float>(0.05, -0.55, 0.85)
 pavilion.cameraPos = SIMD4<Float>(previewEye, 50)
 pavilion.cameraTarget = SIMD4<Float>(previewTarget, 16)
-pavilion.currentViewProj = makePerspective(fovyRadians: 50 * .pi / 180, aspect: 320.0 / 240.0, near: 0.05, far: 100)
-    * makeLookAt(eye: previewEye, target: previewTarget, up: SIMD3<Float>(0, 1, 0))
-pavilion.prevViewProj = pavilion.currentViewProj
 let pavilionRaw = render(pavilion, samples: 8, denoise: true)
 let pavilionFiltered = lastDisplay
 print("320x240 render + MetalFX GPU time: \(lastDenoiseMilliseconds) ms")
@@ -399,23 +470,35 @@ savePreview([pavilionRaw, pavilionFiltered, pavilionReference], width: 320, heig
 let pavilionRaw32 = render(pavilion, samples: 32, denoise: true)
 let metalFXReflection = lastDisplay
 let reflectionNormals = lastNormals
-let specularHits = readTexture(testRenderer.metalFX!.hitDistance)
-let roughnessGuide = readTexture(testRenderer.metalFX!.roughness)
-let specularGuide = readTexture(testRenderer.metalFX!.specular)
-let diffuseGuide = readTexture(testRenderer.metalFX!.diffuse)
 let types = reflectionNormals.map { Int($0.w) }
 let specularIndices = types.indices.filter { types[$0] == 1 || types[$0] == 2 }
 require(!specularIndices.isEmpty, "preview contains reflective surfaces")
-require(specularIndices.contains { specularHits[$0].x > 0 }, "reflection distance is populated")
-require(specularIndices.allSatisfy { roughnessGuide[$0].x >= 0 && roughnessGuide[$0].x <= 1 && (specularGuide[$0].x + diffuseGuide[$0].x) >= 0 }, "valid specular guides")
-let specularReference = specularIndices.map { pavilionReference[$0] }
-let specularNoisy = specularIndices.map { pavilionRaw32[$0] }
-let specularDenoised = specularIndices.map { metalFXReflection[$0] }
-let reflectionError8 = mse(displayPixels(specularIndices.map { pavilionFiltered[$0] }), displayPixels(specularReference))
-let reflectionRawError8 = mse(displayPixels(specularIndices.map { pavilionRaw[$0] }), displayPixels(specularReference))
-print("Reflective region 8-frame display error: raw=\(reflectionRawError8), MetalFX=\(reflectionError8)")
-require(reflectionError8 < reflectionRawError8 * 0.8, "MetalFX improves low-sample reflective-region error")
-print("Reflective region display error: raw32=\(mse(displayPixels(specularNoisy), displayPixels(specularReference))), MetalFX32=\(mse(displayPixels(specularDenoised), displayPixels(specularReference)))")
+if let fx = testRenderer.metalFX {
+    let specularHits = readTexture(fx.hitDistance)
+    let roughnessGuide = readTexture(fx.roughness)
+    let specularGuide = readTexture(fx.specular)
+    let diffuseGuide = readTexture(fx.diffuse)
+    require(specularIndices.contains { specularHits[$0].x > 0 }, "reflection distance is populated")
+    require(specularIndices.allSatisfy { roughnessGuide[$0].x >= 0 && roughnessGuide[$0].x <= 1 && (specularGuide[$0].x + diffuseGuide[$0].x) >= 0 }, "valid specular guides")
+    let specularReference = specularIndices.map { pavilionReference[$0] }
+    let specularNoisy = specularIndices.map { pavilionRaw32[$0] }
+    let specularDenoised = specularIndices.map { metalFXReflection[$0] }
+    let reflectionError8 = mse(displayPixels(specularIndices.map { pavilionFiltered[$0] }), displayPixels(specularReference))
+    let reflectionRawError8 = mse(displayPixels(specularIndices.map { pavilionRaw[$0] }), displayPixels(specularReference))
+    print("Reflective region 8-frame display error: raw=\(reflectionRawError8), MetalFX=\(reflectionError8)")
+    require(reflectionError8 < reflectionRawError8 * 0.8, "MetalFX improves low-sample reflective-region error")
+    print("Reflective region display error: raw32=\(mse(displayPixels(specularNoisy), displayPixels(specularReference))), MetalFX32=\(mse(displayPixels(specularDenoised), displayPixels(specularReference)))")
+    // MetalFX output is a display estimate; its region means must still track the raw
+    // radiance of the same frames (diffuse surfaces, sky and emitters excluded).
+    let diffuseIndices = types.indices.filter { types[$0] == 0 && lastPositions[$0].w > 0 }
+    let pavilionDiffuseRatio = metalFXEnergyRatio(metalFXReflection, pavilionRaw32, diffuseIndices)
+    let pavilionReflectiveRatio = metalFXEnergyRatio(metalFXReflection, pavilionRaw32, specularIndices)
+    print("Pavilion 32-frame MetalFX/raw energy: diffuse \(pavilionDiffuseRatio), reflective \(pavilionReflectiveRatio), whole image \(mean(metalFXReflection) / mean(pavilionRaw32))")
+    // MetalFX dims high-variance (caustic, glossy) radiance, so its output and EXR
+    // exports are not radiometric. These floors sit under the measured M4/macOS 26
+    // ratios (0.87, 0.69) and catch regressions of the earlier 29% class.
+    require(pavilionDiffuseRatio > 0.82 && pavilionReflectiveRatio > 0.6, "MetalFX pavilion energy stays above its measured floor")
+}
 savePreview([pavilionRaw32, metalFXReflection, pavilionReference], width: 320, height: 240, name: "metalfx-reflections.png")
 
 // Resolve the SDK/header versus video mask-convention discrepancy empirically.
@@ -448,9 +531,6 @@ var cylinder = makeUniforms(scene: 0, mode: 0, width: 240, height: 160)
 let cylinderEye = SIMD3<Float>(0.70, -0.40, -2.0), cylinderTarget = SIMD3<Float>(0.70, -0.65, 0.1)
 cylinder.cameraPos = SIMD4<Float>(cylinderEye, 30)
 cylinder.cameraTarget = SIMD4<Float>(cylinderTarget, 16)
-cylinder.currentViewProj = makePerspective(fovyRadians: 30 * .pi / 180, aspect: 1.5, near: 0.05, far: 100)
-    * makeLookAt(eye: cylinderEye, target: cylinderTarget, up: SIMD3<Float>(0, 1, 0))
-cylinder.prevViewProj = cylinder.currentViewProj
 let cylinderRaw = render(cylinder, samples: 64, denoise: true)
 let cylinderFX = lastDisplay
 let cylinderInside = cylinderRaw.indices.filter { i in
@@ -461,7 +541,7 @@ let cylinderInside = cylinderRaw.indices.filter { i in
 }
 require(cylinderInside.count > 30, "grazing view covers the cylinder's inner wall")
 func cylinderMean(_ pixels: [SIMD4<Float>]) -> Float { mean(cylinderInside.map { pixels[$0] }) }
-for (name, pixels) in [("raw", cylinderRaw), ("MetalFX", cylinderFX)] {
+for (name, pixels) in metalFXAvailable ? [("raw", cylinderRaw), ("MetalFX", cylinderFX)] : [("raw", cylinderRaw)] {
     let lit = cylinderInside.filter { max(pixels[$0].x, max(pixels[$0].y, pixels[$0].z)) > 0.05 }.count
     require(Float(lit) / Float(cylinderInside.count) > 0.95, "\(name): grazing cylinder interior receives light")
     let color = cylinderInside.reduce(SIMD3<Float>(repeating: 0)) {
@@ -471,9 +551,21 @@ for (name, pixels) in [("raw", cylinderRaw), ("MetalFX", cylinderFX)] {
     require(color.y > color.x * 0.35 && color.y > color.z,
       "\(name): grazing gold interior stays gold rather than collapsing to red")
 }
+if metalFXAvailable {
+    let cylinderRatio = metalFXEnergyRatio(cylinderFX, cylinderRaw, cylinderInside)
+    print("Cylinder 64-frame MetalFX/raw energy: \(cylinderRatio)")
+    require(cylinderRatio > 0.72, "MetalFX grazing-cylinder energy stays above its measured floor (0.77)")
+}
+// Depth 64 versus the default 16 on the same sample sequence: the paired difference
+// isolates the energy of the extra bounces (measured +4.3% ± 0.6%). Fail only when the
+// gain exceeds 5% by more than 3 standard errors, a one-sided test that noise cannot trip.
 cylinder.cameraTarget.w = 64
 let cylinderDeep = render(cylinder, samples: 64)
-let cylinderRelativeError = abs(cylinderMean(cylinderRaw) - cylinderMean(cylinderDeep)) / cylinderMean(cylinderDeep)
-require(cylinderRelativeError < 0.05, "cylinder brightness is independent of a larger scattering budget")
+let cylinderBudget = pairedDifference(cylinderDeep, cylinderRaw, width: 240, pixels: cylinderInside)
+let cylinderDeepMean = cylinderMean(cylinderDeep)
+print("Cylinder energy gained from depth 16 to 64: \(cylinderBudget.mean / cylinderDeepMean) ± \(cylinderBudget.se / cylinderDeepMean)")
+require(cylinderBudget.se < 0.01 * cylinderDeepMean, "cylinder budget comparison resolves 1% differences")
+require(cylinderBudget.mean - 3 * cylinderBudget.se < 0.05 * cylinderDeepMean,
+    "cylinder brightness is independent of a larger scattering budget")
 savePreview([cylinderRaw, cylinderFX, cylinderDeep], width: 240, height: 160, name: "cylinder-grazing.png")
 print("PASS: grazing cylinder interior, \(cylinderInside.count) pixels, raw/MetalFX/deep means \(cylinderMean(cylinderRaw))/\(cylinderMean(cylinderFX))/\(cylinderMean(cylinderDeep))")

@@ -1,61 +1,71 @@
 #!/usr/bin/env python3
-"""Compile the app and run the actual Metal kernels without opening a window."""
+"""Compile the app and run the actual Metal kernels without opening a window.
+Usage: python3 tests/verify.py [--studio-only | --usd-only] [--require-reference]
+"""
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
 import platform
-import os
 
-root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness
+
+FLAGS = {'--studio-only', '--usd-only', '--require-reference'}
+unknown = [a for a in sys.argv[1:] if a not in FLAGS]
+if unknown:
+    raise SystemExit('verify.py: unknown argument(s) ' + ' '.join(unknown) + '; expected ' + ', '.join(sorted(FLAGS)))
+if '--studio-only' in sys.argv and '--usd-only' in sys.argv:
+    raise SystemExit('verify.py: --studio-only and --usd-only are exclusive')
+mode = 'studio' if '--studio-only' in sys.argv else 'usd' if '--usd-only' in sys.argv else 'full'
+reference = [a for a in sys.argv[1:] if a == '--require-reference']
+ALL = {'full', 'studio', 'usd'}
+# Appended in this order. 'helpers'/'controller' select the marked section of a file.
+PARTS = [
+    ('GPUChecks.swift', {'full'}), ('GPUChecks.swift:helpers', {'studio', 'usd'}),
+    ('MaterialChecks.swift', {'full'}),
+    ('StudioChecks.swift', {'full', 'studio'}), ('StudioChecks.swift:controller', {'usd'}),
+    ('Fix_oidn-export.swift', {'full', 'studio'}),
+    ('MaterialXChecks.swift', {'full', 'studio'}),
+    ('USDChecks.swift', ALL),
+    ('Fix_integration.swift', ALL), ('Fix_lights.swift', ALL), ('Fix_geometry.swift', ALL),
+    ('Fix_bsdf-legacy.swift', {'full'}),
+    ('Fix_materialx.swift', {'full', 'studio'}),
+    ('Fix_integrator.swift', {'full'}),
+    ('Fix_gpu-memory.swift', {'full'}), ('Fix_presentation.swift', {'full'}),
+    ('Fix_persistence.swift', {'full', 'studio'}), ('Fix_frontend.swift', {'full', 'studio'}),
+    ('Fix_usd.swift', {'full', 'usd'}),
+    ('Fix_tests.swift', {'full'}),
+    ('Fix_build.swift', ALL),
+]
+# One GPU suite at a time per checkout; each run writes into its own output directory.
+lock = harness.suite_lock()
+root = harness.ROOT
+output = harness.output_directory('verify')
+environment = {**os.environ, harness.OUTPUT_VARIABLE: str(output), 'VIBE_TRACER_REPOSITORY': str(root)}
 subprocess.run([sys.executable, str(root / 'scripts/prepare_shaders.py')], check=True)
 subprocess.run(['/usr/bin/python3', str(root / 'scripts/prepare_usd.py')], check=True)
 subprocess.run([sys.executable, str(root / 'scripts/prepare_oidn.py'), '--arch', platform.machine()], check=True)
-subprocess.run(['/usr/bin/python3', str(root / 'tests/USDChecks.py')] + [a for a in sys.argv[1:] if a == '--require-reference'], check=True)
-subprocess.run([sys.executable, str(root / 'tests/Fix_build.py')], check=True)
-source = (root / 'main.swift').read_text()
-# Retain production definitions, replacing only the GUI entry point.
-source = source.split('// 5. App Entry Point')[0]
-source += '\n' + '\n'.join(p.read_text() for p in sorted((root / 'Sources').glob('*.swift')))
-gpu_checks = (root / 'tests' / 'GPUChecks.swift').read_text()
-if '--studio-only' in sys.argv or '--usd-only' in sys.argv:
-    source += '\n' + gpu_checks.split('for scene in UInt32(0)...5')[0]
-else:
-    source += '\n' + gpu_checks
-    source += '\n' + (root / 'tests' / 'MaterialChecks.swift').read_text()
-if '--usd-only' in sys.argv:
-    studio = (root / 'tests' / 'StudioChecks.swift').read_text()
-    source += '\n' + 'let application=' + studio.split('let application=')[1].split('for page in')[0]
-else:
-    source += '\n' + (root / 'tests' / 'StudioChecks.swift').read_text()
-    source += '\n' + (root / 'tests' / 'Fix_oidn-export.swift').read_text()
-    source += '\n' + (root / 'tests' / 'MaterialXChecks.swift').read_text()
-source += '\n' + (root / 'tests' / 'USDChecks.swift').read_text()
-source += '\n' + (root / 'tests' / 'Fix_integration.swift').read_text()
-source += '\n' + (root / 'tests' / 'Fix_lights.swift').read_text()
-source += '\n' + (root / 'tests' / 'Fix_geometry.swift').read_text()
-if '--studio-only' not in sys.argv and '--usd-only' not in sys.argv:
-    source += '\n' + (root / 'tests' / 'Fix_bsdf-legacy.swift').read_text()
-if '--usd-only' not in sys.argv:
-    source += '\n' + (root / 'tests' / 'Fix_materialx.swift').read_text()
-if '--studio-only' not in sys.argv and '--usd-only' not in sys.argv:
-    source += '\n' + (root / 'tests' / 'Fix_integrator.swift').read_text()
-if '--studio-only' not in sys.argv and '--usd-only' not in sys.argv:
-    source += '\n' + (root / 'tests' / 'Fix_gpu-memory.swift').read_text()
-    source += '\n' + (root / 'tests' / 'Fix_presentation.swift').read_text()
-if '--usd-only' not in sys.argv:
-    source += '\n' + (root / 'tests' / 'Fix_persistence.swift').read_text()
-    source += '\n' + (root / 'tests' / 'Fix_frontend.swift').read_text()
-if '--studio-only' not in sys.argv:
-    source += '\n' + (root / 'tests' / 'Fix_usd.swift').read_text()
-source += '\n' + (root / 'tests' / 'Fix_build.swift').read_text()
+# -E ignores PYTHONOPTIMIZE and friends, so assert-based helper checks cannot pass vacuously.
+subprocess.run(['/usr/bin/python3', '-E', str(root / 'tests/USDChecks.py')] + reference, check=True, env=environment)
+subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_build.py')], check=True, env=environment)
+subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_tests.py')], check=True, env=environment)
+source = harness.production_source()
+for name, modes in PARTS:
+    if mode not in modes:
+        continue
+    file, _, section = name.partition(':')
+    text = {'helpers': harness.gpu_helpers, 'controller': harness.studio_controller}[section]() if section \
+        else harness.test_file(file)
+    source += '\n' + text
 with tempfile.TemporaryDirectory(prefix='vibe-tracer-tests-') as directory:
-    folder = Path(directory)
-    swift = folder / 'main.swift'
-    swift.write_text(source)
-    binary = folder / 'GPUChecks'
-    subprocess.run(['xcrun', 'swiftc', '-O', '-D', 'VIBE_TESTING', '-target', platform.machine() + '-apple-macosx26.0', '-module-cache-path', str(folder / 'cache'),
-                    str(swift), '-o', str(binary)], check=True)
+    binary = harness.compile_swift(source, Path(directory), 'GPUChecks')
     # Unbundled test binary: resources resolve under the explicit repository root only.
-    sys.exit(subprocess.run([str(binary)] + [a for a in sys.argv[1:] if a == '--require-reference'], cwd=root,
-                            env={**os.environ, 'VIBE_TRACER_REPOSITORY': str(root)}).returncode)
+    # A generous bound turns an unexpected hang into a failure.
+    try:
+        code = subprocess.run([str(binary)] + reference, cwd=root, env=environment, timeout=3600).returncode
+    except subprocess.TimeoutExpired:
+        raise SystemExit('FAIL: the GPU suite did not finish within an hour')
+print(f'Test output: {output.relative_to(root)} (build/checks/latest)')
+sys.exit(code)

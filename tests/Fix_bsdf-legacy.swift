@@ -1,6 +1,6 @@
 // Appended last by verify.py (full suite): legacy material path and delta BSDF regressions.
 func fixBsdfLegacyChecks() throws {
-  let folder = URL(fileURLWithPath: "build/checks/fix-bsdf-legacy", isDirectory: true)
+  let folder = testOutputDirectory.appendingPathComponent("fix-bsdf-legacy", isDirectory: true)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
   func fixture(_ name: String, _ pixel: [UInt8]) throws -> URL {
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8,
@@ -136,6 +136,10 @@ func fixBsdfLegacyChecks() throws {
   // R-05: +Y green tilts toward the image top (+Y here), matching MaterialX normalmap.
   let legacy = xyz(out[3]), materialX = xyz(out[5])
   require(legacy.y > 0.2 && simd_dot(legacy, tangent) > 0.2, "inspector normal map follows +Y green and +X red")
+  // R-116: the analytic tangent frame. The panel's image top is world +Y, so the texel
+  // (200, 180, 255) maps to normalize(T (2*200/255-1) + Y (2*180/255-1) + N).
+  let analytic = simd_normalize(tangent * (2 * 200 / 255 - 1) + SIMD3<Float>(0, 1, 0) * (2 * 180 / 255 - 1) + smooth)
+  require(simd_length(legacy - analytic) < 0.005, "tilted normal map matches the analytic tangent frame: \(legacy) vs \(analytic)")
   require(simd_length(legacy - materialX) < 0.01, "inspector and MaterialX normal maps agree")
   // R-06: a flat map keeps the interpolated shading normal.
   require(simd_dot(xyz(out[7]), smooth) > 0.9999, "flat inspector normal map keeps the smooth normal")

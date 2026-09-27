@@ -2,7 +2,7 @@
 require(MemoryLayout<ObjectSettings>.stride == 64,"object settings layout")
 require(MemoryLayout<MeshTriangle>.stride == 128,"triangle layout")
 require(MemoryLayout<MeshNode>.stride == 48,"BVH layout")
-let studioDirectory=URL(fileURLWithPath:"build/checks/studio",isDirectory:true)
+let studioDirectory=testOutputDirectory.appendingPathComponent("studio",isDirectory:true)
 try FileManager.default.createDirectory(at:studioDirectory,withIntermediateDirectories:true)
 let obj="""
 v -1 0 0
@@ -274,12 +274,16 @@ require(testRenderer.reachedLimit,"time target stops rendering")
 print("PASS: production render scale, MetalFX, sample/time limits, display-only accumulation preservation")
 
 // AppKit layout/actions, without displaying a native window or touching user autosave.
+// verify.py: begin studio controller
 let application=NSApplication.shared
 application.setActivationPolicy(.prohibited)
 let testWindow=NSWindow(contentRect:NSRect(x:0,y:0,width:900,height:680),styleMask:[.titled,.resizable],backing:.buffered,defer:false)
 let controller=StudioController(renderer:testRenderer,window:testWindow)
 testWindow.contentView=controller.view
 controller.viewport.isPaused=true
+// Autosaves from test edits stay in the run directory, never the user's Application Support.
+controller.autosaveURL=testOutputDirectory.appendingPathComponent("studio/Autosave.vtrace")
+// verify.py: end studio controller
 for page in 0..<7 {
     controller.page=page;controller.rebuild();controller.view.layoutSubtreeIfNeeded()
     require(controller.stack.arrangedSubviews.count>3,"inspector page \(page) contains controls")
@@ -315,8 +319,13 @@ require(abs(testRenderer.yaw - 1.1) < 1e-6 && abs(testRenderer.distance - 0.002)
   "same-scene assignment preserves camera")
 let tinyClip = testRenderer.cameraClipPlanes()
 require(tinyClip.near < 0.001 && tinyClip.far >= 100, "camera clip planes support tiny scenes")
-require(testRenderer.renderMemoryError(width: 8192, height: 8192) != nil,
+// Sized from this device's budget, so the check holds on any memory configuration.
+let preflightBudget = max(UInt64(512 * 1024 * 1024), gpu.recommendedMaxWorkingSetSize * 7 / 10)
+let preflightPlan = PathTracerRenderer.FrameResourcePlan(width: 1, height: 1, usesReSTIR: true, usesMetalFX: false)
+let oversizedSide = Int(Double(preflightBudget / preflightPlan.bytesPerPixel).squareRoot()) + 64
+require(testRenderer.renderMemoryError(width: oversizedSide, height: oversizedSide) != nil,
   "oversized render is rejected by GPU memory preflight")
+require(testRenderer.renderMemoryError(width: 64, height: 64) == nil, "small render passes GPU memory preflight")
 let autosaveTestURL = studioDirectory.appendingPathComponent("final-autosave.vtrace")
 try controller.flushAutosave(to: autosaveTestURL)
 let autosaved = try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: autosaveTestURL))

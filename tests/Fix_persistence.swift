@@ -315,7 +315,7 @@ func fixPersistenceChecks() throws {
   print("PASS: fix-persistence OBJ parsing, node budget and off-main import (R-72)")
 
   // R-70: an opened USD scene is untitled and carries no earlier saved views.
-  let usdFolder = URL(fileURLWithPath: "build/checks/usd", isDirectory: true)
+  let usdFolder = testOutputDirectory.appendingPathComponent("usd", isDirectory: true)
   var withViews = ProjectDocument()
   withViews.views["Old"] = CameraState()
   let usd = try USDImporter.load(usdFolder.appendingPathComponent("scene.usda"), into: withViews)
