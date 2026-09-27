@@ -191,7 +191,8 @@ def describe() -> list:
             return subprocess.run(command, capture_output=True, text=True, cwd=root, timeout=30).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             return ''
-    status = run('git', 'status', '--porcelain', '--untracked-files=no')
+    # Only files compiled into the benchmark count; documentation edits do not change timings.
+    status = run('git', 'status', '--porcelain', '--', 'main.swift', 'Sources', 'Shaders', 'Vendor/OpenPBR', 'scripts', 'tests/GPUChecks.swift', 'tests/benchmark.py', 'tests/harness.py', ':(exclude)*.md')
     return [
         'Date: ' + datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
         'Source: ' + (run('git', 'rev-parse', 'HEAD') or 'unknown') + (' with uncommitted changes' if status else ''),
