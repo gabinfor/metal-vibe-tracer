@@ -10,7 +10,16 @@ sys.path.insert(0,str(HERE/'OpenUSD' if (HERE/'OpenUSD').exists() else HERE.pare
 try:from pxr import Usd, UsdGeom, UsdShade, UsdLux, Sdf, Gf, Ar
 except ImportError as e:sys.exit('USD import failed: the bundled OpenUSD SDK could not be loaded ('+str(e)+'); rebuild the app or run scripts/prepare_usd.py.')
 
-def vec(v): return [float(x) for x in v]
+# Indexed reads: iterating a Gf vector ends through a per-element IndexError, about 100x slower.
+def vec(v): return [float(v[i]) for i in range(len(v))]
+def rows(values):
+    # A whole Vt vector array as lists of floats through the buffer protocol (the values vec gives).
+    # Half-precision arrays have no memoryview format and convert element by element; arrays of
+    # scalars are returned unchanged, so a mistyped primvar fails where it is sampled, as before.
+    try:
+        view=memoryview(values)
+        return view.tolist() if view.ndim==2 else values
+    except (TypeError,ValueError,NotImplementedError):return [vec(v) for v in values]
 def identity_settings(): return {'positionScale':[0,0,0,1],'rotationHidden':[0,0,0,0],'uvTransform':[0,0,0,0],'channels':[0,0,0,0]}
 def uid(): return str(uuid.uuid4())
 def fail(msg): raise ValueError(msg)
@@ -320,11 +329,13 @@ def import_stage(filename,directory,frame=None):
                         assigned.add(face);faceSlots[face]=slot
                 st=UsdGeom.PrimvarsAPI(prim).FindPrimvarWithInheritance('st');uv=st.ComputeFlattened(time) if st else None;uvInterp=st.GetInterpolation() if st else ''
                 normalVar=UsdGeom.PrimvarsAPI(prim).GetPrimvar('normals');normals=normalVar.ComputeFlattened(time) if normalVar else mesh.GetNormalsAttr().Get(time);normalInterp=normalVar.GetInterpolation() if normalVar else mesh.GetNormalsInterpolation()
+                # Large meshes: convert each array once instead of one Gf value per corner.
+                points=rows(points);uv=rows(uv) if uv is not None else None;normals=rows(normals) if normals is not None else None;indices=list(indices)
                 def sample(values,interp,face,corner,vertex,default):
                     if values is None or not len(values):return default
                     index={'constant':0,'uniform':face,'vertex':vertex,'varying':vertex,'faceVarying':corner}.get(str(interp))
                     if index is None or index>=len(values):fail(path+': invalid primvar interpolation/count')
-                    return vec(values[index])
+                    return list(values[index])
                 holes=set(mesh.GetHoleIndicesAttr().Get(time) or []);offset=0;triangles=[];left=str(mesh.GetOrientationAttr().Get(time))=='leftHanded';dropped=fanned=0
                 for face,count in enumerate(counts):
                     faceIndices=list(indices[offset:offset+count]);base=offset;offset+=count
@@ -332,7 +343,7 @@ def import_stage(filename,directory,frame=None):
                     faceTriangles,status=triangulate(points,faceIndices);dropped+=status=='degenerate';fanned+=status=='fan'
                     for corners in faceTriangles:
                         if left:corners=(corners[0],corners[2],corners[1])
-                        ps=[vec(points[faceIndices[i]]) for i in corners];ng=normalize(cross(sub(ps[1],ps[0]),sub(ps[2],ps[0])))
+                        ps=[list(points[faceIndices[i]]) for i in corners];ng=normalize(cross(sub(ps[1],ps[0]),sub(ps[2],ps[0])))
                         ns=[normalize(sample(normals,normalInterp,face,base+i,faceIndices[i],ng)) for i in corners]
                         uvs=[sample(uv,uvInterp,face,base+i,faceIndices[i],[0,0]) for i in corners]
                         triangles.append(dict(a=ps[0]+[1],b=ps[1]+[1],c=ps[2]+[1],na=ns[0]+[0],nb=ns[1]+[0],nc=ns[2]+[0],uvab=[uvs[0][0],1-uvs[0][1],uvs[1][0],1-uvs[1][1]],uvc=[uvs[2][0],1-uvs[2][1],faceSlots[face],0]))

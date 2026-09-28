@@ -178,3 +178,39 @@ if other:
  check(run.returncode==1 and 'requires /usr/bin/python3 CPython 3.9' in run.stderr and 'Traceback' not in run.stderr,run.stderr)
 else:print('SKIP: no non-3.9 python3 found for the interpreter guard check')
 print('PASS: USD degenerate faces, placeholder meshes, zero-scale subtrees, light APIs/power/clamp, fallback colors, constant dome, focus, color spaces, varname, interpreter guard')
+# Bulk Vt array conversion (rows, indexed vec) gives the same snapshot bytes as converting one Gf
+# value per corner, for float and half primvars, vertex/uniform/faceVarying interpolation, left-handed
+# winding, holes, a concave face, material colors, a camera and a light; and it is much faster.
+import itertools,time
+(out/'conversion.usda').unlink(missing_ok=True)
+cv=Usd.Stage.CreateNew(str(out/'conversion.usda'));UsdGeom.SetStageMetersPerUnit(cv,1)
+n=40;grid=UsdGeom.Mesh.Define(cv,'/Grid');gp=[(x/n,.1*math.sin(x*.37)*math.cos(z*.23),z/n) for z in range(n+1) for x in range(n+1)]
+gi=[k for z in range(n) for x in range(n) for k in (z*(n+1)+x,(z+1)*(n+1)+x,(z+1)*(n+1)+x+1,z*(n+1)+x+1)]
+grid.CreatePointsAttr(gp);grid.CreateFaceVertexCountsAttr([4]*n*n);grid.CreateFaceVertexIndicesAttr(gi);grid.CreateSubdivisionSchemeAttr('none');grid.CreateHoleIndicesAttr([5,17])
+grid.CreateNormalsAttr([(.1*math.sin(i),1,.05) for i in range(len(gp))]);grid.SetNormalsInterpolation('vertex')
+UsdGeom.PrimvarsAPI(grid).CreatePrimvar('st',Sdf.ValueTypeNames.TexCoord2fArray,'faceVarying').Set([(gp[i][0]*1.3,gp[i][2]-.2) for i in gi])
+half=UsdGeom.Mesh.Define(cv,'/Half');half.CreatePointsAttr([(-1,0,0),(1,0,0),(1,1,0),(0,.5,0),(-1,1,0),(2,0,0)]);half.CreateFaceVertexCountsAttr([5,3]);half.CreateFaceVertexIndicesAttr([0,1,2,3,4,1,5,2]);half.CreateSubdivisionSchemeAttr('none');half.CreateOrientationAttr('leftHanded')
+UsdGeom.PrimvarsAPI(half).CreatePrimvar('st',Sdf.ValueTypeNames.TexCoord2hArray,'vertex').Set([(.1,.2),(.3,.4),(.5,.6),(.7,.8),(.9,.1),(.33,.66)])
+UsdGeom.PrimvarsAPI(half).CreatePrimvar('normals',Sdf.ValueTypeNames.Normal3fArray,'uniform').Set([(0,0,1),(.1,.2,.9)])
+look=UsdShade.Material.Define(cv,'/Looks/Lit');ls=UsdShade.Shader.Define(cv,'/Looks/Lit/S');ls.CreateIdAttr('UsdPreviewSurface');ls.CreateInput('diffuseColor',Sdf.ValueTypeNames.Color3f).Set((.3,.45,.61));ls.CreateInput('emissiveColor',Sdf.ValueTypeNames.Color3f).Set((.2,.1,.05));look.CreateSurfaceOutput().ConnectToSource(ls.ConnectableAPI(),'surface')
+UsdShade.MaterialBindingAPI.Apply(half.GetPrim()).Bind(look)
+lens=UsdGeom.Camera.Define(cv,'/Cam');lens.AddTranslateOp().Set((.3,.7,4.1));lens.AddRotateYOp().Set(11)
+rect=UsdLux.RectLight.Define(cv,'/Rect');rect.CreateColorAttr((1,.8,.6));rect.CreateIntensityAttr(3);rect.AddTranslateOp().Set((0,2,0))
+cv.GetRootLayer().Save()
+def snapshot(**patch):
+ saved={k:getattr(bridge,k) for k in ['uid',*patch]};counter=itertools.count()
+ bridge.uid=lambda:'00000000-0000-4000-8000-%012d'%next(counter)
+ for k,v in patch.items():setattr(bridge,k,v)
+ try:
+  start=time.perf_counter();data=json.dumps(bridge.import_stage(str(out/'conversion.usda'),out),allow_nan=False,separators=(',',':')).encode()
+  return data,time.perf_counter()-start
+ finally:
+  for k,v in saved.items():setattr(bridge,k,v)
+fast,fastTime=snapshot()
+# The pre-2026-09-28 conversion: iterate each Gf value, index the Vt arrays per corner.
+slow,slowTime=snapshot(vec=lambda v:[float(x) for x in v],rows=lambda values:values)
+converted=json.loads(fast);check(sum(len(a['triangles']) for a in converted['assets'])==2*(n*n-2)+3+1+2,'conversion fixture triangle count')
+check(fast==slow,'bulk Vt conversion changes the bridge snapshot')
+print('USD bridge conversion (%d triangles): %.3f s bulk, %.3f s per corner'%(2*(n*n-2)+6,fastTime,slowTime))
+check(fastTime*3<slowTime,'bulk Vt conversion is not faster than per-corner Gf conversion (%.3f s against %.3f s)'%(fastTime,slowTime))
+print('PASS: USD bridge bulk vector conversion is byte-identical to per-corner Gf conversion (float/half primvars, all interpolations)')
