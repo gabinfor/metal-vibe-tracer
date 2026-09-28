@@ -35,6 +35,9 @@ struct MaterialXProgram: Codable {
   var images: [MaterialXImage]
   var parameters: [MaterialXParameter]
   var diffuseRoughness: Int32?
+  // Register holding emission_color x emission_luminance (OpenPBR nits), or nil when the
+  // shader authors neither input; see REFERENCES.md MATERIALX (graph emission).
+  var emission: Int32?
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
       roots.enumerated().allSatisfy({ i, r in r >= (i == 8 ? -1 : 0) && r < instructions.count }),
@@ -42,6 +45,9 @@ struct MaterialXProgram: Codable {
     else { throw MaterialLibrary.error("Invalid MaterialX program capacity or outputs.") }
     if let root = diffuseRoughness, !(0..<instructions.count).contains(Int(root)) {
       throw MaterialLibrary.error("Invalid diffuse roughness output.")
+    }
+    if let root = emission, !(0..<instructions.count).contains(Int(root)) {
+      throw MaterialLibrary.error("Invalid emission output.")
     }
     for (i, n) in instructions.enumerated() {
       guard (0...11).contains(n.code.x),
@@ -63,7 +69,8 @@ struct MaterialXProgram: Codable {
         }
       }
       if n.code.x == 2 {
-        guard n.value.x >= 0 && n.value.x < Float(images.count) && n.value.x.rounded() == n.value.x
+        guard n.value.x >= 0 && n.value.x < Float(images.count) && n.value.x.rounded() == n.value.x,
+          [0, 1].contains(n.value.z), [0, 1].contains(n.value.w)
         else { throw MaterialLibrary.error("Missing MaterialX image.") }
       }
       if n.code.x == 6 {
@@ -78,6 +85,45 @@ struct MaterialXProgram: Codable {
           && instructions[$0.instruction].code.x == 0 && (1...4).contains($0.components)
       })
     else { throw MaterialLibrary.error("Invalid MaterialX parameter.") }
+  }
+}
+extension MaterialXProgram {
+  // Host-side light-selection weight of graph emission: the program's Rec. 709 emission
+  // luminance evaluated with every image replaced by 1 (the maximum of an LDR map) and UV
+  // (0.5, 0.5). It only has to be positive where emission can be nonzero: the GPU
+  // evaluates the real radiance for light samples and BSDF hits alike, and both use this
+  // weight's PDF, so the estimate affects noise, not the expected image. A slot whose
+  // estimate is zero is left to BSDF sampling (MIS weight 1). REFERENCES.md: MATERIALX.
+  var emissionWeight: Double {
+    guard let root = emission, instructions.indices.contains(Int(root)) else { return 0 }
+    var values: [SIMD4<Float>] = []
+    for (i, n) in instructions.enumerated() {
+      func input(_ k: Int) -> SIMD4<Float> {
+        i > 0 && values.indices.contains(Int(n.code[k])) ? values[Int(n.code[k])] : .zero
+      }
+      let a = input(1), b = input(2), c = input(3)
+      var v: SIMD4<Float>
+      switch n.code.x {
+      case 0: v = n.value
+      case 1: v = SIMD4(0.5, 0.5, 0, 0)
+      case 2: v = SIMD4(repeating: 1)
+      case 3: v = a * b
+      case 4: v = a + b
+      case 5: v = a + (b - a) * c
+      case 6: v = SIMD4(repeating: a[min(3, max(0, Int(n.value.x)))])
+      case 7: v = simd_min(simd_max(a, b), c)
+      case 8: v = SIMD4(0, 0, 1, 0)
+      case 9: v = a - b
+      case 10:
+        let s = sin(n.value.x), k = cos(n.value.x)
+        v = SIMD4(k * a.x + s * a.y, -s * a.x + k * a.y, 0, 0)
+      default: v = a
+      }
+      values.append((0..<4).allSatisfy { v[$0].isFinite } ? v : .zero)
+    }
+    let e = simd_max(values[Int(root)], .zero)
+    let luminance = 0.2126 * Double(e.x) + 0.7152 * Double(e.y) + 0.0722 * Double(e.z)
+    return luminance.isFinite ? min(1e8, luminance) : 0
   }
 }
 struct MaterialXImport {
@@ -331,7 +377,8 @@ private final class MXCompiler {
   func value(_ input: MXElement?, default v: SIMD4<Float>, label: String? = nil) throws -> Int32 {
     guard let e = input else {
       return try constant(
-        v, name: label, components: label?.hasSuffix("base_color") == true ? 3 : 1)
+        v, name: label,
+        components: label.map { $0.hasSuffix("base_color") || $0.hasSuffix("emission_color") } == true ? 3 : 1)
     }
     if e.attributes["channels"] != nil || e.attributes["unit"] != nil {
       try fail(
@@ -507,13 +554,24 @@ private final class MXCompiler {
       result = try append(instruction)
     case "image":
       try allowed(e, ["file", "texcoord", "default", "uaddressmode", "vaddressmode", "filtertype"])
-      for name in ["uaddressmode", "vaddressmode"] {
-        if let i = e.input(name), i.attributes["value"] != "periodic" {
-          try fail("Only periodic image addressing is supported at \(e.path).")
+      // MaterialX "clamp" clamps coordinates to 0-1 before sampling: clamp-to-edge.
+      var clamped = SIMD2<Float>(repeating: 0)
+      for (axis, name) in ["uaddressmode", "vaddressmode"].enumerated() {
+        guard let i = e.input(name) else { continue }
+        guard !linked(i), ["periodic", "clamp"].contains(i.attributes["value"] ?? "") else {
+          try fail("Only periodic or clamp image addressing is supported at \(e.path).")
         }
+        clamped[axis] = i.attributes["value"] == "clamp" ? 1 : 0
       }
       if let f = e.input("filtertype"), f.attributes["value"] != "linear" {
         try fail("Only linear image filtering is supported at \(e.path).")
+      }
+      // An empty file reference cannot be resolved, so the node outputs its `default`
+      // input (zero when unauthored), per the MaterialX 1.39 <image> definition.
+      if !(e.input("file").map(linked) ?? false), (e.input("file")?.attributes["value"] ?? "").isEmpty {
+        document.note("\(e.path): image has no file and evaluates to its default value.")
+        result = try constant(try literal(e.input("default"), .zero))
+        break
       }
       guard let input = e.input("file"), let path = input.attributes["value"], !path.isEmpty,
         !linked(input), !path.contains("<UDIM>"), !path.contains("<UVTILE>"), !path.contains("://")
@@ -557,6 +615,8 @@ private final class MXCompiler {
       instruction.code = SIMD4(2, uv, 0, 0)
       instruction.value.x = Float(imageIndex)
       instruction.value.y = e.attributes["type"] == "float" ? 1 : 0
+      instruction.value.z = clamped.x
+      instruction.value.w = clamped.y
       result = try append(instruction)
     case "multiply", "add", "subtract", "mix", "clamp":
       let names: Set<String> =
@@ -656,12 +716,13 @@ private final class MXCompiler {
       "coat_color": SIMD4(repeating: 1), "coat_roughness_anisotropy": .zero,
       "coat_ior": SIMD4(repeating: 1.6), "coat_darkening": SIMD4(repeating: 1),
       "thin_film_weight": .zero, "thin_film_thickness": SIMD4(repeating: 0.5),
-      "thin_film_ior": SIMD4(repeating: 1.4), "emission_luminance": .zero,
-      "emission_color": SIMD4(repeating: 1), "geometry_opacity": SIMD4(repeating: 1),
+      "thin_film_ior": SIMD4(repeating: 1.4), "geometry_opacity": SIMD4(repeating: 1),
       "geometry_thin_walled": .zero,
     ]
     for i in shader.children
-    where i.category == "input" && i.name != "base_diffuse_roughness" && !inputs.contains(where: { $0.0 == i.name }) {
+    where i.category == "input" && !["base_diffuse_roughness", "emission_luminance", "emission_color"].contains(i.name)
+      && !inputs.contains(where: { $0.0 == i.name })
+    {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
       let frames = ["geometry_tangent": "Tworld", "geometry_coat_normal": "Nworld", "geometry_coat_tangent": "Tworld"]
       if let frame = frames[i.name] {
@@ -702,9 +763,21 @@ private final class MXCompiler {
       guard input.attributes["type"] == "float" else { try fail("Diffuse roughness must be float.") }
       diffuseRoot = try value(input, default: .zero, label: shader.name + "/base_diffuse_roughness")
     }
+    // OpenPBR emission: emission_color x emission_luminance (nits), constant or connected.
+    // Unauthored inputs keep the default of no emission and add no instructions.
+    var emissionRoot: Int32?
+    let luminance = shader.input("emission_luminance"), color = shader.input("emission_color")
+    if luminance != nil || color != nil {
+      guard luminance.map({ $0.attributes["type"] == "float" }) ?? true,
+        color.map({ $0.attributes["type"] == "color3" }) ?? true
+      else { try fail("Invalid surface input type for emission.") }
+      let l = try value(luminance, default: .zero, label: shader.name + "/emission_luminance")
+      let c = try value(color, default: SIMD4(1, 1, 1, 0), label: shader.name + "/emission_color")
+      emissionRoot = try append(GraphInstruction(code: SIMD4(3, c, l, 0)))
+    }
     let program = MaterialXProgram(
       name: shader.name, source: source, instructions: nodes, roots: roots, images: images,
-      parameters: parameters, diffuseRoughness: diffuseRoot)
+      parameters: parameters, diffuseRoughness: diffuseRoot, emission: emissionRoot)
     try program.validate()
     return program
   }
@@ -783,7 +856,9 @@ extension MaterialLibrary {
         header.roots1[i] = program.roots[i + 4]
         header.roots2[i] = program.roots[i + 8]
       }
-      header.info = SIMD4(Int32(instructions.count), Int32(program.instructions.count), program.diffuseRoughness ?? -1, 0)
+      header.info = SIMD4(
+        Int32(instructions.count), Int32(program.instructions.count), program.diffuseRoughness ?? -1,
+        program.emission ?? -1)
       headers[slot] = header
       for var node in program.instructions {
         if node.code.x == 2 { node.value.x = Float(imageIndices[Int(node.value.x)]) }

@@ -604,7 +604,8 @@ extension SceneState {
 extension MaterialXProgram {
   func sameProgram(as other: MaterialXProgram) -> Bool {
     guard name == other.name, source == other.source, roots == other.roots,
-      diffuseRoughness == other.diffuseRoughness, sameBytes(instructions, other.instructions),
+      diffuseRoughness == other.diffuseRoughness, emission == other.emission,
+      sameBytes(instructions, other.instructions),
       images.count == other.images.count, parameters.count == other.parameters.count,
       zip(images, other.images).allSatisfy({ $0.name == $1.name && $0.srgb == $1.srgb && $0.data == $1.data })
     else { return false }

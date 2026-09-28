@@ -746,6 +746,26 @@ bool intersect_mesh_triangle(MeshTriangle tri, Ray local, float tMin, float tMax
     return intersect_mesh_triangle(tri,watertight_ray(local),tMin,tMax,t,b1,b2);
 }
 
+// Surface attributes at barycentrics (b1, b2) of a mesh triangle seen along `direction`.
+// Traced hits and light samples on graph emitters share it, so both evaluate the
+// same MaterialX inputs at the same point.
+void mesh_hit_attributes(thread HitRecord &rec, MeshTriangle tri, float b1, float b2, float3 direction) {
+    float3 e1=tri.b.xyz-tri.a.xyz, e2=tri.c.xyz-tri.a.xyz; float b0=1-b1-b2;
+    float3 ng=normalize(cross(e1,e2)); rec.front_face=dot(ng,direction)<0;
+    rec.geometricNormal=rec.front_face?ng:-ng;
+    float3 smooth=b0*tri.na.xyz+b1*tri.nb.xyz+b2*tri.nc.xyz;
+    rec.normal=dot(smooth,smooth)>1e-12f ? normalize(smooth) : rec.geometricNormal;
+    if(dot(rec.normal,rec.geometricNormal)<0) rec.normal=-rec.normal;
+    rec.uv=b0*tri.uvab.xy+b1*tri.uvab.zw+b2*tri.uvc.xy;
+    float2 d1=tri.uvab.zw-tri.uvab.xy,d2=tri.uvc.xy-tri.uvab.xy; float uvDet=d1.x*d2.y-d1.y*d2.x;
+    float3 tangent=abs(uvDet)>1e-8f ? (e1*d2.y-e2*d1.y)/uvDet : e1;
+    tangent-=rec.normal*dot(tangent,rec.normal);
+    if(dot(tangent,tangent)<1e-12f) tangent=cross(rec.normal,abs(rec.normal.y)<0.9f?float3(0,1,0):float3(1,0,0));
+    rec.tangent=normalize(tangent);
+    rec.bitangent=cross(rec.front_face?rec.normal:-rec.normal,rec.tangent)*(uvDet<0?-1.0f:1.0f);
+    rec.uvDensity=float2(max(length(d1)/max(length(e1),1e-6f),length(d2)/max(length(e2),1e-6f)));
+}
+
 // REFERENCES.md: PBRT2023, OBJ2026, WOOP2013. Watertight triangle test and median BVH.
 bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant MaterialResources &images, constant Uniforms &u) {
     float tMin=ray_t_min(r.origin,u);
@@ -768,25 +788,12 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             MeshTriangle tri=images.triangles[node.links.z+k];
             float t,b1,b2;
             if(!intersect_mesh_triangle(tri,watertight,tMin/o.positionScale.w,closest,t,b1,b2)) continue;
-            float3 e1=tri.b.xyz-tri.a.xyz, e2=tri.c.xyz-tri.a.xyz;
             closest=t; hit=true; float b0=1-b1-b2;
             // Rebuild the point from barycentrics: it then lies on the triangle
             // within vertex-magnitude rounding, independent of the ray length.
             rec.t=t; rec.position=b0*tri.a.xyz+b1*tri.b.xyz+b2*tri.c.xyz;
             rec.error=mesh_hit_error(tri,rec.position,u);
-            float3 ng=normalize(cross(e1,e2)); rec.front_face=dot(ng,local.direction)<0;
-            rec.geometricNormal=rec.front_face?ng:-ng;
-            float3 smooth=b0*tri.na.xyz+b1*tri.nb.xyz+b2*tri.nc.xyz;
-            rec.normal=dot(smooth,smooth)>1e-12f ? normalize(smooth) : rec.geometricNormal;
-            if(dot(rec.normal,rec.geometricNormal)<0) rec.normal=-rec.normal;
-            rec.uv=b0*tri.uvab.xy+b1*tri.uvab.zw+b2*tri.uvc.xy;
-            float2 d1=tri.uvab.zw-tri.uvab.xy,d2=tri.uvc.xy-tri.uvab.xy; float uvDet=d1.x*d2.y-d1.y*d2.x;
-            float3 tangent=abs(uvDet)>1e-8f ? (e1*d2.y-e2*d1.y)/uvDet : e1;
-            tangent-=rec.normal*dot(tangent,rec.normal);
-            if(dot(tangent,tangent)<1e-12f) tangent=cross(rec.normal,abs(rec.normal.y)<0.9f?float3(0,1,0):float3(1,0,0));
-            rec.tangent=normalize(tangent);
-            rec.bitangent=cross(rec.front_face?rec.normal:-rec.normal,rec.tangent)*(uvDet<0?-1.0f:1.0f);
-            rec.uvDensity=float2(max(length(d1)/max(length(e1),1e-6f),length(d2)/max(length(e2),1e-6f)));
+            mesh_hit_attributes(rec,tri,b1,b2,local.direction);
             rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=uses_scene_graph(u) ? uint(tri.uvc.z) : 7;
             if(uses_scene_graph(u) && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
             rec.objectID=uses_scene_graph(u) ? 64+uint(tri.uvc.w)-1 : 7;
@@ -924,10 +931,16 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         case 0:break;
         case 1:v=float4(hit.uv.x,1.0f-hit.uv.y,0,0);d=hit.uvDensity;break;
         case 2:{
-            constexpr sampler filter(coord::normalized,address::repeat,filter::linear,mip_filter::linear);
+            // value.z/w select MaterialX clamp (clamp-to-edge) addressing per axis.
+            constexpr sampler periodic(coord::normalized,address::repeat,filter::linear,mip_filter::linear);
+            constexpr sampler clampU(coord::normalized,s_address::clamp_to_edge,t_address::repeat,filter::linear,mip_filter::linear);
+            constexpr sampler clampV(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear);
+            constexpr sampler clampUV(coord::normalized,address::clamp_to_edge,filter::linear,mip_filter::linear);
             uint index=uint(n.value.x);float2 size=float2(images.graphImages[index].get_width(),images.graphImages[index].get_height());
             float lod=max(0.0f,log2(max(1e-6f,max(size.x*da.x,size.y*da.y)*footprint)));
-            v=images.graphImages[index].sample(filter,float2(a.x,1.0f-a.y),level(lod));
+            float2 st=float2(a.x,1.0f-a.y);
+            v=n.value.z>0 ? images.graphImages[index].sample(n.value.w>0?clampUV:clampU,st,level(lod))
+                : images.graphImages[index].sample(n.value.w>0?clampV:periodic,st,level(lod));
             if(n.value.y>0) v=float4(v.x); break;
         }
         case 3:v=a*b;d=abs(a.xy)*db+abs(b.xy)*da;break;
@@ -957,6 +970,9 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
     hit.mat.coatRoughness=clamp(values[h.roots2.y].x,0.0f,1.0f);
     hit.mat.specularWeight=clamp(values[h.roots2.z].x,0.0f,1.0f);
     hit.mat.baseWeight=clamp(values[h.roots2.w].x,0.0f,1.0f);
+    // OpenPBR emission (nits, before coat/fuzz attenuation) leaves the exterior side only;
+    // geometry_thin_walled is fixed at false. See openpbr_emission.
+    hit.mat.emission=h.info.w>=0 && hit.front_face ? clamp(values[h.info.w].rgb,0.0f,1e8f) : float3(0);
     if(h.roots2.x>=0) {
         float3 normal=values[h.roots2.x].xyz;
         if(dot(normal,normal)>1e-12f) {
@@ -1076,7 +1092,18 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
     inputs.geometry_coat_basis = inputs.geometry_basis;
+    if (mat.usesMaterialX) { inputs.emission_luminance = 1.0f; inputs.emission_color = mat.emission; }
     return openpbr_prepare(inputs, float3(1), OpenPBR_BaseRgbWavelengths_nm, 1.0f, wo);
+}
+
+// REFERENCES.md: MATERIALX, OPENPBR, ADOBEOPENPBR. Radiance a MaterialX surface emits
+// toward wo: emission_color x emission_luminance, attenuated by coat and fuzz through the
+// pinned Adobe openpbr_compute_emission (skipped when neither layer is present).
+float3 openpbr_emission(Material mat, float3 n, float3 wo) {
+    if (mat.type != OPENPBR || mat.usesMaterialX == 0 || !any(mat.emission > 0.0f)) return float3(0);
+    if (mat.coat <= 0.0f && mat.fuzz <= 0.0f) return mat.emission;
+    float3 emitted = prepare_openpbr(mat, n, wo).emission;
+    return all(isfinite(emitted)) ? max(emitted, float3(0)) : float3(0);
 }
 
 float3 eval_bsdf(Material mat, float3 n, float3 wo, float3 wi) {
@@ -1146,14 +1173,29 @@ float imported_geometry(float3 p,float3 position,uint index,constant MaterialRes
     float3 n=cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz);
     return d2>1e-12f && dot(n,n)>1e-20f ? max(0.0f,dot(normalize(n),-d*rsqrt(d2)))/d2:0;
 }
-// emitters = [count, triangle indices, cumulative area x luminance (float bits), total].
-// A triangle's area density is its luminance divided by the total power.
+// emitters = [count, triangle indices, cumulative area x weight (float bits), total].
+// emissions[slot].w is the slot's selection weight: the luminance of a constant emitter,
+// or the host estimate of a MaterialX emitter (MaterialXProgram.emissionWeight); zero
+// for slots outside the list. A triangle's area density is that weight over the total.
 float imported_emitter_area_pdf(uint index,constant MaterialResources &images) {
     uint count=images.emitters[0];
     if(count==0) return 0.0f;
     float total=as_type<float>(images.emitters[2*count+1]);uint slot=uint(images.triangles[index].uvc.z);
-    if(slot<8 || !(total>0)) return 0.0f;
-    return max(1e-8f,dot(images.emissions[slot].rgb,float3(0.2126f,0.7152f,0.0722f)))/total;
+    if(slot<8 || slot>=64 || !(total>0)) return 0.0f;
+    return images.emissions[slot].w/total;
+}
+// Radiance a MaterialX emitter sends from a sampled point (barycentrics b1, b2) toward p,
+// evaluated with the graph exactly as at a BSDF hit on that point (finest image level).
+float3 imported_graph_emission(uint index,float b1,float b2,float3 p,float3 position,float3 wi,constant MaterialResources &images) {
+    MeshTriangle t=images.triangles[index];uint slot=uint(t.uvc.z);
+    if(slot>=64 || images.graphHeaders[slot].info.y==0 || images.graphHeaders[slot].info.w<0) return float3(0);
+    HitRecord h={};Ray ray={p,wi};
+    h.t=length(position-p);h.position=position;h.triangle=index;
+    mesh_hit_attributes(h,t,b1,b2,wi);
+    h.mat={DIFFUSE,float3(0.7f),float3(0),0,1};h.mat.slot=slot;
+    h.mat.inside=!h.front_face;h.mat.tangent=h.tangent;h.mat.geometricNormal=h.geometricNormal;
+    resolve_materialx(h,ray,images,0.0f);
+    return openpbr_emission(h.mat,h.normal,-wi);
 }
 float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant MaterialResources &images) {
     float image = u.environment.z > 0.5f ? environment_image_pdf(wi,u,images) : 0.0f;
@@ -1172,6 +1214,9 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
         float3 delta=ls.position-p;ls.dist=length(delta);ls.wi=delta/max(ls.dist,1e-8f);
         float geometry=imported_geometry(p,ls.position,index,materialImages);
         ls.emission=materialImages.emissions[uint(t.uvc.z)].rgb;ls.isDirectional=index+2;
+        // Graph-driven emission varies over the surface: evaluate it at this sample.
+        if(uses_scene_graph(u) && geometry>1e-12f && !any(ls.emission>0))
+            ls.emission=imported_graph_emission(index,root*(1-r.y),root*r.y,p,ls.position,ls.wi,materialImages);
         ls.pdf=geometry>1e-12f ? importedProbability*imported_emitter_area_pdf(index,materialImages)/geometry:0;
         return ls;
     }
@@ -1643,8 +1688,9 @@ struct PrimarySurface {
     float coat, anisotropy, fuzz, transmission;
     float coatRoughness, specularWeight, baseWeight, diffuseRoughness;
     uint triangle; float error;                   // HitRecord.triangle and position rounding bound
+    packed_float3 emission; float reserved;       // Material.emission (MaterialX emission for OPENPBR)
 };
-static_assert(sizeof(PrimarySurface) == 104, "Swift allocates 104-byte primary surfaces");
+static_assert(sizeof(PrimarySurface) == 120, "Swift allocates 120-byte primary surfaces");
 
 PrimarySurface store_primary_surface(HitRecord hit) {
     PrimarySurface s;
@@ -1657,6 +1703,7 @@ PrimarySurface store_primary_surface(HitRecord hit) {
     s.coat = m.coat; s.anisotropy = m.anisotropy; s.fuzz = m.fuzz; s.transmission = m.transmission;
     s.coatRoughness = m.coatRoughness; s.specularWeight = m.specularWeight;
     s.baseWeight = m.baseWeight; s.diffuseRoughness = m.diffuseRoughness;
+    s.emission = m.emission; s.reserved = 0.0f;
     return s;
 }
 
@@ -1673,6 +1720,7 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
     m.coat = s.coat; m.anisotropy = s.anisotropy; m.fuzz = s.fuzz; m.transmission = s.transmission;
     m.tangent = s.tangent; m.coatRoughness = s.coatRoughness; m.specularWeight = s.specularWeight;
     m.baseWeight = s.baseWeight; m.diffuseRoughness = s.diffuseRoughness;
+    m.emission = s.emission;
     m.usesMaterialX = (s.flags & 512u) != 0 ? 1u : 0u;
     m.inside = !hit.front_face; m.geometricNormal = s.geometricNormal;
     hit.mat = m;
@@ -2042,6 +2090,8 @@ kernel void shading_kernel(
         if (mat.type == EMISSIVE) {
             radiance = mat.emission;
         } else {
+            // Camera rays see MaterialX emission directly; no light strategy samples them.
+            radiance = openpbr_emission(mat, norm, -primaryRay.direction);
             if (uniforms.samplingMode == 0 && mat.type == DIFFUSE) {
                 // ReSTIR Spatial Reuse on Primary Surface
                 float4 cPosDir = inSamplePosDir.read(gid);
@@ -2247,6 +2297,16 @@ kernel void shading_kernel(
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
                     radiance += throughput * weight * rec.mat.emission;
                     break;
+                }
+                // A MaterialX emitter also scatters: add its emission with the same MIS
+                // weight as a light hit, then continue the path. Only the imported emitter
+                // list (scene 6) proposes such surfaces to NEE; elsewhere lightPDF is zero.
+                float3 surfaceEmission = openpbr_emission(rec.mat, rec.normal, -currentRay.direction);
+                if (any(surfaceEmission > 0.0f)) {
+                    float lightPDF = uniforms.sceneIndex == 6
+                        ? eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms, materialImages, rec.triangle) : 0.0f;
+                    float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
+                    radiance += throughput * weight * surfaceEmission;
                 }
                 if (emissionOnly) break;
 
@@ -2780,7 +2840,7 @@ final class MaterialLibrary {
     var hasSceneGraph = false
     var nodeCount = 0
     var objectBuffer: MTLBuffer!
-    var materialX: [Int:MaterialXProgram] = [:]
+    var materialX: [Int:MaterialXProgram] = [:] { didSet { emittersDirty = true } }
     var graphInstructionBuffer: MTLBuffer!, graphHeaderBuffer: MTLBuffer!
     var graphTextures: [MTLTexture] = []
     private var emittersDirty = true
@@ -2980,21 +3040,29 @@ final class MaterialLibrary {
         setBuffer(graphHeaderBuffer,389)
         var emissionValues=Array(repeating:SIMD4<Float>(repeating:0),count:SceneLimits.materials)
         for (slot,value) in emissions {if emissionValues.indices.contains(slot){emissionValues[slot]=SIMD4(value,0)}}
+        // .w is each emitting slot's light-selection weight (imported_emitter_area_pdf):
+        // a constant emitter's luminance, else a MaterialX emitter's host estimate. The GPU
+        // evaluates graph radiance per sample and per hit; the weight only shapes the PDF.
+        var weights=[Int:Double]()
+        for slot in 8..<SceneLimits.materials {
+            if let e=emissions[slot], simd_length_squared(e)>0 { weights[slot]=Double(max(1e-8,0.2126*e.x+0.7152*e.y+0.0722*e.z)) }
+            else if let program=materialX[slot] { let w=program.emissionWeight; if w>0 { weights[slot]=max(1e-8,w) } }
+            emissionValues[slot].w=Float(weights[slot] ?? 0)
+        }
         // Unchanged emitter lists keep their immutable buffer.
         let rebuildEmitters = emittersDirty || emitterBuffer == nil
         let emitterValues: [UInt32]
         if rebuildEmitters {
             let triangles=orderedTriangles
-            let indices=triangles.indices.filter { i in let slot=Int(exactly:triangles[i].uvc.z) ?? -1;return slot>=8 && emissions[slot].map{simd_length_squared($0)>0} == true }.map{UInt32($0)}
+            let indices=triangles.indices.filter { i in let slot=Int(exactly:triangles[i].uvc.z) ?? -1;return slot>=8 && weights[slot] != nil }.map{UInt32($0)}
             // REFERENCES.md: PBRT2023 power light sampling. Emitters are chosen by area x
-            // luminance; the shader's imported_emitter_area_pdf uses the same weights.
+            // weight; the shader's imported_emitter_area_pdf uses the same (Float) weights.
             var total=0.0,cumulative=[Double]()
             for i in indices {
-                let t=triangles[Int(i)],e=Int(exactly:t.uvc.z).flatMap { emissions[$0] } ?? .zero
+                let t=triangles[Int(i)],slot=Int(exactly:t.uvc.z) ?? 0
                 let edge1=SIMD3<Double>(Double(t.b.x-t.a.x),Double(t.b.y-t.a.y),Double(t.b.z-t.a.z))
                 let edge2=SIMD3<Double>(Double(t.c.x-t.a.x),Double(t.c.y-t.a.y),Double(t.c.z-t.a.z))
-                let luminance=Double(max(1e-8,0.2126*e.x+0.7152*e.y+0.0722*e.z))
-                total+=0.5*simd_length(simd_cross(edge1,edge2))*luminance;cumulative.append(total)
+                total+=0.5*simd_length(simd_cross(edge1,edge2))*Double(emissionValues[slot].w);cumulative.append(total)
             }
             if total>0 && total.isFinite {
                 let cdf=cumulative.indices.map { $0==cumulative.count-1 ? Float(1).bitPattern : Float(cumulative[$0]/total).bitPattern }
@@ -3084,7 +3152,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var bytesPerPixel: UInt64 {
             // Beauty/sample/position/OIDN accumulations: 6 RGBA32F; three
             // normal/material guides: 3 RGBA16F; resolved primary surfaces:
-            // 104 B. ReSTIR adds DI (6 RGBA32F) and GI (6 RGBA32F + 2 RGBA16F).
+            // 120 B. ReSTIR adds DI (6 RGBA32F) and GI (6 RGBA32F + 2 RGBA16F).
             // MetalFX formats total 55 B/pixel plus the scaler's own history and
             // feature allocations.
             120 + PathTracerRenderer.primarySurfaceStride + (usesReSTIR ? Self.reservoirBytesPerPixel : 0)
@@ -3125,7 +3193,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var gbufferNormalMat: MTLTexture?
     var gbufferAlbedoRough: MTLTexture?
     // MSL PrimarySurface per pixel: pass 1 writes it; shading and MetalFX guides read it.
-    nonisolated static let primarySurfaceStride: UInt64 = 104
+    nonisolated static let primarySurfaceStride: UInt64 = 120
     private(set) var primarySurfaces: MTLBuffer?
     var accumTexture: MTLTexture?
     var sampleTexture: MTLTexture?
