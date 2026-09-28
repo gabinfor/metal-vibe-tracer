@@ -40,6 +40,7 @@ PARTS = [
     ('Fix_tests.swift', {'full'}),
     ('Fix_build.swift', ALL), ('Fix_swift6.swift', ALL),
     ('Fix_renderer-followups.swift', {'full'}),
+    ('Fix_shaderball-emission.swift', {'full'}),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()
