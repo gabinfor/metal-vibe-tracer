@@ -318,11 +318,20 @@ enum USDImporter {
           sun.angle ?? 0.53, p.options.sunAngle ?? 0))
       }
     }
+    // Graph-emissive materials (OpenPBR emission_color x emission_luminance, or PreviewSurface
+    // emissiveColor) are authored lighting too: the renderer samples them as emitters when
+    // their host weight is positive (MaterialXProgram.emissionWeight), so no sky is added.
+    let graphEmissive = state.materialX?.values.contains { $0.emissionWeight > 0 } == true
     if snapshot.environment == nil && snapshot.sun == nil && state.emissions?.isEmpty != false {
-      p.options.environmentIntensity = 1
-      p.options.sunIntensity = 0
-      snapshot.report.append(
-        "No supported authored lighting: neutral procedural sky used for inspection.")
+      if graphEmissive {
+        snapshot.report.append(
+          "No UsdLux lights: emissive materials light the scene; no environment or sun added.")
+      } else {
+        p.options.environmentIntensity = 1
+        p.options.sunIntensity = 0
+        snapshot.report.append(
+          "No supported authored lighting: neutral procedural sky used for inspection.")
+      }
     }
     var importedCamera: CameraState?
     var importedFocus: Float?
