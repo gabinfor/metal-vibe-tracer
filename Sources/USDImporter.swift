@@ -101,6 +101,37 @@ enum USDImporter {
       bundled: Bundle.main.resourceURL?.appendingPathComponent("usd_bridge.py"),
       repositoryPath: "scripts/usd_bridge.py")
   }
+  // REFERENCES.md: OBJ2026 (scene bridge). One streamed pass over the visible triangles gives
+  // their bounds and, for each ray, the nearest surface distance (nil: no hit). It builds no
+  // flattened host copy (R-101), and it throws what forEachRenderTriangle throws for invalid
+  // combined transforms. The pivot keeps a two-sided Möller–Trumbore test rather than the
+  // renderer's watertight one (WOOP2013): it only places the orbit target, a ray that slips
+  // through a shared edge falls back to the bounds depth, and results stay those of the
+  // earlier flattened-array computation.
+  static func sceneExtent(
+    _ graph: SceneGraph, rays: [(eye: SIMD3<Float>, forward: SIMD3<Float>)]
+  ) throws -> (lo: SIMD3<Float>, hi: SIMD3<Float>, hits: [Float?]) {
+    var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+    var hi = -lo
+    var nearest = [Float](repeating: .greatestFiniteMagnitude, count: rays.count)
+    try graph.forEachRenderTriangle { t in
+      for v in [t.a, t.b, t.c] {
+        let q = SIMD3(v.x, v.y, v.z)
+        lo = simd_min(lo, q)
+        hi = simd_max(hi, q)
+      }
+      let a = SIMD3(t.a.x, t.a.y, t.a.z)
+      let e1 = SIMD3(t.b.x, t.b.y, t.b.z) - a, e2 = SIMD3(t.c.x, t.c.y, t.c.z) - a
+      for (r, ray) in rays.enumerated() {
+        let p = simd_cross(ray.forward, e2), det = simd_dot(e1, p)
+        guard abs(det) > 1e-30 else { continue }
+        let s = ray.eye - a, q = simd_cross(s, e1)
+        let u = simd_dot(s, p) / det, v = simd_dot(ray.forward, q) / det, d = simd_dot(e2, q) / det
+        if u >= 0, v >= 0, u + v <= 1, d > 1e-6, d < nearest[r] { nearest[r] = d }
+      }
+    }
+    return (lo, hi, nearest.map { $0 < .greatestFiniteMagnitude ? $0 : nil })
+  }
   static func load(
     _ url: URL, into source: ProjectDocument, frame: Double? = nil,
     job: USDImportJob = USDImportJob()
@@ -221,30 +252,23 @@ enum USDImporter {
       }
     }
     try graph.validate()
-    // Validate combined transforms before replacing any active renderer resources.
-    let sceneTriangles = try graph.renderTriangles()
-    var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-    var hi = -lo
-    for t in sceneTriangles {
-      for v in [t.a, t.b, t.c] {
-        let q = SIMD3(v.x, v.y, v.z)
-        lo = simd_min(lo, q)
-        hi = simd_max(hi, q)
-      }
+    // A supported camera's view ray (eye, unit forward); nil for unsupported parameters.
+    func viewRay(_ camera: USDImportSnapshot.Camera) -> (eye: SIMD3<Float>, forward: SIMD3<Float>)? {
+      guard camera.eye.count == 3, camera.direction.count == 3, camera.up.count == 3,
+        (5...150).contains(camera.fov)
+      else { return nil }
+      return (SIMD3(camera.eye[0], camera.eye[1], camera.eye[2]),
+        simd_normalize(SIMD3(camera.direction[0], camera.direction[1], camera.direction[2])))
     }
+    let cameraRays = snapshot.cameras.map(viewRay)
+    // Validate combined transforms before replacing any active renderer resources. The
+    // triangles are streamed once for every camera; no flattened copy is built (R-101).
+    let extent = try sceneExtent(graph, rays: cameraRays.compactMap { $0 })
+    let lo = extent.lo, hi = extent.hi
+    var hits = extent.hits[...]
     // Orbit pivot: the first surface on the view ray, else the bounds center's depth.
-    func orbitDistance(_ eye: SIMD3<Float>, _ forward: SIMD3<Float>) -> Float {
-      var nearest = Float.greatestFiniteMagnitude
-      for t in sceneTriangles {
-        let a = SIMD3(t.a.x, t.a.y, t.a.z)
-        let e1 = SIMD3(t.b.x, t.b.y, t.b.z) - a, e2 = SIMD3(t.c.x, t.c.y, t.c.z) - a
-        let p = simd_cross(forward, e2), det = simd_dot(e1, p)
-        guard abs(det) > 1e-30 else { continue }
-        let s = eye - a, q = simd_cross(s, e1)
-        let u = simd_dot(s, p) / det, v = simd_dot(forward, q) / det, d = simd_dot(e2, q) / det
-        if u >= 0, v >= 0, u + v <= 1, d > 1e-6, d < nearest { nearest = d }
-      }
-      if nearest < .greatestFiniteMagnitude { return nearest }
+    func orbitDistance(_ eye: SIMD3<Float>, _ forward: SIMD3<Float>, _ hit: Float?) -> Float {
+      if let hit { return hit }
       guard lo.x <= hi.x else { return 1 }
       let depth = simd_dot((lo + hi) / 2 - eye, forward)
       return depth > 0 ? depth : simd_length(hi - lo)
@@ -302,18 +326,13 @@ enum USDImporter {
     }
     var importedCamera: CameraState?
     var importedFocus: Float?
-    for camera in snapshot.cameras {
-      guard camera.eye.count == 3, camera.direction.count == 3, camera.up.count == 3,
-        (5...150).contains(camera.fov)
-      else {
+    for (camera, ray) in zip(snapshot.cameras, cameraRays) {
+      guard let (eye, forward) = ray, let hit = hits.popFirst() else {
         snapshot.report.append(camera.name + ": unsupported camera parameters")
         continue
       }
-      let eye = SIMD3(camera.eye[0], camera.eye[1], camera.eye[2])
-      let forward = simd_normalize(
-        SIMD3(camera.direction[0], camera.direction[1], camera.direction[2]))
       // The orbit pivot is scene-derived; optical focus stays separate and is kept only when authored.
-      let distance = min(1_000_000, max(0.0001, orbitDistance(eye, forward)))
+      let distance = min(1_000_000, max(0.0001, orbitDistance(eye, forward, hit)))
       let target = eye + forward * distance
       let delta = eye - target
       var c = CameraState()

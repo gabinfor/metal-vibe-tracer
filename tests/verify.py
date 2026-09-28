@@ -36,7 +36,7 @@ PARTS = [
     ('Fix_gpu-memory.swift', {'full'}), ('Fix_presentation.swift', {'full'}),
     ('Fix_persistence.swift', {'full', 'studio'}), ('Fix_frontend.swift', {'full', 'studio'}),
     ('Fix_project-format.swift', {'full', 'studio'}),
-    ('Fix_usd.swift', {'full', 'usd'}),
+    ('Fix_usd.swift', {'full', 'usd'}), ('Fix_usd-pivot.swift', {'full', 'usd'}),
     ('Fix_tests.swift', {'full'}),
     ('Fix_build.swift', ALL), ('Fix_swift6.swift', ALL),
     ('Fix_renderer-followups.swift', {'full'}),

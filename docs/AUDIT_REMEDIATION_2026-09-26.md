@@ -138,7 +138,7 @@ Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding
 | R-98 | low | eval_light_pdf looped over emitters | fixed | O(1) via hit triangle | Fix_lights |
 | R-99 | low | Primary ray traced 2–3 times per pixel | fixed | `PrimarySurface` cache | Fix_integrator |
 | R-100 | low | Emitter buffer re-uploaded on every rebuild | fixed | Reused when unchanged | Fix_gpu-memory |
-| R-101 | low | Imported triangles held in ≥3 copies | fixed (2026-09-28) | Graph meshes flattened into the GPU buffer and BVH-ordered in place; `SceneGraph` assets are the only host copy | Fix_gpu-memory, Fix_renderer-followups |
+| R-101 | low | Imported triangles held in ≥3 copies | fixed (2026-09-28) | Graph meshes flattened into the GPU buffer and BVH-ordered in place; `SceneGraph` assets are the only host copy | Fix_gpu-memory, Fix_renderer-followups, Fix_usd-pivot |
 | R-102 | low | OIDN fast path checked 1 of 5 dylibs; unlocked | fixed | File-table manifest, lock, atomic publish | Fix_build.py |
 | R-103 | low | Corrupt OpenUSD wheel never discarded | fixed | Moved to `rejected/`, refetched; module list from bridge | Fix_build.py |
 | R-104 | low | build.sh updated the bundle in place | fixed | Staged, checked, swapped | ./build.sh + check_bundle.py |
@@ -244,13 +244,16 @@ Commits on `main` after the remediation record (`git log --oneline c6971af..HEAD
 - **Watertight intersection.** `intersect_mesh_triangle` implements Woop, Benthin and Wald (JCGT 2013; `REFERENCES.md` `WOOP2013`), and BVH boxes are enlarged per ray so traversal never culls a triangle the test would hit. Of 14,598 rays aimed at shared edges and vertices, 2,614 missed before and none miss now. The imported-mesh benchmark is about 1.2 ms (10%) slower per frame (`tests/PERFORMANCE.md`).
 - **Time limits.** `USDImportJob` and the progressive render time limit measure awake time (`awakeSeconds`, `CLOCK_UPTIME_RAW`), so system sleep no longer uses them up. Cancellation and SIGKILL escalation are unchanged.
 - **MetalFX guides.** Glossy and dielectric guide pixels take their geometric normal and rounding bound from the `PrimarySurface` cache instead of re-tracing the primary ray. Per `84db5e3`, the guide kernel alone went from 0.81 to 0.74 ms on Pavilion at 640×480.
+- **USD orbit pivot (R-101 residual).** `USDImporter.load` computes the scene bounds and each supported camera's orbit pivot in one streamed pass (`USDImporter.sceneExtent` over `SceneGraph.forEachRenderTriangle`) instead of flattening every triangle with `SceneGraph.renderTriangles`, which is now used only by tests. The pivot keeps the former two-sided Möller–Trumbore test rather than the renderer's watertight one: it only places the orbit target, a missed view ray falls back to the bounds depth, and pivots and bounds are bit-identical to the flattened computation (`Fix_usd-pivot`, including an unsupported camera ahead of the others). Measured on Apple M4: for 400,000 instanced triangles and 9 rays the scan's heap peak is +0.00 MiB against +48.8 MiB flattened, at 148 against 144 ms. The import of a 240-mesh, 48,000-triangle stage peaks at +1.26 to +1.45 MiB, against +6.21 MiB before.
 - **R-136.** The stale `build/` conflict copies and `build/module-cache.stale-before-move` were deleted on 2026-09-28.
 - **Behaviour changes.** Builds from before format 3 cannot open format-3 projects. A recovery copy moved out of `~/Library/Application Support/VibeTracer/` needs its `AutosaveAssets` folder beside it; alternatively, open it and use Save As. The imported-mesh benchmark's mean raw radiance changed by 2.9% (0.6370 to 0.6186) with the watertight test.
 
 Follow-up validation (2026-09-28, `main`): `./build.sh` passed (Swift 6 mode, bundle check); `MTL_DEBUG_LAYER=1 python3 tests/verify.py` exited 0 with 97 PASS, 0 FAIL and no compiler warnings, on Apple M4 16 GB, macOS 27, Swift 6.4.
 
+USD orbit pivot validation (2026-09-28): `./build.sh` passed; `MTL_DEBUG_LAYER=1 python3 tests/verify.py` exited 0 with 98 PASS, 0 FAIL and no compiler warnings. With the former flattened pivot restored, `Fix_usd-pivot` fails its import heap check.
+
 ## Remaining limitations and partial fixes
 
-- **R-101 (residual):** the `SceneGraph` assets are the document's host copy of imported triangles, beside the GPU buffer. `USDImporter.load` builds one transient flattened copy (`SceneGraph.renderTriangles`) to place the orbit pivot, released when the import returns.
+- **R-101 (residual):** the `SceneGraph` assets are the document's host copy of imported triangles, beside the GPU buffer. *(Updated 2026-09-28: `USDImporter.load` no longer builds a transient flattened copy to place the orbit pivot; see "USD orbit pivot" under "Follow-up, 2026-09-28".)*
 - **Project format 3:** builds from before format 3 cannot open format-3 projects or autosaves.
 - Out of scope, unchanged: OCIO/ACES colour management, a matched Karma benchmark, external MaterialX Sdf composition, subdivision, skinning, point instancers, a two-level accelerator for multi-million-triangle scenes, and signed/notarized distribution.
