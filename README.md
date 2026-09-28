@@ -10,7 +10,7 @@ An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Expl
 - **Lighting:** procedural skies, HDRI environments, editable area lights, and a thin-lens camera.
 - **Denoising:** MetalFX interactive preview and Open Image Denoise for in-app snapshots and offline exports.
 - **Viewport:** beauty, albedo, world normals, depth, and material/roughness views.
-- **Projects:** portable `.vtrace` files with embedded assets, saved camera views, undo/redo, and autosave recovery.
+- **Projects:** portable `.vtrace` files with embedded assets stored once each, saved camera views, undo/redo, and autosave recovery.
 - **Export:** sRGB PNG and linear HDR OpenEXR (32-bit float RGB) at independent resolutions and sample counts.
 
 ## Requirements
@@ -58,7 +58,7 @@ The **Window** menu provides Minimize, Zoom and Bring All to Front. ⌘E and **S
 
 Use **OIDN Preview Current Frame** to denoise the current accumulation inside the app. For a final image, open **Export**, choose a resolution and sample count, and select OIDN, raw, or MetalFX output. PNG includes display adjustments and is sRGB-encoded. OpenEXR stores linear HDR radiance as 32-bit float RGB without an alpha channel, so values above 65504 are kept. MetalFX output, in the preview or in an export, is a display estimate, not radiometric data. The suite measured MetalFX/raw region-mean ratios of 1.03 on diffuse Cornell surfaces, 0.87 on diffuse Pavilion surfaces, 0.69 on reflective regions and 0.77 on the grazing gold cylinder. For linear radiance, export the raw or OIDN source as OpenEXR.
 
-Projects embed imported assets and can be reopened without the original files. Open, New and Open USD Scene ask Save / Don't Save / Cancel when the document has unsaved changes; a replaced unsaved document is also kept as `Autosave-previous.vtrace`. The app restores its latest autosave on startup, together with its project file association and edited state. An autosave that cannot be restored is moved aside as `Autosave-unrestorable-<date>.vtrace` and never overwritten. Quit waits for pending saves.
+Projects embed imported assets and can be reopened without the original files. Since project format 3, each distinct image, environment or mesh is stored once per file, and autosaves write only assets that changed, as separate sidecar files. Older projects open and are saved as format 3; builds from before this change cannot open format-3 projects. Open, New and Open USD Scene ask Save / Don't Save / Cancel when the document has unsaved changes; a replaced unsaved document is also kept as `Autosave-previous.vtrace`. The app restores its latest autosave on startup, together with its project file association and edited state. An autosave that cannot be restored is moved aside as `Autosave-unrestorable-<date>.vtrace` and never overwritten. Quit waits for pending saves.
 
 See the [user guide](docs/USER_GUIDE.md) for material controls, project behavior, import coverage, and export details.
 
@@ -102,7 +102,7 @@ The September 26, 2026 audit remediation and its validation are recorded in
 The application is currently distributed as an unsigned local build; signing,
 notarization, and clean-machine installation remain release packaging work.
 
-`python3 tests/benchmark.py [--baseline /path/to/previous/main.swift] [--report FILE] [--frames 12] [--rounds 2] [--output-tolerance 0.05]` times the production `renderFrame` path on fixed scenes. A baseline's shaders are compared only when their Uniforms layout, argument-buffer length and kernel bindings match the current host code, and each scenario's mean raw radiance agrees within `--output-tolerance`. Otherwise no timings are printed. Current measurements, from September 27, 2026 at `0eb96bb`, are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md), with the unedited report in [tests/PERFORMANCE-raw.txt](tests/PERFORMANCE-raw.txt). Earlier speedup figures, which predate ReSTIR GI and could not be reproduced, have been withdrawn.
+`python3 tests/benchmark.py [--baseline /path/to/previous/main.swift] [--report FILE] [--frames 12] [--rounds 2] [--output-tolerance 0.05]` times the production `renderFrame` path on fixed scenes. A baseline's shaders are compared only when their Uniforms layout, argument-buffer length and kernel bindings match the current host code, and each scenario's mean raw radiance agrees within `--output-tolerance`. Otherwise no timings are printed. Current measurements, from September 28, 2026 at `84db5e3`, are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md), with the unedited report in [tests/PERFORMANCE-raw.txt](tests/PERFORMANCE-raw.txt). Earlier speedup figures, which predate ReSTIR GI and could not be reproduced, have been withdrawn.
 
 See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
 
@@ -110,7 +110,6 @@ See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, a
 
 - ReSTIR GI currently reuses the first diffuse indirect vertex. Deeper and glossy transport use ordinary path tracing; practical reservoir reuse is not a fully unbiased reference estimator. Use Standard MIS with fog and ring boost disabled for comparisons.
 - HDRI sampling uses a luminance-weighted lat-long distribution; very small or high-contrast features can still require additional samples.
-- Imported mesh intersections use a non-watertight determinant test; rays can occasionally slip through shared edges.
 - OpenUSD import is a scene snapshot, with partial material and light support. Animation, subdivision evaluation, volumes, curves, and USD export are unsupported.
 - MaterialX support is a bounded importer, with no node editor or graph export. OCIO/ACES color management, UDIMs, displacement, and several advanced material features are unsupported.
 - MetalFX can soften detail. OIDN works on the accumulated image; raw output remains available for comparison.

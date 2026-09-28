@@ -27,12 +27,14 @@ This record supersedes `AUDIT.md` (2026-09-07) and `docs/AUDIT_FIX_PLAN_2026-09-
 | tests | `59c0ee9` `0eb96bb` `4f518a6` | R-105 R-107–R-109 R-111 R-112 R-114–R-118 R-139–R-141 |
 | swift6 | `ddec29d` | R-133 |
 | docs | uncommitted working-tree changes | R-120 R-121 R-142 R-144 R-145 R-146 |
+| project-format (follow-up, `main`) | `f435fd8` `88bf52f` | R-45 R-74 |
+| renderer-followups (follow-up, `main`) | `a0586f2` `9f80023` `4df8853` `84db5e3` | R-101; watertight intersection; sleep-proof time limits; guide re-trace (R-57 follow-up) |
 
 Tests named below live in `tests/`. `Fix_<package>.swift` files run inside `tests/verify.py`; `USDChecks.py`, `Fix_build.py` and `Fix_tests.py` are Python checks that `verify.py` also runs.
 
 ## Findings
 
-Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding was closed as "not a defect".
+Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding was closed as "not a defect". R-45, R-74, R-101 and R-136 were partial on 2026-09-26 and were fixed on 2026-09-28 (see "Follow-up, 2026-09-28").
 
 | ID | Sev. | Finding (short) | Disposition | Note | Test |
 | --- | --- | --- | --- | --- | --- |
@@ -80,7 +82,7 @@ Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding
 | R-42 | med | Slow drags treated as clicks | fixed | 3 pt drag threshold | Fix_frontend |
 | R-43 | med | Rename dialog crash during open | fixed | No force unwrap; guarded | Fix_frontend |
 | R-44 | med | Undo/imports rebuilt GPU resources on main thread | fixed | Off-main preparation with reuse | Fix_persistence |
-| R-45 | med | Uncoalesced full-project autosaves | partial | Coalesced, revision skip, 5 s camera debounce; no binary sidecars | Fix_persistence |
+| R-45 | med | Uncoalesced full-project autosaves | fixed (2026-09-28) | Coalesced, revision skip, 5 s camera debounce; format-3 binary sidecars written once per content, unreferenced ones collected | Fix_persistence, Fix_project-format |
 | R-46 | med | draw(in:) blocked on currentDrawable | fixed | In-flight check first | Fix_presentation |
 | R-47 | med | Full-resolution map decode on main thread | fixed | Cached small thumbnails | Fix_frontend |
 | R-48 | med | Environment-PDF test never ran | fixed | Non-uniform 64×32 fixture, chi-square | Fix_lights |
@@ -109,7 +111,7 @@ Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding
 | R-71 | low | Fallback displayColor shared across prims | fixed | Per-prim colour key | USDChecks.py |
 | R-72 | low | OBJ/MaterialX/.vmat parsed on main thread; O(n·parts) | fixed | Off-main, linear lookup, early node limit | Fix_persistence |
 | R-73 | low | MaterialX files read fully before size checks | fixed | Checked first; out-of-folder reported | Fix_materialx |
-| R-74 | low | Shared images re-read/uploaded per shader | partial | Decoded and bound once; still stored per program on disk | Fix_materialx |
+| R-74 | low | Shared images re-read/uploaded per shader | fixed (2026-09-28) | Decoded and bound once; stored once per project in the format-3 asset table | Fix_materialx, Fix_project-format |
 | R-75 | low | Undo checkpoints before fallible operations | fixed | No undo step on failure | Fix_persistence |
 | R-76 | low | Popups/gestures mutated state during busy I/O | fixed | Guarded | Fix_persistence |
 | R-77 | low | Unbound materials deleted on object removal | fixed | Kept; "Remove unused materials" | Fix_persistence |
@@ -136,7 +138,7 @@ Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding
 | R-98 | low | eval_light_pdf looped over emitters | fixed | O(1) via hit triangle | Fix_lights |
 | R-99 | low | Primary ray traced 2–3 times per pixel | fixed | `PrimarySurface` cache | Fix_integrator |
 | R-100 | low | Emitter buffer re-uploaded on every rebuild | fixed | Reused when unchanged | Fix_gpu-memory |
-| R-101 | low | Imported triangles held in ≥3 copies | partial | Ordered copy read via shared buffer; `meshTriangles` and SceneGraph copies remain | Fix_gpu-memory |
+| R-101 | low | Imported triangles held in ≥3 copies | fixed (2026-09-28) | Graph meshes flattened into the GPU buffer and BVH-ordered in place; `SceneGraph` assets are the only host copy | Fix_gpu-memory, Fix_renderer-followups |
 | R-102 | low | OIDN fast path checked 1 of 5 dylibs; unlocked | fixed | File-table manifest, lock, atomic publish | Fix_build.py |
 | R-103 | low | Corrupt OpenUSD wheel never discarded | fixed | Moved to `rejected/`, refetched; module list from bridge | Fix_build.py |
 | R-104 | low | build.sh updated the bundle in place | fixed | Staged, checked, swapped | ./build.sh + check_bundle.py |
@@ -171,7 +173,7 @@ Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding
 | R-133 | info | Swift 5 mode without strict concurrency | fixed | `-swift-version 6` everywhere, zero warnings; `@MainActor` renderer/app; one OIDN-options race fixed | Fix_swift6.swift |
 | R-134 | info | Executable and OIDN arch could disagree | fixed | One `uname -m` for both; manifest records arch | Fix_build.py |
 | R-135 | info | OpenUSD version hard-coded in globs | fixed | Single `VERSION` constant | USDChecks.py |
-| R-136 | info | build/ in iCloud; conflict copies | partial | `com.apple.fileprovider.ignore#P`; stale copies remain | — |
+| R-136 | info | build/ in iCloud; conflict copies | fixed (2026-09-28) | `com.apple.fileprovider.ignore#P`; stale conflict copies and old module cache deleted | — (checked by hand) |
 | R-137 | info | Python ABI checked only at build | fixed | Bridge refuses non-3.9 interpreters | USDChecks.py |
 | R-138 | info | HDRIs downloaded without checksums | fixed | Pinned size + SHA-256 | — (network script) |
 | R-139 | info | USDChecks.py bare asserts | fixed | Explicit `check()` that still runs under `python -O` | USDChecks.py |
@@ -218,17 +220,37 @@ Full suite `MTL_DEBUG_LAYER=1 python3 tests/verify.py`, 0 FAIL at every stage, o
 - `./build.sh` passed in the Swift 6 language mode.
 - After the test step, `--studio-only` gave 53 PASS and `--usd-only` gave 21 PASS.
 - Each package passed the full suite in its own worktree before integration, according to the package reports and, for bsdf-legacy, its run log.
-- Final validation in the user's checkout (`~/Vibe Tracer`, 2026-09-28): `./build.sh` passed (Swift 6 mode, bundle check), and `MTL_DEBUG_LAYER=1 python3 tests/verify.py` exited 0 with 88 PASS and 0 FAIL. A first attempt started on 2026-09-27 failed only because the Mac slept mid-run and the 5-minute USD import timeout, which measures wall-clock time, expired; the re-run under `caffeinate` passed.
+- Final validation in the user's checkout (`~/Vibe Tracer`, 2026-09-28): `./build.sh` passed (Swift 6 mode, bundle check), and `MTL_DEBUG_LAYER=1 python3 tests/verify.py` exited 0 with 88 PASS and 0 FAIL. A first attempt started on 2026-09-27 failed only because the Mac slept mid-run and the 5-minute USD import timeout, which then measured wall-clock time, expired; the re-run under `caffeinate` passed. Since `4df8853` the timeout excludes system sleep (see "Follow-up, 2026-09-28").
 
 ## Repository move (2026-09-27)
 
-During the remediation, the repository was moved from the iCloud-synced `~/Documents/ChatGPT/Vibe Tracer` to `~/Vibe Tracer`. Evicted (dataless) iCloud files had caused build and test timeouts. The build package's `com.apple.fileprovider.ignore#P` attribute keeps `build/` local in a synced location, but a checkout outside iCloud-synced folders is the reliable choice. `build/module-cache.stale-before-move` is unused and can be deleted.
+During the remediation, the repository was moved from the iCloud-synced `~/Documents/ChatGPT/Vibe Tracer` to `~/Vibe Tracer`. Evicted (dataless) iCloud files had caused build and test timeouts. The build package's `com.apple.fileprovider.ignore#P` attribute keeps `build/` local in a synced location, but a checkout outside iCloud-synced folders is the reliable choice. `build/module-cache.stale-before-move` was unused and was deleted on 2026-09-28, together with the stale conflict copies (R-136).
+
+## Follow-up, 2026-09-28
+
+Commits on `main` after the remediation record (`git log --oneline c6971af..HEAD`):
+
+| Commit | Change | Closes |
+| --- | --- | --- |
+| `f435fd8` | fix(project-format): content-addressed asset table for projects and autosave sidecars | R-45, R-74 |
+| `88bf52f` | test(project-format): format 3 round trips, dedup, sidecar reuse, collection and validation | R-45, R-74 (tests) |
+| `a0586f2` | fix(renderer-followups): keep one host copy of imported triangles | R-101 |
+| `9f80023` | fix(renderer-followups): watertight ray/triangle intersection | Former "Triangle intersection" limitation |
+| `4df8853` | fix(renderer-followups): time limits exclude system sleep | USD import timeout during sleep (see "Validation") |
+| `84db5e3` | fix(renderer-followups): MetalFX specular guides read the primary-surface cache | Specular-guide re-trace left by R-57 |
+
+- **Project format 3 (R-45, R-74).** Embedded maps, MaterialX images, the environment and mesh triangles are stored once each in an asset table keyed by SHA-256 (CryptoKit; `REFERENCES.md` `SHA256FIPS`). Triangles are binary records. `.vtrace` files and `.vmat` presets keep the table inline and stay self-contained. Autosaves and recovery copies keep payloads as `AutosaveAssets/<digest>` sidecars, written once. Sidecars that no recovery file references are collected after a successful write, with a 10-minute grace period. Version 1 and 2 projects open and are saved as format 3, and identical images count once against the 512 MiB limit. `Fix_project-format` reports the autosave bytes per revision for its fixture: 5,059,502 in the version 2 layout on every revision. In format 3 they are 3,670,014 for the first revision, 25,675 for a camera-only revision and 75,311 after a new map.
+- **R-101.** Scene-graph meshes are flattened straight into the shared GPU triangle buffer and put into BVH order in place (`OBJMesh.buildInPlace`). `meshTriangles` only shares a legacy document's own array. Framing reads the buffer, and graph-edit rollback rebinds the previous buffers. Per `a0586f2`, peak host bytes while publishing a 500,000-triangle graph mesh fell from +218.9 MiB to +96.7 MiB.
+- **Watertight intersection.** `intersect_mesh_triangle` implements Woop, Benthin and Wald (JCGT 2013; `REFERENCES.md` `WOOP2013`), and BVH boxes are enlarged per ray so traversal never culls a triangle the test would hit. Of 14,598 rays aimed at shared edges and vertices, 2,614 missed before and none miss now. The imported-mesh benchmark is about 1.2 ms (10%) slower per frame (`tests/PERFORMANCE.md`).
+- **Time limits.** `USDImportJob` and the progressive render time limit measure awake time (`awakeSeconds`, `CLOCK_UPTIME_RAW`), so system sleep no longer uses them up. Cancellation and SIGKILL escalation are unchanged.
+- **MetalFX guides.** Glossy and dielectric guide pixels take their geometric normal and rounding bound from the `PrimarySurface` cache instead of re-tracing the primary ray. Per `84db5e3`, the guide kernel alone went from 0.81 to 0.74 ms on Pavilion at 640×480.
+- **R-136.** The stale `build/` conflict copies and `build/module-cache.stale-before-move` were deleted on 2026-09-28.
+- **Behaviour changes.** Builds from before format 3 cannot open format-3 projects. A recovery copy moved out of `~/Library/Application Support/VibeTracer/` needs its `AutosaveAssets` folder beside it; alternatively, open it and use Save As. The imported-mesh benchmark's mean raw radiance changed by 2.9% (0.6370 to 0.6186) with the watertight test.
+
+Follow-up validation (2026-09-28, `main`): `./build.sh` passed (Swift 6 mode, bundle check); `MTL_DEBUG_LAYER=1 python3 tests/verify.py` exited 0 with 97 PASS, 0 FAIL and no compiler warnings, on Apple M4 16 GB, macOS 27, Swift 6.4.
 
 ## Remaining limitations and partial fixes
 
-- **R-45:** autosave still writes the whole project as JSON, with base64 images and decimal triangle arrays. Coalescing, revision skipping and the 5 s camera debounce bound how often that happens, but large assets are not yet stored as binary sidecars.
-- **R-74:** images shared by several shaders in one `.mtlx` are decoded and bound once, but the project file still embeds their bytes once per MaterialX program, so on-disk size grows with each sharing shader.
-- **R-101:** the BVH-ordered triangle copy is gone; host code reads through the shared GPU buffer. `meshTriangles` and the `SceneGraph` asset copies remain, so large imports still hold two host copies.
-- **R-136:** `build/` is now excluded from iCloud syncing, but older conflict copies in `build/` (`OpenUSD 2`, `OpenUSD-26 2.8…`, `OpenUSD-26 3.8…`, a stale `VibeTracer.app`) are not deleted automatically. Delete them by hand. A checkout outside iCloud-synced folders avoids the issue.
-- **Triangle intersection:** `intersect_mesh_triangle` is a Möller–Trumbore-style test with a relative determinant cutoff. It is not watertight, so rays can occasionally pass between triangles that share an edge. This predates the audit.
+- **R-101 (residual):** the `SceneGraph` assets are the document's host copy of imported triangles, beside the GPU buffer. `USDImporter.load` builds one transient flattened copy (`SceneGraph.renderTriangles`) to place the orbit pivot, released when the import returns.
+- **Project format 3:** builds from before format 3 cannot open format-3 projects or autosaves.
 - Out of scope, unchanged: OCIO/ACES colour management, a matched Karma benchmark, external MaterialX Sdf composition, subdivision, skinning, point instancers, a two-level accelerator for multi-million-triangle scenes, and signed/notarized distribution.
