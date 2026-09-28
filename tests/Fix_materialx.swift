@@ -26,7 +26,7 @@
     return data
   }
   let gray8 = try png("gray8.png", samples: 1, bits: 8, [153])
-  let grayAlpha8 = try png("grayAlpha8.png", samples: 2, bits: 8, [153, 200])
+  _ = try png("grayAlpha8.png", samples: 2, bits: 8, [153, 200])
   let rgba16 = try png("rgba16.png", samples: 4, bits: 16, [153, 153, 153, 255])
   let gray16 = try png("gray16.png", samples: 1, bits: 16, [153])
   _ = try png("grayAlpha16.png", samples: 2, bits: 16, [153, 200])
