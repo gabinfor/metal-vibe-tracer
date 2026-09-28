@@ -4,8 +4,14 @@ Date: 2026-09-07. Requested scope: renderer correctness, performance, visuals, G
 
 > This file is a historical record of the September 7 audit. Its descriptions of
 > working-tree state, unfinished drafts, and commands awaiting execution are not
-> current instructions. For the September 11 follow-up and its implementation
-> status, see `docs/AUDIT_FIX_PLAN_2026-09-11.md`.
+> current instructions. For the September 11 follow-up, see
+> `docs/AUDIT_FIX_PLAN_2026-09-11.md`.
+>
+> **Superseded (2026-09-26).** Current finding status is recorded in
+> [`docs/AUDIT_REMEDIATION_2026-09-26.md`](docs/AUDIT_REMEDIATION_2026-09-26.md),
+> which covers the 146 findings of the audit at `7a54652`. Items below that the
+> remediation addressed are marked inline. Items without such a mark keep
+> their historical status.
 
 ## Current release status
 
@@ -18,8 +24,14 @@ all scenes and strategies, energy/BRDF checks, MetalFX, OIDN, persistence, UI,
 MaterialX, OpenUSD, and the ASWF Shader Ball.
 
 This file remains historical evidence and a record of broader limitations. Use
-the September 11 plan for implementation status. The app is not yet signed or
-notarized for clean-machine distribution.
+the September 26 remediation record for implementation status. The app is not yet
+signed or notarized for clean-machine distribution.
+
+*Correction (2026-09-26):* the September 21 run passed, but the later audit found
+several statements here and in the September 11 plan that the code did not support.
+Examples are the "conservative" memory preflight (R-17, R-58, R-59), "skip
+reservoir access" (R-21), and the P1-02/P1-03 fixes, which had no regression tests
+(R-119). A passing suite was not evidence for untested claims.
 
 **Implementation update, 2026-09-07:** the shipping-priority findings and the concrete draft work in this audit were implemented and exercised with Metal API Validation. The detailed findings below are design history and a roadmap for larger interchange/color-management work.
 
@@ -68,6 +80,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 
 ### P1-02 — Imported fine geometry and shadows disappear with procedural-scale tolerances
 
+*Addressed 2026-09-26 (R-03, R-51, R-119): error-bounded offsets (`HitRecord.error`, `mesh_hit_error`, `ray_hit_error`, `endpoint_tolerance`). The acceptance fixture (20 µm triangle, sub-millimetre occluders, emitters near the origin) is in `tests/Fix_geometry.swift`.*
+
 **Confirmed original code defect; draft fix unverified.** Original mesh intersections rejected `t < 0.001` meters, used absolute determinant cutoff `1e-9`, and offset spawned rays by 1 mm. Shadow endpoints tolerated 2 mm. The reference scene contains millimeter details and light/backplane separations considerably smaller than that.
 
 **Implement/review:** validate the draft `ray_epsilon`/`ray_origin`, relative determinant test, and mesh minimum distance. Check all primary, secondary, shadow, and MetalFX guide paths use consistent geometric normals and tolerances. Prefer explicit error bounds if the heuristic fails distant/tiny geometry. Do not claim that the heuristic implements PBRT's bounded-error method.
@@ -75,6 +89,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 **Accept:** a 20-micrometer triangle 0.5 mm from a ray origin is hittable; an occluder less than 1 mm away still shadows; spawned rays avoid self-hit. Test scaled copies, large translations, negative/nonuniform transforms, grazing rays, and both reflected/refracted paths. Preserve existing procedural energy/MetalFX regressions.
 
 ### P1-03 — Imported sun points in the wrong direction
+
+*Addressed 2026-09-26 (R-07, R-119): oblique and rotated distant lights on Y-up and Z-up stages are tested in `tests/Fix_lights.swift`. The imported sun is now an independent directional light with UsdLux irradiance.*
 
 **Confirmed original mapping mismatch; draft correction present.** `renderFrame` reconstructs direction as `(sin(az)*cos(el), sin(el), cos(az)*cos(el))`; `USDImporter.load` previously computed azimuth with `atan2(z,x)`.
 
@@ -99,6 +115,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 **Accept:** oversized export/image requests fail recoverably before allocating a multi-GiB set; the active project remains usable. Verify representative 1080p/4K export memory and cancellation on the target M4.
 
 ### P1-06 — USD material/color interpretation can silently change the reference
+
+*Addressed 2026-09-26 (R-30): `ND_image` colour spaces come from `Usd.ColorSpaceAPI`, and unsupported spaces fall back with a report line (`tests/USDChecks.py`). The ACEScg/OCIO workflow remains unimplemented.*
 
 **Confirmed supported-subset limitations plus translator defects.** Original `UsdUVTexture` translation ignored literal `st`, defaulting to mesh UVs; connected Transform2d scale/translation were read as literals. Direct ND shader declarations with no authored value were emitted with a guessed zero, replacing standard defaults. Drafts address these cases but have no new tests. `sourceColorSpace=auto` still guesses from the receiving value type, not image metadata. Direct MaterialX image color-space metadata is not fully carried through. The ASWF texture documentation specifies ACEScg, while the renderer has no OCIO/ACES workflow.
 
@@ -150,6 +168,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 
 ### P2-05 — Light sampling wastes most environment proposals when the sun is disabled
 
+*Addressed 2026-09-26 (R-12, R-53, R-98): power-weighted emitter selection, an O(1) BSDF-hit emitter PDF, and no sun-cone proposals for a disabled or below-horizon sun (`tests/Fix_lights.swift`).*
+
 **Confirmed sampling strategy; no bias claim.** Scene 0/6 environment proposals choose the sun cone 60% of the time even if sun intensity is zero. Imported area-lit scenes still reserve half of proposals for environment even when it is entirely black. Emitters are chosen uniformly by triangle count regardless of area/power, and `eval_light_pdf` loops over all emitters on a BSDF light hit.
 
 **Implement:** derive proposal probabilities from enabled lights and measurable power/area; consider an alias table/CDF and a direct triangle-to-emitter PDF lookup. Update sampling and PDF evaluation together, including ReSTIR's area-measure target and temporal history reset.
@@ -158,6 +178,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 
 ### P2-06 — Paused rendering still submits display work continuously
 
+*Addressed 2026-09-26 (R-14, R-15, R-16, R-46): paused repaints trace nothing and do not re-run MetalFX (`tests/Fix_presentation.swift`).*
+
 **Confirmed.** `draw(in:)` obtains a drawable and encodes display work on every MTKView tick while paused/completed. Presentation work does not use the tracing in-flight semaphore. `presentCurrentFrame` may run MetalFX again when presentation refresh is requested, so display refresh and temporal input advancement need clear separation.
 
 **Implement:** use event-driven redraw while idle and keep display-only changes separate from new denoiser inputs. Request redraw for resize/exposure/compare/capture. Ensure pause behavior is coherent immediately after a scene edit or when textures are absent.
@@ -165,6 +187,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 **Accept:** near-idle GPU utilization while paused/completed; exposure and compare changes repaint; no extra path samples; no repeated temporal accumulation of the same noisy frame.
 
 ### P2-07 — Main-thread import/restore/edit work can stall the GUI
+
+*Addressed 2026-09-26 (R-44, R-45, R-47, R-72): off-main preparation with resource reuse, and coalesced autosaves with a 5 s camera debounce. Binary asset sidecars were not implemented (R-45 partial).*
 
 **Confirmed paths; latency unmeasured.** USD composition is background work, but final decode/material resource preparation, graph flattening and BVH upload occur synchronously on restore. OBJ parsing, project open/save, undo and many graph edits run on the main thread. Large JSON projects and 40 undo snapshots amplify cost.
 
@@ -182,6 +206,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 
 ### P2-09 — Camera framing and interaction need consistent scale and clip semantics
 
+*Addressed 2026-09-26 (R-29, R-88, R-124): orbit pivot and optical focus are separated, scroll zoom distinguishes precise and line deltas, and MetalFX depth is reversed-Z.*
+
 **Confirmed original issues; partial draft fixes.** Framing originally lacked a distance cap and narrow-viewport adjustment. Scene assignment always invokes a preset, even when assigning the same index (the test helper previously reset an imported camera). Wheel zoom uses a fixed 0.04-unit step, too coarse for centimeter-scale USD scenes. Projection/MetalFX depth use fixed near=0.05/far=100 despite much wider supported camera/scene extents. Imported zero focus distance becomes a 0.05-unit orbit pivot.
 
 **Implement:** validate draft frame-all/selection behavior, adopt scene-relative or multiplicative zoom, preserve current camera on same-scene assignment, and use consistent near/far parameters across render and denoiser guides. Distinguish camera orbit pivot from optical focus.
@@ -189,6 +215,8 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 **Accept:** frame visible selection/all at portrait/landscape sizes; tiny and large scenes remain navigable; persisted camera stays valid; switching/restoring/tests do not accidentally apply presets; depth/motion guides agree with the camera projection.
 
 ### P2-10 — Input parsing and project validation need structural/memory bounds
+
+*Addressed 2026-09-26 (R-71, R-73, R-129, R-37): per-prim fallback colours, bounded MaterialX image reads, UTF-8-only XML, and save refusing projects that open would reject.*
 
 **Confirmed missing bounds, not a demonstrated exploit.** MaterialX's 16 MB XML byte cap does not bound element depth/count; recursive descendant traversal and graph resolution can exhaust stack. Project JSON is loaded whole with embedded data before structural validation. Geometry asset storage, unused assets, camera target magnitude and aggregate image bytes are not uniformly bounded. A fallback `displayColor` keyed only by failed material path can incorrectly share the first prim's display color among different prims.
 
@@ -205,7 +233,7 @@ Preserve the Swift/Metal renderer, ReSTIR, MetalFX, stable reference keys, and u
 | P3-03 | Hierarchy is a large popup with indented names. | Add a searchable outline with expansion, selection, visibility and material summary. Preserve selection/scroll position while editing. Avoid a complete inspector rebuild that loses focus for every operation. |
 | P3-04 | Material slots are never reclaimed when deleting geometry. | Provide delete-unused-materials and explicit material deletion/reassignment, releasing image/emission state. Repeated import/delete should not permanently exhaust 56 slots; retain shared materials still in use. |
 | P3-05 | Material reset uses the value present when the inspector was opened, not a stable original/default. | Store meaningful parameter metadata/defaults and units. Distinguish reset-to-imported from reset-to-standard; constrain physical sliders without hiding valid data. |
-| P3-06 | Project association and dirty state need explicit lifecycle handling. | Draft dirty indicator is set by generic `changed`, including click-only camera callbacks. Clear it appropriately after successful open/save; show document name/path; preserve intended association during undo/new/import. Review recovery UX and save-on-quit semantics without adding unnecessary confirmation prompts. |
+| P3-06 | Project association and dirty state need explicit lifecycle handling. *Addressed 2026-09-26 (R-08, R-36, R-70, R-85, R-132).* | Draft dirty indicator is set by generic `changed`, including click-only camera callbacks. Clear it appropriately after successful open/save; show document name/path; preserve intended association during undo/new/import. Review recovery UX and save-on-quit semantics without adding unnecessary confirmation prompts. |
 | P3-07 | Toolbar/menus lack several direct commands and busy-state feedback. | Validate draft Save As, OBJ/USD import, Frame Selection/All, dynamic Undo/Redo labels and Pause label. Keep menu/toolbar availability consistent. Add visible import stage/progress and actionable error summaries. |
 | P3-08 | USD frame/variant/camera controls are inaccessible at import. | Add a small import-options UI for chosen camera, authored time and variants, with useful defaults and a concise capability report. Persist provenance separately from the flattened snapshot. |
 | P3-09 | Missing color-management workflow prevents fair visual comparisons. | Add an explicit working/display color pipeline and tagged image conversion before cosmetic tone-map changes. Compare raw linear exports first, then matched display transforms. |

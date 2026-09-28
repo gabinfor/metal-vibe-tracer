@@ -1,6 +1,21 @@
 # Technical audit fix plan — 2026-09-11
 
-Status: implemented. F1–F8 have code or documentation dispositions. Final release validation passed on 2026-09-21 with Xcode 27, Swift 6.4, and an Apple M4.
+Status: **superseded (2026-09-26)** by [AUDIT_REMEDIATION_2026-09-26.md](AUDIT_REMEDIATION_2026-09-26.md). This plan is kept as history.
+
+*Corrected status (2026-09-26):* this file previously read "Status: implemented", but that was not supported. The work landed in one commit, `7eaa8a7` (2026-09-21), and no per-package commits, disposition table, measured resource or latency data, or raw-radiance fixture were recorded, although "Final verification and handoff" below required them. The full suite did pass on 2026-09-21 with Xcode 27, Swift 6.4, and an Apple M4. The audit at `7a54652` then found that F1–F7 were only partly implemented; see the disposition table below.
+
+## Disposition at `7a54652` (added 2026-09-26)
+
+| ID | Status at `7a54652` | Missing evidence or defect found later | 2026-09-26 outcome |
+| --- | --- | --- | --- |
+| F1 | Partial | `restore()` did not budget new maps with new MaterialX textures (R-19). Whole-library replacement was not counted against the live library (R-20). The 11 B/pixel predecode estimate was not conservative for float images (R-59). Environment CDFs and staging were unbudgeted (R-58). No budget tests (R-107). | Fixed; `tests/Fix_gpu-memory.swift` |
+| F2 | Partial | `setEnvironment(nil)` aliased slot 0 (R-62). A rollback republished stale buffers (R-60). No release tests (R-107). | Fixed; `tests/Fix_gpu-memory.swift` |
+| F3 | Partial | Only the helper's arithmetic was tested, with no low-depth radiance fixture (R-110). Depth 1 behaved like depth 2 (R-64). | Fixed; depth semantics changed to pbrt's (`tests/Fix_integrator.swift`) |
+| F4 | Partial | Switching to or from an inspection view reallocated every texture and discarded beauty samples (R-04). The miss branch wrote reservoirs out of bounds (R-21). The preflight omitted MetalFX scaler memory (R-17), and the denoiser was never released (R-18). No allocation-inventory tests or measured bytes. | Fixed; scaler bytes are measured per device (`tests/Fix_gpu-memory.swift`) |
+| F5 | Partial | Undo, redo, imports and restore still rebuilt resources synchronously on the main thread (R-44). Autosave was uncoalesced (R-45). OBJ/MaterialX parsing ran on the main thread (R-72). No latency measurements. | Fixed except binary autosave sidecars (R-45 partial) |
+| F6 | Partial | The OIDN fast path checked one of five libraries, and preparation was unlocked and non-atomic (R-102). A corrupt cached wheel was never discarded (R-103). | Fixed; `tests/Fix_build.py` |
+| F7 | Partial | `AUDIT.md` and `REFERENCES.md` still overclaimed conservative preflight, joint accounting and skipped reservoir access (R-144), and cited dead symbols (R-121). | Corrected in the 2026-09-26 docs step |
+| F8 | As described | `AppDelegate` extraction only. The verifier's marker-based source splitting remains a risk (R-115). | R-115 handled by the remediation's test step |
 
 ## Objective and constraints
 
@@ -179,7 +194,9 @@ Acceptance: no rendering/schema/shortcut changes attributable to refactoring; cl
 
 ## Final verification and handoff
 
-## Implementation result — September 11, 2026
+## Implementation result (written for the September 11 plan; code landed in `7eaa8a7` on 2026-09-21)
+
+*Historical claims; the disposition table at the top records what was actually true at `7a54652`.*
 
 - **F1/F2:** Encoded image dimensions are checked before decode; candidate scene textures are deduplicated and budgeted cumulatively, including old/new replacement overlap. Empty map restore publishes channel defaults and releases obsolete texture references. Argument encoder state is restored on transactional failures.
 - **F3:** Terminal ReSTIR GI secondary vertices use unit NEE weight when the configured path-depth budget does not permit a complementary BSDF continuation. A deterministic helper regression covers the endpoint decision.
@@ -202,7 +219,7 @@ Remaining distribution work is outside this renderer audit: code signing,
 notarization, clean-machine installation testing, and publishing a versioned
 release artifact.
 
-Existing commands (run sequentially to avoid shared preparation races until F6 is fixed):
+Existing commands at the time. The earlier note to run them sequentially until F6 was fixed is obsolete. Since the 2026-09-26 remediation, preparation is locked and atomic, `build/verify.lock` serializes suite runs, and outputs go to `build/checks/runs/verify-*` (see README).
 
 ```sh
 ./build.sh
