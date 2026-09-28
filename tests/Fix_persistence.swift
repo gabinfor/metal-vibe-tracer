@@ -15,7 +15,7 @@
     try body()
   }
   func decode(_ url: URL) throws -> ProjectDocument {
-    try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: url))
+    try ProjectDocument.decodeProject(Data(contentsOf: url), near: url)
   }
   func button(_ title: String, in view: NSView) -> ActionButton? {
     if let b = view as? ActionButton, b.title == title { return b }

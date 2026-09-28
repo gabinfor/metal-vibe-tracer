@@ -273,7 +273,7 @@
   do {
     try reset()
     func idle() { waitUntil({ !controller.isBusy }, seconds: 60) }
-    func decode(_ url: URL) throws -> ProjectDocument { try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: url)) }
+    func decode(_ url: URL) throws -> ProjectDocument { try ProjectDocument.decodeProject(Data(contentsOf: url), near: url) }
     let fileA = folder.appendingPathComponent("guard-A.vtrace"), fileB = folder.appendingPathComponent("guard-B.vtrace")
     let fileC = folder.appendingPathComponent("guard-C.vtrace")
     for url in [fileA, fileB, fileC] { try? FileManager.default.removeItem(at: url) }
@@ -396,7 +396,7 @@
     try? FileManager.default.removeItem(at: controller.autosaveURL)
     require(appDelegate.applicationShouldTerminate(NSApplication.shared) == .terminateNow,
       "quit without pending I/O terminates immediately")
-    let flushed = try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: controller.autosaveURL))
+    let flushed = try ProjectDocument.decodeProject(Data(contentsOf: controller.autosaveURL), near: controller.autosaveURL)
     require(flushed.options.exposure == 0.75, "applicationShouldTerminate flushes the final autosave")
     controller.terminationRequested = false
     try reset()

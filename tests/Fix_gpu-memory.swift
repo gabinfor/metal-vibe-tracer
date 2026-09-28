@@ -361,7 +361,8 @@
   var oversized = ProjectDocument()
   oversized.environmentData = Data(count: 200 * 1024 * 1024)
   var heavy = SceneState()
-  for i in 0..<3 { heavy.maps[i] = Data(count: 128 * 1024 * 1024) }
+  // Distinct payloads: identical ones are stored once and count once (R-74).
+  for i in 0..<3 { var map = Data(count: 128 * 1024 * 1024); map[0] = UInt8(i + 1); heavy.maps[i] = map }
   oversized.scenes[0] = heavy
   do { _ = try oversized.encodeForSaving(); require(false, "save rejects embedded assets above the open limit") } catch {
     require(error.localizedDescription.contains("512 MiB"), "embedded-limit message is actionable")
@@ -370,7 +371,7 @@
   var broken = ProjectDocument(); broken.scenes[0] = SceneState(); broken.scenes[0]!.surfaces = []
   do { _ = try broken.encodeForSaving(); require(false, "save rejects documents validate() rejects") } catch {}
   let saved = try controller.snapshot().encodeForSaving()
-  try JSONDecoder().decode(ProjectDocument.self, from: saved).validate()
+  try ProjectDocument.decodeProject(saved, near: nil).validate()
   let v = SIMD4<Float>(-3.4028235e+38, -1.1754944e-38, -0.12345679, -9.8765434e-12)
   let worst = MeshTriangle(a: v, b: v, c: v, na: v, nb: v, nc: v, uvab: v, uvc: v)
   let perTriangle = try JSONEncoder().encode(Array(repeating: worst, count: 1000)).count / 1000

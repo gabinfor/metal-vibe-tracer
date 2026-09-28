@@ -125,21 +125,25 @@ struct ProjectDocument: Codable {
   // (4/3 size), each of up to 500,000 flat and 500,000 graph triangles encodes in
   // at most ~600 bytes (507 measured with worst-case floats), and 64 MiB covers
   // settings, graphs and names. Saving refuses anything larger, so every saved
-  // project reopens.
+  // project reopens. Format 3 (ProjectAssets) stores each distinct payload once and
+  // triangles as 128-byte binary records (171 bytes as base64), so the version 1/2
+  // bound also covers it; an autosave's JSON is smaller still.
   static let maximumFileBytes =
     embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.triangles * 600 + 64 * 1024 * 1024
 
+  // Identical payloads (a map or image shared by several slots, programs or scenes) are
+  // stored once in the asset table and count once.
   var embeddedAssetBytes: Int {
-    scenes.values.reduce(environmentData?.count ?? 0) { total, state in
-      total + state.maps.reduce(0) { $0 + ($1?.count ?? 0) }
-        + (state.materialX ?? [:]).values.reduce(0) { sum, program in
-          sum + program.images.reduce(0) { $0 + $1.data.count }
-        }
-    }
+    ProjectAssets.distinct(imagePayloads).reduce(0) { $0 + $1.count }
   }
 
-  // Encodes a snapshot for save or autosave only if the open path accepts it.
-  func encodeForSaving() throws -> Data {
+  // Encodes a self-contained snapshot for Save only if the open path accepts it.
+  func encodeForSaving() throws -> Data { try encodedForWriting(inline: true).json }
+  // Autosave JSON plus the payloads it references, stored as sidecars (writeAutosave).
+  func encodeForAutosave() throws -> (json: Data, payloads: [String: Data]) {
+    try encodedForWriting(inline: false)
+  }
+  private func encodedForWriting(inline: Bool) throws -> (json: Data, payloads: [String: Data]) {
     let embedded = embeddedAssetBytes
     guard embedded <= Self.embeddedAssetLimit else {
       throw MaterialLibrary.error(
@@ -150,18 +154,19 @@ struct ProjectDocument: Codable {
       throw MaterialLibrary.error(
         "This project could not be reopened, so it was not written: \(error.localizedDescription)")
     }
-    let data = try JSONEncoder().encode(self)
+    let encoded = try encodedProject(inline: inline)
+    let data = encoded.json
     guard data.count <= Self.maximumFileBytes else {
       throw MaterialLibrary.error(
         "This project would be \(data.count / 1_048_576) MiB, above the \(Self.maximumFileBytes / 1_048_576) MiB file limit. Reduce embedded images or geometry before saving."
       )
     }
-    return data
+    return encoded
   }
 
   func validate() throws {
     func bad() throws { throw MaterialLibrary.error("Invalid or unsupported project data.") }
-    guard (1...2).contains(version), scene <= 6, strategy <= 3, sky <= 2, fog <= 1, ring <= 1,
+    guard (1...ProjectAssets.formatVersion).contains(version), scene <= 6, strategy <= 3, sky <= 2, fog <= 1, ring <= 1,
       options.maxSamples <= 16_777_214, options.exportSamples > 0,
       options.exportSamples <= 16_777_214,
       (16...8192).contains(options.outputWidth), (16...8192).contains(options.outputHeight),
@@ -199,8 +204,7 @@ struct ProjectDocument: Codable {
       try bad()
       return
     }
-    var embeddedBytes = environmentData?.count ?? 0
-    guard embeddedBytes <= 256 * 1024 * 1024 else { try bad(); return }
+    guard (environmentData?.count ?? 0) <= 256 * 1024 * 1024 else { try bad(); return }
     for (index, state) in scenes {
       guard (0...6).contains(index), [8, SceneLimits.materials].contains(state.surfaces.count),
         state.objects.count == state.surfaces.count,
@@ -225,13 +229,11 @@ struct ProjectDocument: Codable {
         try program.validate()
         for image in program.images {
           guard image.data.count <= 128 * 1024 * 1024 else { try bad(); return }
-          embeddedBytes += image.data.count
         }
       }
       for i in state.maps.indices {
         if let data = state.maps[i] {
           guard data.count <= 128 * 1024 * 1024 else { try bad(); return }
-          embeddedBytes += data.count
         }
         guard state.surfaces[i / 4].mapMask & (1 << (i % 4)) == 0 || state.maps[i] != nil else {
           try bad()
@@ -263,7 +265,7 @@ struct ProjectDocument: Codable {
         }
       }
     }
-    guard embeddedBytes <= Self.embeddedAssetLimit else { try bad(); return }
+    guard embeddedAssetBytes <= Self.embeddedAssetLimit else { try bad(); return }
     try graph?.validate()
     // Legacy meshes use the scene-graph bounds; uvc.z is converted to an integer slot.
     for t in triangles {

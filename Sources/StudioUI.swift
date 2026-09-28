@@ -1422,9 +1422,9 @@ final class StudioController: NSViewController {
     guard let item else { return nil }
     return writeAutosave(item)
   }
+  // Payloads go to AutosaveAssets/ beside the file, each written once (ProjectAssets).
   nonisolated private func writeAutosave(_ document: ProjectDocument, to url: URL) throws {
-    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try document.encodeForSaving().write(to: url, options: .atomic)
+    _ = try document.writeAutosave(to: url)
   }
   // autosaveQueue only: skips a revision that is already on disk at that location.
   nonisolated private func writeAutosave(_ item: PendingAutosave) -> Error? {
@@ -1519,7 +1519,7 @@ final class StudioController: NSViewController {
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, MaterialLibrary) in
         let data = try self.readBounded(url, maximum: ProjectDocument.maximumFileBytes)
-        let document = try JSONDecoder().decode(ProjectDocument.self, from: data)
+        let document = try ProjectDocument.decodeProject(data, near: url)
         return (document, try self.prepareResources(document, reuse: reuse))
       }
       var preserved: Result<URL, Error>?
@@ -1601,7 +1601,7 @@ final class StudioController: NSViewController {
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, MaterialLibrary) in
         let data = try self.readBounded(url, maximum: ProjectDocument.maximumFileBytes)
-        let document = try JSONDecoder().decode(ProjectDocument.self, from: data)
+        let document = try ProjectDocument.decodeProject(data, near: url)
         return (document, try self.prepareResources(document, reuse: reuse))
       }
       DispatchQueue.main.async { [weak self] in
@@ -1771,7 +1771,7 @@ final class StudioController: NSViewController {
     var document = ProjectDocument()
     document.scenes[0] = state
     chooseSave("Save material preset", name: "Material.vmat", ext: "vmat") { [weak self] url in
-      do { try JSONEncoder().encode(document).write(to: url, options: .atomic) } catch {
+      do { try document.encodedProject().json.write(to: url, options: .atomic) } catch {
         self?.showError(error.localizedDescription)
       }
     }
@@ -1791,8 +1791,8 @@ final class StudioController: NSViewController {
     beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, Void) in
       guard let self else { throw MaterialLibrary.error("Material preset load cancelled.") }
       var document = document  // The build runs on projectIOQueue with its own copy.
-      let p = try JSONDecoder().decode(
-        ProjectDocument.self, from: self.readBounded(url, maximum: ProjectDocument.maximumFileBytes))
+      let p = try ProjectDocument.decodeProject(
+        self.readBounded(url, maximum: ProjectDocument.maximumFileBytes), near: nil)
       try p.validate()
       // Padding keeps short (legacy or hand-written) presets within bounds.
       guard let source = p.scenes[0]?.padded else {

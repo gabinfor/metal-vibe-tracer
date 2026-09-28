@@ -328,7 +328,7 @@ require(testRenderer.renderMemoryError(width: oversizedSide, height: oversizedSi
 require(testRenderer.renderMemoryError(width: 64, height: 64) == nil, "small render passes GPU memory preflight")
 let autosaveTestURL = studioDirectory.appendingPathComponent("final-autosave.vtrace")
 try controller.flushAutosave(to: autosaveTestURL)
-let autosaved = try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: autosaveTestURL))
+let autosaved = try ProjectDocument.decodeProject(Data(contentsOf: autosaveTestURL), near: autosaveTestURL)
 require(autosaved.camera.distance == testRenderer.distance, "shutdown autosave flush persists final snapshot")
 testRenderer.distance = 4.6; testRenderer.pitch = 0.2
 // Export through the actual controller, then decode its independently sized file.
