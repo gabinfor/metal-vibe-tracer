@@ -243,6 +243,8 @@ Commits on `main` after the remediation record (`git log --oneline c6971af..HEAD
 | `ff32d34` | feat(usd): map PreviewSurface emissiveColor to OpenPBR emission | PreviewSurface emission fallback |
 | `751b164` | test(materialx): graph emission radiance, strategy agreement and the ASWF shader ball | Tests for the two above |
 | `78cd868` | fix(materialx): coat emission with the MaterialX generalized_schlick_edf factor | Frame-time cost of the first coat attenuation |
+| `29d46aa` | fix(usd): emissive-only stages are lit by their materials, without the neutral sky | Inspection sky on emissive-only stages ("Graph emission" limitation) |
+| `5890d3a` | perf(usd): convert mesh arrays at once in the USD bridge | Slow large USD imports (per-value Gf conversion) |
 
 - **Project format 3 (R-45, R-74).** Embedded maps, MaterialX images, the environment and mesh triangles are stored once each in an asset table keyed by SHA-256 (CryptoKit; `REFERENCES.md` `SHA256FIPS`). Triangles are binary records. `.vtrace` files and `.vmat` presets keep the table inline and stay self-contained. Autosaves and recovery copies keep payloads as `AutosaveAssets/<digest>` sidecars, written once. Sidecars that no recovery file references are collected after a successful write, with a 10-minute grace period. Version 1 and 2 projects open and are saved as format 3, and identical images count once against the 512 MiB limit. `Fix_project-format` reports the autosave bytes per revision for its fixture: 5,059,502 in the version 2 layout on every revision. In format 3 they are 3,670,014 for the first revision, 25,675 for a camera-only revision and 75,311 after a new map.
 - **R-101.** Scene-graph meshes are flattened straight into the shared GPU triangle buffer and put into BVH order in place (`OBJMesh.buildInPlace`). `meshTriangles` only shares a legacy document's own array. Framing reads the buffer, and graph-edit rollback rebinds the previous buffers. Per `a0586f2`, peak host bytes while publishing a 500,000-triangle graph mesh fell from +218.9 MiB to +96.7 MiB.
@@ -261,6 +263,8 @@ Follow-up validation (2026-09-28, `main`): `./build.sh` passed (Swift 6 mode, bu
 USD orbit pivot validation (2026-09-28): `./build.sh` passed; `MTL_DEBUG_LAYER=1 python3 tests/verify.py` exited 0 with 98 PASS, 0 FAIL and no compiler warnings. With the former flattened pivot restored, `Fix_usd-pivot` fails its import heap check.
 
 Graph-emission validation (2026-09-28, `78cd868`): `./build.sh` passed (Swift 6 mode, bundle check, no warnings); `MTL_DEBUG_LAYER=1 python3 tests/verify.py --require-reference` exited 0 with 101 PASS, 0 FAIL and no compiler warnings, on the same machine.
+
+Emissive-only lighting and bridge conversion validation (2026-09-28, `5890d3a`): `/usr/bin/python3 tests/USDChecks.py` passed; `MTL_DEBUG_LAYER=1 python3 tests/verify.py --require-reference` exited 0 with 104 PASS, 0 FAIL and no compiler warnings; `./build.sh` passed (Swift 6 mode, bundle check). Without the `USDImporter.load` change, `Fix_usd-lighting` fails its neutral-sky check.
 
 ## Remaining limitations and partial fixes
 
