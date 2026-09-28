@@ -10,9 +10,15 @@ Intel Open Image Denoise 2.5.0, downloaded from the official RenderKit GitHub re
 - Intel SHA-256: `afa810e4a184df145659a0ab140c1fd126897a529819f14e083e9c2de191ac31`
 - License: Apache License 2.0.
 
-`scripts/prepare_oidn.py` verifies the archive and copies its unmodified dynamic
-libraries and documentation into ignored `build/OIDN`. `build.sh` bundles that
-runtime under `Contents/Frameworks/OIDN`. The complete upstream license and
+`scripts/prepare_oidn.py --arch <arch>` verifies the archive for the architecture of
+the executable being built and copies its unmodified dynamic libraries and
+documentation into ignored `build/OIDN`. It writes `VIBE_RUNTIME.json`, which
+records the version, architecture, archive SHA-256 and a SHA-256 table of every
+file under `lib/` and `doc/`. A cached runtime is reused only when that table
+still matches and all five required libraries are present. Preparation is locked,
+extracted in staging and published atomically. `build.sh` bundles that runtime
+under `Contents/Frameworks/OIDN`, and `scripts/check_bundle.py` checks the staged
+bundle before it replaces the previous app. The complete upstream license and
 dependency notices remain in the bundled `doc` directory.
 
 `Sources/OIDN.swift` is original integration code against OIDN's C99 ABI. It

@@ -9,7 +9,10 @@ Pinned revision: c91aad1d1ce1693e803f039d7c92c2965c4eb013.
 The complete license is provided in Vendor/OpenPBR/LICENSE and in the app bundle
 as OpenPBR-LICENSE. Original copyright and attribution comments remain in the
 vendored files. The generated shader adapts two metal energy lookup functions;
-see Vendor/OpenPBR/UPSTREAM.md and REFERENCES.md. The local adapter, texture
+see Vendor/OpenPBR/UPSTREAM.md and REFERENCES.md. As a modified file under
+Apache-2.0 section 4(b), the bundled OpenPBR.metal keeps the upstream per-file
+copyright and license comments and begins with a "Modified by Metal Vibe
+Tracer" notice that describes the changes. The local adapter, texture
 infrastructure, and editor are separate from the vendored upstream source.
 
 ## Sheen implementation and lookup data included through Adobe
@@ -45,8 +48,16 @@ The original Simball inspiration is credited to Thomas Anagnostou; this download
 is the ASWF reimplementation, with its own CC-BY-4.0 license.
 Local adaptations select the triangulated/plastic variants in a separate layer,
 map supported shading to OpenPBR, and snapshot into this renderer. Original
-source files are unchanged. Assets and generated renders/projects are optional
-local downloads, not bundled with the application. See Examples/OpenUSD/README.md.
+source files are unchanged. The downloaded assets and renders/projects generated
+by the tests are optional local files under build/, not bundled with the
+application. See Examples/OpenUSD/README.md.
+
+The repository does contain one derived render of this asset:
+docs/images/openusd-reference.png, a Metal Vibe Tracer image of the adapted
+scene described above. It is derived from the CC-BY-4.0 asset
+(https://creativecommons.org/licenses/by/4.0/); its adjacent attribution and
+statement of changes are in docs/images/README.md. It is not bundled with the
+application.
 
 ## Intel Open Image Denoise
 
@@ -57,3 +68,15 @@ final-frame denoising. Its complete license and bundled dependency notices are
 preserved under `Contents/Frameworks/OIDN/doc`. Pinned archive details and the
 boundary between upstream code and local integration are documented in
 `Vendor/OIDN/UPSTREAM.md` and `REFERENCES.md`.
+
+## Tone-mapping fit from Baking Lab
+
+The filmic display curve in `tonemap` (main.swift) uses the rational fit
+`RRTAndODTFit` by Stephen Hill (@self_shadow), as published in Baking Lab by MJP
+and David Neubelt: https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl.
+Baking Lab states that all its code is under the MIT License (Copyright (c) 2016
+MJP). Only the fit's two rational-polynomial expressions and their five numeric
+coefficients are reproduced; the ACES color matrices and the surrounding source are
+not. The project treats this as a minimal reproduction, records this attribution,
+and would include the full MIT notice if more of that source were copied. See
+REFERENCES.md (HILLFIT).

@@ -15,3 +15,12 @@ ideal-metal energy-complement and average-complement lookup bodies with the
 denser checked-in Shaders/MetalEnergy.metal table. It is regenerated with the
 pinned VNDF/Smith functions by scripts/generate_metal_energy.py. No vendored
 header is modified. See REFERENCES.md (ADOBEOPENPBR) for rationale and validation.
+
+Modification notice (Apache-2.0 section 4(b)): the generated
+build/ShaderResources/OpenPBR.metal, bundled as Contents/Resources/OpenPBR.metal,
+is a modified form of these headers. scripts/prepare_shaders.py preprocesses them
+with `clang -E -P -C`, keeping the upstream per-file copyright and license
+comments, and prefixes the file with a "Modified by Metal Vibe Tracer" line that
+names the preprocessing and the energy-lookup substitution. The upstream-only
+variant (--upstream-only --output) used by the energy-table generator is never
+bundled. tests/Fix_build.py and tests/Fix_build.swift check these notices.
