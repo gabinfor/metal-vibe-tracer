@@ -393,8 +393,8 @@ enum OBJMesh {
           let c = vertices[i + 1]
           let e1 = b.0 - a.0, e2 = c.0 - a.0
           let cross = simd_cross(e1, e2)
-          // Relative test, matching the GPU determinant test: sub-millimetre
-          // faces in meter units stay; only collinear or coincident edges go.
+          // Relative test: sub-millimetre faces in meter units stay; only collinear
+          // or coincident edges go (the GPU's watertight test rejects only det = 0).
           let area = simd_length(cross)
           guard area.isFinite, area > 1e-7 * simd_length(e1) * simd_length(e2) else {
             skipped += 1

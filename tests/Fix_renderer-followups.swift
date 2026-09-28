@@ -1,4 +1,5 @@
-// Renderer follow-ups: one host copy of imported triangles (R-101).
+// Renderer follow-ups: one host copy of imported triangles (R-101), the watertight
+// ray/triangle test (WOOP2013) and its conservative BVH traversal.
 @MainActor func fixRendererFollowupsChecks() throws {
   let stride = MemoryLayout<MeshTriangle>.stride
   func triangle(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>, slot: Float = 0, id: Float = 1) -> MeshTriangle {
@@ -133,5 +134,103 @@
   }
   print("PASS: fix-renderer-followups single host triangle copy and buffer-based framing (R-101)")
 
+  // WOOP2013: rays aimed exactly at shared edges and vertices of a tessellated, curved
+  // patch never pass between its triangles (closest hit and any hit), and the BVH still
+  // returns exactly the brute-force closest hit. The patch is a height field whose slope
+  // stays below 20 degrees and every eye looks down on it more steeply, so each ray
+  // crosses it exactly once (no silhouette tangency): any miss is a crack.
+  let kernels = """
+  kernel void rf_edge_rays(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+      device atomic_uint *out [[buffer(3)]], constant uint &count [[buffer(4)]], device const float4 *targets [[buffer(5)]],
+      constant uint &targetCount [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+      if(gid.x>=targetCount) return;
+      float3 eyes[6]={float3(0.3f,3,0.2f),float3(4,3.5f,-3),float3(-7,6,5),float3(0.05f,20,0.01f),float3(2.5f,1.8f,1.7f),float3(-0.4f,9,-12)};
+      float3 eye=eyes[gid.y], target=targets[gid.x].xyz;
+      Ray r={eye,normalize(target-eye)}; HitRecord h;
+      atomic_fetch_add_explicit(&out[0],1,memory_order_relaxed);
+      bool hit=trace_scene(r,6,h,images,u) && h.objectID>=64;
+      if(!hit) atomic_fetch_add_explicit(&out[1],1,memory_order_relaxed);
+      if(!scene_occluded(r,6,length(target-eye)*1.001f+1e-3f,images,u)) atomic_fetch_add_explicit(&out[2],1,memory_order_relaxed);
+      float tMin=ray_t_min(eye,u), best=1e20f; bool mesh=false; HitRecord p;
+      if(trace_scene(r,6,p,images.objects,u.light.w,u.light.xyz,tMin)) best=p.t;
+      for(uint i=0;i<count;++i) { float t,b1,b2; if(intersect_mesh_triangle(images.triangles[i],r,tMin,best,t,b1,b2)) { best=t; mesh=true; } }
+      if(hit!=mesh || (hit && abs(h.t-best)>1e-6f*max(1.0f,best))) atomic_fetch_add_explicit(&out[3],1,memory_order_relaxed);
+  }
+  // Edge functions are exact negatives for the two orientations of an edge, including
+  // near-collinear operands; a tie of the rounded products resolves to the exact sign.
+  kernel void rf_edge_function(device atomic_uint *out [[buffer(3)]], device float *tie [[buffer(5)]], uint gid [[thread_position_in_grid]]) {
+      if(gid==0) {
+          float2 p=float2(1.000244140625f,1.00048828125f), q=float2(1.0f,1.000244140625f);
+          tie[0]=watertight_edge(p,q); tie[1]=watertight_edge(q,p);
+      }
+      uint seed=gid*7919u+3u;
+      for(int k=0;k<64;++k) {
+          float2 p=float2(rand_f(seed),rand_f(seed))*4.0f-2.0f;
+          float s=rand_f(seed)*3.0f-1.5f;
+          float2 q=k<32 ? p*s*float2(1.0f+1e-7f*(rand_f(seed)-0.5f),1.0f+1e-7f*(rand_f(seed)-0.5f)) : float2(rand_f(seed),rand_f(seed))*4.0f-2.0f;
+          if(watertight_edge(p,q)!=-watertight_edge(q,p)) atomic_fetch_add_explicit(&out[0],1,memory_order_relaxed);
+      }
+  }
+  """
+  let library = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  func dispatch(_ name: String, _ input: Uniforms, grid: MTLSize, count: UInt32 = 0, extra: MTLBuffer? = nil,
+                extraCount: UInt32 = 0) throws -> MTLBuffer {
+    var u = input, n = count, m = extraCount
+    guard let function = library.makeFunction(name: name),
+      let out = gpu.makeBuffer(length: 64, options: .storageModeShared),
+      let command = testRenderer.commandQueue.makeCommandBuffer(),
+      let encoder = command.makeComputeCommandEncoder()
+    else { throw MaterialLibrary.error("Could not encode \(name).") }
+    memset(out.contents(), 0, 64)
+    encoder.setComputePipelineState(try gpu.makeComputePipelineState(function: function))
+    require(testRenderer.materials.bind(encoder), "\(name) binds scene resources")
+    encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+    encoder.setBuffer(out, offset: 0, index: 3)
+    encoder.setBytes(&n, length: 4, index: 4)
+    encoder.setBuffer(extra, offset: 0, index: 5)
+    encoder.setBytes(&m, length: 4, index: 6)
+    encoder.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: min(grid.width, 64), height: 1, depth: 1))
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    require(command.status == .completed, "\(name) GPU command")
+    return out
+  }
+  func counters(_ buffer: MTLBuffer, _ count: Int) -> [UInt32] {
+    (0..<count).map { buffer.contents().load(fromByteOffset: $0 * 4, as: UInt32.self) }
+  }
+  let cells = 16
+  let (vertices, surface) = patch(cells)
+  var targets: [SIMD4<Float>] = []
+  for i in 1..<cells { for j in 1..<cells { targets.append(SIMD4(vertices[i][j], 0)) } }
+  func edge(_ a: SIMD3<Float>, _ b: SIMD3<Float>) { for f in [Float(0.25), 0.5, 0.75] { targets.append(SIMD4(a + (b - a) * f, 0)) } }
+  for i in 0..<cells {
+    for j in 0..<cells {
+      if j > 0 { edge(vertices[i][j], vertices[i + 1][j]) }
+      if i > 0 { edge(vertices[i][j], vertices[i][j + 1]) }
+      if (i + j) % 2 == 0 { edge(vertices[i][j], vertices[i + 1][j + 1]) } else { edge(vertices[i + 1][j], vertices[i][j + 1]) }
+    }
+  }
+  try testRenderer.materials.restore(SceneState())
+  try testRenderer.materials.setMesh(surface)
+  var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+  u.environment = SIMD4(0, 0, 0, Float(testRenderer.materials.nodeCount))
+  u.lens.z = 1
+  u.sunParams.w = 0
+  guard let targetBuffer = targets.withUnsafeBytes({ gpu.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
+    let tieBuffer = gpu.makeBuffer(length: 8, options: .storageModeShared)
+  else { throw MaterialLibrary.error("Could not allocate edge-ray inputs.") }
+  let edges = counters(try dispatch("rf_edge_rays", u, grid: MTLSize(width: targets.count, height: 6, depth: 1),
+    count: UInt32(surface.count), extra: targetBuffer, extraCount: UInt32(targets.count)), 4)
+  print("Watertight edge rays: \(edges[0]) rays at shared edges/vertices, \(edges[1]) closest-hit misses, "
+    + "\(edges[2]) any-hit misses, \(edges[3]) BVH/brute-force mismatches")
+  require(edges[0] == UInt32(targets.count * 6) && edges[1] == 0 && edges[2] == 0 && edges[3] == 0,
+    "rays at shared edges and vertices never pass between triangles; BVH matches brute force")
+  let symmetric = counters(try dispatch("rf_edge_function", u, grid: MTLSize(width: 4096, height: 1, depth: 1), extra: tieBuffer), 1)
+  let tie = (0..<2).map { tieBuffer.contents().load(fromByteOffset: $0 * 4, as: Float.self) }
+  print("Edge functions: \(symmetric[0]) antisymmetry failures, tie resolved to \(tie)")
+  require(symmetric[0] == 0 && tie[0] == 0x1p-24 && tie[1] == -0x1p-24,
+    "edge functions are exactly antisymmetric and resolve rounded-product ties exactly")
+  try testRenderer.materials.setMesh([])
+  try testRenderer.materials.restore(SceneState())
+  print("PASS: fix-renderer-followups watertight ray/triangle intersection and conservative traversal (WOOP2013)")
 }
 try fixRendererFollowupsChecks()

@@ -667,10 +667,20 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
 }
 
 
-bool mesh_node_hit(MeshNode node, Ray local, float nearT, float farT) {
+// REFERENCES.md: WOOP2013 (3.3). The watertight test below decides edges in a translated
+// and sheared frame, which rounds like moving each vertex by up to about
+// 5 * 2^-24 * (|vertex - origin| + |vertex.z - origin.z|). Boxes are enlarged by a per-ray
+// bound on that (and on the slab divisions): the paper's shifted origins, lo - (o + e) and
+// hi - (o - e), so traversal never culls a triangle the edge test would hit.
+struct MeshBoxRay { float3 low, high; };
+MeshBoxRay mesh_box_ray(Ray local, MeshNode root) {
+    float e=1.1920929e-6f*(max_abs(local.origin)+max(max_abs(root.lo.xyz),max_abs(root.hi.xyz)));
+    return { local.origin+e, local.origin-e };
+}
+bool mesh_node_hit(MeshNode node, Ray local, MeshBoxRay box, float nearT, float farT) {
     for(int axis=0;axis<3;++axis) {
-        if(abs(local.direction[axis])<1e-8f) { if(local.origin[axis]<node.lo[axis] || local.origin[axis]>node.hi[axis]) farT=-1; }
-        else { float a=(node.lo[axis]-local.origin[axis])/local.direction[axis], b=(node.hi[axis]-local.origin[axis])/local.direction[axis]; nearT=max(nearT,min(a,b)); farT=min(farT,max(a,b)); }
+        if(abs(local.direction[axis])<1e-8f) { if(box.low[axis]<node.lo[axis] || box.high[axis]>node.hi[axis]) farT=-1; }
+        else { float a=(node.lo[axis]-box.low[axis])/local.direction[axis], b=(node.hi[axis]-box.high[axis])/local.direction[axis]; nearT=max(nearT,min(a,b)); farT=min(farT,max(a,b)); }
     }
     return nearT<=farT;
 }
@@ -681,17 +691,62 @@ void push_mesh_children(MeshNode node, Ray local, thread int *stack, thread int 
     bool leftFirst=local.direction[clamp(node.links.z,0,2)]>=0;
     stack[top++]=leftFirst?node.links.y:node.links.x; stack[top++]=leftFirst?node.links.x:node.links.y;
 }
+// REFERENCES.md: WOOP2013. Watertight ray/triangle intersection (Woop, Benthin and Wald,
+// JCGT 2(1), 2013; also PBRT2023 6.5.3). The ray is translated to the origin and sheared
+// and scaled onto +z once per ray, so each 2D edge function depends only on the ray and
+// that edge's two vertices, and an edge value of 0 counts as inside for both sides.
+// The permutation and shear are folded into three rows applied to every vertex: rows x and
+// y are e_kx - S_x e_kz and e_ky - S_y e_kz, row z is S_z e_kz. Their zero and unit entries
+// are exact, so this is the paper's per-vertex transform without per-triangle indexing.
+struct WatertightRay { float3 origin, x, y, z; };
+WatertightRay watertight_ray(Ray r) {
+    float3 d=abs(r.direction);
+    int kz=d.x>d.y ? (d.x>d.z ? 0 : 2) : (d.y>d.z ? 1 : 2);
+    int kx=kz==2 ? 0 : kz+1, ky=kx==2 ? 0 : kx+1;
+    // Swapping x and y for a negative z direction preserves the winding.
+    if(r.direction[kz]<0) { int s=kx; kx=ky; ky=s; }
+    float3 ex=float3(kx==0,kx==1,kx==2), ey=float3(ky==0,ky==1,ky==2), ez=float3(kz==0,kz==1,kz==2);
+    WatertightRay w;
+    w.origin=r.origin;
+    w.x=ex-ez*(r.direction[kx]/r.direction[kz]);
+    w.y=ey-ez*(r.direction[ky]/r.direction[kz]);
+    w.z=ez*(1.0f/r.direction[kz]);
+    return w;
+}
+// p.x*q.y - p.y*q.x. Neighbours spanning a shared edge in opposite directions compute
+// fl(fl(ab) - fl(cd)) and fl(fl(cd) - fl(ab)), exact negatives only while each product is
+// rounded on its own: relaxed math would otherwise fuse one product into an FMA (MSL 4.1
+// 1.6.3), which measurably reopened cracks. When the rounded products tie, their FMA
+// rounding errors (exact) give the exact sign: the paper's double-precision fallback, which
+// Metal lacks (it restores accuracy; the float test is already watertight).
+float watertight_edge(float2 p, float2 q) {
+    #pragma METAL fp contract(off)
+    float x=p.x*q.y, y=p.y*q.x, e=x-y;
+    if(e==0.0f) e=fma(p.x,q.y,-x)-fma(p.y,q.x,-y);
+    return e;
+}
+// Two-sided hit in [tMin, tMax); b1 and b2 weight vertices b and c.
+bool intersect_mesh_triangle(MeshTriangle tri, WatertightRay r, float tMin, float tMax, thread float &t, thread float &b1, thread float &b2) {
+    float3 A=tri.a.xyz-r.origin, B=tri.b.xyz-r.origin, C=tri.c.xyz-r.origin;
+    float2 a=float2(dot(r.x,A),dot(r.y,A)), b=float2(dot(r.x,B),dot(r.y,B)), c=float2(dot(r.x,C),dot(r.y,C));
+    float U=watertight_edge(c,b), V=watertight_edge(a,c);
+    // Opposite signs already mean a miss (the test below, applied early).
+    if((U<0 && V>0) || (U>0 && V<0)) return false;
+    float W=watertight_edge(b,a);
+    if((U<0 || V<0 || W<0) && (U>0 || V>0 || W>0)) return false;
+    // det = 0: the ray lies in the triangle's plane, or the triangle is degenerate.
+    float det=U+V+W;
+    if(det==0.0f) return false;
+    float T=U*dot(r.z,A)+V*dot(r.z,B)+W*dot(r.z,C);
+    float inverse=1.0f/det;
+    t=T*inverse; b1=V*inverse; b2=W*inverse;
+    return t>=tMin && t<tMax;
+}
 bool intersect_mesh_triangle(MeshTriangle tri, Ray local, float tMin, float tMax, thread float &t, thread float &b1, thread float &b2) {
-    float3 e1=tri.b.xyz-tri.a.xyz, e2=tri.c.xyz-tri.a.xyz;
-    float3 q=cross(local.direction,e2); float det=dot(e1,q);
-    if(abs(det)<=1e-7f*length(e1)*length(e2)) return false;
-    float3 d=local.origin-tri.a.xyz; b1=dot(d,q)/det;
-    float3 v=cross(d,e1); b2=dot(local.direction,v)/det;
-    t=dot(e2,v)/det;
-    return !(b1<0 || b2<0 || b1+b2>1 || t<tMin || t>=tMax);
+    return intersect_mesh_triangle(tri,watertight_ray(local),tMin,tMax,t,b1,b2);
 }
 
-// REFERENCES.md: PBRT2023, OBJ2026. Local determinant triangle test and median BVH.
+// REFERENCES.md: PBRT2023, OBJ2026, WOOP2013. Watertight triangle test and median BVH.
 bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant MaterialResources &images, constant Uniforms &u) {
     float tMin=ray_t_min(r.origin,u);
     bool hit=trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz,tMin);
@@ -702,15 +757,17 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
     if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float closest=hit ? rec.t/o.positionScale.w : 1e20f;
+    WatertightRay watertight=watertight_ray(local);
+    MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
     while(top>0) {
         MeshNode node=images.nodes[stack[--top]];
-        if(!mesh_node_hit(node,local,tMin/o.positionScale.w,closest)) continue;
+        if(!mesh_node_hit(node,local,box,tMin/o.positionScale.w,closest)) continue;
         if(node.links.w==0) { push_mesh_children(node,local,stack,top); continue; }
         for(int k=0;k<node.links.w;++k) {
             MeshTriangle tri=images.triangles[node.links.z+k];
             float t,b1,b2;
-            if(!intersect_mesh_triangle(tri,local,tMin/o.positionScale.w,closest,t,b1,b2)) continue;
+            if(!intersect_mesh_triangle(tri,watertight,tMin/o.positionScale.w,closest,t,b1,b2)) continue;
             float3 e1=tri.b.xyz-tri.a.xyz, e2=tri.c.xyz-tri.a.xyz;
             closest=t; hit=true; float b0=1-b1-b2;
             // Rebuild the point from barycentrics: it then lies on the triangle
@@ -751,15 +808,17 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
     if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float nearT=tMin/o.positionScale.w, farT=tMax/o.positionScale.w;
+    WatertightRay watertight=watertight_ray(local);
+    MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
     while(top>0) {
         MeshNode node=images.nodes[stack[--top]];
-        if(!mesh_node_hit(node,local,nearT,farT)) continue;
+        if(!mesh_node_hit(node,local,box,nearT,farT)) continue;
         if(node.links.w==0) { push_mesh_children(node,local,stack,top); continue; }
         for(int k=0;k<node.links.w;++k) {
             MeshTriangle tri=images.triangles[node.links.z+k];
             float t,b1,b2,slack=uses_scene_graph(u) ? mesh_hit_error(tri,float3(0),u) : 0.0f;
-            if(intersect_mesh_triangle(tri,local,nearT,farT-slack,t,b1,b2)) return true;
+            if(intersect_mesh_triangle(tri,watertight,nearT,farT-slack,t,b1,b2)) return true;
         }
     }
     return false;
