@@ -67,6 +67,8 @@
     graph.nodes.append(SceneNode(name: "patch", mesh: asset.id, bindings: [material.id]))
     let count = large.count, copy = count * stride
     let library = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    // The flat reference path's in-place BVH; tests/Fix_accel.swift checks the two-level one.
+    library.acceleration = .flat
     let sampler = HeapSampler()
     let baseline = HeapSampler.inUse()
     let started = DispatchSemaphore(value: 0), finished = DispatchSemaphore(value: 0)

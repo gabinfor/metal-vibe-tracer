@@ -42,6 +42,7 @@ PARTS = [
     ('Fix_renderer-followups.swift', {'full'}),
     ('Fix_shaderball-emission.swift', {'full'}),
     ('Fix_usd-lighting.swift', {'full', 'usd'}),
+    ('Fix_accel.swift', ALL),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()

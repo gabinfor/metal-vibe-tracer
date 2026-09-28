@@ -108,6 +108,8 @@ if !CommandLine.arguments[1].isEmpty {
         fputs("INCOMPATIBLE: material argument buffer is \(oldLength) B in the baseline, \(newLength) B now\n", stderr); exit(3)
     }
     let baseline = try PathTracerRenderer(device: gpu)
+    // Earlier shaders read the flat BVH layout (MeshNode array over flattened triangles).
+    baseline.materials.acceleration = .flat
     metalSource = optimizedShader
     benchmarkSafeMath = false
     renderers.insert(("baseline", baseline), at: 0)
@@ -126,8 +128,39 @@ for i in 0..<rings { for j in 0..<segments {
     obj += "f \(a) \(b) \(b + segments) \(a + segments)\n"
 }}
 let mesh = try OBJMesh.load(obj)
+// A scene graph of 25 rotated instances of one bumpy 19,968-triangle patch (499,200 rendered,
+// within the earlier flat BVH's 500,000-triangle limit so a baseline can render it).
+var instanced = SceneGraph()
+do {
+    let cells = 100
+    var grid: [[SIMD3<Float>]] = []
+    for i in 0...cells { grid.append((0...cells).map { j in
+        let x = Float(i) / Float(cells) * 2 - 1, z = Float(j) / Float(cells) * 2 - 1
+        return SIMD3(x, 0.12 * sin(9 * x) * cos(7 * z) + 0.05 * sin(23 * x + 17 * z), z) }) }
+    func triangle(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>) -> MeshTriangle {
+        let n = simd_normalize(simd_cross(b - a, c - a))
+        return MeshTriangle(a: SIMD4(a, 1), b: SIMD4(b, 1), c: SIMD4(c, 1), na: SIMD4(n, 0), nb: SIMD4(n, 0), nc: SIMD4(n, 0),
+                            uvab: SIMD4(a.x, a.z, b.x, b.z), uvc: SIMD4(c.x, c.z, 0, 0))
+    }
+    var patch: [MeshTriangle] = []
+    for i in 0..<cells { for j in 0..<cells {
+        let a = grid[i][j], b = grid[i + 1][j], c = grid[i + 1][j + 1], d = grid[i][j + 1]
+        patch += [triangle(a, b, c), triangle(a, c, d)]
+    }}
+    let material = try instanced.addMaterial("Patch")
+    let asset = MeshAsset(name: "patch", triangles: patch, subsets: ["Patch"])
+    instanced.assets.append(asset)
+    for k in 0..<25 {
+        var o = ObjectSettings()
+        o.positionScale = SIMD4(Float(k % 5) * 0.9 - 1.6, -0.75 + 0.1 * Float(k % 3), Float(k / 5) * 0.9 - 1.1, 0.42)
+        o.rotationHidden = SIMD4(0, Float(k) * 0.61, 0, 0)
+        instanced.nodes.append(SceneNode(name: "patch \(k)", mesh: asset.id, transform: o, bindings: [material.id]))
+    }
+    try instanced.validate()
+}
 let scenarios: [(String, UInt32, UInt32)] = [("Default Pavilion", 0, 0), ("Pavilion with coated OpenPBR floor", 0, 0),
-    ("Cornell box", 1, 0), ("Imported mesh (scene 6, \(mesh.count) triangles)", 6, 0), ("Default Pavilion, MIS", 0, 1)]
+    ("Cornell box", 1, 0), ("Imported mesh (scene 6, \(mesh.count) triangles)", 6, 0), ("Default Pavilion, MIS", 0, 1),
+    ("Instanced scene graph (scene 6, 25 x 19,968 triangles)", 6, 0)]
 @MainActor func prepare(_ renderer: PathTracerRenderer, _ scenario: Int) throws {
     renderer.materials.settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
     if scenario == 1 {
@@ -135,11 +168,14 @@ let scenarios: [(String, UInt32, UInt32)] = [("Default Pavilion", 0, 0), ("Pavil
         coated.surface = SIMD4<Float>(0.4, 0, 0.5, 0)
         renderer.materials.settings[1] = coated
     }
-    try renderer.materials.setMesh(scenarios[scenario].1 == 6 ? mesh : [])
+    if scenario == 5 { try renderer.materials.setMesh(instanced) }
+    else { try renderer.materials.setMesh(scenarios[scenario].1 == 6 ? mesh : []) }
+    renderer.materials.hasSceneGraph = scenario == 5
 }
 @MainActor func view(_ scenario: Int) -> Uniforms {
     var u = makeUniforms(scene: scenarios[scenario].1, mode: scenarios[scenario].2, width: 640, height: 480)
     u.environment.w = Float(testRenderer.materials.nodeCount)
+    if scenario == 5 { u.lens.z = 1 }
     return u
 }
 // Warm every renderer and MetalFX instance before collecting interleaved observations.

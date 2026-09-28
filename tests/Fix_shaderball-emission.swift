@@ -139,7 +139,7 @@
     "USD MaterialX emission imports as a graph emitter, not a light (\(glow.report))")
   try controller.restore(glow.document)
   let materials = testRenderer.materials
-  let ordered = materials.orderedTriangles
+  let ordered = materials.renderedTriangles()
   let emitterTriangles = ordered.filter { Int($0.uvc.z) == glowSlot }
   require(emitterTriangles.count == 2 && emitterTriangles.allSatisfy {
       simd_cross(SIMD3($0.b.x - $0.a.x, $0.b.y - $0.a.y, $0.b.z - $0.a.z), SIMD3($0.c.x - $0.a.x, $0.c.y - $0.a.y, $0.c.z - $0.a.z)).y < 0 },
@@ -364,7 +364,7 @@
       && litProgram?.images.contains(where: { $0.data == bulbMap }) == true,
     "the bulb variant's textured neutral emission compiles")
   try controller.restore(lit.document)
-  let constantEmitters = testRenderer.materials.orderedTriangles.filter {
+  let constantEmitters = testRenderer.materials.renderedTriangles().filter {
     (testRenderer.materials.emissions[Int($0.uvc.z)].map { simd_length_squared($0) > 0 }) == true }.count
   let bulbList = Int(testRenderer.materials.emitterBuffer.contents().load(as: UInt32.self))
   require(bulbList > constantEmitters, "neutral's graph emission joins the light list (\(bulbList) > \(constantEmitters))")
