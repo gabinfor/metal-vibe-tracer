@@ -7,7 +7,10 @@ enum SceneLimits {
   static let materials = 64
   static let graphImages = 128
   static let nodes = 256
-  static let triangles = 500_000
+  // Stored (unique) mesh triangles: document assets, the graph-less mesh and the flat BVH.
+  static let triangles = 1_000_000
+  // Rendered triangles: instances of the stored ones (two-level acceleration only).
+  static let renderedTriangles = 64_000_000
 }
 struct MeshAsset: Codable {
   var id = UUID()
@@ -195,7 +198,7 @@ struct SceneGraph: Codable {
       }
     }
     guard storedTriangles <= SceneLimits.triangles else {
-      try fail("stored mesh assets exceed the 500,000 triangle limit.")
+      try fail("stored mesh assets exceed the \(SceneLimits.triangles.formatted()) triangle limit.")
       return
     }
     for node in nodes {
@@ -244,8 +247,8 @@ struct SceneGraph: Codable {
         triangles += asset.triangles.count
       }
     }
-    guard triangles <= SceneLimits.triangles else {
-      try fail("instances exceed the 500,000 rendered-triangle limit.")
+    guard triangles <= SceneLimits.renderedTriangles else {
+      try fail("instances exceed the \(SceneLimits.renderedTriangles.formatted()) rendered-triangle limit.")
       return
     }
   }
@@ -278,7 +281,8 @@ struct SceneGraph: Codable {
     }
     return (local, o.rotationHidden.w > 0)
   }
-  // Instances share document mesh data. This initial GPU bridge flattens visible instances.
+  // Instances share document mesh data. The GPU renders them as instances (MeshSceneLayout);
+  // flattening remains for the flat reference BVH, checks and host-side scene queries.
   func renderTriangles() throws -> [MeshTriangle] {
     var result: [MeshTriangle] = []
     result.reserveCapacity(try renderTriangleCount())

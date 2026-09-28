@@ -122,7 +122,7 @@ struct ProjectDocument: Codable {
   // Aggregate embedded asset bytes (maps, MaterialX images, environment) across all scenes.
   static let embeddedAssetLimit = 512 * 1024 * 1024
   // Open accepts everything validate() accepts: JSON embeds assets as base64
-  // (4/3 size), each of up to 500,000 flat and 500,000 graph triangles encodes in
+  // (4/3 size), each of up to SceneLimits.triangles flat and graph triangles encodes in
   // at most ~600 bytes (507 measured with worst-case floats), and 64 MiB covers
   // settings, graphs and names. Saving refuses anything larger, so every saved
   // project reopens. Format 3 (ProjectAssets) stores each distinct payload once and
@@ -180,7 +180,7 @@ struct ProjectDocument: Codable {
       options.sunAzimuth.isFinite, options.sunElevation.isFinite,
       options.environmentRotation.isFinite,
       options.sunAngle.map({ StudioOptions.sunAngleRange.contains($0) }) ?? true,
-      triangles.count <= 500_000
+      triangles.count <= SceneLimits.triangles
     else {
       try bad()
       return
@@ -435,8 +435,8 @@ enum OBJMesh {
               nb: SIMD4(b.2 ?? n, 0), nc: SIMD4(c.2 ?? n, 0),
               uvab: SIMD4(a.1.x, a.1.y, b.1.x, b.1.y), uvc: SIMD4(c.1.x, c.1.y, Float(subset), 0)))
           total += 1
-          guard total <= 500_000 else {
-            throw failure("OBJ exceeds the 500,000-triangle import limit.")
+          guard total <= SceneLimits.triangles else {
+            throw failure("OBJ exceeds the \(SceneLimits.triangles.formatted())-triangle import limit.")
           }
         }
       }
@@ -552,6 +552,8 @@ struct ReusableResources: @unchecked Sendable {
   var triangleCount: Int
   var nodeBuffer: MTLBuffer
   var nodeCount: Int
+  var meshLayout: MeshSceneLayout?
+  var acceleration: MeshAcceleration
   var hasSceneGraph: Bool
   var graph: SceneGraph?
   // The published texture set, which stays live while the candidate is prepared;
@@ -625,7 +627,7 @@ extension MaterialLibrary {
         ? nil : (environmentTexture, environmentRows, environmentColumns),
       meshTriangles: meshTriangles,
       triangleBuffer: triangleBuffer, triangleCount: triangleCount, nodeBuffer: nodeBuffer, nodeCount: nodeCount,
-      hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
+      meshLayout: meshLayout, acceleration: acceleration, hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
   }
   // Seed a freshly created candidate. It is published only after restore,
   // setEnvironment and the mesh step have rebuilt its bindings.
@@ -645,6 +647,8 @@ extension MaterialLibrary {
     triangleCount = r.triangleCount
     nodeBuffer = r.nodeBuffer
     nodeCount = r.nodeCount
+    meshLayout = r.meshLayout
+    acceleration = r.acceleration
     hasSceneGraph = r.hasSceneGraph
   }
   func state() -> SceneState {
@@ -963,6 +967,18 @@ extension MaterialLibrary {
   // A graph-less (legacy) mesh. The document's array is retained as meshTriangles by
   // reference (copy-on-write storage is shared, not duplicated) for snapshots.
   func setMesh(_ triangles: [MeshTriangle]) throws {
+    if acceleration != .flat {
+      guard triangles.count <= SceneLimits.triangles else {
+        throw Self.error("The mesh exceeds the \(SceneLimits.triangles.formatted()) triangle limit.")
+      }
+      var layout = MeshSceneLayout()
+      try publishTwoLevel(
+        assets: [(MeshSceneLayout.legacyAsset, triangles)], document: triangles, layout: &layout
+      ) { layout in
+        if !triangles.isEmpty { try layout.addInstance(node: -1, asset: 0, world: matrix_identity_float4x4, slots: []) }
+      }
+      return
+    }
     let t = try triangleStorage(triangles.count)
     if !triangles.isEmpty {
       triangles.withUnsafeBytes { t.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
@@ -972,7 +988,18 @@ extension MaterialLibrary {
   // A scene-graph mesh, flattened straight into the shared GPU buffer and reordered there:
   // the graph's assets stay the only other host copy, and no flattened array is retained.
   func setMesh(_ graph: SceneGraph) throws {
+    if acceleration != .flat {
+      try graph.validate()
+      var layout = MeshSceneLayout()
+      try publishTwoLevel(assets: graph.assets.map { ($0.id, $0.triangles) }, document: [], layout: &layout) { layout in
+        try layout.addInstances(graph)
+      }
+      return
+    }
     let count = try graph.renderTriangleCount()
+    guard count <= SceneLimits.triangles else {
+      throw Self.error("The flat BVH renders at most \(SceneLimits.triangles.formatted()) triangles.")
+    }
     let t = try triangleStorage(count)
     let target = t.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, count))
     var written = 0
@@ -991,10 +1018,11 @@ extension MaterialLibrary {
   struct MeshResources {
     let triangles: [MeshTriangle], triangleBuffer: MTLBuffer, triangleCount: Int
     let nodeBuffer: MTLBuffer, nodeCount: Int
+    var layout: MeshSceneLayout? = nil
   }
   var meshResources: MeshResources {
     MeshResources(triangles: meshTriangles, triangleBuffer: triangleBuffer, triangleCount: triangleCount,
-      nodeBuffer: nodeBuffer, nodeCount: nodeCount)
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: meshLayout)
   }
   func restoreMesh(_ m: MeshResources) throws {
     let old = meshResources, oldArgument = argumentBuffer
@@ -1006,6 +1034,7 @@ extension MaterialLibrary {
     triangleBuffer = m.triangleBuffer; triangleCount = m.triangleCount
     nodeBuffer = m.nodeBuffer; nodeCount = m.nodeCount
     meshTriangles = m.triangles
+    meshLayout = m.layout
   }
   private func triangleStorage(_ count: Int) throws -> MTLBuffer {
     let bytes = count.multipliedReportingOverflow(by: MemoryLayout<MeshTriangle>.stride)
@@ -1038,6 +1067,20 @@ extension MaterialLibrary {
 
   func setMeshBindings(_ graph: SceneGraph) throws {
     try graph.validate()
+    if let current = meshLayout, current.assets.first?.id != MeshSceneLayout.legacyAsset {
+      // Two-level: bindings live in the scene's slot table; no hierarchy is rebuilt.
+      var layout = current
+      layout.instances = []
+      layout.renderedTriangles = 0
+      layout.lo = SIMD3(repeating: .greatestFiniteMagnitude); layout.hi = -layout.lo
+      try layout.addInstances(graph)
+      guard layout.instances.count == current.instances.count,
+        zip(layout.instances, current.instances).allSatisfy({ $0.node == $1.node && $0.asset == $1.asset && $0.world == $1.world })
+      else { throw Self.error("Scene binding no longer matches the published geometry.") }
+      // Same instances and transforms: the hardware instance structure is kept too.
+      try publishScene(layout, triangleBuffer: triangleBuffer, document: meshTriangles, keepScene: true)
+      return
+    }
     let slots = Dictionary(uniqueKeysWithValues: graph.materials.map { ($0.id, $0.slot) })
     func rebound(_ triangle: MeshTriangle) throws -> MeshTriangle {
       var result = triangle
@@ -1051,14 +1094,19 @@ extension MaterialLibrary {
       return result
     }
     // Rebind straight from the shared buffer into its replacement; the BVH order is unchanged.
+    // A two-level graph-less mesh of flattened triangles keeps its hierarchy after them.
     let ordered = orderedTriangles
-    guard let candidateBuffer = device.makeBuffer(
-      length: max(128, ordered.count * MemoryLayout<MeshTriangle>.stride), options: .storageModeShared)
+    let length = meshLayout == nil ? ordered.count * MemoryLayout<MeshTriangle>.stride : triangleBuffer.length
+    guard let candidateBuffer = device.makeBuffer(length: max(128, length), options: .storageModeShared)
     else { throw Self.error("Could not allocate imported mesh bindings.") }
+    if meshLayout != nil { candidateBuffer.contents().copyMemory(from: triangleBuffer.contents(), byteCount: length) }
     let target = candidateBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, ordered.count))
     for (i, triangle) in ordered.enumerated() { target[i] = try rebound(triangle) }
+    // The rebound triangles no longer equal the document array the layout remembers.
+    var layout = meshLayout
+    if layout != nil { layout?.assets[0].source = [] }
     // Bindings belong to a scene-graph mesh, which retains no document-order copy.
     try restoreMesh(MeshResources(triangles: [], triangleBuffer: candidateBuffer, triangleCount: ordered.count,
-      nodeBuffer: nodeBuffer, nodeCount: nodeCount))
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: layout))
   }
 }

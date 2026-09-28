@@ -38,7 +38,7 @@ extension PathTracerRenderer {
         return
       }
       var point = pixel
-      encoder.setComputePipelineState(pickPipeline)
+      encoder.setComputePipelineState(sceneKernels.pick)
       guard materials.bind(encoder) else {
         encoder.endEncoding()
         completion(nil)

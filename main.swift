@@ -48,10 +48,20 @@ func shaderCompileOptions() -> MTLCompileOptions {
 
 let metalSource = loadOpenPBRSource() + """
 #include <metal_stdlib>
+#include <metal_raytracing>
 using namespace metal;
 
 #define PI 3.14159265358979323846f
 #define TWO_PI 6.28318530717958647692f
+
+// Scene kernels (PathTracerRenderer.proceduralKernels) compile with VIBE_MESHES=0: scenes 0-5
+// then carry no imported-mesh traversal or emitter code, which otherwise costs them registers.
+// The default library, used for scene 6, by the checks and by the argument encoder, has it all.
+#ifndef VIBE_MESHES
+#define VIBE_MESHES 1
+#endif
+constant bool MESHES = VIBE_MESHES;
+constant bool HARDWARE_MESHES = VIBE_MESHES;
 
 // --- PRNG (PCG Hash) ---
 // References: HASH2020, PCG2014; float conversion and seed feedback are local.
@@ -766,17 +776,258 @@ void mesh_hit_attributes(thread HitRecord &rec, MeshTriangle tri, float b1, floa
     rec.uvDensity=float2(max(length(d1)/max(length(e1),1e-6f),length(d2)/max(length(e2),1e-6f)));
 }
 
+// REFERENCES.md: WALD2007, WIDEBVH2008, PBRT2023, WOOP2013. Two-level hierarchy
+// (MeshSceneLayout on the host): a 4-wide TLAS over the visible instances in world space and
+// a 4-wide binned-SAH BLAS per mesh asset in object space. BLAS nodes follow the stored
+// triangles in the triangle buffer; the node buffer holds the header, the instances, the
+// TLAS and the subset-to-slot table. A flat BVH (the reference path) leaves nodes[0].lo.w 0.
+struct MeshWideNode { float4 lox, loy, loz, hix, hiy, hiz; int4 child; int4 count; };
+struct MeshInstance { float4 world[3]; float4 local[3]; uint4 range; uint4 binding; float4 bound; };
+struct MeshSceneHeader { uint4 info; uint4 counts; float4 lo, hi; uint4 accelerator; };
+static_assert(sizeof(MeshWideNode) == 128 && sizeof(MeshInstance) == 144 && sizeof(MeshSceneHeader) == 80, "Swift mesh layouts");
+// Hardware traversal (METALRT, header.counts.w = 1): header.accelerator holds the instance
+// acceleration structure's resource ID, read as an argument-buffer member.
+struct MeshAccelerator { raytracing::instance_acceleration_structure scene; };
+device const MeshAccelerator &mesh_accelerator(constant MaterialResources &images) {
+    return *(device const MeshAccelerator *)((device const char *)images.nodes+64);
+}
+bool mesh_two_level(constant MaterialResources &images) { return as_type<uint>(images.nodes[0].lo.w) == 0x3256544cu; }
+device const MeshSceneHeader &mesh_header(constant MaterialResources &images) { return *(device const MeshSceneHeader *)images.nodes; }
+device const MeshInstance *mesh_instances(constant MaterialResources &images) {
+    return (device const MeshInstance *)((device const char *)images.nodes + sizeof(MeshSceneHeader));
+}
+float3 instance_point(MeshInstance m, float3 p) { return float3(dot(m.world[0].xyz,p)+m.world[0].w,dot(m.world[1].xyz,p)+m.world[1].w,dot(m.world[2].xyz,p)+m.world[2].w); }
+// Object-space ray with the world ray's parameter: the direction is not renormalized.
+Ray instance_ray(MeshInstance m, Ray r) {
+    return {float3(dot(m.local[0].xyz,r.origin)+m.local[0].w,dot(m.local[1].xyz,r.origin)+m.local[1].w,dot(m.local[2].xyz,r.origin)+m.local[2].w),
+            float3(dot(m.local[0].xyz,r.direction),dot(m.local[1].xyz,r.direction),dot(m.local[2].xyz,r.direction))};
+}
+// The world-space triangle an instance renders, as SceneGraph.forEachRenderTriangle flattens it
+// (normals by the inverse transpose; a mirroring transform swaps b and c, and with them the
+// barycentrics), with the bound slot in uvc.z, node index + 1 in uvc.w and the subset in na.w.
+MeshTriangle instance_triangle(MeshTriangle t, MeshInstance m, constant MaterialResources &images, thread float &b1, thread float &b2) {
+    if(m.binding.y==0) return t;
+    uint subset=uint(t.uvc.z);
+    MeshTriangle w=t;
+    w.a=float4(instance_point(m,t.a.xyz),1); w.b=float4(instance_point(m,t.b.xyz),1); w.c=float4(instance_point(m,t.c.xyz),1);
+    float3 n[3]={t.na.xyz,t.nb.xyz,t.nc.xyz};
+    for(int k=0;k<3;++k) {
+        float3 v=m.local[0].xyz*n[k].x+m.local[1].xyz*n[k].y+m.local[2].xyz*n[k].z;
+        n[k]=dot(v,v)>1e-12f ? normalize(v) : float3(0,1,0);
+    }
+    w.na=float4(n[0],float(subset)); w.nb=float4(n[1],0); w.nc=float4(n[2],0);
+    if((m.binding.z&1u)!=0) {
+        float4 p=w.b; w.b=w.c; w.c=p; p=w.nb; w.nb=w.nc; w.nc=p;
+        float2 uv=w.uvab.zw; w.uvab.zw=w.uvc.xy; w.uvc.xy=uv;
+        float s=b1; b1=b2; b2=s;
+    }
+    const device uint *slots=(const device uint *)((device const char *)images.nodes+16*mesh_header(images).info.z);
+    w.uvc.z=float(slots[m.binding.x+subset]); w.uvc.w=float(m.binding.y);
+    return w;
+}
+// World triangle of a rendered-triangle ID (HitRecord.triangle, emitter lists): the stored
+// triangle itself for a flat BVH, else the instance whose rendered range holds it.
+MeshTriangle scene_triangle(uint id, constant MaterialResources &images) {
+    if(!mesh_two_level(images)) return images.triangles[id];
+    device const MeshInstance *instances=mesh_instances(images);
+    uint low=0, high=max(1u,mesh_header(images).info.x)-1;
+    while(low<high) { uint middle=(low+high+1)/2; if(instances[middle].range.z<=id) low=middle; else high=middle-1; }
+    MeshInstance m=instances[low]; float b1=0, b2=0;
+    return instance_triangle(images.triangles[m.range.x+(id-m.range.z)],m,images,b1,b2);
+}
+// Position rounding of a hit rebuilt from an instance's world corners: the bound of the
+// corners themselves (mesh_hit_error) and of the transform that produced them.
+float instance_hit_error(MeshTriangle t, MeshInstance m, float3 p, constant Uniforms &u) {
+    float local=max(max_abs(t.a.xyz),max(max_abs(t.b.xyz),max_abs(t.c.xyz)));
+    return u.sceneIndex==6 && uses_scene_graph(u) ? max(1e-7f, 1.907349e-6f*(m.bound.x+m.bound.y*local)) : ray_epsilon(p,u);
+}
+// A ray against the four child boxes of a node, conservatively as mesh_node_hit does
+// (WOOP2013 3.3: boxes grow by the per-ray bound e through shifted origins).
+struct WideRay { float3 low, high, inverse; bool3 parallel; };
+WideRay wide_ray(Ray r, float e) {
+    WideRay w; w.low=r.origin+e; w.high=r.origin-e; w.parallel=abs(r.direction)<1e-8f;
+    w.inverse=1.0f/select(r.direction,float3(1),w.parallel);
+    return w;
+}
+bool4 wide_node_hit(MeshWideNode n, WideRay w, float tMin, float tMax, thread float4 &nearT) {
+    float4 ax=(n.lox-w.low.x)*w.inverse.x, bx=(n.hix-w.high.x)*w.inverse.x;
+    float4 ay=(n.loy-w.low.y)*w.inverse.y, by=(n.hiy-w.high.y)*w.inverse.y;
+    float4 az=(n.loz-w.low.z)*w.inverse.z, bz=(n.hiz-w.high.z)*w.inverse.z;
+    float4 lx=w.parallel.x ? float4(-1e30f) : min(ax,bx), hx=w.parallel.x ? float4(1e30f) : max(ax,bx);
+    float4 ly=w.parallel.y ? float4(-1e30f) : min(ay,by), hy=w.parallel.y ? float4(1e30f) : max(ay,by);
+    float4 lz=w.parallel.z ? float4(-1e30f) : min(az,bz), hz=w.parallel.z ? float4(1e30f) : max(az,bz);
+    nearT=max(max(lx,ly),max(lz,float4(tMin)));
+    bool4 hit=nearT<=min(min(hx,hy),min(hz,float4(tMax))) && n.child!=0;
+    if(w.parallel.x) hit=hit && !(w.low.x<n.lox || w.high.x>n.hix);
+    if(w.parallel.y) hit=hit && !(w.low.y<n.loy || w.high.y>n.hiy);
+    if(w.parallel.z) hit=hit && !(w.low.z<n.loz || w.high.z>n.hiz);
+    return hit;
+}
+// Children hit, near to far (insertion sort of at most four).
+int wide_order(bool4 hit, float4 nearT, thread int *order, thread float *key) {
+    int m=0;
+    for(int k=0;k<4;++k) if(hit[k]) { int j=m++; while(j>0 && key[j-1]>nearT[k]) { key[j]=key[j-1]; order[j]=order[j-1]; --j; } key[j]=nearT[k]; order[j]=k; }
+    return m;
+}
+// Closest hit in one asset's BLAS, in object space. The host keeps BLAS depth <= 20, so the
+// stack (at most 3 net pushes per level) never overflows.
+void blas_closest(device const MeshWideNode *nodes, device const MeshTriangle *triangles, Ray local, float rootMax,
+                  float tMin, thread float &closest, thread int &hit, thread float &hb1, thread float &hb2) {
+    WatertightRay watertight=watertight_ray(local);
+    WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+rootMax));
+    int stack[64]; int top=0; stack[top++]=0;
+    while(top>0) {
+        MeshWideNode node=nodes[stack[--top]];
+        float4 nearT; int order[4]; float key[4];
+        int m=wide_order(wide_node_hit(node,w,tMin,closest,nearT),nearT,order,key);
+        for(int j=0;j<m;++j) {
+            int k=order[j];
+            if(node.child[k]>0 || key[j]>closest) continue;
+            int first=-node.child[k]-1;
+            for(int q=0;q<node.count[k];++q) {
+                float t,b1,b2;
+                if(!intersect_mesh_triangle(triangles[first+q],watertight,tMin,closest,t,b1,b2)) continue;
+                closest=t; hit=first+q; hb1=b1; hb2=b2;
+            }
+        }
+        for(int j=m-1;j>=0;--j) { int k=order[j]; if(node.child[k]>0 && key[j]<=closest && top<64) stack[top++]=node.child[k]; }
+    }
+}
+// Any hit in [tMin, tMax - slack) of one asset; slack is the endpoint surface's own bound
+// (see scene_occluded), from the instance transform and the triangle's local corners.
+bool blas_any(device const MeshWideNode *nodes, device const MeshTriangle *triangles, Ray local, MeshInstance instance,
+              float tMin, float tMax, bool slack) {
+    WatertightRay watertight=watertight_ray(local);
+    WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+instance.bound.z));
+    int stack[64]; int top=0; stack[top++]=0;
+    while(top>0) {
+        MeshWideNode node=nodes[stack[--top]];
+        float4 nearT; bool4 hit=wide_node_hit(node,w,tMin,tMax,nearT);
+        for(int k=0;k<4;++k) {
+            if(!hit[k]) continue;
+            if(node.child[k]>0) { if(top<64) stack[top++]=node.child[k]; continue; }
+            int first=-node.child[k]-1;
+            for(int q=0;q<node.count[k];++q) {
+                MeshTriangle tri=triangles[first+q];
+                float t,b1,b2,local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
+                float s=slack ? max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local)) : 0.0f;
+                if(intersect_mesh_triangle(tri,watertight,tMin,tMax-s,t,b1,b2)) return true;
+            }
+        }
+    }
+    return false;
+}
+struct MeshHit { float t, b1, b2; int triangle; uint instance; };
+// TLAS traversal. Its boxes are world bounds of transformed object bounds, grown per ray by
+// lo.w * (|origin| + hi.w): the rounding of the object-space ray, amplified by the largest
+// transform condition number, never culls an instance whose object-space traversal hits.
+bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &images, thread MeshHit &h) {
+    MeshSceneHeader header=mesh_header(images);
+    if(HARDWARE_MESHES && header.counts.w!=0) {
+        // Same instances and primitive order as the software hierarchy, so the hit resolves alike.
+        raytracing::intersector<raytracing::triangle_data,raytracing::instancing> closest;
+        closest.assume_geometry_type(raytracing::geometry_type::triangle);
+        auto x=closest.intersect(raytracing::ray(r.origin,r.direction,tMin,tMax),mesh_accelerator(images).scene);
+        if(x.type!=raytracing::intersection_type::triangle) return false;
+        h.t=x.distance; h.b1=x.triangle_barycentric_coord.x; h.b2=x.triangle_barycentric_coord.y;
+        h.triangle=int(x.primitive_id); h.instance=x.instance_id;
+        return true;
+    }
+    device const MeshInstance *instances=mesh_instances(images);
+    device const MeshWideNode *tlas=(device const MeshWideNode *)((device const char *)images.nodes+16*header.info.y);
+    device const MeshWideNode *blas=(device const MeshWideNode *)images.triangles;
+    WideRay w=wide_ray(r,header.lo.w*(max_abs(r.origin)+header.hi.w));
+    float closest=tMax; bool found=false;
+    int stack[32]; int top=0; stack[top++]=0;
+    while(top>0) {
+        MeshWideNode node=tlas[stack[--top]];
+        float4 nearT; int order[4]; float key[4];
+        int m=wide_order(wide_node_hit(node,w,tMin,closest,nearT),nearT,order,key);
+        for(int j=0;j<m;++j) {
+            int k=order[j];
+            if(node.child[k]>0 || key[j]>closest) continue;
+            uint index=uint(-node.child[k]-1);
+            MeshInstance instance=instances[index];
+            int triangle=-1; float b1=0, b2=0;
+            blas_closest(blas+instance.range.y,images.triangles+instance.range.x,instance_ray(instance,r),instance.bound.z,tMin,closest,triangle,b1,b2);
+            if(triangle>=0) { h.t=closest; h.b1=b1; h.b2=b2; h.triangle=triangle; h.instance=index; found=true; }
+        }
+        for(int j=m-1;j>=0;--j) { int k=order[j]; if(node.child[k]>0 && key[j]<=closest && top<32) stack[top++]=node.child[k]; }
+    }
+    return found;
+}
+bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialResources &images) {
+    MeshSceneHeader header=mesh_header(images);
+    device const MeshInstance *instances=mesh_instances(images);
+    if(HARDWARE_MESHES && header.counts.w!=0) {
+        // Any opaque hit before tMax - S (S bounds every triangle's slack), then the candidates
+        // in [tMax - S, tMax) against their own slack, exactly as blas_any decides.
+        float S=slack ? max(1e-7f,1.907349e-6f*header.hi.w) : 0.0f;
+        raytracing::instance_acceleration_structure scene=mesh_accelerator(images).scene;
+        raytracing::intersector<raytracing::instancing> any;
+        any.assume_geometry_type(raytracing::geometry_type::triangle);
+        any.accept_any_intersection(true);
+        if(tMax-S>tMin && any.intersect(raytracing::ray(r.origin,r.direction,tMin,tMax-S),scene).type==raytracing::intersection_type::triangle) return true;
+        if(!slack) return false;
+        raytracing::intersection_params params;
+        params.assume_geometry_type(raytracing::geometry_type::triangle);
+        params.force_opacity(raytracing::forced_opacity::non_opaque);
+        raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(raytracing::ray(r.origin,r.direction,max(tMin,tMax-S),tMax),scene,params);
+        while(query.next()) {
+            MeshInstance instance=instances[query.get_candidate_instance_id()];
+            MeshTriangle tri=images.triangles[instance.range.x+query.get_candidate_primitive_id()];
+            float local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
+            if(query.get_candidate_triangle_distance()<tMax-max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local))) { query.abort(); return true; }
+        }
+        return false;
+    }
+    device const MeshWideNode *tlas=(device const MeshWideNode *)((device const char *)images.nodes+16*header.info.y);
+    device const MeshWideNode *blas=(device const MeshWideNode *)images.triangles;
+    WideRay w=wide_ray(r,header.lo.w*(max_abs(r.origin)+header.hi.w));
+    int stack[32]; int top=0; stack[top++]=0;
+    while(top>0) {
+        MeshWideNode node=tlas[stack[--top]];
+        float4 nearT; bool4 hit=wide_node_hit(node,w,tMin,tMax,nearT);
+        for(int k=0;k<4;++k) {
+            if(!hit[k]) continue;
+            if(node.child[k]>0) { if(top<32) stack[top++]=node.child[k]; continue; }
+            MeshInstance instance=instances[-node.child[k]-1];
+            if(blas_any(blas+instance.range.y,images.triangles+instance.range.x,instance_ray(instance,r),instance,tMin,tMax,slack)) return true;
+        }
+    }
+    return false;
+}
+
 // REFERENCES.md: PBRT2023, OBJ2026, WOOP2013. Watertight triangle test and median BVH.
 bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant MaterialResources &images, constant Uniforms &u) {
     float tMin=ray_t_min(r.origin,u);
     bool hit=trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz,tMin);
     if(hit) { rec.objectID=rec.mat.slot; rec.error=ray_hit_error(r,rec.t,rec.position,u); }
     rec.triangle=0xffffffffu;
-    if (sceneIndex != 6 || u.environment.w < 1 || (!uses_scene_graph(u) && images.objects[7].rotationHidden.w > 0.5f)) return hit;
+    if (!MESHES || sceneIndex != 6 || u.environment.w < 1 || (!uses_scene_graph(u) && images.objects[7].rotationHidden.w > 0.5f)) return hit;
     ObjectSettings o=images.objects[7];
     if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float closest=hit ? rec.t/o.positionScale.w : 1e20f;
+    if(mesh_two_level(images)) {
+        MeshHit m;
+        if(!mesh_closest(local,tMin/o.positionScale.w,closest,images,m)) return hit;
+        MeshInstance instance=mesh_instances(images)[m.instance];
+        MeshTriangle stored=images.triangles[instance.range.x+uint(m.triangle)];
+        float b1=m.b1, b2=m.b2;
+        MeshTriangle tri=instance_triangle(stored,instance,images,b1,b2);
+        float b0=1-b1-b2;
+        // As below: the point rebuilt from barycentrics lies on the world triangle.
+        rec.t=m.t; rec.position=b0*tri.a.xyz+b1*tri.b.xyz+b2*tri.c.xyz;
+        rec.error=max(mesh_hit_error(tri,rec.position,u),instance_hit_error(stored,instance,rec.position,u));
+        mesh_hit_attributes(rec,tri,b1,b2,local.direction);
+        rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=uses_scene_graph(u) ? uint(tri.uvc.z) : 7;
+        if(uses_scene_graph(u) && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
+        rec.objectID=uses_scene_graph(u) ? 64+uint(tri.uvc.w)-1 : 7;
+        rec.triangle=instance.range.z+uint(m.triangle);
+        world_hit(rec,o);
+        return true;
+    }
     WatertightRay watertight=watertight_ray(local);
     MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
@@ -810,11 +1061,12 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
     float tMin=ray_t_min(r.origin,u);
     HitRecord rec;
     if(trace_scene(r,sceneIndex,rec,images.objects,u.light.w,u.light.xyz,tMin) && rec.t<tMax) return true;
-    if (sceneIndex != 6 || u.environment.w < 1 || (!uses_scene_graph(u) && images.objects[7].rotationHidden.w > 0.5f)) return false;
+    if (!MESHES || sceneIndex != 6 || u.environment.w < 1 || (!uses_scene_graph(u) && images.objects[7].rotationHidden.w > 0.5f)) return false;
     ObjectSettings o=images.objects[7];
     if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float nearT=tMin/o.positionScale.w, farT=tMax/o.positionScale.w;
+    if(mesh_two_level(images)) return mesh_occluded(local,nearT,farT,uses_scene_graph(u),images);
     WatertightRay watertight=watertight_ray(local);
     MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
@@ -1166,11 +1418,11 @@ float environment_mixture_pdf(float3 wi, float3 n, float imagePdf, constant Unif
 
 // OPENUSD/PBRT2023: power-weighted triangle emitter proposal, mixed with the environment.
 float imported_light_probability(constant Uniforms &u,constant MaterialResources &images) {
-    if(u.sceneIndex!=6 || images.emitters[0]==0) return 0.0f;
+    if(!MESHES || u.sceneIndex!=6 || images.emitters[0]==0) return 0.0f;
     return u.environment.x>0 || (u.lens.w>0 && u.sunParams.w>0) ? 0.5f:1.0f;
 }
 float imported_geometry(float3 p,float3 position,uint index,constant MaterialResources &images) {
-    MeshTriangle t=images.triangles[index];float3 d=position-p;float d2=dot(d,d);
+    MeshTriangle t=scene_triangle(index,images);float3 d=position-p;float d2=dot(d,d);
     float3 n=cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz);
     return d2>1e-12f && dot(n,n)>1e-20f ? max(0.0f,dot(normalize(n),-d*rsqrt(d2)))/d2:0;
 }
@@ -1181,14 +1433,14 @@ float imported_geometry(float3 p,float3 position,uint index,constant MaterialRes
 float imported_emitter_area_pdf(uint index,constant MaterialResources &images) {
     uint count=images.emitters[0];
     if(count==0) return 0.0f;
-    float total=as_type<float>(images.emitters[2*count+1]);uint slot=uint(images.triangles[index].uvc.z);
+    float total=as_type<float>(images.emitters[2*count+1]);uint slot=uint(scene_triangle(index,images).uvc.z);
     if(slot<8 || slot>=64 || !(total>0)) return 0.0f;
     return images.emissions[slot].w/total;
 }
 // Radiance a MaterialX emitter sends from a sampled point (barycentrics b1, b2) toward p,
 // evaluated with the graph exactly as at a BSDF hit on that point (finest image level).
 float3 imported_graph_emission(uint index,float b1,float b2,float3 p,float3 position,float3 wi,constant MaterialResources &images) {
-    MeshTriangle t=images.triangles[index];uint slot=uint(t.uvc.z);
+    MeshTriangle t=scene_triangle(index,images);uint slot=uint(t.uvc.z);
     if(slot>=64 || images.graphHeaders[slot].info.y==0 || images.graphHeaders[slot].info.w<0) return float3(0);
     HitRecord h={};Ray ray={p,wi};
     h.t=length(position-p);h.position=position;h.triangle=index;
@@ -1210,7 +1462,7 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
         uint count=materialImages.emitters[0],low=0,high=count-1;float value=rand_f(seed);
         while(low<high) {uint middle=(low+high)/2;if(as_type<float>(materialImages.emitters[1+count+middle])>=value) high=middle; else low=middle+1;}
         uint index=materialImages.emitters[1+low];
-        MeshTriangle t=materialImages.triangles[index];float2 r=rand_f2(seed);float root=sqrt(r.x);
+        MeshTriangle t=scene_triangle(index,materialImages);float2 r=rand_f2(seed);float root=sqrt(r.x);
         ls.position=(1-root)*t.a.xyz+root*(1-r.y)*t.b.xyz+root*r.y*t.c.xyz;
         float3 delta=ls.position-p;ls.dist=length(delta);ls.wi=delta/max(ls.dist,1e-8f);
         float geometry=imported_geometry(p,ls.position,index,materialImages);
@@ -1370,7 +1622,7 @@ float eval_light_pdf(float3 p, float3 hit_pos, Material mat, constant Uniforms &
 // coordinate magnitude and O(1) in the number of emissive triangles.
 float eval_light_pdf(float3 p,float3 hit_pos,Material mat,constant Uniforms &u,constant MaterialResources &images,uint triangle) {
     if(u.sceneIndex!=6) return eval_light_pdf(p,hit_pos,mat,u);
-    if(triangle==0xffffffffu || images.emitters[0]==0) return 0.0f;
+    if(!MESHES || triangle==0xffffffffu || images.emitters[0]==0) return 0.0f;
     float g=imported_geometry(p,hit_pos,triangle,images);
     return g>1e-12f ? imported_light_probability(u,images)*imported_emitter_area_pdf(triangle,images)/g : 0.0f;
 }
@@ -1463,7 +1715,7 @@ float3 sample_specular_manifold_caustic(float3 x, float3 n_x, constant Uniforms 
 }
 
 float light_geometry(float3 p, LightSample ls, uint sceneIndex, float lightSize,constant MaterialResources &images) {
-    if(sceneIndex==6 && ls.isDirectional>=2) return imported_geometry(p,ls.position,ls.isDirectional-2,images);
+    if(MESHES && sceneIndex==6 && ls.isDirectional>=2) return imported_geometry(p,ls.position,ls.isDirectional-2,images);
     if (ls.isDirectional == 1) return 1.0f;
     float3 delta = ls.position - p;
     float d2 = dot(delta, delta);
@@ -2834,12 +3086,36 @@ final class MaterialLibrary {
     // orderedTriangles). meshTriangles is the document's own array of a graph-less
     // (legacy) mesh, shared rather than copied, for snapshots; it is empty for a
     // scene-graph mesh, whose assets remain the only other host copy.
+    // Two-level (MeshSceneLayout): triangleBuffer holds every asset's triangles in object
+    // space, then their BLAS nodes; nodeBuffer the instances and TLAS. Flat (the reference
+    // path): flattened world-space triangles and the median-split nodes.
     var triangleBuffer: MTLBuffer! { didSet { emittersDirty = true } }
-    var nodeBuffer: MTLBuffer!
+    var nodeBuffer: MTLBuffer! { didSet { emittersDirty = true } }
     var meshTriangles: [MeshTriangle] = []
     var triangleCount = 0
     var hasSceneGraph = false
     var nodeCount = 0
+    var acceleration = MaterialLibrary.defaultAcceleration
+    // The published two-level structure; nil for a flat BVH.
+    var meshLayout: MeshSceneLayout?
+    // Asset hierarchies built and top levels built (edit-path accounting).
+    var assetBuildCount = 0, sceneBuildCount = 0
+    // Builds hardware acceleration structures (created on first use).
+    var accelerationQueue: MTLCommandQueue?
+    static var defaultAcceleration: MeshAcceleration {
+#if VIBE_TESTING
+        // Test builds can run the whole suite on the reference or the hardware path.
+        switch ProcessInfo.processInfo.environment["VIBE_ACCELERATION"] {
+        case "flat": return .flat
+        case "hardware": return .hardware
+        case "twoLevel": return .twoLevel
+        default: break
+        }
+#endif
+        // Metal's intersector where it traces the unwelded layout watertight on this device
+        // (MaterialLibrary.hardwareWatertight); the exact software traversal elsewhere.
+        return MaterialLibrary.hardwareWatertight ? .hardware : .twoLevel
+    }
     var objectBuffer: MTLBuffer!
     var materialX: [Int:MaterialXProgram] = [:] { didSet { emittersDirty = true } }
     var graphInstructionBuffer: MTLBuffer!, graphHeaderBuffer: MTLBuffer!
@@ -2872,6 +3148,7 @@ final class MaterialLibrary {
     var bindingAllocationFailureCountdown: Int?
     // Internal seam for bounded memory-accounting tests. Production uses the device budget.
     var textureBudgetOverride: UInt64?
+    var meshBudgetOverride: UInt64?
 
     private func bindingBuffer(bytes: UnsafeRawPointer? = nil, length: Int) -> MTLBuffer? {
         if let count = bindingAllocationFailureCountdown {
@@ -3034,6 +3311,8 @@ final class MaterialLibrary {
         setTexture(environmentColumns,393)
         setBuffer(triangleBuffer,257)
         setBuffer(nodeBuffer,258)
+        // Hardware traversal reaches these through the node buffer's resource ID.
+        bound += meshLayout?.structures ?? []
         guard let objectBuffer=objects.withUnsafeBytes({ bindingBuffer(bytes:$0.baseAddress!,length:$0.count) }) else { throw Self.error("Could not allocate object settings.") }
         setBuffer(objectBuffer,259)
         for i in 0..<SceneLimits.graphImages { setTexture(i < graphTextures.count ? graphTextures[i] : replacement[0],260+i) }
@@ -3054,15 +3333,16 @@ final class MaterialLibrary {
         let rebuildEmitters = emittersDirty || emitterBuffer == nil
         let emitterValues: [UInt32]
         if rebuildEmitters {
-            let triangles=orderedTriangles
-            let indices=triangles.indices.filter { i in let slot=Int(exactly:triangles[i].uvc.z) ?? -1;return slot>=8 && weights[slot] != nil }.map{UInt32($0)}
             // REFERENCES.md: PBRT2023 power light sampling. Emitters are chosen by area x
             // weight; the shader's imported_emitter_area_pdf uses the same (Float) weights.
-            var total=0.0,cumulative=[Double]()
-            for i in indices {
-                let t=triangles[Int(i)],slot=Int(exactly:t.uvc.z) ?? 0
+            // IDs are rendered-triangle IDs (HitRecord.triangle); areas are world areas.
+            var indices=[UInt32](),total=0.0,cumulative=[Double]()
+            forEachRenderedTriangle(emitting: { weights[$0] != nil }) { id, t in
+                let slot=Int(exactly:t.uvc.z) ?? 0
+                guard slot>=8, weights[slot] != nil else { return }
                 let edge1=SIMD3<Double>(Double(t.b.x-t.a.x),Double(t.b.y-t.a.y),Double(t.b.z-t.a.z))
                 let edge2=SIMD3<Double>(Double(t.c.x-t.a.x),Double(t.c.y-t.a.y),Double(t.c.z-t.a.z))
+                indices.append(UInt32(id))
                 total+=0.5*simd_length(simd_cross(edge1,edge2))*Double(emissionValues[slot].w);cumulative.append(total)
             }
             if total>0 && total.isFinite {
@@ -3177,6 +3457,14 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     let shadingPipeline: MTLComputePipelineState
     let metalFXGuidePipeline: MTLComputePipelineState
     let presentPipeline: MTLComputePipelineState
+    // The scene kernels. Scenes 0-5 use a library compiled with VIBE_MESHES=0: the imported-mesh
+    // traversal is dead code there, but its registers slowed them by 13-17% (tests/PERFORMANCE.md).
+    struct SceneKernels { let temporal, shading, guides, pick: MTLComputePipelineState }
+    let proceduralKernels: SceneKernels
+    var sceneKernels: SceneKernels {
+        sceneIndex == 6 ? SceneKernels(temporal: restirTemporalPipeline, shading: shadingPipeline,
+                                       guides: metalFXGuidePipeline, pick: pickPipeline) : proceduralKernels
+    }
     let supportsMetalFX: Bool
     var materials: MaterialLibrary
     private(set) var metalFX: MetalFXDenoiser?
@@ -3348,8 +3636,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let additionalFX = !resizes && needsMetalFX ? fx.partialValue : 0
         let withFX = required.partialValue.addingReportingOverflow(additionalFX)
         let withConcurrent = withFX.partialValue.addingReportingOverflow(concurrentRenderBytes)
+        // Scene textures and the imported mesh (triangles, hierarchies, emitter list).
         let withTextures = withConcurrent.partialValue.addingReportingOverflow(
-            materials.uniqueTextureBytes(materials.residentTextures + materials.external.textures))
+            materials.uniqueTextureBytes(materials.residentTextures + materials.external.textures) + materials.meshBytes)
         let total = withTextures.partialValue.addingReportingOverflow(headroom.partialValue)
         if reservoirs.overflow || fx.overflow || withResident.overflow || required.overflow || withFX.overflow
             || withConcurrent.overflow || withTextures.overflow || total.overflow {
@@ -3396,6 +3685,21 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             self.shadingPipeline = try shared?.shadingPipeline ?? device.makeComputePipelineState(function: fnShading)
             self.metalFXGuidePipeline = try shared?.metalFXGuidePipeline ?? device.makeComputePipelineState(function: fnGuides)
             self.presentPipeline = try shared?.presentPipeline ?? device.makeComputePipelineState(function: fnPresent)
+            if let shared {
+                self.proceduralKernels = shared.proceduralKernels
+            } else {
+                let options = shaderCompileOptions()
+                options.preprocessorMacros = ["VIBE_MESHES": NSNumber(value: 0)]
+                let procedural = try device.makeLibrary(source: metalSource, options: options)
+                func pipeline(_ name: String) throws -> MTLComputePipelineState {
+                    guard let function = procedural.makeFunction(name: name) else {
+                        throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
+                    }
+                    return try device.makeComputePipelineState(function: function)
+                }
+                self.proceduralKernels = SceneKernels(temporal: try pipeline("restir_temporal_kernel"), shading: try pipeline("shading_kernel"),
+                                                      guides: try pipeline("metalfx_guides_kernel"), pick: try pipeline("pick_kernel"))
+            }
         } catch {
             throw error
         }
@@ -3499,7 +3803,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let surfaces = primarySurfaceBuffer(width: accumulation.width, height: accumulation.height),
                   let prepare = commandBuffer.makeComputeCommandEncoder() else { return nil }
             prepare.label = "MetalFX surface and motion guides"
-            prepare.setComputePipelineState(metalFXGuidePipeline)
+            prepare.setComputePipelineState(sceneKernels.guides)
             let inputs = [samples, positions, normals, materials, fx.color, fx.depth, fx.motion,
                           fx.diffuse, fx.specular, fx.normal, fx.roughness, fx.hitDistance, fx.denoiseMask]
             for (index, texture) in inputs.enumerated() { prepare.setTexture(texture, index: index) }
@@ -3771,7 +4075,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         guard let enc1 = cmdBuffer.makeComputeCommandEncoder() else { return }
         do {
             enc1.label = "Pass 1: G-Buffer & ReSTIR Temporal"
-            enc1.setComputePipelineState(restirTemporalPipeline)
+            enc1.setComputePipelineState(sceneKernels.temporal)
             enc1.setTexture(gPos, index: 0)
             enc1.setTexture(gNorm, index: 1)
             enc1.setTexture(gAlb, index: 2)
@@ -3806,7 +4110,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return }
         do {
             enc2.label = "Pass 2: Spatial Resampling & Shading"
-            enc2.setComputePipelineState(shadingPipeline)
+            enc2.setComputePipelineState(sceneKernels.shading)
             enc2.setTexture(gPos, index: 0)
             enc2.setTexture(gNorm, index: 1)
             enc2.setTexture(gAlb, index: 2)

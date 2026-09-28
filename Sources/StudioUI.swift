@@ -1909,7 +1909,32 @@ final class StudioController: NSViewController {
     let o = materials.hasSceneGraph ? ObjectSettings() : materials.objects[7]
     let family = selectedNode.flatMap { project.graph?.descendants(of: $0) }
     let rotation = SIMD3(o.rotationHidden.x, o.rotationHidden.y, o.rotationHidden.z)
-    if family == nil, rotation == .zero, materials.nodeCount > 0 {
+    if let layout = materials.meshLayout {
+      // Two-level: each instance of the family, exactly. A translated instance is bounded by
+      // its asset's bounds plus the translation (rounding is monotonic), others by vertices.
+      func add(_ p: SIMD3<Float>) {
+        let v = rotateObject(p * o.positionScale.w, rotation) + SIMD3(o.positionScale.x, o.positionScale.y, o.positionScale.z)
+        lo = simd_min(lo, v)
+        hi = simd_max(hi, v)
+      }
+      for (i, instance) in layout.instances.enumerated() {
+        if let graph = project.graph, let family, instance.node >= 0,
+          !graph.nodes.indices.contains(instance.node) || !family.contains(graph.nodes[instance.node].id)
+        {
+          continue
+        }
+        let asset = layout.assets[instance.asset]
+        if rotation == .zero, MeshSceneLayout.linear(instance.world) == matrix_identity_float3x3 {
+          let t = SIMD3(instance.world.columns.3.x, instance.world.columns.3.y, instance.world.columns.3.z)
+          if asset.count > 0 { add(asset.lo + t); add(asset.hi + t) }
+          continue
+        }
+        for k in 0..<asset.count {
+          let w = layout.worldTriangle(tris[asset.triangleBase + k], instance: i)
+          for p in [w.a, w.b, w.c] { add(SIMD3(p.x, p.y, p.z)) }
+        }
+      }
+    } else if family == nil, rotation == .zero, materials.nodeCount > 0 {
       // Unrotated whole-mesh framing: the BVH root already bounds every vertex.
       let root = materials.nodeBuffer.contents().load(as: MeshNode.self)
       for v in [SIMD3(root.lo.x, root.lo.y, root.lo.z), SIMD3(root.hi.x, root.hi.y, root.hi.z)] {
@@ -1918,7 +1943,7 @@ final class StudioController: NSViewController {
         hi = simd_max(hi, p)
       }
     }
-    for t in lo.x <= hi.x ? UnsafeBufferPointer(rebasing: tris[..<0]) : tris {
+    for t in lo.x <= hi.x || materials.meshLayout != nil ? UnsafeBufferPointer(rebasing: tris[..<0]) : tris {
       if let graph = project.graph, let family, Int(t.uvc.w) > 0,
         !family.contains(graph.nodes[Int(t.uvc.w) - 1].id)
       {

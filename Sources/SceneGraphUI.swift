@@ -245,7 +245,7 @@ extension StudioController {
     button("Open USD scene…") { [weak self] in self?.importUSD() }
     button("Import OBJ…") { [weak self] in self?.importMesh() }
     text(
-      "OBJ objects, groups and usemtl subsets are preserved. Imports append. Instances share mesh assets; the current GPU bridge rebuilds a flattened BVH after edits. MTL shading and concave polygon triangulation are not supported."
+      "OBJ objects, groups and usemtl subsets are preserved. Imports append. Instances share mesh assets and render as instances: moving, hiding or rebinding one keeps every mesh's acceleration structure. MTL shading and concave polygon triangulation are not supported."
     )
   }
   func showMaterialXReport() {

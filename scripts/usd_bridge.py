@@ -4,6 +4,8 @@ No input file is executed. This process only loads USD's installed core plugins.
 """
 import sys, pathlib, os, json, math, uuid, hashlib, argparse, xml.etree.ElementTree as ET
 HERE=pathlib.Path(__file__).resolve().parent
+# Mirror SceneLimits.triangles (stored, distinct meshes) and SceneLimits.renderedTriangles.
+STORED_TRIANGLES=1000000;RENDERED_TRIANGLES=64000000
 # The bundled SDK is a CPython 3.9 wheel; any other interpreter gets a concise requirement message.
 if sys.version_info[:2]!=(3,9):sys.exit('USD import failed: the bundled OpenUSD SDK requires /usr/bin/python3 CPython 3.9 (Xcode Command Line Tools); found Python '+sys.version.split()[0]+'.')
 sys.path.insert(0,str(HERE/'OpenUSD' if (HERE/'OpenUSD').exists() else HERE.parent/'build/OpenUSD'))
@@ -253,7 +255,7 @@ def import_stage(filename,directory,frame=None):
     conversion=Gf.Matrix4d().SetScale(UsdGeom.GetStageMetersPerUnit(stage))*conversion
     cache=UsdGeom.XformCache(time); nodes=[];assets=[];materials=[];materialIndex={};assetCache={};cameras=[];environment=None;sun=None
     rootID=uid();nodes.append({'id':rootID,'name':pathlib.Path(filename).name,'transform':identity_settings(),'bindings':[]})
-    nodeIDs={};worlds={};rendered=0;translations={};collapsed=set();fallbackColors={}
+    nodeIDs={};worlds={};rendered=0;stored=0;translations={};collapsed=set();fallbackColors={}
     def get_material(prim):
         material,_=UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
         path=str(material.GetPath()) if material else ''
@@ -351,9 +353,12 @@ def import_stage(filename,directory,frame=None):
                 if fanned:report.append(path+': '+str(fanned)+' non-simple polygons fan-triangulated')
                 if not triangles:report.append(path+': mesh has no renderable faces; skipped');continue
                 rendered+=len(triangles)
-                if rendered>500000:fail('Stage exceeds 500,000 rendered triangles')
+                if rendered>RENDERED_TRIANGLES:fail('Stage exceeds 64,000,000 rendered triangles')
                 key=hashlib.sha256(json.dumps({'triangles':triangles,'subsets':subsetNames},separators=(',',':')).encode()).hexdigest()
                 if key not in assetCache:
+                    # Identical meshes share one asset: Swift instances it (SceneLimits).
+                    stored+=len(triangles)
+                    if stored>STORED_TRIANGLES:fail('Stage exceeds 1,000,000 stored (distinct) triangles')
                     asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':subsetNames};assets.append(asset);assetCache[key]=asset['id']
                 node['mesh']=assetCache[key];node['bindings']=bindings
                 # Per-binding displayColors let Swift split a material its compiler rejects.
@@ -403,7 +408,7 @@ def import_stage(filename,directory,frame=None):
                 material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':emission}
                 if len(materials)>=56:fail('Stage exceeds 56 materials including lights')
                 materials.append(material)
-                asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':['Emission']};assets.append(asset)
+                asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':['Emission']};assets.append(asset);stored+=len(triangles)
                 pp,parentID,local=attach(prim,world)
                 nodes.append({'id':uid(),'name':str(prim.GetName()),'parent':parentID,'mesh':asset['id'],'transform':identity_settings(),'bindings':[material['id']],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]})
                 rendered+=len(triangles)
@@ -430,7 +435,7 @@ def import_stage(filename,directory,frame=None):
             elif prim.HasAPI(UsdLux.VolumeLightAPI):report.append(path+': VolumeLightAPI emission and volume geometry '+prim.GetTypeName()+' are not imported')
             elif prim.HasAPI(UsdLux.LightAPI):report.append(path+': unsupported light type '+prim.GetTypeName())
             elif prim.IsA(UsdGeom.Gprim) or prim.GetTypeName() in ('PointInstancer','Volume'):report.append(path+': unsupported geometry '+prim.GetTypeName())
-    if len(nodes)>256 or rendered>500000:fail('Stage exceeds renderer capacity including lights')
+    if len(nodes)>256 or rendered>RENDERED_TRIANGLES or stored>STORED_TRIANGLES:fail('Stage exceeds renderer capacity including lights')
     if not assets:fail('No supported meshes were found')
     report.insert(1,f'{len(assets)} mesh assets, {len(nodes)} nodes, {len(materials)} materials, {rendered} triangles')
     return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report,'fallbackColors':fallbackColors}
