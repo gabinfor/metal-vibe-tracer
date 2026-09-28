@@ -174,11 +174,17 @@ class MaterialTranslator:
         ident=str(shader.GetIdAttr().Get())
         inputs=[]
         if ident=='UsdPreviewSurface':
-            for key,default in [('useSpecularWorkflow',0),('opacity',1),('opacityThreshold',0),('displacement',0),('emissiveColor',Gf.Vec3f(0))]:
+            for key,default in [('useSpecularWorkflow',0),('opacity',1),('opacityThreshold',0),('displacement',0)]:
                 i=shader.GetInput(key)
                 if i and (i.GetConnectedSource() or get(shader,key,default,self.time)!=default):fail('Unsupported PreviewSurface input '+key)
             mapping=[('diffuseColor','base_color','color3',[.18]*3),('roughness','specular_roughness','float',.5),('metallic','base_metalness','float',0),('ior','specular_ior','float',1.5),('clearcoat','coat_weight','float',0),('clearcoatRoughness','coat_roughness','float',.01)]
             for src,dst,t,default in mapping:inputs.append((dst,t,self.expression(shader.GetInput(src),t,default)))
+            # emissiveColor is the emitted radiance (MaterialX IMP_UsdPreviewSurface: uniform_edf
+            # color); OpenPBR expresses it as emission_color at unit luminance.
+            emissive=shader.GetInput('emissiveColor')
+            if emissive and (emissive.GetConnectedSource() or any(vec(get(shader,'emissiveColor',Gf.Vec3f(0),self.time)))):
+                inputs.append(('emission_color','color3',self.expression(emissive,'color3',[0,0,0])))
+                inputs.append(('emission_luminance','float',1.0))
             normal=shader.GetInput('normal')
             if normal and (normal.GetConnectedSource() or normal.Get(self.time) is not None):
                 n=self.expression(normal,'vector3',[0,0,1])
