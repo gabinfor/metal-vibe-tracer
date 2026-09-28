@@ -2418,16 +2418,14 @@ kernel void metalfx_guides_kernel(
             guideCamera+=radius*(cos(angle)*right+sin(angle)*up);
         }
         float3 wo = normalize(guideCamera - p.xyz);
-        // The G-buffer holds the shading normal. Specular guide rays re-trace the
-        // primary hit and offset along its geometric normal and rounding bound.
+        // The G-buffer holds the shading normal. Specular guide rays offset along the
+        // primary hit's geometric normal and rounding bound, which pass 1 cached beside
+        // the full-precision position (as the shading pass uses them): no re-trace, and
+        // only those two cache fields are read, only for the pixels that need them.
         float3 offsetPosition = p.xyz, offsetNormal = normal; float offsetError = 0.0f;
         if ((int(n.w) == GLOSSY && material.w < 0.15f) || int(n.w) == DIELECTRIC) {
-            Ray primary = { guideCamera, -wo };
-            HitRecord surface;
-            if (trace_scene(primary, u.sceneIndex, surface, materialImages, u) &&
-                distance(surface.position, p.xyz) <= max(1e-4f, 1e-3f * p.w)) {
-                offsetPosition = surface.position; offsetNormal = surface.geometricNormal; offsetError = surface.error;
-            }
+            const device PrimarySurface &surface = primarySurfaces[gid.y * u.width + gid.x];
+            offsetNormal = surface.geometricNormal; offsetError = surface.error;
         }
         if (int(n.w) == DIFFUSE) diffuseAlbedo = material.xyz;
         if (int(n.w) == GLOSSY) {
