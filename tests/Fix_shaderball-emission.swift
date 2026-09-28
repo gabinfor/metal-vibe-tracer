@@ -158,6 +158,16 @@
           HitRecord h; bool hit = trace_scene(r, 6, h, images, u);
           if (hit) resolve_material(h, r, u, settings, images, 0.0f);
           out[i] = float4(hit ? openpbr_emission(h.mat, h.normal, -r.direction) : float3(-1), hit ? float(h.mat.type) : -1);
+          if (i == 0 && tid == 0) {
+              // MaterialX coat on emission: (1 - F0(1.6)) (1 - (1 - N.V)^5), mixed by coat_weight.
+              Material coated = h.mat; coated.coat = 1.0f;
+              float3 e = openpbr_emission(h.mat, h.normal, -r.direction);
+              float3 grazing = normalize(h.normal + 3.0f * h.tangent);
+              float normal = openpbr_emission(coated, h.normal, -r.direction).x / e.x;
+              float oblique = openpbr_emission(coated, h.normal, grazing).x / openpbr_emission(h.mat, h.normal, grazing).x;
+              coated.coat = 0.5f;
+              out[3] = float4(normal, oblique, openpbr_emission(coated, h.normal, -r.direction).x / e.x, dot(h.normal, grazing));
+          }
       }
       // Light samples evaluate the graph at the sampled point exactly as a hit there does.
       float3 p = float3(0.2f * float(int(tid % 5u) - 2), 0.0f, 0.2f * float(int(tid / 5u) - 2));
@@ -179,7 +189,7 @@
               : ls.position.x > 0.2f ? 3.0f * float3(\(right.x), \(right.y), \(right.z)) : float3(-1);
           if (expected.x >= 0) { halves += 1; if (all(abs(ls.emission - expected) < 2e-3f)) pure += 1; }
       }
-      out[3 + tid] = float4(samples, mismatch, pdfError, halves - pure);
+      out[4 + tid] = float4(samples, mismatch, pdfError, halves - pure);
   }
   """
   let library = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
@@ -189,7 +199,7 @@
   probe.sunParams.w = 0
   probe.lens.z = 1
   let threads = 25
-  let buffer = gpu.makeBuffer(length: (3 + threads) * 16, options: .storageModeShared)!
+  let buffer = gpu.makeBuffer(length: (4 + threads) * 16, options: .storageModeShared)!
   let command = testRenderer.commandQueue.makeCommandBuffer()!
   let encoder = command.makeComputeCommandEncoder()!
   encoder.setComputePipelineState(pipeline)
@@ -199,13 +209,18 @@
   encoder.dispatchThreads(MTLSize(width: threads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
   encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
   require(command.status == .completed, "emission probe GPU command: \(String(describing: command.error))")
-  let probed = (0..<(3 + threads)).map { buffer.contents().load(fromByteOffset: $0 * 16, as: SIMD4<Float>.self) }
+  let probed = (0..<(4 + threads)).map { buffer.contents().load(fromByteOffset: $0 * 16, as: SIMD4<Float>.self) }
   print("Graph emission probe: front \(probed[0]) \(probed[1]), back \(probed[2])")
   func close(_ a: SIMD4<Float>, _ b: SIMD3<Float>) -> Bool { simd_length(SIMD3(a.x, a.y, a.z) - b) < 2e-3 * max(1, simd_length(b)) }
   require(close(probed[0], 3 * left) && close(probed[1], 3 * right) && probed[0].w == 4 && probed[1].w == 4,
     "hits see texture x luminance on the front face of an OpenPBR emitter")
   require(close(probed[2], .zero) && probed[2].w == 4, "the back face of a non-thin-walled emitter is dark")
-  let lightSamples = probed[3...]
+  let f0: Float = 0.36 / 6.76, cosine = probed[3].w
+  print("Graph emission coat factors: normal \(probed[3].x), oblique \(probed[3].y), half weight \(probed[3].z)")
+  require(abs(probed[3].x - (1 - f0)) < 1e-4 && abs(probed[3].y - (1 - f0) * (1 - pow(1 - cosine, 5))) < 1e-4
+      && abs(probed[3].z - (1 + (1 - f0)) / 2) < 1e-4,
+    "coated emission follows the MaterialX generalized_schlick_edf coat factor")
+  let lightSamples = probed[4...]
   let sampled = lightSamples.reduce(0) { $0 + $1.x }, worstMismatch = lightSamples.map { $0.y }.max() ?? 1
   let worstPDF = lightSamples.map { $0.z }.max() ?? 1, impure = lightSamples.reduce(0) { $0 + $1.w }
   print("Graph emission light samples: \(sampled), radiance mismatch \(worstMismatch), PDF error \(worstPDF), off-texel \(impure)")

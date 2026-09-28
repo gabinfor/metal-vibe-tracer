@@ -1092,18 +1092,19 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
     inputs.geometry_coat_basis = inputs.geometry_basis;
-    if (mat.usesMaterialX) { inputs.emission_luminance = 1.0f; inputs.emission_color = mat.emission; }
     return openpbr_prepare(inputs, float3(1), OpenPBR_BaseRgbWavelengths_nm, 1.0f, wo);
 }
 
-// REFERENCES.md: MATERIALX, OPENPBR, ADOBEOPENPBR. Radiance a MaterialX surface emits
-// toward wo: emission_color x emission_luminance, attenuated by coat and fuzz through the
-// pinned Adobe openpbr_compute_emission (skipped when neither layer is present).
+// REFERENCES.md: MATERIALX, OPENPBR. Radiance a MaterialX surface emits toward wo, as in
+// the pinned MaterialX v1.39.5 open_pbr_surface graph: emission_color x emission_luminance
+// (uniform_edf), mixed by coat_weight with its generalized_schlick_edf coated form, whose
+// factor is (1 - F0) (1 - (1 - N.V)^5) for the coat IOR (fixed at 1.6) and coat_color (1).
 float3 openpbr_emission(Material mat, float3 n, float3 wo) {
     if (mat.type != OPENPBR || mat.usesMaterialX == 0 || !any(mat.emission > 0.0f)) return float3(0);
-    if (mat.coat <= 0.0f && mat.fuzz <= 0.0f) return mat.emission;
-    float3 emitted = prepare_openpbr(mat, n, wo).emission;
-    return all(isfinite(emitted)) ? max(emitted, float3(0)) : float3(0);
+    const float coatF0 = 0.6f * 0.6f / (2.6f * 2.6f);
+    float grazing = 1.0f - clamp(dot(n, wo), 1.1920929e-7f, 1.0f);
+    float coated = (1.0f - coatF0) * (1.0f - pow(grazing, 5.0f));
+    return mat.emission * mix(1.0f, coated, clamp(mat.coat, 0.0f, 1.0f));
 }
 
 float3 eval_bsdf(Material mat, float3 n, float3 wo, float3 wi) {
