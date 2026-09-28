@@ -2713,10 +2713,13 @@ final class MaterialLibrary {
     var environmentColumns: MTLTexture!
     var defaultEnvironmentSampling: MTLTexture!
     // BVH-ordered triangles live only in the shared triangleBuffer (read through
-    // orderedTriangles); meshTriangles keeps the document order for snapshots.
+    // orderedTriangles). meshTriangles is the document's own array of a graph-less
+    // (legacy) mesh, shared rather than copied, for snapshots; it is empty for a
+    // scene-graph mesh, whose assets remain the only other host copy.
     var triangleBuffer: MTLBuffer! { didSet { emittersDirty = true } }
     var nodeBuffer: MTLBuffer!
     var meshTriangles: [MeshTriangle] = []
+    var triangleCount = 0
     var hasSceneGraph = false
     var nodeCount = 0
     var objectBuffer: MTLBuffer!
@@ -2727,9 +2730,9 @@ final class MaterialLibrary {
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
     var orderedTriangles: UnsafeBufferPointer<MeshTriangle> {
-        UnsafeBufferPointer(start: meshTriangles.isEmpty ? nil
-            : triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: meshTriangles.count),
-            count: meshTriangles.count)
+        UnsafeBufferPointer(start: triangleCount == 0 ? nil
+            : triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: triangleCount),
+            count: triangleCount)
     }
     // Every resource referenced by the argument buffer. bind() declares exactly
     // this list with useResources, which is what keeps indirectly referenced

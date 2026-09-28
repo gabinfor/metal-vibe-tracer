@@ -104,12 +104,11 @@ extension StudioController {
                  _ edit: (inout SceneGraph) throws -> Void) {
     guard acceptsEdits, var graph = project.graph else { return }
     let previousState = renderer.materials.state()
-    let previousTriangles = renderer.materials.meshTriangles
+    let previousMesh = renderer.materials.meshResources
     do {
       let previousMaterials = graph.materials
       try edit(&graph)
       try graph.validate()
-      let triangles = kind == .geometry ? try graph.renderTriangles() : nil
       // Registered only after the resources and document are published.
       let record = undoRecord(title)
       let remaining = Set(graph.materials.map(\.id))
@@ -128,7 +127,7 @@ extension StudioController {
         }
         try renderer.materials.restore(state)
       }
-      if let triangles { try renderer.materials.setMesh(triangles) }
+      if kind == .geometry { try renderer.materials.setMesh(graph) }
       else if kind == .bindings { try renderer.materials.setMeshBindings(graph) }
       renderer.materials.hasSceneGraph = true
       project.graph = graph
@@ -141,7 +140,7 @@ extension StudioController {
       var rollbackFailures: [String] = []
       do { try renderer.materials.restore(previousState) }
       catch { rollbackFailures.append("materials: \(error.localizedDescription)") }
-      do { try renderer.materials.setMesh(previousTriangles) }
+      do { try renderer.materials.restoreMesh(previousMesh) }
       catch { rollbackFailures.append("mesh: \(error.localizedDescription)") }
       renderer.materials.hasSceneGraph = project.graph != nil
       if rollbackFailures.isEmpty {

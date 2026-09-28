@@ -95,7 +95,7 @@ extension StudioController {
       r.concurrentRenderBytes = concurrentTotal.overflow ? UInt64.max : concurrentTotal.partialValue
       try r.materials.restore(renderer.materials.state())
       try r.materials.setEnvironment(p.environmentData)
-      try r.materials.setMesh(p.graph?.renderTriangles() ?? p.triangles)
+      try r.materials.setMesh(p)
       r.materials.hasSceneGraph = p.graph != nil
       r.sceneIndex = p.scene
       r.samplingMode = p.strategy

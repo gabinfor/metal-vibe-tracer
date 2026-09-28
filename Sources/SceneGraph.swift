@@ -280,11 +280,26 @@ struct SceneGraph: Codable {
   }
   // Instances share document mesh data. This initial GPU bridge flattens visible instances.
   func renderTriangles() throws -> [MeshTriangle] {
-    try validate()
     var result: [MeshTriangle] = []
+    result.reserveCapacity(try renderTriangleCount())
+    try forEachRenderTriangle { result.append($0) }
+    return result
+  }
+  // The number of triangles forEachRenderTriangle visits (visible mesh instances).
+  func renderTriangleCount() throws -> Int {
+    try validate()
+    let counts = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0.triangles.count) })
+    return nodes.reduce(0) { total, node in
+      guard let id = node.mesh, let count = counts[id], !worldTransform(node.id).1 else { return total }
+      return total + count
+    }
+  }
+  // Streams the flattened triangles, so a caller can write them straight into their
+  // destination (the GPU buffer) instead of materializing another full host copy.
+  func forEachRenderTriangle(_ body: (MeshTriangle) throws -> Void) throws {
+    try validate()
     let assetsByID = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) })
     let slotsByID = Dictionary(uniqueKeysWithValues: materials.map { ($0.id, $0.slot) })
-    result.reserveCapacity(nodes.reduce(0) { $0 + ($1.mesh.flatMap { assetsByID[$0]?.triangles.count } ?? 0) })
     for (index, node) in nodes.enumerated() {
       guard let id = node.mesh, let asset = assetsByID[id] else { continue }
       let (world, hidden) = worldTransform(node.id)
@@ -340,10 +355,9 @@ struct SceneGraph: Codable {
         else {
           throw MaterialLibrary.error("Hierarchy transform exceeds the supported scene extent.")
         }
-        result.append(t)
+        try body(t)
       }
     }
-    return result
   }
 }
 

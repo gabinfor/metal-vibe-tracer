@@ -83,7 +83,7 @@
   _ = testWindow.makeFirstResponder(translation.field)
   translation.field.stringValue = "0.5"
   try controller.restore(ProjectDocument())
-  require(controller.project.graph == nil && testRenderer.materials.meshTriangles.isEmpty,
+  require(controller.project.graph == nil && testRenderer.materials.triangleCount == 0,
     "restoring over a focused graph field neither crashes nor edits the new document")
   var removed = SceneGraph()
   _ = try removed.addOBJ(obj, name: "quad")

@@ -448,6 +448,29 @@ enum OBJMesh {
     return result
   }
   static func build(_ input: [MeshTriangle]) -> ([MeshTriangle], [MeshNode]) {
+    let (order, nodes) = input.withUnsafeBufferPointer { hierarchy($0) }
+    return (order.map { input[$0] }, nodes)
+  }
+  // Builds the hierarchy and reorders `triangles` into BVH order in place (following the
+  // permutation's cycles), so the GPU buffer needs no second, reordered host copy.
+  static func buildInPlace(_ triangles: UnsafeMutableBufferPointer<MeshTriangle>) -> [MeshNode] {
+    let (order, nodes) = hierarchy(UnsafeBufferPointer(triangles))
+    var placed = [Bool](repeating: false, count: order.count)
+    for start in order.indices where !placed[start] {
+      let first = triangles[start]
+      var slot = start
+      while true {
+        placed[slot] = true
+        let source = order[slot]
+        if source == start { triangles[slot] = first; break }
+        triangles[slot] = triangles[source]
+        slot = source
+      }
+    }
+    return nodes
+  }
+  // Returns the BVH triangle order (ordered[i] = input[order[i]]) and the nodes.
+  static func hierarchy(_ input: UnsafeBufferPointer<MeshTriangle>) -> ([Int], [MeshNode]) {
     guard !input.isEmpty else { return ([], []) }
     // Partition integer references in place. Recursive triangle copies and a
     // full sort at every node used to dominate large imported-scene edits.
@@ -504,7 +527,7 @@ enum OBJMesh {
       return index
     }
     _ = buildNode(0, input.count)
-    return (order.map { input[$0] }, nodes)
+    return (order, nodes)
   }
 
 }
@@ -526,6 +549,7 @@ struct ReusableResources: @unchecked Sendable {
   var meshTriangles: [MeshTriangle]
   // BVH-ordered triangles live only in triangleBuffer (MaterialLibrary.orderedTriangles).
   var triangleBuffer: MTLBuffer
+  var triangleCount: Int
   var nodeBuffer: MTLBuffer
   var nodeCount: Int
   var hasSceneGraph: Bool
@@ -599,7 +623,7 @@ extension MaterialLibrary {
       environment: environmentData == nil
         ? nil : (environmentTexture, environmentRows, environmentColumns),
       meshTriangles: meshTriangles,
-      triangleBuffer: triangleBuffer, nodeBuffer: nodeBuffer, nodeCount: nodeCount,
+      triangleBuffer: triangleBuffer, triangleCount: triangleCount, nodeBuffer: nodeBuffer, nodeCount: nodeCount,
       hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
   }
   // Seed a freshly created candidate. It is published only after restore,
@@ -617,6 +641,7 @@ extension MaterialLibrary {
     }
     meshTriangles = r.meshTriangles
     triangleBuffer = r.triangleBuffer
+    triangleCount = r.triangleCount
     nodeBuffer = r.nodeBuffer
     nodeCount = r.nodeCount
     hasSceneGraph = r.hasSceneGraph
@@ -934,35 +959,80 @@ extension MaterialLibrary {
     try publishEnvironment(
       makeEnvironment(bytes, residentBytes: uniqueTextureBytes(residentTextures + external.textures)))
   }
+  // A graph-less (legacy) mesh. The document's array is retained as meshTriangles by
+  // reference (copy-on-write storage is shared, not duplicated) for snapshots.
   func setMesh(_ triangles: [MeshTriangle]) throws {
+    let t = try triangleStorage(triangles.count)
+    if !triangles.isEmpty {
+      triangles.withUnsafeBytes { t.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+    }
+    try publishMesh(t, count: triangles.count, document: triangles)
+  }
+  // A scene-graph mesh, flattened straight into the shared GPU buffer and reordered there:
+  // the graph's assets stay the only other host copy, and no flattened array is retained.
+  func setMesh(_ graph: SceneGraph) throws {
+    let count = try graph.renderTriangleCount()
+    let t = try triangleStorage(count)
+    let target = t.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, count))
+    var written = 0
+    try graph.forEachRenderTriangle { triangle in
+      guard written < count else { throw Self.error("Flattened scene size changed while building the mesh.") }
+      target[written] = triangle
+      written += 1
+    }
+    guard written == count else { throw Self.error("Flattened scene size changed while building the mesh.") }
+    try publishMesh(t, count: count, document: [])
+  }
+  func setMesh(_ p: ProjectDocument) throws {
+    if let graph = p.graph { try setMesh(graph) } else { try setMesh(p.triangles) }
+  }
+  // The published mesh buffers, for an exact rollback that neither flattens nor rebuilds.
+  struct MeshResources {
+    let triangles: [MeshTriangle], triangleBuffer: MTLBuffer, triangleCount: Int
+    let nodeBuffer: MTLBuffer, nodeCount: Int
+  }
+  var meshResources: MeshResources {
+    MeshResources(triangles: meshTriangles, triangleBuffer: triangleBuffer, triangleCount: triangleCount,
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount)
+  }
+  func restoreMesh(_ m: MeshResources) throws {
+    let old = meshResources, oldArgument = argumentBuffer
+    apply(m)
+    do { try rebuildArguments(images) }
+    catch { apply(old); argumentBuffer = oldArgument; throw error }
+  }
+  private func apply(_ m: MeshResources) {
+    triangleBuffer = m.triangleBuffer; triangleCount = m.triangleCount
+    nodeBuffer = m.nodeBuffer; nodeCount = m.nodeCount
+    meshTriangles = m.triangles
+  }
+  private func triangleStorage(_ count: Int) throws -> MTLBuffer {
+    let bytes = count.multipliedReportingOverflow(by: MemoryLayout<MeshTriangle>.stride)
+    guard !bytes.overflow,
+      let b = device.makeBuffer(length: max(128, bytes.partialValue), options: .storageModeShared)
+    else { throw Self.error("Could not allocate imported mesh.") }
+    return b
+  }
+  private func publishMesh(_ t: MTLBuffer, count: Int, document: [MeshTriangle]) throws {
     meshBuildCount += 1
-    let (ordered, nodes) = OBJMesh.build(triangles)
-    func buffer<T>(_ values: [T]) throws -> MTLBuffer {
-      if values.isEmpty {
-        guard let b = device.makeBuffer(length: 128, options: .storageModeShared) else {
-          throw Self.error("Could not allocate imported mesh.")
-        }
-        return b
+    let nodes = OBJMesh.buildInPlace(UnsafeMutableBufferPointer(
+      start: count == 0 ? nil : t.contents().bindMemory(to: MeshTriangle.self, capacity: count), count: count))
+    let n: MTLBuffer
+    if nodes.isEmpty {
+      guard let b = device.makeBuffer(length: 128, options: .storageModeShared) else {
+        throw Self.error("Could not allocate imported mesh.")
       }
+      n = b
+    } else {
       guard
-        let b = values.withUnsafeBytes({
+        let b = nodes.withUnsafeBytes({
           device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
         })
       else { throw Self.error("Could not allocate imported mesh.") }
-      return b
+      n = b
     }
-    let t = try buffer(ordered)
-    let n = try buffer(nodes)
-    let oldTriangles = triangleBuffer, oldNodes = nodeBuffer
-    let oldMesh = meshTriangles, oldNodeCount = nodeCount, oldArgument = argumentBuffer
-    triangleBuffer = t; nodeBuffer = n
-    meshTriangles = triangles; nodeCount = nodes.count
-    do { try rebuildArguments(images) }
-    catch {
-      triangleBuffer = oldTriangles; nodeBuffer = oldNodes
-      meshTriangles = oldMesh; nodeCount = oldNodeCount; argumentBuffer = oldArgument
-      throw error
-    }
+    try restoreMesh(MeshResources(triangles: document, triangleBuffer: t, triangleCount: count,
+      nodeBuffer: n, nodeCount: nodes.count))
   }
 
   func setMeshBindings(_ graph: SceneGraph) throws {
@@ -986,17 +1056,8 @@ extension MaterialLibrary {
     else { throw Self.error("Could not allocate imported mesh bindings.") }
     let target = candidateBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, ordered.count))
     for (i, triangle) in ordered.enumerated() { target[i] = try rebound(triangle) }
-    let candidateMesh = try meshTriangles.map(rebound)
-    let oldMesh = meshTriangles
-    let oldTriangleBuffer = triangleBuffer, oldArgument = argumentBuffer
-    meshTriangles = candidateMesh
-    triangleBuffer = candidateBuffer
-    do { try rebuildArguments(images) }
-    catch {
-      meshTriangles = oldMesh
-      triangleBuffer = oldTriangleBuffer
-      argumentBuffer = oldArgument
-      throw error
-    }
+    // Bindings belong to a scene-graph mesh, which retains no document-order copy.
+    try restoreMesh(MeshResources(triangles: [], triangleBuffer: candidateBuffer, triangleCount: ordered.count,
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount))
   }
 }

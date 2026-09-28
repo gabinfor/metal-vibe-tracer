@@ -22,7 +22,7 @@ let areaResult = try USDImporter.load(usdFolder.appendingPathComponent("area.usd
 let usdBytes = try JSONEncoder().encode(areaResult.document)
 let usdRoundtrip = try JSONDecoder().decode(ProjectDocument.self, from: usdBytes)
 try controller.restore(usdRoundtrip)
-require(testRenderer.materials.emissions.count == 1 && testRenderer.materials.meshTriangles.count == 4, "area emitter survives project roundtrip")
+require(testRenderer.materials.emissions.count == 1 && testRenderer.materials.triangleCount == 4, "area emitter survives project roundtrip")
 let usdKernel = """
 kernel void usd_checks(constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],constant MaterialResources &images [[buffer(2)]],device float4 *out [[buffer(3)]]) {
  uint seed=47;uint count=0;float error=0,envError=0;float3 p=float3(0,.01f,0),n=float3(0,1,0);

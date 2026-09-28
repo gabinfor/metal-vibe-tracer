@@ -1176,7 +1176,7 @@ final class StudioController: NSViewController {
     {
       // The adopted flattened mesh and BVH are already bound.
     } else {
-      try resources.setMesh(p.graph?.renderTriangles() ?? p.triangles)
+      try resources.setMesh(p)
     }
     resources.hasSceneGraph = p.graph != nil
     return resources
@@ -1251,7 +1251,7 @@ final class StudioController: NSViewController {
       {
         if !graph.sameBindings(as: current) { try live.setMeshBindings(graph) }
       } else if p.graph != nil || live.hasSceneGraph || !sameBytes(p.triangles, live.meshTriangles) {
-        try live.setMesh(p.graph?.renderTriangles() ?? p.triangles)
+        try live.setMesh(p)
       }
     } catch {
       if materialsChanged {
@@ -1899,14 +1899,26 @@ final class StudioController: NSViewController {
       switchScene(6) { [weak self] in self?.frameMesh(recordUndo: recordUndo) }
       return
     }
-    let tris = renderer.materials.meshTriangles
+    // Reads the shared GPU buffer (BVH order); no host copy of the mesh is kept for this.
+    let materials = renderer.materials
+    let tris = materials.orderedTriangles
     guard !tris.isEmpty else { return }
     if recordUndo { checkpoint("Frame mesh") }
     var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
     var hi = -lo
-    let o = renderer.materials.hasSceneGraph ? ObjectSettings() : renderer.materials.objects[7]
+    let o = materials.hasSceneGraph ? ObjectSettings() : materials.objects[7]
     let family = selectedNode.flatMap { project.graph?.descendants(of: $0) }
-    for t in tris {
+    let rotation = SIMD3(o.rotationHidden.x, o.rotationHidden.y, o.rotationHidden.z)
+    if family == nil, rotation == .zero, materials.nodeCount > 0 {
+      // Unrotated whole-mesh framing: the BVH root already bounds every vertex.
+      let root = materials.nodeBuffer.contents().load(as: MeshNode.self)
+      for v in [SIMD3(root.lo.x, root.lo.y, root.lo.z), SIMD3(root.hi.x, root.hi.y, root.hi.z)] {
+        let p = v * o.positionScale.w + SIMD3(o.positionScale.x, o.positionScale.y, o.positionScale.z)
+        lo = simd_min(lo, p)
+        hi = simd_max(hi, p)
+      }
+    }
+    for t in lo.x <= hi.x ? UnsafeBufferPointer(rebasing: tris[..<0]) : tris {
       if let graph = project.graph, let family, Int(t.uvc.w) > 0,
         !family.contains(graph.nodes[Int(t.uvc.w) - 1].id)
       {
