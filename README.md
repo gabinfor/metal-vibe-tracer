@@ -6,7 +6,7 @@ An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Expl
 
 - **Path tracing:** ReSTIR direct lighting and first-bounce diffuse GI, with Standard MIS, light-only, and BSDF-only comparison modes.
 - **Materials:** OpenPBR surfaces, image textures, normal maps, and a supported subset of MaterialX graphs.
-- **Scenes:** six procedural test scenes, OBJ import, and OpenUSD scene import with hierarchy, instances, materials, lights, and cameras.
+- **Scenes:** six procedural test scenes, OBJ import, and OpenUSD scene import with hierarchy, instances, materials, lights, and cameras. Imported meshes are traced as instances through a two-level acceleration structure: Metal hardware ray tracing where a launch-time check finds it watertight (Apple M4 does), otherwise an exact software 4-wide SAH hierarchy. Up to 1,000,000 stored and 64,000,000 rendered triangles.
 - **Lighting:** procedural skies, HDRI environments, editable area lights, and a thin-lens camera.
 - **Denoising:** MetalFX interactive preview and Open Image Denoise for in-app snapshots and offline exports.
 - **Viewport:** beauty, albedo, world normals, depth, and material/roughness views.

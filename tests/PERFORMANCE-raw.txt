@@ -1,46 +1,99 @@
-Date: 2026-09-28T10:35:49+08:00
-Source: 84db5e385df4b86e8bded671f0faffe058120e90
-Baseline: none
+Date: 2026-09-28T16:13:54+08:00
+Source: 192724facb77e4d2b2cae3b38537dc0fcc3d34a9 with uncommitted changes
+Baseline: /private/tmp/claude-501/-Users-montrichardairm4-Vibe-Tracer/d132f1ac-2111-425e-983e-02e9e8c6cea2/scratchpad/accel/main-192724f.swift
 Machine: Apple M4, 16 GB
 macOS: 27.0 (26A428)
 Compiler: Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)
 Settings: 640x480, previewScale 1, 12 frames per run (first 4 untimed), 3 rounds, depth 16, sampling from tests/GPUChecks.swift render()
 PASS: runtime shader compilation on Apple M4
 PASS: inside-box exit, parallel-box miss, random endpoints, small-PDF MIS, glass total internal reflection, emission weighting, sphere emitter endpoints, finite-roughness grazing cylinder, terminal ReSTIR GI weighting
+Baseline layout: Uniforms 304 B and offsets, material arguments 3152 B, kernel bindings: compatible
+RUN round=0 Default Pavilion | MetalFX off variant=baseline meanRadiance=1.1647099
 RUN round=0 Default Pavilion | MetalFX off variant=current meanRadiance=1.1647099
+RUN round=0 Default Pavilion | MetalFX on variant=baseline meanRadiance=1.1647099
 RUN round=0 Default Pavilion | MetalFX on variant=current meanRadiance=1.1647099
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=baseline meanRadiance=1.3255147
 RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3255147
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=baseline meanRadiance=1.3255147
 RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3255147
+RUN round=0 Cornell box | MetalFX off variant=baseline meanRadiance=0.14767331
 RUN round=0 Cornell box | MetalFX off variant=current meanRadiance=0.14767331
+RUN round=0 Cornell box | MetalFX on variant=baseline meanRadiance=0.14767331
 RUN round=0 Cornell box | MetalFX on variant=current meanRadiance=0.14767331
-RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6185692
-RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6185692
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=baseline meanRadiance=0.6185692
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6186289
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=baseline meanRadiance=0.6185692
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6186289
+RUN round=0 Default Pavilion, MIS | MetalFX off variant=baseline meanRadiance=1.1175245
 RUN round=0 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.1175245
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=baseline meanRadiance=0.65513706
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.6551408
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=baseline meanRadiance=0.65513706
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.6551408
 RUN round=1 Default Pavilion | MetalFX off variant=current meanRadiance=1.1647099
+RUN round=1 Default Pavilion | MetalFX off variant=baseline meanRadiance=1.1647099
 RUN round=1 Default Pavilion | MetalFX on variant=current meanRadiance=1.1647099
+RUN round=1 Default Pavilion | MetalFX on variant=baseline meanRadiance=1.1647099
 RUN round=1 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3255147
+RUN round=1 Pavilion with coated OpenPBR floor | MetalFX off variant=baseline meanRadiance=1.3255147
 RUN round=1 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3255147
+RUN round=1 Pavilion with coated OpenPBR floor | MetalFX on variant=baseline meanRadiance=1.3255147
 RUN round=1 Cornell box | MetalFX off variant=current meanRadiance=0.14767331
+RUN round=1 Cornell box | MetalFX off variant=baseline meanRadiance=0.14767331
 RUN round=1 Cornell box | MetalFX on variant=current meanRadiance=0.14767331
-RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6185692
-RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6185692
+RUN round=1 Cornell box | MetalFX on variant=baseline meanRadiance=0.14767331
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6186289
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=baseline meanRadiance=0.6185692
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6186289
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=baseline meanRadiance=0.6185692
 RUN round=1 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.1175245
+RUN round=1 Default Pavilion, MIS | MetalFX off variant=baseline meanRadiance=1.1175245
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.6551408
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=baseline meanRadiance=0.65513706
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.6551408
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=baseline meanRadiance=0.65513706
+RUN round=2 Default Pavilion | MetalFX off variant=baseline meanRadiance=1.1647099
 RUN round=2 Default Pavilion | MetalFX off variant=current meanRadiance=1.1647099
+RUN round=2 Default Pavilion | MetalFX on variant=baseline meanRadiance=1.1647099
 RUN round=2 Default Pavilion | MetalFX on variant=current meanRadiance=1.1647099
+RUN round=2 Pavilion with coated OpenPBR floor | MetalFX off variant=baseline meanRadiance=1.3255147
 RUN round=2 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3255147
+RUN round=2 Pavilion with coated OpenPBR floor | MetalFX on variant=baseline meanRadiance=1.3255147
 RUN round=2 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3255147
+RUN round=2 Cornell box | MetalFX off variant=baseline meanRadiance=0.14767331
 RUN round=2 Cornell box | MetalFX off variant=current meanRadiance=0.14767331
+RUN round=2 Cornell box | MetalFX on variant=baseline meanRadiance=0.14767331
 RUN round=2 Cornell box | MetalFX on variant=current meanRadiance=0.14767331
-RUN round=2 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6185692
-RUN round=2 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6185692
+RUN round=2 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=baseline meanRadiance=0.6185692
+RUN round=2 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6186289
+RUN round=2 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=baseline meanRadiance=0.6185692
+RUN round=2 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6186289
+RUN round=2 Default Pavilion, MIS | MetalFX off variant=baseline meanRadiance=1.1175245
 RUN round=2 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.1175245
-RESULT Cornell box | MetalFX off | current | medianMS=11.81 min=11.73 max=12.36 n=24
-RESULT Cornell box | MetalFX on | current | medianMS=16.08 min=15.21 max=17.92 n=24
-RESULT Default Pavilion | MetalFX off | current | medianMS=26.11 min=25.84 max=28.23 n=24
-RESULT Default Pavilion | MetalFX on | current | medianMS=31.60 min=29.96 max=33.72 n=24
-RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=22.09 min=21.84 max=22.33 n=24
-RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=13.80 min=13.15 max=14.95 n=24
-RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=17.22 min=16.48 max=21.02 n=24
-RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=33.26 min=32.82 max=35.54 n=24
-RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=38.76 min=37.65 max=41.32 n=24
-Thermal state: 0 (0 nominal, 1 fair, 2 serious, 3 critical)
+RUN round=2 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=baseline meanRadiance=0.65513706
+RUN round=2 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.6551408
+RUN round=2 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=baseline meanRadiance=0.65513706
+RUN round=2 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.6551408
+RESULT Cornell box | MetalFX off | baseline | medianMS=13.51 min=12.38 max=15.61 n=24
+RESULT Cornell box | MetalFX off | current | medianMS=12.98 min=11.91 max=14.99 n=24
+RESULT Cornell box | MetalFX on | baseline | medianMS=18.24 min=16.33 max=27.30 n=24
+RESULT Cornell box | MetalFX on | current | medianMS=17.81 min=15.55 max=27.75 n=24
+RESULT Default Pavilion | MetalFX off | baseline | medianMS=33.58 min=31.42 max=36.45 n=24
+RESULT Default Pavilion | MetalFX off | current | medianMS=31.06 min=28.68 max=32.66 n=24
+RESULT Default Pavilion | MetalFX on | baseline | medianMS=38.88 min=36.27 max=48.77 n=24
+RESULT Default Pavilion | MetalFX on | current | medianMS=36.55 min=35.00 max=47.12 n=24
+RESULT Default Pavilion, MIS | MetalFX off | baseline | medianMS=27.12 min=23.31 max=28.99 n=24
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=25.33 min=23.55 max=28.38 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | baseline | medianMS=14.71 min=13.92 max=17.21 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=8.20 min=7.45 max=13.56 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | baseline | medianMS=19.13 min=17.35 max=28.68 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=12.45 min=11.03 max=20.07 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | baseline | medianMS=49.94 min=45.47 max=53.99 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=15.71 min=14.19 max=19.02 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | baseline | medianMS=58.74 min=49.41 max=69.32 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=20.01 min=18.24 max=29.72 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | baseline | medianMS=42.79 min=39.94 max=47.77 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=40.76 min=37.72 max=43.77 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | baseline | medianMS=48.23 min=46.02 max=51.90 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=46.14 min=42.98 max=54.35 n=24
+Thermal state: 1 (0 nominal, 1 fair, 2 serious, 3 critical)

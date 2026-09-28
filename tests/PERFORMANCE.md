@@ -1,18 +1,21 @@
-# Renderer performance — September 28, 2026
+# Renderer performance — September 28, 2026 (acceleration structure)
 
-Measured with `python3 tests/benchmark.py --rounds 3 --frames 12 --report tests/PERFORMANCE-raw.txt`
-(run through the suite's GPU slot lock, no other GPU suite running). The unedited report,
-including every per-run mean radiance, is committed as
-[`PERFORMANCE-raw.txt`](PERFORMANCE-raw.txt).
+Measured with `python3 tests/benchmark.py --baseline <main.swift of 192724f> --rounds 3 --frames 12
+--report tests/PERFORMANCE-raw.txt` (run through the suite's GPU slot lock, no other GPU suite
+running). The unedited report, including every per-run mean radiance, is committed as
+[`PERFORMANCE-raw.txt`](PERFORMANCE-raw.txt). "Baseline" is the shaders of `192724f` (the flat
+median BVH) compiled against the current host code, which gives the baseline renderer the flat
+mesh layout (`MeshAcceleration.flat`); "current" is this change with its default traversal.
 
 ## Environment
 
 | | |
 | --- | --- |
-| Source | `84db5e3` (`main`): the remediation packages plus the 2026-09-28 follow-up fixes, no uncommitted source changes |
-| Device | Apple M4, 16 GB unified memory |
+| Source | `192724f` (`main`) plus the acceleration-structure change (uncommitted at measurement; the committed source is identical) |
+| Device | Apple M4 (10-core GPU), 16 GB unified memory |
 | System | macOS 27.0 (26A428), Apple Swift 6.4 (`-O`, arm64) |
-| Thermal state | nominal (0) at the end of the run |
+| Default traversal | hardware (`MaterialLibrary.hardwareWatertight`: 0 leaks on this device) |
+| Thermal state | fair (1) at the end of the run |
 
 ## Method
 
@@ -23,31 +26,94 @@ including every per-run mean radiance, is committed as
   scene. Strategy ReSTIR DI+GI unless marked MIS.
 - Each run starts from a reset accumulation and the same jitter/seed sequence, renders 12
   frames and times frames 5–12 (GPU command-buffer start to end, no CPU readback). Three
-  rounds, so each median is over 24 frames. All renderers and the MetalFX scaler are warmed
-  before timing.
+  rounds, interleaved with the baseline, so each median is over 24 frames.
 - The imported-mesh fixture is scene 6 with a generated 8,130-triangle UV sphere on a floor
-  quad, exercising the mesh BVH path.
+  quad (a graph-less mesh). The instanced fixture, new with this change, is a scene graph of 25
+  rotated, scaled instances of one bumpy 19,968-triangle patch (499,200 rendered triangles, the
+  most the flat BVH of `192724f` could render).
 
 ## Results (median GPU ms per frame; min–max in the raw report)
 
-| Scene fixture | Strategy | MetalFX off | MetalFX on |
-| --- | --- | ---: | ---: |
-| Default Pavilion (scene 0) | ReSTIR | 26.11 | 31.60 |
-| Pavilion with coated OpenPBR floor | ReSTIR | 33.26 | 38.76 |
-| Cornell box (scene 1) | ReSTIR | 11.81 | 16.08 |
-| Imported mesh (scene 6, 8,130 triangles) | ReSTIR | 13.80 | 17.22 |
-| Default Pavilion (scene 0) | MIS | 22.09 | — |
+| Scene fixture | Strategy | MetalFX | Baseline (flat BVH) | Current | Change |
+| --- | --- | --- | ---: | ---: | ---: |
+| Default Pavilion (scene 0) | ReSTIR | off | 33.58 | 31.06 | −7.5% |
+| Default Pavilion (scene 0) | ReSTIR | on | 38.88 | 36.55 | −6.0% |
+| Pavilion with coated OpenPBR floor | ReSTIR | off | 42.79 | 40.76 | −4.7% |
+| Pavilion with coated OpenPBR floor | ReSTIR | on | 48.23 | 46.14 | −4.3% |
+| Cornell box (scene 1) | ReSTIR | off | 13.51 | 12.98 | −3.9% |
+| Cornell box (scene 1) | ReSTIR | on | 18.24 | 17.81 | −2.4% |
+| Default Pavilion (scene 0) | MIS | off | 27.12 | 25.33 | −6.6% |
+| Imported mesh (scene 6, 8,130 triangles) | ReSTIR | off | 14.71 | 8.20 | −44% |
+| Imported mesh (scene 6, 8,130 triangles) | ReSTIR | on | 19.13 | 12.45 | −35% |
+| Instanced scene graph (25 × 19,968 triangles) | ReSTIR | off | 49.94 | 15.71 | −69% |
+| Instanced scene graph (25 × 19,968 triangles) | ReSTIR | on | 58.74 | 20.01 | −66% |
 
-MetalFX adds about 3.4–5.5 ms per frame at this size. The slowest single frame in this run
-took 41.3 ms (coated floor, MetalFX on; see the raw report's max values). The medians are
-insensitive to such outliers. These figures describe these fixtures on this machine; they
-are not window frame rates.
+Every scenario's mean raw radiance agrees with the baseline within the 5% tolerance. Scenes
+0–5 run kernels compiled without the mesh code (`VIBE_MESHES=0`, see below), which is why they
+are slightly faster than the baseline, whose kernels still carried the flat BVH. Figures
+describe these fixtures on this machine; compare figures within one run.
 
-The scenes without imported meshes are 5–14% faster than in the September 27 run at `0eb96bb`
-(for example Pavilion 30.28 → 26.11 ms). The paired comparison below finds no difference
-between the shaders before and after the follow-up for those scenes, so the difference
-comes from other changes between the two revisions or from run-to-run conditions, not from
-the watertight test. Compare figures within one run rather than across runs.
+With the software traversal forced (`VIBE_ACCELERATION=twoLevel`, same session, three rounds;
+report not committed), the two scene-6 fixtures measured 13.96 vs 14.74 ms (imported mesh) and
+46.21 vs 50.92 ms (instanced), MetalFX off: the two-level SAH hierarchy alone is 5–9% faster on
+these fixtures, and hardware traversal accounts for the rest.
+
+## Acceleration structure selection
+
+The gate compared three candidates (prototype kernels using the renderer's exact
+`intersect_mesh_triangle`, `mesh_box_ray` and `mesh_node_hit` code; 1,600,000 rays per run;
+`primary` = camera rays, `diffuse` = random directions from the primary hits). GPU ms:
+
+| Scene (triangles) | Rays | Median BVH (before) | Binned SAH, binary | Binned SAH, 4-wide (adopted) | Metal boxes + software test | Metal triangles |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Curved patch (999,698) | primary | 10.45 | 5.89 | 5.92 | 4.39 | 1.46 |
+| Curved patch (999,698) | diffuse | 22.22 | 17.23 | 13.83 | 19.17 | 1.89 |
+| Triangle soup (500,000) | primary | 28.63 | 31.77 | 24.28 | 185.90 | 2.25 |
+| Triangle soup (500,000) | diffuse | 44.69 | 46.72 | 33.46 | 202.96 | 2.67 |
+| Floor + 400 thin pillars (339,200) | primary | 45.50 | 6.57 | 7.21 | 13.65 | 1.25 |
+| Floor + 400 thin pillars (339,200) | diffuse | 62.67 | 17.51 | 12.32 | 20.80 | 1.64 |
+
+Leaf size 2 was fastest (leaf size 4: patch 6.55/15.36, soup 25.61/37.93, pillars 7.58/13.69;
+leaf size 8 slower still); 32 bins instead of 16 changed nothing. A quantized 80-byte 4-wide node
+(`REFERENCES.md` `CWBVH2017`) was 7–12% slower than the 128-byte float node. The
+4-wide binned-SAH build of the 1,000,000-triangle patch takes 104 ms on the CPU (the median
+build 485 ms). "Metal boxes + software test" (one bounding box per SAH leaf, the watertight test
+in an `intersection_query`) is exact but not reliably faster than software.
+
+Metal's triangle intersector was 4–13× faster than the adopted software hierarchy but is gated on watertightness (`METALRT`): rays
+aimed at shared edges of a curved patch leaked through packed float3 vertices (20 of 14,598 at
+16×16 cells, 71 of 242,694 at 64×64, 309 of 3,919,878 at 256×256; similar for welded indexed
+vertices, 1 km offsets and 1 mm scale), and never through the unwelded `MeshTriangle` layout the
+renderer now uses (all of those fixtures, compacted or not, `preferFastIntersection` or not,
+identity or rotated/scaled instances). With that layout the hardware traversal passed every other
+gate check as well (`tests/Fix_accel.swift`, and the whole suite with
+`VIBE_ACCELERATION=hardware`), so it is the default where the run-time probe finds no leak.
+
+## Large instanced scene (`tests/Fix_accel.swift`)
+
+40 instances of a 199,712-triangle patch (7,988,480 rendered triangles, 16× the former
+500,000-triangle cap), 320×240, MIS, 12 frames (median of frames 5–12), same run:
+
+| | Software two-level | Hardware | Flat BVH |
+| --- | ---: | ---: | ---: |
+| Mesh GPU memory | 30.4 MiB | 48.5 MiB | refused (975 MiB of flattened triangles alone) |
+| Build | 43 ms | 73 ms | — |
+| Median frame | 8.04 ms | 3.28 ms | — |
+
+Five instances (998,560 rendered, within the flat BVH's limit): flat 551 ms build, 2.85 ms per
+frame, 145.9 MiB; software two-level 36 ms, 2.26 ms, 30.4 MiB; identical mean radiance. Transform,
+visibility and binding edits rebuild no asset hierarchy (checked by counters in
+`tests/Fix_accel.swift`).
+
+## Kernels without mesh code (scenes 0–5)
+
+With the two-level and hardware traversal inlined into every kernel, scenes 0–5 (which never
+trace a mesh) were 13–17% slower than the baseline in paired runs (Pavilion 35.92 vs 31.56 ms).
+Compiling the same source a second time with the macro `VIBE_MESHES=0` removes the dead mesh
+code; those kernels (`PathTracerRenderer.proceduralKernels`) measured at or below the baseline
+(table above). The second library costs about 0.7 s of shader compilation plus about 7.8 s of
+pipeline creation on the first launch after a shader change; the Metal shader cache serves later
+launches.
 
 ## Watertight intersection cost (imported meshes)
 
