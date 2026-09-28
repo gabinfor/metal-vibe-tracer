@@ -1,5 +1,6 @@
 // Renderer follow-ups: one host copy of imported triangles (R-101), the watertight
-// ray/triangle test (WOOP2013) and its conservative BVH traversal.
+// ray/triangle test (WOOP2013) and its conservative BVH traversal, and time limits that
+// do not count system sleep.
 @MainActor func fixRendererFollowupsChecks() throws {
   let stride = MemoryLayout<MeshTriangle>.stride
   func triangle(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>, slot: Float = 0, id: Float = 1) -> MeshTriangle {
@@ -232,5 +233,54 @@
   try testRenderer.materials.setMesh([])
   try testRenderer.materials.restore(SceneState())
   print("PASS: fix-renderer-followups watertight ray/triangle intersection and conservative traversal (WOOP2013)")
+
+  // The USD import limit, its SIGTERM grace period and the render time limit run on
+  // awakeSeconds: CLOCK_UPTIME_RAW, the mach_absolute_time clock that stops while the Mac
+  // sleeps (CLOCK_MONOTONIC_RAW keeps counting). Injected clocks stand in for sleep.
+  do {
+    let uptime = Double(DispatchTime.now().uptimeNanoseconds) / 1e9, awake = awakeSeconds()
+    let continuous = Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1e9
+    print(String(format: "Clocks: awake %.3f s, uptime %.3f s, continuous %.3f s since boot", awake, uptime, continuous))
+    require(abs(awake - uptime) < 0.05 && continuous >= awake - 0.05, "time limits use the clock that excludes sleep")
+    final class ManualClock: @unchecked Sendable {
+      private let lock = NSLock()
+      private var value: TimeInterval = 0, step: TimeInterval = 0
+      nonisolated func now() -> TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        value += step
+        return value
+      }
+      nonisolated func advance(by step: TimeInterval) { lock.lock(); self.step = step; lock.unlock() }
+    }
+    let file = usdFolder.appendingPathComponent("scene.usda")
+    let scratch = { Set((try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory())) ?? []).filter { $0.hasPrefix("vibe-usd-") } }
+    let before = scratch()
+    // Awake time stands still for the whole import (the Mac slept through it): the import
+    // outlasts its limit in wall time and still completes.
+    let asleep = ManualClock()
+    let started = Date()
+    let slept = try USDImporter.load(file, into: ProjectDocument(), job: USDImportJob(limit: 0.01, clock: { asleep.now() }))
+    require(slept.document.graph != nil && Date().timeIntervalSince(started) > 0.01,
+      "an import whose awake time stays under the limit completes however long the wall time")
+    // Awake time passing the limit mid-import stops the helper, escalating to SIGKILL once the
+    // grace period has passed on the same clock, and removes the scratch folder.
+    let awakeClock = ManualClock()
+    let job = USDImportJob(limit: 300, clock: { awakeClock.now() })
+    final class Outcome: @unchecked Sendable { var message: String? }
+    let outcome = Outcome(), done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      do { _ = try USDImporter.load(file, into: ProjectDocument(), job: job) } catch { outcome.message = error.localizedDescription }
+      done.signal()
+    }
+    let launch = Date()
+    while !job.isHelperRunning && Date().timeIntervalSince(launch) < 10 { Thread.sleep(forTimeInterval: 0.005) }
+    require(job.isHelperRunning, "USD helper started for the time-limit check")
+    awakeClock.advance(by: 1000)
+    require(done.wait(timeout: .now() + 20) == .success, "an import past its awake-time limit stops")
+    require(outcome.message?.contains("exceeded five minutes") == true && !job.isHelperRunning && !job.isCancelled,
+      "the awake-time limit terminates the helper (\(outcome.message ?? "no error"))")
+    require(scratch().subtracting(before).isEmpty, "a timed-out import removes its scratch folder")
+  }
+  print("PASS: fix-renderer-followups USD import limit and render time limit exclude system sleep")
 }
 try fixRendererFollowupsChecks()

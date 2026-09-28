@@ -3199,7 +3199,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var gpuMilliseconds: Double = 0
     var framesPerSecond: Double = 0
     var completedSamples: UInt32 = 0
-    var lastTick = Date()
+    // Awake seconds (awakeSeconds): the render time limit does not count system sleep.
+    var lastTick = awakeSeconds()
     var lastCompletion = Date()
     var presentationNeedsRefresh = true
     var lastDisplay: MTLTexture?
@@ -3373,7 +3374,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     }
 
     func resetAccumulation(resetDenoiser: Bool = true) {
-        renderElapsed = 0; lastTick = Date(); completedSamples = 0
+        renderElapsed = 0; lastTick = awakeSeconds(); completedSamples = 0
         generation &+= 1
         frameIndex = 0
         debugFrames = 0
@@ -3525,7 +3526,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         (options.timeLimit > 0 && renderElapsed >= options.timeLimit)
     }
     func draw(in view: MTKView) {
-        let now=Date(); defer { lastTick=now }
+        let now=awakeSeconds(); defer { lastTick=now }
         guard view.drawableSize.width > 0, view.drawableSize.height > 0 else { return }
         if paused || reachedLimit {
             // Refresh only the display while stopped; never trace another sample.
@@ -3538,7 +3539,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
             return
         }
-        renderElapsed += max(0,now.timeIntervalSince(lastTick))
+        renderElapsed += max(0,now-lastTick)
         // Reserve an in-flight slot before currentDrawable: nextDrawable blocks
         // the main thread while in-flight frames hold every drawable.
         guard inFlightFrames.wait(timeout: .now()) == .success else { return }

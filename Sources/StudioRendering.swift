@@ -178,7 +178,7 @@ extension StudioController {
     exportOutput = nil
     exportURL = nil
     renderer.paused = previousPaused
-    renderer.lastTick = Date()
+    renderer.lastTick = awakeSeconds()
     viewport.renderer = renderer
     rebuild()
     show("Export cancelled")
@@ -340,7 +340,7 @@ extension StudioController {
           self.viewport.renderer = self.renderer
           guard self.renderer.interactionGeneration == generation else {
             self.renderer.paused = self.oidnPreviewWasPaused
-            self.renderer.lastTick = Date()
+            self.renderer.lastTick = awakeSeconds()
             self.rebuild()
             self.show("OIDN preview discarded because the view changed.")
             return
@@ -356,7 +356,7 @@ extension StudioController {
           self.previewDenoiseJob = nil
           self.viewport.renderer = self.renderer
           self.renderer.paused = self.oidnPreviewWasPaused
-          self.renderer.lastTick = Date()
+          self.renderer.lastTick = awakeSeconds()
           self.rebuild()
           self.showError("OIDN preview failed: \(error.localizedDescription)")
         }
@@ -369,7 +369,7 @@ extension StudioController {
     previewDenoiseJob = nil
     viewport.renderer = renderer
     renderer.paused = oidnPreviewWasPaused
-    renderer.lastTick = Date()
+    renderer.lastTick = awakeSeconds()
     rebuild()
     show("OIDN preview cancelled")
   }
@@ -380,7 +380,7 @@ extension StudioController {
     renderer.offlineDenoisedPreview = nil
     renderer.presentationNeedsRefresh = true
     renderer.paused = resume ? false : oidnPreviewWasPaused
-    renderer.lastTick = Date()
+    renderer.lastTick = awakeSeconds()
     rebuild()
     show(resume ? "Resumed live rendering" : "Cleared OIDN preview")
   }

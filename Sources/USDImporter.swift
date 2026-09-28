@@ -43,12 +43,24 @@ struct USDImportResult {
   var document: ProjectDocument
   var report: [String]
 }
+/// Seconds on a monotonic clock that does not advance while the Mac sleeps
+/// (CLOCK_UPTIME_RAW: mach_absolute_time, the clock of DispatchTime). Limits measured on it
+/// are neither used up by system sleep nor moved by wall-clock changes, unlike Date().
+func awakeSeconds() -> TimeInterval { Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9 }
 // @unchecked Sendable: the UI thread cancels while the import thread runs the helper;
 // every mutable property is read and written only while holding `lock`.
 final class USDImportJob: @unchecked Sendable {
   private let lock = NSLock()
   private var process: Process?
   private var cancelled = false
+  // The import limit and the SIGTERM grace period run on `clock` (injectable for tests),
+  // so a Mac that sleeps mid-import does not fail it.
+  let limit: TimeInterval
+  let clock: @Sendable () -> TimeInterval
+  init(limit: TimeInterval = 300, clock: @escaping @Sendable () -> TimeInterval = awakeSeconds) {
+    self.limit = limit
+    self.clock = clock
+  }
   func cancel() {
     lock.lock()
     cancelled = true
@@ -117,16 +129,17 @@ enum USDImporter {
       "PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory(), "PYTHONNOUSERSITE": "1",
     ]
     try job.run(process)
-    let deadline = Date().addingTimeInterval(300)
+    let deadline = job.clock() + job.limit
     while process.isRunning {
-      if job.isCancelled || Date() > deadline {
+      if job.isCancelled || job.clock() > deadline {
         process.terminate()
-        let exitDeadline = Date().addingTimeInterval(2)
-        while process.isRunning && Date() < exitDeadline { Thread.sleep(forTimeInterval: 0.02) }
+        let exitDeadline = job.clock() + 2
+        while process.isRunning && job.clock() < exitDeadline { Thread.sleep(forTimeInterval: 0.02) }
         if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
         process.waitUntilExit()
         throw MaterialLibrary.error(
-          job.isCancelled ? "USD import cancelled." : "USD import exceeded five minutes.")
+          job.isCancelled ? "USD import cancelled."
+            : "USD import exceeded \(job.limit == 300 ? "five minutes" : "\(job.limit) s") (time asleep is not counted).")
       }
       Thread.sleep(forTimeInterval: 0.05)
     }

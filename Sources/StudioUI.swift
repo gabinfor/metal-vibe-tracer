@@ -1023,7 +1023,7 @@ final class StudioController: NSViewController {
       return
     }
     renderer.paused.toggle()
-    renderer.lastTick = Date()
+    renderer.lastTick = awakeSeconds()
     messageUntil = .distantPast
     updateStatus()
   }
