@@ -26,7 +26,7 @@ This record supersedes `AUDIT.md` (2026-09-07) and `docs/AUDIT_FIX_PLAN_2026-09-
 | integration | `56b2b05` `108d761` `920a494` `cf79830` | Merge fixes: the imported sun angle resets accumulation; autosave reads are bounded by the project file limit; the verify.py runner is merged; the guarded OpenUSD import is parsed; direct kernel dispatches bind the primary-surface cache |
 | tests | `59c0ee9` `0eb96bb` `4f518a6` | R-105 R-107–R-109 R-111 R-112 R-114–R-118 R-139–R-141 |
 | swift6 | `ddec29d` | R-133 |
-| docs | uncommitted working-tree changes | R-120 R-121 R-142 R-144 R-145 R-146 |
+| docs | 18fc005, c6971af | R-120 R-121 R-142 R-144 R-145 R-146 |
 | project-format (follow-up, `main`) | `f435fd8` `88bf52f` | R-45 R-74 |
 | renderer-followups (follow-up, `main`) | `a0586f2` `9f80023` `4df8853` `84db5e3` | R-101; watertight intersection; sleep-proof time limits; guide re-trace (R-57 follow-up) |
 
@@ -183,7 +183,7 @@ Dispositions: **fixed** or **partial** (see "Remaining limitations"). No finding
 | R-143 | info | OpenPBR.metal lost upstream attribution | fixed | `clang -E -P -C` + modification notice | Fix_build.py, Fix_build.swift |
 | R-144 | info | Fix plan marked implemented without evidence | fixed | Plan superseded; F1–F7 partial; REFERENCES corrected | — (docs) |
 | R-145 | info | Cycles listed as engine-adoption candidate | fixed | Reworded as validation/reference only | — (docs) |
-| R-146 | info | Hill fit without notice decision | fixed | Attribution and decision recorded | — (docs) |
+| R-146 | info | Hill fit without notice decision | fixed | Attribution recorded; full Baking Lab MIT notice added to THIRD_PARTY_NOTICES.md (2026-09-28) | — (docs) |
 
 ## Behaviour changes users will notice
 

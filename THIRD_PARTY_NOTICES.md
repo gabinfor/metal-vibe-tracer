@@ -74,9 +74,32 @@ boundary between upstream code and local integration are documented in
 The filmic display curve in `tonemap` (main.swift) uses the rational fit
 `RRTAndODTFit` by Stephen Hill (@self_shadow), as published in Baking Lab by MJP
 and David Neubelt: https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl.
-Baking Lab states that all its code is under the MIT License (Copyright (c) 2016
-MJP). Only the fit's two rational-polynomial expressions and their five numeric
+Only the fit's two rational-polynomial expressions and their five numeric
 coefficients are reproduced; the ACES color matrices and the surrounding source are
-not. The project treats this as a minimal reproduction, records this attribution,
-and would include the full MIT notice if more of that source were copied. See
-REFERENCES.md (HILLFIT).
+not. Baking Lab is distributed under the MIT License, reproduced in full below from
+https://github.com/TheRealMJP/BakingLab/blob/master/LICENSE (retrieved 2026-09-28).
+See REFERENCES.md (HILLFIT).
+
+```text
+MIT License
+
+Copyright (c) 2016 MJP
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
