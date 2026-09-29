@@ -1,3 +1,131 @@
+# Multi-layer reservoir splatting — September 29, 2026
+
+Temporal reuse by multi-layer reservoir splatting (`REFERENCES.md` `HONG2026`, `LIU2025`;
+`TemporalReuse.splatting`) against the existing reprojection (`TemporalReuse.reprojection`, the
+default), on an Apple M4 (10-core GPU, 16 GB), macOS 27.0 (26A428), Swift 6.4. Source: `bd7134b`
+plus this change (uncommitted at measurement; the committed shaders are identical apart from
+comments). One deep layer, hole-filling radius 1, pool of one domain per four pixels.
+
+Splatting runs only on frames where the view changed, so every figure below comes from a moving
+camera. The scratch driver (not part of the suite) renders through the production `renderFrame`
+path at 320×240, path depth 16, along four 48-frame camera paths from the default view: **orbit**
+(yaw +0.015 rad per frame), **pan** (the target slides sideways by 0.6% of the orbit distance per
+frame), **dolly** (distance ×0.985 per frame) and **back-and-forth** (the orbit reversing every 16
+frames, so that recently hidden surfaces reappear). At frames 32 and 48 it compares the raw
+single frame and the MetalFX output with a 512-frame MIS reference of that view (384 for the
+Shader Ball), tone-mapped x/(1+x) (MetalFX: the display curve), averaged over 3 seed sequences (2
+for the Shader Ball). **New** pixels are those whose primary hit was behind a nearer surface in the
+previous frame (a depth test against that frame's G-buffer); **recent** ones were hidden in any of
+the last 8 frames. Pixels entering the frame at the image border are not counted as disoccluded.
+
+## Per-frame error with unified ReSTIR PT (the imported-scene default)
+
+Reprojection's error, and the change with splatting:
+
+| Scene | Path | New px | New | Splat | Recent | Splat | All | Splat | MetalFX all | Deep domains |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pavilion | orbit | 236–453 | 2.28e-2 | −15% | 1.47e-2 | −7% | 8.89e-3 | −0.9% | −0.2% | 13,391 |
+| Pavilion | pan | 151–200 | 3.09e-2 | 0% | 2.03e-2 | 0% | 9.81e-3 | +0.2% | −1.0% | 2,829 |
+| Pavilion | dolly | 292–445 | 3.03e-2 | −3% | 2.17e-2 | +2% | 1.41e-2 | −0.2% | +1.9% | 3,543 |
+| Pavilion | back-and-forth | 349–414 | 2.55e-2 | −25% | 1.64e-2 | −9% | 1.01e-2 | −1.1% | −0.3% | 6,093 |
+| Cornell box | orbit | 62–119 | 7.99e-3 | 0% | 6.52e-3 | −2% | 1.16e-3 | 0.0% | 0.0% | 3,539 |
+| Cornell box | pan | 127–305 | 6.42e-3 | +3% | 4.40e-3 | +3% | 1.01e-3 | −0.2% | −1.0% | 2,053 |
+| Cornell box | dolly | 255–433 | 6.92e-3 | +4% | 2.65e-3 | −2% | 8.03e-4 | +3.4% | −1.6% | 2,765 |
+| Cornell box | back-and-forth | 115–151 | 6.62e-3 | −5% | 5.86e-3 | −3% | 1.13e-3 | +1.1% | +1.5% | 2,022 |
+| Imported UV sphere | orbit | 152–179 | 1.09e-2 | −16% | 6.01e-3 | −7% | 2.53e-3 | −0.1% | −2.4% | 6,317 |
+| Imported UV sphere | pan | 105–117 | 1.29e-2 | −10% | 6.41e-3 | −2% | 2.56e-3 | −0.4% | −0.3% | 3,672 |
+| Imported UV sphere | dolly | 6–9 | (1.14e-2) | (−6%) | (1.41e-2) | (+48%) | 1.87e-3 | +1.2% | −3.8% | 11,010 |
+| Imported UV sphere | back-and-forth | 180–222 | 1.06e-2 | −39% | 5.80e-3 | −20% | 2.54e-3 | −0.3% | −4.7% | 3,045 |
+| Instanced patches | orbit | 702–1,076 | 2.58e-2 | −9% | 1.68e-2 | −4% | 6.99e-3 | −0.6% | +1.3% | 5,123 |
+| Instanced patches | pan | 677–1,984 | 3.33e-2 | −4% | 2.08e-2 | −1% | 8.00e-3 | +0.1% | +1.7% | 4,031 |
+| Instanced patches | dolly | 749–1,727 | 3.08e-2 | −3% | 2.06e-2 | −1% | 8.07e-3 | −1.0% | +1.2% | 2,279 |
+| Instanced patches | back-and-forth | 1,210–1,224 | 2.65e-2 | −7% | 1.67e-2 | −4% | 7.51e-3 | −0.7% | +1.9% | 5,000 |
+| ASWF Shader Ball | orbit | 309–332 | 1.17e-2 | −12% | 5.17e-3 | −8% | 4.15e-3 | +0.6% | +1.3% | 6,394 |
+| ASWF Shader Ball | back-and-forth | 266–415 | 1.06e-2 | −17% | 5.27e-3 | −7% | 4.79e-3 | +0.8% | −1.3% | 5,294 |
+
+"Deep domains" is the largest pool of the sequence (capacity 19,200; no overflow). The UV-sphere
+dolly disoccludes fewer than 10 pixels, so its masked figures are noise. MetalFX display error of
+recently disoccluded pixels changed by −14% to +8% (no consistent sign): MetalFX's own history
+dominates the displayed image.
+
+ReSTIR PT (with ReSTIR DI) on Pavilion: new-pixel error −10% (orbit), −9% (pan), −7% (dolly), −27%
+(back-and-forth); whole image within ±0.7%.
+
+ReSTIR GI (the procedural default): new-pixel error −5 to −3% on Pavilion, −13% to +2% on the UV
+sphere, within ±2% on the patches and −3% to +6% on Cornell; whole image within ±1% except −3.1%
+on the UV-sphere orbit. Its temporal reuse carries little of the per-frame error: dropping temporal
+reuse entirely (history cleared every frame) raised whole-image error by only 7% on Pavilion and
+31% on Cornell (unified ReSTIR PT: 73% and 83%), which bounds what any temporal reuse can recover.
+
+Why the gain is modest: splatting finds temporal history for most disoccluded pixels (on the
+Pavilion back-and-forth, about 85% of them took a deep-domain splat in a diagnostic run, with a
+mean DI confidence of 21 against 4 without history), but deep domains get no spatial reuse, and this renderer's paired spatial reuse
+(three neighbours) already lifts history-less pixels; on monotonic paths many revealed surfaces
+were never visible before (the paper's stated limitation).
+
+## Frame time and memory
+
+Median GPU time of moving frames (orbit, frames 9–32 of three interleaved rounds), 640×480:
+
+| Scene | GI | GI splat | Change | Unified | Unified splat | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pavilion | 25.99 | 28.64 | +10% | 68.29 | 73.71 | +8% |
+| Cornell box | 12.20 | 14.19 | +16% | 22.38 | 24.13 | +8% |
+| Imported UV sphere | 9.14 | 11.49 | +26% | 15.88 | 17.66 | +11% |
+| Instanced patches | 22.60 | 25.29 | +12% | 31.63 | 35.64 | +13% |
+| ASWF Shader Ball | — | — | — | 152.32 | 159.87 | +5% |
+
+(The UV-sphere unified pair is from a repeat run; the first gave 19.68 / 27.66 ms under an
+interfering load.) Ablations on the UV sphere and Cornell put 35–60% of the overhead in
+the per-pixel passes (activation, reservoir splats, the DI/GI merge) and the rest in proportion
+to the deep domains (their layers, canonical samples and temporal shifts). A second deep layer
+doubled the pool on the instanced patches (+30% instead of +13%) without lowering the error. Static
+frames (every accumulated frame after the first) run no splat pass.
+
+Splat resources (`FrameResourcePlan.splatBytesPerPixel`, allocated only with
+`TemporalReuse.splatting`): ReSTIR GI and ReSTIR PT 198 B per pixel, unified ReSTIR PT 174 B: 58 /
+51 MiB at 640×480 and 392 / 344 MiB at 1920×1080.
+
+`tests/benchmark.py --rounds 2 --frames 12` (default hardware traversal, 640×480; the two new
+"orbiting" scenarios move the camera every frame and use each scene's default indirect reuse, ReSTIR
+GI for Pavilion and unified ReSTIR PT for the mesh), default against `VIBE_TEMPORAL_REUSE=splatting`,
+median GPU ms (reports in [`PERFORMANCE-splatting-raw.txt`](PERFORMANCE-splatting-raw.txt)):
+
+| Scenario | MetalFX | Reprojection | Splatting | Change |
+| --- | --- | ---: | ---: | ---: |
+| Default Pavilion, orbiting | off | 25.51 | 27.89 | +9% |
+| Default Pavilion, orbiting | on | 29.94 | 32.02 | +7% |
+| Imported mesh, orbiting | off | 15.66 | 16.66 | +6% |
+| Imported mesh, orbiting | on | 19.17 | 20.23 | +6% |
+
+The static scenarios run no splat pass (only an 8-byte counter clear per frame) and matched within
+±1%, except the static imported mesh (+4% and +7%, from a noisy splatting run whose frames ranged
+up to 19 ms).
+
+## Mean radiance (bias)
+
+Mean radiance of moving frames against MIS stays as with reprojection: over the scenes above,
+the mean of the measured single frames differed from the references by the same amounts in both
+modes (ReSTIR GI +0.1% to +1.4% on Pavilion and Cornell in either mode, unified ReSTIR PT
+within ±0.9%). The suite's alternating-view check (`tests/Fix_splatting.swift`, 192 frames per
+view at 128×96) gives unified ReSTIR PT −0.7 ± 0.5% / +0.1 ± 0.4% with splatting against −0.7 /
++0.0% with reprojection, and ReSTIR GI −0.5 ± 0.6% / +0.9 ± 0.4% against +0.0 / +1.3%.
+
+## Default
+
+At equal time the whole image favours reprojection in every mode: its error is within ±3% either
+way while splatting costs 5–26% more frame time. Splatting's gain is local to disoccluded pixels
+(up to −39% with ReSTIR PT) and does not carry through MetalFX. `TemporalReuse.automatic`
+therefore resolves to reprojection; `PathTracerRenderer.temporalReuse = .splatting` (or
+`VIBE_TEMPORAL_REUSE=splatting` in test builds) trades that time for less noise behind moving
+occluders with ReSTIR PT.
+
+## Equivalence against `main`
+
+`VIBE_ACCELERATION=flat python3 tests/benchmark.py --baseline <main.swift of bd7134b> --rounds 1
+--frames 8 --output-tolerance 0` (reprojection, the default): all six static scenarios rendered
+mean raw radiance identical to `bd7134b`'s shaders, with timings within ±1.2%.
+
 # ReSTIR PT — September 29, 2026
 
 ReSTIR PT (`REFERENCES.md` `RESTIRPT2022`, `RESTIRPTE2026`; `IndirectReuse`) against the

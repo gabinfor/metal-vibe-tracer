@@ -1,0 +1,233 @@
+Multi-layer reservoir splatting measurements, 2026-09-29 (HONG2026). Scratch drivers; see tests/PERFORMANCE.md for the method.
+
+== Per-frame error while moving, 320x240 (RES scene path mode: all/new/recent raw tone-mapped MSE | MetalFX all/recent | median GPU ms at 320x240 (sequential, not interleaved) | largest pool | mean(frame)/mean(reference) - 1). Modes: gi/pt/u = ReSTIR GI / PT / unified PT; -r reprojection, -s splatting.
+SEQ pavilion orbit: disoccluded pixels new [236, 453] recent(<=8) [2703, 2785] of 76800
+RES pavilion orbit gi-r all 2.8895e-02 new 4.3790e-02 recent 3.7174e-02 | fx all 1.0753e-03 fx recent 1.3540e-03 | ms 7.94 | pool 0 | meanDiff +0.0103
+RES pavilion orbit gi-s all 2.8957e-02 new 4.1709e-02 recent 3.6862e-02 | fx all 1.0768e-03 fx recent 1.3331e-03 | ms 8.84 | pool 11747 | meanDiff +0.0098
+RES pavilion orbit pt-r all 1.7683e-02 new 3.7962e-02 recent 2.7267e-02 | fx all 1.1090e-03 fx recent 1.6512e-03 | ms 19.17 | pool 0 | meanDiff -0.0033
+RES pavilion orbit pt-s all 1.7566e-02 new 3.4131e-02 recent 2.5573e-02 | fx all 1.0963e-03 fx recent 1.6047e-03 | ms 22.66 | pool 13391 | meanDiff -0.0018
+RES pavilion orbit u-r all 8.8938e-03 new 2.2783e-02 recent 1.4690e-02 | fx all 9.8534e-04 fx recent 1.5154e-03 | ms 17.44 | pool 0 | meanDiff -0.0004
+RES pavilion orbit u-s all 8.8155e-03 new 1.9252e-02 recent 1.3620e-02 | fx all 9.8343e-04 fx recent 1.4644e-03 | ms 20.72 | pool 13391 | meanDiff -0.0009
+SEQ pavilion pan: disoccluded pixels new [151, 200] recent(<=8) [940, 793] of 76800
+RES pavilion pan gi-r all 3.3827e-02 new 5.2842e-02 recent 4.4942e-02 | fx all 1.0589e-03 fx recent 3.6616e-03 | ms 8.07 | pool 0 | meanDiff +0.0131
+RES pavilion pan gi-s all 3.3791e-02 new 5.1423e-02 recent 4.5182e-02 | fx all 1.0735e-03 fx recent 3.8970e-03 | ms 8.84 | pool 2829 | meanDiff +0.0137
+RES pavilion pan pt-r all 2.0730e-02 new 4.5900e-02 recent 3.2526e-02 | fx all 1.0354e-03 fx recent 4.4217e-03 | ms 20.06 | pool 0 | meanDiff +0.0007
+RES pavilion pan pt-s all 2.0832e-02 new 4.1766e-02 recent 3.2192e-02 | fx all 1.0386e-03 fx recent 4.4492e-03 | ms 21.61 | pool 2829 | meanDiff -0.0032
+RES pavilion pan u-r all 9.8062e-03 new 3.0945e-02 recent 2.0310e-02 | fx all 9.5798e-04 fx recent 3.7006e-03 | ms 18.05 | pool 0 | meanDiff +0.0004
+RES pavilion pan u-s all 9.8234e-03 new 3.0904e-02 recent 2.0329e-02 | fx all 9.4880e-04 fx recent 3.5718e-03 | ms 19.61 | pool 2829 | meanDiff -0.0037
+SEQ pavilion dolly: disoccluded pixels new [292, 445] recent(<=8) [1560, 1996] of 76800
+RES pavilion dolly gi-r all 4.0872e-02 new 4.7256e-02 recent 4.3139e-02 | fx all 2.5082e-03 fx recent 4.8258e-03 | ms 9.01 | pool 0 | meanDiff +0.0021
+RES pavilion dolly gi-s all 4.0842e-02 new 4.5241e-02 recent 4.1974e-02 | fx all 2.5087e-03 fx recent 4.8363e-03 | ms 9.54 | pool 3543 | meanDiff +0.0017
+RES pavilion dolly pt-r all 2.2621e-02 new 4.1183e-02 recent 3.0057e-02 | fx all 1.9689e-03 fx recent 5.1048e-03 | ms 23.16 | pool 0 | meanDiff -0.0072
+RES pavilion dolly pt-s all 2.2508e-02 new 3.8416e-02 recent 2.9837e-02 | fx all 2.0007e-03 fx recent 5.1532e-03 | ms 24.98 | pool 3543 | meanDiff +0.0056
+RES pavilion dolly u-r all 1.4090e-02 new 3.0261e-02 recent 2.1679e-02 | fx all 1.9726e-03 fx recent 4.9165e-03 | ms 21.46 | pool 0 | meanDiff -0.0087
+RES pavilion dolly u-s all 1.4068e-02 new 2.9370e-02 recent 2.2024e-02 | fx all 2.0101e-03 fx recent 4.9902e-03 | ms 23.21 | pool 3543 | meanDiff +0.0027
+SEQ pavilion oscillate: disoccluded pixels new [349, 414] recent(<=8) [2833, 2987] of 76800
+RES pavilion oscillate gi-r all 3.2454e-02 new 4.5068e-02 recent 3.9076e-02 | fx all 1.1746e-03 fx recent 1.6450e-03 | ms 8.05 | pool 0 | meanDiff +0.0007
+RES pavilion oscillate gi-s all 3.2745e-02 new 4.3617e-02 recent 3.9182e-02 | fx all 1.1830e-03 fx recent 1.7786e-03 | ms 8.86 | pool 6038 | meanDiff -0.0017
+RES pavilion oscillate pt-r all 1.9859e-02 new 4.0788e-02 recent 2.8539e-02 | fx all 1.0993e-03 fx recent 1.9834e-03 | ms 19.79 | pool 0 | meanDiff -0.0023
+RES pavilion oscillate pt-s all 1.9734e-02 new 2.9758e-02 recent 2.4993e-02 | fx all 1.0852e-03 fx recent 1.8470e-03 | ms 21.98 | pool 6093 | meanDiff -0.0006
+RES pavilion oscillate u-r all 1.0074e-02 new 2.5464e-02 recent 1.6428e-02 | fx all 1.0457e-03 fx recent 1.6630e-03 | ms 18.69 | pool 0 | meanDiff -0.0026
+RES pavilion oscillate u-s all 9.9620e-03 new 1.9206e-02 recent 1.5009e-02 | fx all 1.0426e-03 fx recent 1.7304e-03 | ms 20.52 | pool 6093 | meanDiff -0.0005
+SEQ cornell orbit: disoccluded pixels new [62, 119] recent(<=8) [1450, 1176] of 76800
+RES cornell orbit gi-r all 1.9817e-03 new 8.7744e-03 recent 8.6252e-03 | fx all 1.3937e-03 fx recent 7.1622e-03 | ms 4.29 | pool 0 | meanDiff +0.0056
+RES cornell orbit gi-s all 1.9811e-03 new 8.8174e-03 recent 8.5557e-03 | fx all 1.3967e-03 fx recent 7.0706e-03 | ms 4.84 | pool 3539 | meanDiff +0.0060
+RES cornell orbit u-r all 1.1600e-03 new 7.9887e-03 recent 6.5175e-03 | fx all 1.1145e-03 fx recent 6.4778e-03 | ms 6.84 | pool 0 | meanDiff +0.0015
+RES cornell orbit u-s all 1.1599e-03 new 8.0081e-03 recent 6.3998e-03 | fx all 1.1147e-03 fx recent 6.5840e-03 | ms 7.70 | pool 3539 | meanDiff -0.0008
+SEQ cornell pan: disoccluded pixels new [305, 127] recent(<=8) [1873, 517] of 76800
+RES cornell pan gi-r all 1.6759e-03 new 7.2321e-03 recent 5.1484e-03 | fx all 1.1033e-03 fx recent 4.7476e-03 | ms 4.51 | pool 0 | meanDiff +0.0056
+RES cornell pan gi-s all 1.6775e-03 new 7.2193e-03 recent 5.1173e-03 | fx all 1.1039e-03 fx recent 4.7725e-03 | ms 4.56 | pool 2053 | meanDiff +0.0058
+RES cornell pan u-r all 1.0107e-03 new 6.4166e-03 recent 4.3973e-03 | fx all 8.2736e-04 fx recent 4.4479e-03 | ms 6.64 | pool 0 | meanDiff +0.0008
+RES cornell pan u-s all 1.0082e-03 new 6.6031e-03 recent 4.5476e-03 | fx all 8.1949e-04 fx recent 4.4990e-03 | ms 7.30 | pool 2053 | meanDiff +0.0001
+SEQ cornell dolly: disoccluded pixels new [433, 255] recent(<=8) [1546, 1250] of 76800
+RES cornell dolly gi-r all 1.7404e-03 new 8.0743e-03 recent 3.4137e-03 | fx all 2.4704e-04 fx recent 1.2273e-03 | ms 5.24 | pool 0 | meanDiff +0.0041
+RES cornell dolly gi-s all 1.7379e-03 new 8.5271e-03 recent 3.3869e-03 | fx all 2.4910e-04 fx recent 1.2607e-03 | ms 5.87 | pool 2765 | meanDiff +0.0042
+RES cornell dolly u-r all 8.0264e-04 new 6.9240e-03 recent 2.6496e-03 | fx all 2.6488e-04 fx recent 1.5465e-03 | ms 8.26 | pool 0 | meanDiff -0.0013
+RES cornell dolly u-s all 8.2960e-04 new 7.1968e-03 recent 2.5953e-03 | fx all 2.6056e-04 fx recent 1.6169e-03 | ms 9.03 | pool 2765 | meanDiff +0.0002
+SEQ cornell oscillate: disoccluded pixels new [151, 115] recent(<=8) [1435, 919] of 76800
+RES cornell oscillate gi-r all 1.9075e-03 new 7.8182e-03 recent 7.4701e-03 | fx all 1.4174e-03 fx recent 6.5678e-03 | ms 5.63 | pool 0 | meanDiff +0.0043
+RES cornell oscillate gi-s all 1.9013e-03 new 7.5937e-03 recent 7.3232e-03 | fx all 1.4137e-03 fx recent 6.5094e-03 | ms 4.84 | pool 2022 | meanDiff +0.0038
+RES cornell oscillate u-r all 1.1297e-03 new 6.6243e-03 recent 5.8625e-03 | fx all 1.1442e-03 fx recent 5.8696e-03 | ms 6.81 | pool 0 | meanDiff -0.0008
+RES cornell oscillate u-s all 1.1423e-03 new 6.2756e-03 recent 5.6944e-03 | fx all 1.1609e-03 fx recent 6.0286e-03 | ms 7.64 | pool 2022 | meanDiff -0.0003
+SEQ mesh orbit: disoccluded pixels new [152, 179] recent(<=8) [1535, 1541] of 76800
+RES mesh orbit gi-r all 8.0530e-03 new 2.1278e-02 recent 1.7995e-02 | fx all 1.4719e-04 fx recent 1.2443e-03 | ms 3.05 | pool 0 | meanDiff +0.0022
+RES mesh orbit gi-s all 7.8051e-03 new 2.0825e-02 recent 1.7534e-02 | fx all 1.5023e-04 fx recent 1.3066e-03 | ms 3.61 | pool 6317 | meanDiff +0.0031
+RES mesh orbit u-r all 2.5289e-03 new 1.0925e-02 recent 6.0106e-03 | fx all 1.5727e-04 fx recent 7.5171e-04 | ms 5.23 | pool 0 | meanDiff +0.0006
+RES mesh orbit u-s all 2.5254e-03 new 9.1940e-03 recent 5.5859e-03 | fx all 1.5349e-04 fx recent 6.7060e-04 | ms 6.00 | pool 6317 | meanDiff +0.0007
+SEQ mesh pan: disoccluded pixels new [105, 117] recent(<=8) [603, 551] of 76800
+RES mesh pan gi-r all 8.5593e-03 new 2.4077e-02 recent 2.1042e-02 | fx all 1.2932e-04 fx recent 7.8060e-04 | ms 3.07 | pool 0 | meanDiff +0.0009
+RES mesh pan gi-s all 8.5268e-03 new 2.4664e-02 recent 2.1211e-02 | fx all 1.3211e-04 fx recent 8.0474e-04 | ms 3.54 | pool 3672 | meanDiff +0.0012
+RES mesh pan u-r all 2.5643e-03 new 1.2911e-02 recent 6.4096e-03 | fx all 1.4384e-04 fx recent 7.3477e-04 | ms 5.23 | pool 0 | meanDiff +0.0008
+RES mesh pan u-s all 2.5551e-03 new 1.1664e-02 recent 6.2792e-03 | fx all 1.4334e-04 fx recent 8.0373e-04 | ms 5.79 | pool 3672 | meanDiff +0.0006
+SEQ mesh dolly: disoccluded pixels new [9, 6] recent(<=8) [17, 10] of 76800
+RES mesh dolly gi-r all 7.5854e-03 new 1.9459e-02 recent 2.6406e-02 | fx all 9.6751e-05 fx recent 1.3890e-03 | ms 3.05 | pool 0 | meanDiff +0.0014
+RES mesh dolly gi-s all 7.4984e-03 new 1.9324e-02 recent 2.3886e-02 | fx all 9.6646e-05 fx recent 1.5988e-03 | ms 3.66 | pool 11010 | meanDiff +0.0019
+RES mesh dolly u-r all 1.8649e-03 new 1.1428e-02 recent 1.4065e-02 | fx all 1.1172e-04 fx recent 1.5338e-03 | ms 5.28 | pool 0 | meanDiff -0.0007
+RES mesh dolly u-s all 1.8876e-03 new 1.0730e-02 recent 2.0881e-02 | fx all 1.0751e-04 fx recent 1.6983e-03 | ms 6.24 | pool 11010 | meanDiff -0.0003
+SEQ mesh oscillate: disoccluded pixels new [222, 180] recent(<=8) [1507, 1541] of 76800
+RES mesh oscillate gi-r all 8.0316e-03 new 2.0603e-02 recent 1.7465e-02 | fx all 1.3763e-04 fx recent 8.2963e-04 | ms 3.02 | pool 0 | meanDiff +0.0030
+RES mesh oscillate gi-s all 7.9657e-03 new 1.7902e-02 recent 1.6859e-02 | fx all 1.3939e-04 fx recent 7.8358e-04 | ms 3.57 | pool 3045 | meanDiff +0.0019
+RES mesh oscillate u-r all 2.5363e-03 new 1.0616e-02 recent 5.7978e-03 | fx all 1.5624e-04 fx recent 6.5786e-04 | ms 5.25 | pool 0 | meanDiff -0.0003
+RES mesh oscillate u-s all 2.5295e-03 new 6.4695e-03 recent 4.6666e-03 | fx all 1.4882e-04 fx recent 5.4755e-04 | ms 5.90 | pool 3045 | meanDiff +0.0011
+SEQ patches orbit: disoccluded pixels new [702, 1076] recent(<=8) [5488, 5330] of 76800
+RES patches orbit gi-r all 1.6411e-02 new 4.3744e-02 recent 3.8355e-02 | fx all 1.7203e-03 fx recent 7.1566e-03 | ms 5.89 | pool 0 | meanDiff -0.0006
+RES patches orbit gi-s all 1.6362e-02 new 4.3661e-02 recent 3.7727e-02 | fx all 1.6907e-03 fx recent 7.2358e-03 | ms 6.56 | pool 5123 | meanDiff -0.0005
+RES patches orbit u-r all 6.9883e-03 new 2.5793e-02 recent 1.6834e-02 | fx all 1.0757e-03 fx recent 3.8214e-03 | ms 7.65 | pool 0 | meanDiff -0.0008
+RES patches orbit u-s all 6.9459e-03 new 2.3404e-02 recent 1.6215e-02 | fx all 1.0897e-03 fx recent 3.8042e-03 | ms 8.87 | pool 5123 | meanDiff -0.0002
+SEQ patches pan: disoccluded pixels new [677, 1984] recent(<=8) [2950, 4320] of 76800
+RES patches pan gi-r all 1.6468e-02 new 5.0117e-02 recent 3.8687e-02 | fx all 1.7692e-03 fx recent 7.5151e-03 | ms 5.85 | pool 0 | meanDiff +0.0005
+RES patches pan gi-s all 1.6404e-02 new 4.9926e-02 recent 3.8423e-02 | fx all 1.7052e-03 fx recent 6.9953e-03 | ms 6.81 | pool 4031 | meanDiff +0.0012
+RES patches pan u-r all 8.0010e-03 new 3.3299e-02 recent 2.0780e-02 | fx all 1.2232e-03 fx recent 4.2900e-03 | ms 7.83 | pool 0 | meanDiff -0.0004
+RES patches pan u-s all 8.0061e-03 new 3.1957e-02 recent 2.0493e-02 | fx all 1.2444e-03 fx recent 4.3278e-03 | ms 8.81 | pool 4031 | meanDiff -0.0016
+SEQ patches dolly: disoccluded pixels new [749, 1727] recent(<=8) [4582, 4363] of 76800
+RES patches dolly gi-r all 1.9140e-02 new 4.7306e-02 recent 4.1056e-02 | fx all 2.0462e-03 fx recent 6.8741e-03 | ms 6.09 | pool 0 | meanDiff +0.0000
+RES patches dolly gi-s all 1.8967e-02 new 4.7573e-02 recent 4.1479e-02 | fx all 2.0593e-03 fx recent 7.1113e-03 | ms 6.67 | pool 2279 | meanDiff +0.0006
+RES patches dolly u-r all 8.0725e-03 new 3.0833e-02 recent 2.0620e-02 | fx all 1.3705e-03 fx recent 4.1827e-03 | ms 7.99 | pool 0 | meanDiff -0.0004
+RES patches dolly u-s all 7.9936e-03 new 2.9787e-02 recent 2.0447e-02 | fx all 1.3872e-03 fx recent 4.3393e-03 | ms 8.95 | pool 2279 | meanDiff +0.0006
+SEQ patches oscillate: disoccluded pixels new [1210, 1224] recent(<=8) [5598, 5763] of 76800
+RES patches oscillate gi-r all 1.6920e-02 new 4.2846e-02 recent 3.6249e-02 | fx all 1.9269e-03 fx recent 6.9054e-03 | ms 5.87 | pool 0 | meanDiff +0.0007
+RES patches oscillate gi-s all 1.6915e-02 new 4.1895e-02 recent 3.6074e-02 | fx all 1.9296e-03 fx recent 6.8217e-03 | ms 6.60 | pool 5000 | meanDiff +0.0000
+RES patches oscillate u-r all 7.5136e-03 new 2.6508e-02 recent 1.6722e-02 | fx all 1.3118e-03 fx recent 4.1013e-03 | ms 7.75 | pool 0 | meanDiff -0.0001
+RES patches oscillate u-s all 7.4573e-03 new 2.4603e-02 recent 1.6100e-02 | fx all 1.3368e-03 fx recent 4.0665e-03 | ms 9.04 | pool 5000 | meanDiff -0.0011
+SEQ shaderball orbit: disoccluded pixels new [309, 332] recent(<=8) [2655, 2738] of 76800
+RES shaderball orbit u-r all 4.1487e-03 new 1.1711e-02 recent 5.1721e-03 | fx all 8.6611e-04 fx recent 1.9273e-03 | ms 36.60 | pool 0 | meanDiff -0.0009
+RES shaderball orbit u-s all 4.1748e-03 new 1.0364e-02 recent 4.7689e-03 | fx all 8.7727e-04 fx recent 1.9845e-03 | ms 39.87 | pool 6394 | meanDiff +0.0000
+SEQ shaderball oscillate: disoccluded pixels new [415, 266] recent(<=8) [2450, 2575] of 76800
+RES shaderball oscillate u-r all 4.7896e-03 new 1.0566e-02 recent 5.2646e-03 | fx all 8.1583e-04 fx recent 1.5365e-03 | ms 38.15 | pool 0 | meanDiff +0.0003
+RES shaderball oscillate u-s all 4.8280e-03 new 8.7715e-03 recent 4.8754e-03 | fx all 8.0538e-04 fx recent 1.6380e-03 | ms 39.94 | pool 5294 | meanDiff +0.0007
+
+== Interleaved moving-frame GPU time, 640x480, orbit
+TIME pavilion orbit gi-r 640x480 median 25.99 ms
+TIME pavilion orbit gi-s 640x480 median 28.64 ms
+TIME pavilion orbit u-r 640x480 median 68.29 ms
+TIME pavilion orbit u-s 640x480 median 73.71 ms
+TIME cornell orbit gi-r 640x480 median 12.20 ms
+TIME cornell orbit gi-s 640x480 median 14.19 ms
+TIME cornell orbit u-r 640x480 median 22.38 ms
+TIME cornell orbit u-s 640x480 median 24.13 ms
+TIME mesh orbit gi-r 640x480 median 9.14 ms
+TIME mesh orbit gi-s 640x480 median 11.49 ms
+TIME mesh orbit u-r 640x480 median 19.68 ms
+TIME mesh orbit u-s 640x480 median 27.66 ms
+TIME patches orbit gi-r 640x480 median 22.60 ms
+TIME patches orbit gi-s 640x480 median 25.29 ms
+TIME patches orbit u-r 640x480 median 31.63 ms
+TIME patches orbit u-s 640x480 median 35.64 ms
+TIME mesh orbit u-r 640x480 median 15.88 ms
+TIME mesh orbit u-s 640x480 median 17.66 ms
+TIME shaderball orbit u-r 640x480 median 152.32 ms
+TIME shaderball orbit u-s 640x480 median 159.87 ms
+
+== tests/benchmark.py --rounds 2 --frames 12, default (reprojection)
+Date: 2026-09-29T15:19:33+08:00
+Source: bd7134bb85514c0f41bd9de12130375a05b5f813 with uncommitted changes
+Baseline: none
+Machine: Apple M4, 16 GB
+macOS: 27.0 (26A428)
+Compiler: Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)
+Settings: 640x480, previewScale 1, 12 frames per run (first 4 untimed), 2 rounds, depth 16, sampling from tests/GPUChecks.swift render()
+PASS: runtime shader compilation on Apple M4
+PASS: inside-box exit, parallel-box miss, random endpoints, small-PDF MIS, glass total internal reflection, emission weighting, sphere emitter endpoints, finite-roughness grazing cylinder, terminal ReSTIR GI weighting
+RUN round=0 Default Pavilion | MetalFX off variant=current meanRadiance=1.1647032
+RUN round=0 Default Pavilion | MetalFX on variant=current meanRadiance=1.1647032
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3255125
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3255125
+RUN round=0 Cornell box | MetalFX off variant=current meanRadiance=0.14767331
+RUN round=0 Cornell box | MetalFX on variant=current meanRadiance=0.14767331
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.61001325
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.61001325
+RUN round=0 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.117516
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.6505374
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.6505374
+RUN round=0 Default Pavilion, orbiting | MetalFX off variant=current meanRadiance=1.1346061
+RUN round=0 Default Pavilion, orbiting | MetalFX on variant=current meanRadiance=1.1346061
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX off variant=current meanRadiance=0.61051494
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX on variant=current meanRadiance=0.61051494
+RUN round=1 Default Pavilion | MetalFX off variant=current meanRadiance=1.1647032
+RUN round=1 Default Pavilion | MetalFX on variant=current meanRadiance=1.1647032
+RUN round=1 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3255125
+RUN round=1 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3255125
+RUN round=1 Cornell box | MetalFX off variant=current meanRadiance=0.14767331
+RUN round=1 Cornell box | MetalFX on variant=current meanRadiance=0.14767331
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.61001325
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.61001325
+RUN round=1 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.117516
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.6505374
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.6505374
+RUN round=1 Default Pavilion, orbiting | MetalFX off variant=current meanRadiance=1.1346061
+RUN round=1 Default Pavilion, orbiting | MetalFX on variant=current meanRadiance=1.1346061
+RUN round=1 Imported mesh (scene 6), orbiting | MetalFX off variant=current meanRadiance=0.61051494
+RUN round=1 Imported mesh (scene 6), orbiting | MetalFX on variant=current meanRadiance=0.61051494
+RESULT Cornell box | MetalFX off | current | medianMS=11.62 min=11.51 max=11.77 n=16
+RESULT Cornell box | MetalFX on | current | medianMS=15.21 min=14.98 max=15.96 n=16
+RESULT Default Pavilion | MetalFX off | current | medianMS=25.52 min=25.30 max=25.90 n=16
+RESULT Default Pavilion | MetalFX on | current | medianMS=29.70 min=29.32 max=30.09 n=16
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=21.58 min=21.26 max=22.62 n=16
+RESULT Default Pavilion, orbiting | MetalFX off | current | medianMS=25.51 min=25.34 max=25.82 n=16
+RESULT Default Pavilion, orbiting | MetalFX on | current | medianMS=29.94 min=29.17 max=30.75 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | current | medianMS=15.66 min=15.51 max=15.77 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | current | medianMS=19.17 min=18.89 max=19.62 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=11.79 min=11.70 max=11.89 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=15.34 min=14.94 max=16.05 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=20.16 min=20.00 max=20.33 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=23.62 min=23.36 max=24.21 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=32.19 min=31.89 max=32.48 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=36.44 min=35.87 max=36.82 n=16
+Thermal state: 1 (0 nominal, 1 fair, 2 serious, 3 critical)
+
+== tests/benchmark.py --rounds 2 --frames 12, VIBE_TEMPORAL_REUSE=splatting
+Date: 2026-09-29T15:20:23+08:00
+Source: bd7134bb85514c0f41bd9de12130375a05b5f813 with uncommitted changes
+Baseline: none
+Machine: Apple M4, 16 GB
+macOS: 27.0 (26A428)
+Compiler: Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)
+Settings: 640x480, previewScale 1, 12 frames per run (first 4 untimed), 2 rounds, depth 16, sampling from tests/GPUChecks.swift render()
+PASS: runtime shader compilation on Apple M4
+PASS: inside-box exit, parallel-box miss, random endpoints, small-PDF MIS, glass total internal reflection, emission weighting, sphere emitter endpoints, finite-roughness grazing cylinder, terminal ReSTIR GI weighting
+RUN round=0 Default Pavilion | MetalFX off variant=current meanRadiance=1.1647032
+RUN round=0 Default Pavilion | MetalFX on variant=current meanRadiance=1.1647032
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3255125
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3255125
+RUN round=0 Cornell box | MetalFX off variant=current meanRadiance=0.14767331
+RUN round=0 Cornell box | MetalFX on variant=current meanRadiance=0.14767331
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.61001325
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.61001325
+RUN round=0 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.117516
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.6505374
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.6505374
+RUN round=0 Default Pavilion, orbiting | MetalFX off variant=current meanRadiance=1.1287206
+RUN round=0 Default Pavilion, orbiting | MetalFX on variant=current meanRadiance=1.12873
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX off variant=current meanRadiance=0.6105073
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX on variant=current meanRadiance=0.61050755
+RUN round=1 Default Pavilion | MetalFX off variant=current meanRadiance=1.1647032
+RUN round=1 Default Pavilion | MetalFX on variant=current meanRadiance=1.1647032
+RUN round=1 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3255125
+RUN round=1 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3255125
+RUN round=1 Cornell box | MetalFX off variant=current meanRadiance=0.14767331
+RUN round=1 Cornell box | MetalFX on variant=current meanRadiance=0.14767331
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.61001325
+RUN round=1 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.61001325
+RUN round=1 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.117516
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.6505374
+RUN round=1 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.6505374
+RUN round=1 Default Pavilion, orbiting | MetalFX off variant=current meanRadiance=1.1287235
+RUN round=1 Default Pavilion, orbiting | MetalFX on variant=current meanRadiance=1.1287274
+RUN round=1 Imported mesh (scene 6), orbiting | MetalFX off variant=current meanRadiance=0.6105071
+RUN round=1 Imported mesh (scene 6), orbiting | MetalFX on variant=current meanRadiance=0.61050737
+RESULT Cornell box | MetalFX off | current | medianMS=11.66 min=11.50 max=11.77 n=16
+RESULT Cornell box | MetalFX on | current | medianMS=15.10 min=14.94 max=15.74 n=16
+RESULT Default Pavilion | MetalFX off | current | medianMS=25.50 min=25.27 max=25.74 n=16
+RESULT Default Pavilion | MetalFX on | current | medianMS=29.78 min=29.27 max=30.21 n=16
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=21.48 min=21.33 max=22.67 n=16
+RESULT Default Pavilion, orbiting | MetalFX off | current | medianMS=27.89 min=27.63 max=28.11 n=16
+RESULT Default Pavilion, orbiting | MetalFX on | current | medianMS=32.02 min=31.66 max=32.20 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | current | medianMS=16.66 min=16.56 max=16.90 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | current | medianMS=20.23 min=19.71 max=20.79 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=12.23 min=11.67 max=13.04 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=16.48 min=15.47 max=19.21 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=20.22 min=20.01 max=20.58 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=23.82 min=23.43 max=24.60 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=32.14 min=31.84 max=32.46 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=36.19 min=35.96 max=37.05 n=16
+Thermal state: 1 (0 nominal, 1 fair, 2 serious, 3 critical)
