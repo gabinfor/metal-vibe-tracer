@@ -179,7 +179,8 @@ bool uses_scene_graph(constant Uniforms &u) { return u.lens.z > 0; }
 // Uniforms.indirectReuse: bits 0-1 select IndirectReuse (0 ReSTIR GI, 1 ReSTIR PT for
 // paths of three or more vertices, 2 ReSTIR PT for every path); bit 2 enables the
 // duplication-map confidence reduction (RESTIRPTE2026 Sec. 5, biased); bit 3 keeps temporal
-// reuse on while a static view accumulates; bit 4 marks a reservoir-splatting frame (splat_frame).
+// reuse on while a static view accumulates; bit 4 marks a reservoir-splatting frame (splat_frame);
+// bit 5 shades ReSTIR PT with spatio-temporal control variates (restir_pt_control_variates).
 uint indirect_reuse_mode(constant Uniforms &u) { return min(u.indirectReuse & 3u, 2u); }
 bool restir_gi_active(constant Uniforms &u) { return indirect_reuse_mode(u) == 0; }
 bool restir_pt_active(constant Uniforms &u) { return indirect_reuse_mode(u) != 0; }
@@ -194,6 +195,10 @@ bool restir_pt_temporal(constant Uniforms &u) { return u.frameIndex <= 1u || (u.
 // Bit 4: this frame reuses temporally by multi-layer reservoir splatting (HONG2026) instead of
 // reprojection. The host sets it while the view changes (PathTracerRenderer.temporalReuse).
 bool splat_frame(constant Uniforms &u) { return (u.indirectReuse & 16u) != 0u; }
+// Bit 5: ReSTIR PT pixels are shaded with ReSTCV's accumulated colour estimate (RESTCV2026) instead
+// of the reservoirs' resampled contribution (PathTracerRenderer.controlVariates). The host sets it
+// only with paired spatial reuse, the MIS the method is defined with.
+bool restir_pt_control_variates(constant Uniforms &u) { return restir_pt_active(u) && (u.indirectReuse & 32u) != 0u; }
 
 // ============================================================================
 // Procedural Physical Sky
@@ -2527,6 +2532,46 @@ PTReservoir pt_empty() {
 
 float pt_luminance(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
 
+// ReSTCV (REFERENCES.md: RESTCV2026): each path reservoir carries a colour estimate F_i of its
+// pixel, accumulated over space and time with control variates. Per pixel, `estimate` is the
+// current frame's F_i (the path tree's initial estimate, then the temporal combination) and
+// `reflectance` the primary hit's average reflectance rho_i (Eq. 9), 10 bits per channel on a
+// square-root scale. The previous frame's final estimate is the history (ptIndirect.xyz).
+struct PTControl { packed_float3 estimate; uint reflectance; };
+static_assert(sizeof(PTControl) == 16, "Swift allocates 16-byte ReSTCV estimates");
+// Spatial compositing weight of the pixel's own estimate; each valid partner's estimator has
+// weight one (RESTCV2026 supplemental Sec. 1: c = 1.6 for about 2.4 valid ReSTIR PT neighbours).
+constant float PT_CV_CENTER_WEIGHT = 1.6f;
+// Upper bound of the coefficient alpha_ij = rho_i / rho_j (Eq. 9).
+constant float PT_CV_ALPHA_MAX = 2.0f;
+
+uint pt_encode_reflectance(float3 rho) {
+    uint3 q = uint3(round(sqrt(saturate(rho)) * 1023.0f));
+    return q.x | (q.y << 10) | (q.z << 20);
+}
+float3 pt_decode_reflectance(uint v) {
+    float3 r = float3(float(v & 1023u), float((v >> 10) & 1023u), float((v >> 20) & 1023u)) * (1.0f / 1023.0f);
+    return r * r;
+}
+// Average reflectance rho of the primary hit, seen along wo: the diffuse albedo and a Fresnel
+// estimate of the specular albedo, as the MetalFX albedo guides estimate them. Transmissive and
+// ideal-specular types return one, so their pairs keep alpha = 1.
+float3 pt_reflectance(Material m, float3 n, float3 wo) {
+    float cosine = max(0.0f, dot(n, wo));
+    if (m.type == DIFFUSE) return saturate(m.albedo);
+    if (m.type == GLOSSY) return conductor_fresnel(saturate(m.albedo), cosine);
+    if (m.type == OPENPBR) {
+        float f0 = pow((m.ior - 1.0f) / (m.ior + 1.0f), 2.0f);
+        return saturate(m.albedo) * (1.0f - m.metalness) * (1.0f - m.transmission) +
+            conductor_fresnel(mix(float3(f0), saturate(m.albedo), m.metalness), cosine);
+    }
+    return float3(1.0f);
+}
+// alpha_ij = min(rho_i / rho_j, 2) per channel (Eq. 9); a pair of black channels keeps 1.
+float3 pt_cv_alpha(float3 rhoI, float3 rhoJ) {
+    return select(min(rhoI / max(rhoJ, 1e-8f), PT_CV_ALPHA_MAX), select(float3(PT_CV_ALPHA_MAX), float3(1.0f), rhoI <= 0.0f), rhoJ <= 0.0f);
+}
+
 // Octahedral unit-vector encoding with two 16-bit unorm components.
 uint pt_encode_direction(float3 d) {
     d /= max(abs(d.x) + abs(d.y) + abs(d.z), 1e-30f);
@@ -2641,10 +2686,13 @@ float pt_pairwise(float neighbor, float neighborConfidence, float canonical, flo
 // is the only one covering its domain, so its resampling weight is p-hat / p(u), with the
 // PSS source density p(u) = product of roulette survival probabilities (RESTIRPTE2026 Sec. 6.2.4)
 // and, for RIS light sampling, W_RIS p1. Returns whether the candidate replaces the selection.
-bool pt_accept(thread float &weightSum, thread uint &risSeed, float3 F, float sourceWeight) {
+// `estimate` sums F / p(u) over the same candidates: the path tree's own (unresampled) estimate
+// of the pixel, ReSTCV's initial colour estimate <F_i>_init (RESTCV2026 Sec. 5.1.1).
+bool pt_accept(thread float &weightSum, thread uint &risSeed, float3 F, float sourceWeight, thread float3 &estimate) {
     float w = pt_luminance(F) * sourceWeight;
     if (!(w > 0.0f) || !isfinite(w)) return false;
     weightSum += w;
+    estimate += F * sourceWeight;
     return rand_f(risSeed) * weightSum < w;
 }
 
@@ -2655,9 +2703,10 @@ bool pt_accept(thread float &weightSum, thread uint &risSeed, float3 F, float so
 // pt_connectable, a forced NEE light vertex (RESTIRPTE2026 Sec. 6.2.3), or none (replay only).
 PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, float coneSpread,
                         constant Uniforms &u, constant SurfaceSettings *settings,
-                        constant MaterialResources &images, thread float &firstHitDistance) {
+                        constant MaterialResources &images, thread float &firstHitDistance, thread float3 &estimate) {
     PTReservoir selected = pt_empty();
     float weightSum = 0.0f;
+    estimate = float3(0.0f);
     uint risSeed = pt_seed(seed, 0u, 3u);
     const int limit = scattering_limit(u.cameraTarget.w);
     const uint minLength = restir_pt_unified(u) ? 2u : 3u;
@@ -2719,7 +2768,7 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
                 bool valid = rcIndex != 0u || atVertex || forcedJacobian > 0.0f;
                 float3 F = throughput * contribution * w;
                 if (valid && any(contribution > 0.0f) && all(isfinite(contribution)) &&
-                    pt_accept(weightSum, risSeed, F, inverseSurvival * lightWeight)) {
+                    pt_accept(weightSum, risSeed, F, inverseSurvival * lightWeight, estimate)) {
                     selected = pt_empty();
                     selected.F = F; selected.seed = seed;
                     if (rcIndex != 0u) {
@@ -2810,7 +2859,7 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
                 abs(dot(current.geometricNormal, direction)), false, 0.0f, threshold);
             float endJacobian = environment ? pdf : pdf * endCosine / distance2;
             if (any(emitted > 0.0f) && all(isfinite(emitted)) && (!atEnd || endJacobian > 0.0f) &&
-                pt_accept(weightSum, risSeed, F, inverseSurvival)) {
+                pt_accept(weightSum, risSeed, F, inverseSurvival, estimate)) {
                 selected = pt_empty();
                 selected.F = F; selected.seed = seed;
                 if (rcIndex != 0u) {
@@ -2839,6 +2888,7 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
     } else {
         selected = pt_empty();
     }
+    if (!all(isfinite(estimate))) estimate = float3(0.0f);
     selected.M = 1.0f;
     return selected;
 }
@@ -3083,15 +3133,18 @@ float pt_primary_cone(constant Uniforms &u) {
 
 // ReSTIR PT pass A: the initial path tree of every scattering primary hit (pt_generate).
 // It also records the first BSDF segment length for the MetalFX specular hit-distance guide.
+// With ReSTCV it stores the tree's initial colour estimate and rho_i (PTControl) and keeps the
+// previous frame's final estimate in ptIndirect.xyz for temporal reuse.
 kernel void restir_pt_initial_kernel(
     texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
     texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
-    texture2d<float, access::write> ptIndirect [[texture(5)]],
+    texture2d<float, access::read_write> ptIndirect [[texture(5)]],
     constant Uniforms &u [[buffer(0)]],
     constant SurfaceSettings *settings [[buffer(1)]],
     constant MaterialResources &images [[buffer(2)]],
     const device PrimarySurface *primarySurfaces [[buffer(3)]],
     device PTReservoir *reservoirs [[buffer(5)]],
+    device PTControl *controls [[buffer(24)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -3100,15 +3153,23 @@ kernel void restir_pt_initial_kernel(
     float4 normalMaterial = gbufferNormalMat.read(gid);
     PTReservoir result = pt_empty();
     float firstHit = 0.0f;
+    float3 estimate = float3(0.0f), reflectance = float3(0.0f);
     if (position.w > 0.0f && normalMaterial.w != float(EMISSIVE) ) {
         HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
         float3 view = float3(primarySurfaces[index].view);
         uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2545f491u);
         result = pt_generate(x1, view, seed, pt_footprint_threshold(position.w, x1.geometricNormal, view),
-                             pt_primary_cone(u), u, settings, images, firstHit);
+                             pt_primary_cone(u), u, settings, images, firstHit, estimate);
+        reflectance = pt_reflectance(x1.mat, x1.normal, -view);
     }
     reservoirs[index] = result;
-    ptIndirect.write(float4(0.0f, 0.0f, 0.0f, firstHit), gid);
+    if (restir_pt_control_variates(u)) {
+        PTControl control = { estimate, pt_encode_reflectance(reflectance) };
+        controls[index] = control;
+        ptIndirect.write(float4(ptIndirect.read(gid).xyz, firstHit), gid);
+    } else {
+        ptIndirect.write(float4(0.0f, 0.0f, 0.0f, firstHit), gid);
+    }
 }
 
 // The temporal domain is the reprojected pixel when it shows the same surface (the ReSTIR DI
@@ -3126,9 +3187,14 @@ bool pt_same_surface(float4 position, float4 normalMaterial, float3 view, float4
 // Generalized Talbot MIS with confidences (RESTIRPT2022 Eq. 36, Sec. 8.3) over the canonical
 // reservoir c of domain x1 and the temporal reservoir t of domain y1 (depths are camera
 // distances), each sample shifted into the other domain; the temporal confidence is capped at cap.
+// `difference` receives ReSTCV's reservoir-based difference estimate <F_x1 - F_y1> (RESTCV2026
+// Eq. 10 with these Talbot weights and alpha = 1): the same two samples, weights and shifts give
+// the two-domain estimates of both pixels, and their difference is correlated to zero variance
+// where the domains agree.
 PTReservoir pt_temporal_merge(PTReservoir c, HitRecord x1, float3 view, float depth, PTReservoir t, HitRecord y1,
                               float3 oldView, float oldDepth, float cap, uint selectSeed, constant Uniforms &u,
-                              constant SurfaceSettings *settings, constant MaterialResources &images) {
+                              constant SurfaceSettings *settings, constant MaterialResources &images,
+                              thread float3 &difference) {
     float cone = pt_primary_cone(u);
     float cc = c.M, ct = min(t.M, cap);
     float pc = pt_luminance(c.F), pt = pt_luminance(t.F);
@@ -3138,9 +3204,13 @@ PTReservoir pt_temporal_merge(PTReservoir c, HitRecord x1, float3 view, float de
     if (pt > 0.0f && t.W > 0.0f) toCurrent = pt_shift(t, x1, view, pt_footprint_threshold(depth, x1.geometricNormal, view),
                                                       cone, u, settings, images);
     float pcPrevious = pt_luminance(toPrevious.FJ), ptCurrent = pt_luminance(toCurrent.FJ);
-    float wc = c.W > 0.0f ? pt_talbot(pc, cc, pcPrevious, ct) * pc * c.W : 0.0f;
-    float wt = pt_talbot(pt, ct, ptCurrent, cc) * ptCurrent * t.W;
+    float mc = pt_talbot(pc, cc, pcPrevious, ct), mt = pt_talbot(pt, ct, ptCurrent, cc);
+    float wc = c.W > 0.0f ? mc * pc * c.W : 0.0f;
+    float wt = mt * ptCurrent * t.W;
     float sum = wc + wt;
+    // Eq. 10: m_c W_c (F_x1(x_c) - F_y1(T x_c) J) - m_t W_t (F_y1(x_t) - F_x1(T x_t) J).
+    difference = mc * c.W * (float3(c.F) - toPrevious.FJ) - mt * t.W * (float3(t.F) - toCurrent.FJ);
+    if (!all(isfinite(difference))) difference = float3(0.0f);
     PTReservoir chosen = c;
     float chosenTarget = pc;
     if (wt > 0.0f && rand_f(selectSeed) * sum < wt) {
@@ -3157,16 +3227,31 @@ PTReservoir pt_temporal_merge(PTReservoir c, HitRecord x1, float3 view, float de
     return chosen;
 }
 
+// ReSTCV temporal control variates (RESTCV2026 Eq. 6 and 7 with alpha = 1, as in the authors'
+// code for this step): the initial estimate, weighted by the canonical confidence (q_init = 1),
+// and the "from-previous" estimator <F>_prev + <F_x1 - F_y1>, weighted by the capped temporal
+// confidence. The previous estimate belongs to the history domain y1, which the difference
+// estimate shifts into, so the combination stays unbiased; the weights depend on geometry only.
+void pt_cv_temporal(device PTControl &control, float canonicalConfidence, float temporalConfidence, float3 previous,
+                    float3 difference) {
+    float total = canonicalConfidence + temporalConfidence;
+    if (!(total > 0.0f) || !all(isfinite(previous))) return;
+    float3 estimate = (canonicalConfidence * float3(control.estimate) + temporalConfidence * (previous + difference)) / total;
+    if (all(isfinite(estimate))) control.estimate = estimate;
+}
+
 // ReSTIR PT pass B: temporal reuse. The temporal neighbour's domain is the previous frame's
 // primary hit (history G-buffer and PrimarySurface); generalized Talbot MIS with confidences
 // (RESTIRPT2022 Eq. 36, Sec. 8.3) weighs the canonical and the temporal sample, each shifted
 // into the other domain. c_Cap = 20, optionally reduced by the duplication map (RESTIRPTE2026 Sec. 5).
+// With ReSTCV the pixel's estimate becomes the temporal control-variate combination (pt_cv_temporal).
 kernel void restir_pt_temporal_kernel(
     texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
     texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
     texture2d<float, access::read> historyPosDepth [[texture(2)]],
     texture2d<float, access::read> historyNormalMat [[texture(3)]],
     texture2d<float, access::read> duplication [[texture(4)]],
+    texture2d<float, access::read> ptIndirect [[texture(5)]],
     constant Uniforms &u [[buffer(0)]],
     constant SurfaceSettings *settings [[buffer(1)]],
     constant MaterialResources &images [[buffer(2)]],
@@ -3174,6 +3259,7 @@ kernel void restir_pt_temporal_kernel(
     const device PrimarySurface *historySurfaces [[buffer(4)]],
     device PTReservoir *reservoirs [[buffer(5)]],
     const device PTReservoir *history [[buffer(6)]],
+    device PTControl *controls [[buffer(24)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -3204,8 +3290,11 @@ kernel void restir_pt_temporal_kernel(
         cap = mix(PT_CONFIDENCE_CAP, PT_CONFIDENCE_MIN, pow(score, PT_DUPLICATION_EXPONENT));
     }
     uint selectSeed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
+    float3 difference;
     reservoirs[index] = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldPosition.w, cap, selectSeed,
-                                          u, settings, images);
+                                          u, settings, images, difference);
+    if (restir_pt_control_variates(u))
+        pt_cv_temporal(controls[index], c.M, min(t.M, cap), ptIndirect.read(uint2(prevCoord)).xyz, difference);
 }
 
 // ReSTIR PT pass B: each pixel shifts its path to its PT_NEIGHBORS paired partners once.
@@ -3254,6 +3343,8 @@ kernel void restir_pt_shift_kernel(
 // prototype weighs it), shading with the vector-valued resampling weights (RESTIRPTE2026
 // Sec. 6.3). The selected path becomes the next frame's temporal history. The current
 // PrimarySurface is copied to the history buffer here, after pass A read the old one.
+// With ReSTCV (RESTCV2026 Sec. 5.3) the pixel is shaded with its spatial control-variate estimate
+// instead, which also becomes the next frame's history estimate; the reservoirs are unchanged.
 kernel void restir_pt_spatial_kernel(
     texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
     texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
@@ -3265,6 +3356,7 @@ kernel void restir_pt_spatial_kernel(
     device PTReservoir *output [[buffer(6)]],
     const device float4 *shifts [[buffer(7)]],
     const device char2 *pairing [[buffer(8)]],
+    const device PTControl *controls [[buffer(24)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -3297,16 +3389,42 @@ kernel void restir_pt_spatial_kernel(
     float3 color = float3(0.0f);
     PTReservoir chosen = c;
     float chosenTarget = pc;
+    // ReSTCV spatial control variates (Eq. 8): the pixel's own estimate, weighted PT_CV_CENTER_WEIGHT,
+    // and one "from-q" estimator per valid partner, weighted one. The paper composites by confidence
+    // M_q; equal weights, as in the authors' ReSTIR PT code, measured lower error here, mostly where
+    // a disoccluded pixel's partners have long histories (REFERENCES.md: RESTCV2026).
+    const bool controlVariates = restir_pt_control_variates(u);
+    float3 cvSum = float3(0.0f), rhoC = float3(1.0f);
+    float cvWeight = 0.0f;
+    if (controlVariates) {
+        PTControl own = controls[index];
+        cvWeight = PT_CV_CENTER_WEIGHT;
+        cvSum = cvWeight * float3(own.estimate);
+        rhoC = pt_decode_reflectance(own.reflectance);
+    }
     for (uint n = 0u; n < PT_NEIGHBORS; ++n) {
         if (!valid[n]) continue;
         PTReservoir q = reservoirs[partner[n]];
         confidence += q.M;
         // Canonical sample shifted to q: p-hat_q(T x_c) |dT/dx_c|.
-        float toPartner = pt_luminance(shifts[index * PT_NEIGHBORS + n].xyz);
-        canonical += 1.0f - pt_pairwise(toPartner, q.M, pc, c.M, count);
+        float3 toPartnerF = shifts[index * PT_NEIGHBORS + n].xyz;
+        float toPartner = pt_luminance(toPartnerF);
+        float canonicalShare = 1.0f - pt_pairwise(toPartner, q.M, pc, c.M, count);
+        canonical += canonicalShare;
         // q's sample shifted here: F(T x_q) |dT/dx_q| and its own Jacobian denominator.
         float4 fromPartner = shifts[partner[n] * PT_NEIGHBORS + n];
         float pq = pt_luminance(q.F), pqc = pt_luminance(fromPartner.xyz);
+        if (controlVariates) {
+            // <F_c>_<-q = <F_c>_pair + alpha (<F_q> - <F_q>_pair) (Eqs. 7 and 10): the pair (c, q)'s
+            // pairwise weights and shifts estimate both pixels from the same two samples.
+            float mq = pq > 0.0f && q.W > 0.0f ? pt_pairwise(pq, q.M, pqc, c.M, count) : 0.0f;
+            float3 ownPair = mq * q.W * fromPartner.xyz + canonicalShare * c.W * float3(c.F);
+            float3 partnerPair = mq * q.W * float3(q.F) + canonicalShare * c.W * toPartnerF;
+            PTControl other = controls[partner[n]];
+            float3 fromQ = ownPair + pt_cv_alpha(rhoC, pt_decode_reflectance(other.reflectance)) *
+                (float3(other.estimate) - partnerPair);
+            if (all(isfinite(fromQ))) { cvSum += fromQ; cvWeight += 1.0f; }
+        }
         if (pq > 0.0f && pqc > 0.0f && q.W > 0.0f) {
             float m = pt_pairwise(pq, q.M, pqc, c.M, count);
             float w = m * pqc * q.W;
@@ -3335,6 +3453,12 @@ kernel void restir_pt_spatial_kernel(
     else chosen.W = W;
     chosen.M = confidence;
     output[index] = chosen;
+    if (controlVariates) {
+        // Unclamped: a control-variate estimate may be negative, and clamping would bias it.
+        color = cvWeight > 0.0f ? cvSum / cvWeight : float3(0.0f);
+        ptIndirect.write(float4(all(isfinite(color)) ? color : float3(0.0f), firstHit), gid);
+        return;
+    }
     if (!all(isfinite(color))) color = float3(0.0f);
     ptIndirect.write(float4(max(color, 0.0f), firstHit), gid);
 }
@@ -4141,7 +4265,8 @@ kernel void splat_deep_restir_kernel(
     }
 }
 
-// Pass 3 (ReSTIR PT): initial path trees of the deep domains (pt_generate).
+// Pass 3 (ReSTIR PT): initial path trees of the deep domains (pt_generate), and with ReSTCV
+// their initial colour estimates (RESTCV2026), which temporal reuse carries across frames.
 kernel void restir_pt_deep_initial_kernel(
     constant Uniforms &u [[buffer(0)]],
     constant SurfaceSettings *settings [[buffer(1)]],
@@ -4150,20 +4275,28 @@ kernel void restir_pt_deep_initial_kernel(
     const device PrimarySurface *surfaces [[buffer(13)]],
     const device uint *counters [[buffer(14)]],
     device PTReservoir *pt [[buffer(23)]],
+    device PTControl *controls [[buffer(25)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= splat_count(counters)) return;
     SplatDomain d = domains[tid];
     PrimarySurface s = surfaces[tid];
     PTReservoir r = pt_empty();
+    float3 estimate = float3(0.0f), reflectance = float3(0.0f);
     if (MaterialType(s.flags & 255u) != EMISSIVE) {
         HitRecord x1 = load_primary_surface(s, float4(float3(d.position), d.depth));
         float3 view = float3(s.view);
         float firstHit = 0.0f;
         r = pt_generate(x1, view, splat_seed(d.pixel, d.flags & 255u, 0x2545f491u, u),
-                        pt_footprint_threshold(d.depth, x1.geometricNormal, view), pt_primary_cone(u), u, settings, images, firstHit);
+                        pt_footprint_threshold(d.depth, x1.geometricNormal, view), pt_primary_cone(u), u, settings, images, firstHit,
+                        estimate);
+        reflectance = pt_reflectance(x1.mat, x1.normal, -view);
     }
     pt[tid] = r;
+    if (restir_pt_control_variates(u)) {
+        PTControl control = { estimate, pt_encode_reflectance(reflectance) };
+        controls[tid] = control;
+    }
 }
 
 // Pass 4: every previous domain (front layer and deep pool) is splatted to the pixel its
@@ -4342,13 +4475,17 @@ kernel void splat_temporal_kernel(
 
 // Pass 5 (ReSTIR PT): the generalized Talbot temporal merge (pt_temporal_merge) with the source
 // domain chosen by the splat, for front-layer pixels and deep domains; it replaces
-// restir_pt_temporal_kernel on splat frames. Deep domains skip spatial reuse (Sec. 5).
+// restir_pt_temporal_kernel on splat frames. Deep domains skip spatial reuse (Sec. 5). With ReSTCV
+// every domain's estimate takes the temporal control variates from its source: a front-layer
+// source's final estimate (ptIndirect) or a deep source's estimate (previousControls), so deep
+// domains carry their colour history to the pixels they reappear in.
 kernel void restir_pt_splat_temporal_kernel(
     texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
     texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
     texture2d<float, access::read> historyPosDepth [[texture(2)]],
     texture2d<float, access::read> historyNormalMat [[texture(3)]],
     texture2d<float, access::read> duplication [[texture(4)]],
+    texture2d<float, access::read> ptIndirect [[texture(5)]],
     constant Uniforms &u [[buffer(0)]],
     constant SurfaceSettings *settings [[buffer(1)]],
     constant MaterialResources &images [[buffer(2)]],
@@ -4364,6 +4501,9 @@ kernel void restir_pt_splat_temporal_kernel(
     const device ulong *sources [[buffer(17)]],
     const device PTReservoir *previousPT [[buffer(22)]],
     device PTReservoir *pt [[buffer(23)]],
+    device PTControl *controls [[buffer(24)]],
+    device PTControl *deepControls [[buffer(25)]],
+    const device PTControl *previousControls [[buffer(26)]],
     uint tid [[thread_position_in_grid]])
 {
     uint pixels = u.width * u.height;
@@ -4417,9 +4557,16 @@ kernel void restir_pt_splat_temporal_kernel(
     if (!(t.M > 0.0f)) return;
     HitRecord x1 = load_primary_surface(s, position);
     uint selectSeed = pcg_hash(tid ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
-    PTReservoir chosen = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldDepth, cap, selectSeed, u, settings, images);
+    float3 difference;
+    PTReservoir chosen = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldDepth, cap, selectSeed, u, settings, images,
+                                           difference);
     if (deep) pt[j] = chosen;
     else reservoirs[tid] = chosen;
+    if (restir_pt_control_variates(u)) {
+        float3 previousEstimate = source < pixels ? ptIndirect.read(uint2(source % u.width, source / u.width)).xyz
+                                                  : float3(previousControls[source - pixels].estimate);
+        pt_cv_temporal(deep ? deepControls[j] : controls[tid], c.M, min(t.M, cap), previousEstimate, difference);
+    }
 }
 
 // ============================================================================
@@ -4821,6 +4968,9 @@ kernel void shading_kernel(
         isinf(radiance.r) || isinf(radiance.g) || isinf(radiance.b)) {
         radiance = float3(0.0f);
     }
+    // ReSTCV estimates can be negative in single frames; the progressive average keeps them so
+    // that it converges without the clamp's upward bias. MetalFX receives the clamped frame.
+    float3 accumulated = restir_pt_control_variates(uniforms) && uniforms.samplingMode == 0 ? radiance : max(radiance, float3(0.0f));
     radiance = max(radiance, float3(0.0f));
 
     // OIDN auxiliary inputs must use the same jitter/reconstruction filter as
@@ -4845,10 +4995,10 @@ kernel void shading_kernel(
 
     // MetalFX consumes the current noisy frame, never the progressively averaged image.
     sampleTexture.write(float4(radiance, specularHitDistance), gid);
-    float3 average = radiance;
+    float3 average = accumulated;
     if (uniforms.frameIndex > 1) {
         float3 previous = accumTexture.read(gid).rgb;
-        if (all(isfinite(previous))) average = previous + (radiance - previous) / float(uniforms.frameIndex);
+        if (all(isfinite(previous))) average = previous + (accumulated - previous) / float(uniforms.frameIndex);
     }
     accumTexture.write(float4(average, 1.0f), gid);
 }
@@ -5189,6 +5339,25 @@ enum TemporalReuse: UInt32, Sendable {
     case automatic = 2
     func resolved(indirectReuse: IndirectReuse) -> TemporalReuse {
         self == .automatic ? .reprojection : self
+    }
+}
+
+// Shading of ReSTIR PT pixels (Uniforms.indirectReuse bit 5). REFERENCES.md: RESTCV2026.
+enum ControlVariates: UInt32, Sendable {
+    // The reservoirs' resampled contribution with vector-valued weights (RESTIRPTE2026 Sec. 6.3).
+    case off = 0
+    // ReSTCV: an accumulated colour estimate per reservoir, reused across pixels and frames as
+    // control variates with reservoir-based difference estimates (RESTCV2026).
+    case restcv = 1
+    // Host-side default: ReSTCV wherever it applies. With unified ReSTIR PT it lowered the per-frame
+    // error of a moving camera by 5-47% and the MetalFX display error by 4-18%, and static
+    // equal-sample MSE by 1-14%, at unchanged frame time (tests/PERFORMANCE.md).
+    case automatic = 2
+    // ReSTCV needs ReSTIR PT with its paired (deterministic pairwise MIS) spatial reuse; ReSTIR GI
+    // and stochastic pairwise MIS run without it.
+    func resolved(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection) -> ControlVariates {
+        guard indirectReuse != .restirGI && indirectReuse != .automatic && spatialNeighbors != .stochasticPairwise else { return .off }
+        return self == .automatic ? .restcv : self
     }
 }
 
@@ -5778,11 +5947,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 
         // DI: 6 RGBA32F. GI: 6 RGBA32F + 2 RGBA16F. ReSTIR PT: two 64 B path reservoirs,
-        // three 16 B paired shifts, the RGBA32F indirect estimate, a history PrimarySurface
-        // and the R16F duplication map.
+        // three 16 B paired shifts, the RGBA32F indirect estimate, a history PrimarySurface,
+        // the R16F duplication map and the 16 B ReSTCV estimate (RESTCV2026).
         static let diReservoirBytesPerPixel: UInt64 = 96
         static let giReservoirBytesPerPixel: UInt64 = 112
         static let ptReservoirBytesPerPixel: UInt64 = 2 * 64 + 3 * 16 + 16 + PathTracerRenderer.primarySurfaceStride + 2
+            + UInt64(PathTracerRenderer.ptControlStride)
         static func reservoirBytesPerPixel(_ mode: IndirectReuse) -> UInt64 {
             switch mode {
             case .restirGI: return diReservoirBytesPerPixel + giReservoirBytesPerPixel
@@ -5795,13 +5965,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Reservoir splatting (HONG2026): per pixel an activation mask (4 B), SplatLayers (48 B) and a
         // splat source (8 B); per deep-domain slot a splat source (8 B) and, in each of two pools,
         // a SplatDomain (32 B), a PrimarySurface (128 B) and the active reuse's reservoirs (DI 48 B,
-        // GI 64 B, PT 64 B), with PathTracerRenderer.splatSlotsPerPixel slots per pixel.
+        // GI 64 B, PT 64 B and its 16 B ReSTCV estimate), with PathTracerRenderer.splatSlotsPerPixel
+        // slots per pixel.
         static func splatBytesPerPixel(_ mode: IndirectReuse) -> UInt64 {
             let reservoirs: UInt64
+            let pt = 64 + UInt64(PathTracerRenderer.ptControlStride)
             switch mode {
             case .restirGI: reservoirs = 48 + 64
-            case .restirPT: reservoirs = 48 + 64
-            case .restirPTUnified: reservoirs = 64
+            case .restirPT: reservoirs = 48 + pt
+            case .restirPTUnified: reservoirs = pt
             case .automatic: return max(splatBytesPerPixel(.restirGI), splatBytesPerPixel(.restirPTUnified))
             }
             return 60 + (8 + 2 * (32 + PathTracerRenderer.primarySurfaceStride + reservoirs)) / PathTracerRenderer.splatSlotDivisor
@@ -5921,6 +6093,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var ptReservoirs: MTLBuffer?
     var ptHistory: MTLBuffer?
     var ptShifts: MTLBuffer?
+    // ReSTCV (RESTCV2026): each pixel's current colour estimate and primary reflectance (MSL
+    // PTControl); the previous frame's final estimate stays in ptIndirect until spatial reuse.
+    var ptControls: MTLBuffer?
+    nonisolated static let ptControlStride = 16
     var historyPrimarySurfaces: MTLBuffer?
     var ptIndirect: MTLTexture?
     var ptDuplication: MTLTexture?
@@ -5944,8 +6120,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     struct SplatPool {
         let domains, surfaces, counters: MTLBuffer   // SplatDomain, PrimarySurface; counters are shared
         let di, gi, pt: MTLBuffer?                   // SplatDI, SplatGI, PTReservoir of the active reuse
+        let controls: MTLBuffer?                     // ReSTCV PTControl estimates beside `pt` (RESTCV2026)
         let capacity: Int
-        var buffers: [MTLBuffer] { [domains, surfaces, counters] + [di, gi, pt].compactMap { $0 } }
+        var buffers: [MTLBuffer] { [domains, surfaces, counters] + [di, gi, pt, controls].compactMap { $0 } }
     }
     private(set) var splatCurrent: SplatPool?
     private(set) var splatPrevious: SplatPool?
@@ -5990,6 +6167,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var temporalReuse = PathTracerRenderer.defaultTemporalReuse {
         didSet { if oldValue != temporalReuse { resetAccumulation() } }
     }
+    // Shading of ReSTIR PT pixels: resampled contributions or ReSTCV control variates (RESTCV2026).
+    var controlVariates = PathTracerRenderer.defaultControlVariates {
+        didSet { if oldValue != controlVariates { resetAccumulation() } }
+    }
     // RESTIRPTE2026 Sec. 5 duplication-map confidence reduction for ReSTIR PT. It trades
     // correlation for bias, so the progressive renderer leaves it off by default.
     var ptDecorrelation = PathTracerRenderer.defaultPTDecorrelation {
@@ -6018,6 +6199,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         switch ProcessInfo.processInfo.environment["VIBE_TEMPORAL_REUSE"] {
         case "reprojection": return .reprojection
         case "splatting": return .splatting
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultControlVariates: ControlVariates {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with or without ReSTCV.
+        switch ProcessInfo.processInfo.environment["VIBE_CONTROL_VARIATES"] {
+        case "off": return .off
+        case "restcv": return .restcv
         default: break
         }
 #endif
@@ -6106,12 +6298,19 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     }
     // spatialNeighbors with .automatic resolved for the current scene.
     var activeSpatialNeighbors: SpatialNeighborSelection { resolvedSpatialNeighbors(spatialNeighbors) }
+    // controlVariates resolved for the current scene and reuse modes.
+    var activeControlVariates: ControlVariates { resolvedControlVariates(controlVariates) }
     // What a mode would run as in the current scene (the inspector's "Automatic (currently: …)").
     func resolvedIndirectReuse(_ mode: IndirectReuse) -> IndirectReuse {
         sceneKernels.pt == nil ? .restirGI : mode.resolved(importedScene: sceneIndex == 6)
     }
     func resolvedTemporalReuse(_ mode: TemporalReuse, indirectReuse: IndirectReuse) -> TemporalReuse {
         sceneKernels.splat == nil ? .reprojection : mode.resolved(indirectReuse: resolvedIndirectReuse(indirectReuse))
+    }
+    func resolvedControlVariates(_ mode: ControlVariates, indirectReuse candidateIndirect: IndirectReuse? = nil,
+                                 spatialNeighbors candidateSpatial: SpatialNeighborSelection? = nil) -> ControlVariates {
+        mode.resolved(indirectReuse: resolvedIndirectReuse(candidateIndirect ?? indirectReuse),
+                      spatialNeighbors: resolvedSpatialNeighbors(candidateSpatial ?? spatialNeighbors))
     }
     func resolvedSpatialNeighbors(_ mode: SpatialNeighborSelection) -> SpatialNeighborSelection {
         let imported = sceneIndex == 6 && materials.hasSceneGraph
@@ -6150,7 +6349,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return (textures + metalFXTextures).compactMap { $0 }.reduce(scalerBytes) { total, texture in
             let id = ObjectIdentifier(texture as AnyObject)
             return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
-        } + ([primarySurfaces, historyPrimarySurfaces, ptReservoirs, ptHistory, ptShifts, ptPairing,
+        } + ([primarySurfaces, historyPrimarySurfaces, ptReservoirs, ptHistory, ptShifts, ptPairing, ptControls,
               splatMask, splatLayers, splatSources, spmisCells, spmisSlots, spmisChoices] + (splatCurrent?.buffers ?? []) + (splatPrevious?.buffers ?? []))
             .reduce(UInt64(0)) { $0 + UInt64($1?.allocatedSize ?? 0) }
     }
@@ -6549,6 +6748,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 usesPT ? device.makeBuffer(length: w * h * bytesPerPixel, options: .storageModePrivate) : nil
             }
             let newPTReservoirs = ptBuffer(Self.ptReservoirStride), newPTHistory = ptBuffer(Self.ptReservoirStride)
+            let newPTControls = ptBuffer(Self.ptControlStride)
             // Stochastic pairwise MIS stores its shift records in the paired shifts' buffer.
             let usesSPMISShifts = needsReSTIR && activeSpatialNeighbors == .stochasticPairwise
             let newPTShifts = ptBuffer(usesSPMISShifts ? max(Self.ptShiftBytesPerPixel, Self.spmisShiftBytesPerPixel) : Self.ptShiftBytesPerPixel)
@@ -6570,8 +6770,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     words[0] = 0; words[1] = 0; words[2] = UInt32(capacity); words[3] = 0
                     let di = usesDI ? buffer(capacity * 48) : nil, gi = usesGI ? buffer(capacity * 64) : nil
                     let pt = usesPT ? buffer(capacity * Self.ptReservoirStride) : nil
-                    guard di != nil || !usesDI, gi != nil || !usesGI, pt != nil || !usesPT else { return nil }
-                    return SplatPool(domains: domains, surfaces: surfaces, counters: counters, di: di, gi: gi, pt: pt, capacity: capacity)
+                    let controls = usesPT ? buffer(capacity * Self.ptControlStride) : nil
+                    guard di != nil || !usesDI, gi != nil || !usesGI, pt != nil && controls != nil || !usesPT else { return nil }
+                    return SplatPool(domains: domains, surfaces: surfaces, counters: counters, di: di, gi: gi, pt: pt,
+                                     controls: controls, capacity: capacity)
                 }
                 guard let a = pool(), let b = pool(), let mask = buffer(w * h * 4), let layers = buffer(w * h * 48),
                       let sources = buffer((w * h + capacity) * 8) else {
@@ -6616,7 +6818,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let newPTIndirect = device.makeTexture(descriptor: indirect32),
                   let newDuplication = device.makeTexture(descriptor: duplication16),
                   !usesPT || (newPTReservoirs != nil && newPTHistory != nil && newPTShifts != nil
-                              && newHistorySurfaces != nil && ptPairing != nil),
+                              && newHistorySurfaces != nil && ptPairing != nil && newPTControls != nil),
                   // Primary surfaces depend only on the frame size.
                   let newSurfaces = resized
                     ? device.makeBuffer(length: w * h * Int(Self.primarySurfaceStride), options: .storageModePrivate)
@@ -6643,7 +6845,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             giPosPdfB = newGIPosB; giNormalB = newGINormalB
             giRadianceB = newGIRadianceB; giWeightsB = newGIWeightsB
             ptIndirect = newPTIndirect; ptDuplication = newDuplication
-            ptReservoirs = newPTReservoirs; ptHistory = newPTHistory; ptShifts = newPTShifts
+            ptReservoirs = newPTReservoirs; ptHistory = newPTHistory; ptShifts = newPTShifts; ptControls = newPTControls
             historyPrimarySurfaces = newHistorySurfaces
             splatCurrent = newSplat?.current; splatPrevious = newSplat?.previous
             splatMask = newSplat?.mask; splatLayers = newSplat?.layers; splatSources = newSplat?.sources
@@ -6718,7 +6920,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             width: UInt32(w),
             height: UInt32(h),
             indirectReuse: indirectReuse.rawValue | (ptDecorrelation ? 4 : 0) | (ptTemporalWhileAccumulating ? 8 : 0)
-                | (splatFrame ? 16 : 0),
+                | (splatFrame ? 16 : 0) | (usesPT && activeControlVariates == .restcv ? 32 : 0),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
             spatialNeighbors: activeSpatialNeighbors.rawValue,
@@ -6751,7 +6953,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 (9, previous.domains), (10, previous.surfaces), (11, previous.counters),
                 (12, current.domains), (13, current.surfaces), (14, current.counters),
                 (15, splatMask), (16, splatLayers), (17, splatSources),
-                (18, previous.di), (19, current.di), (20, previous.gi), (21, current.gi), (22, previous.pt), (23, current.pt)]
+                (18, previous.di), (19, current.di), (20, previous.gi), (21, current.gi), (22, previous.pt), (23, current.pt),
+                (25, current.controls), (26, previous.controls)]
             for (index, buffer) in buffers { encoder.setBuffer(buffer ?? placeholder, offset: 0, index: index) }
         }
 
@@ -6868,7 +7071,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // pairwise MIS, the reuse cells and restir_pt_spmis_kernel replace the paired passes.
         if usesPT {
             guard let current = ptReservoirs, let history = ptHistory, let shifts = ptShifts,
-                  let historySurfaces = historyPrimarySurfaces, let pairing = ptPairing,
+                  let historySurfaces = historyPrimarySurfaces, let pairing = ptPairing, let controls = ptControls,
                   let kernels = sceneKernels.pt else { return }
             // A nil pipeline is the reuse-cell pass of stochastic pairwise MIS (encodeSPMISCells).
             var passes: [(String, MTLComputePipelineState?, Bool)] = [("ReSTIR PT: initial paths", kernels.initial, true)]
@@ -6911,6 +7114,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 for (index, buffer) in [surfaces, historySurfaces, current, history, shifts, pairing].enumerated() {
                     encoder.setBuffer(buffer, offset: 0, index: index + 3)
                 }
+                encoder.setBuffer(controls, offset: 0, index: 24)
                 bindSPMIS(encoder)
                 if pipeline === splatTemporal, let slots = splatState?.0.capacity {
                     bindSplatBuffers(encoder)

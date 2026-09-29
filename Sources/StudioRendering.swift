@@ -457,6 +457,9 @@ enum RenderImage {
         context.render(image, toBitmap: bytes.baseAddress!, rowBytes: width * 16,
           bounds: CGRect(x: 0, y: 0, width: width, height: height), format: .RGBAf, colorSpace: nil)
       }
+      // Radiance is nonnegative, as presentation shows it: a raw ReSTCV accumulation (RESTCV2026)
+      // can hold small negative values before it converges, which the file would otherwise keep.
+      for index in pixels.indices { pixels[index] = simd_max(pixels[index], .zero) }
       try OpenEXRFloat.encode(pixels, width: width, height: height).write(to: temporary)
     } else {
       try context.writePNGRepresentation(
