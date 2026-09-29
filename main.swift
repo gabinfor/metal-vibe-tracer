@@ -1834,7 +1834,9 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
             float fresnel = r0 * r0 + (1.0f - r0 * r0) * pow(1.0f - cosine, 5.0f);
             bool reflected = sin2T >= 1.0f || rand_f(seed) < fresnel;
             if (reflected) {
-                direction = reflect(incoming, m);
+                // Renormalized: rounding in long mirror chains otherwise compounds into
+                // non-unit rays that the sphere test (unit-direction form) hits off-surface.
+                direction = normalize(reflect(incoming, m));
                 weight = mat.albedo;
             } else {
                 direction = normalize(eta * incoming + (eta * cosI - sqrt(1.0f - sin2T)) * m);
@@ -1846,7 +1848,7 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
     }
     if (is_delta(mat)) {
         float3 m = dot(reflect(incoming, normal), geometric) > 0.0f ? normal : geometric;
-        direction = reflect(incoming, m);
+        direction = normalize(reflect(incoming, m));
         float cosI = clamp(dot(-incoming, m), 0.0f, 1.0f);
         weight = mat.albedo + (1.0f - mat.albedo) * pow(1.0f - cosI, 5.0f);
         return dot(direction, geometric) > 0.0f;
