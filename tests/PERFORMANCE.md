@@ -1,6 +1,6 @@
 # ReSTIR spatial neighbour selection — September 29, 2026
 
-Compatibility-guided selection (`REFERENCES.md` `COMPATRESTIR2026`, now the default)
+Compatibility-guided selection (`REFERENCES.md` `COMPATRESTIR2026`; the default for imported scene graphs through `SpatialNeighborSelection.automatic`, while procedural scenes keep uniform selection)
 versus the earlier uniform selection (`PathTracerRenderer.spatialNeighbors = .uniform`),
 on an Apple M4 (10-core GPU, 16 GB), macOS 27.0 (26A428), Swift 6.4. Source: `d5a449f` plus
 this change (uncommitted at measurement; the committed shaders are identical).

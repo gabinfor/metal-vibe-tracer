@@ -4,7 +4,7 @@ An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Expl
 
 ## Features
 
-- **Path tracing:** ReSTIR direct lighting and first-bounce diffuse GI, with Standard MIS, light-only, and BSDF-only comparison modes. Spatial reuse picks its neighbours by compatibility-guided selection (Junkins et al., HPG 2026; `COMPATRESTIR2026` in [REFERENCES.md](REFERENCES.md)).
+- **Path tracing:** ReSTIR direct lighting and first-bounce diffuse GI, with Standard MIS, light-only, and BSDF-only comparison modes. On imported scenes, spatial reuse picks its neighbours by compatibility-guided selection (Junkins et al., HPG 2026; `COMPATRESTIR2026` in [REFERENCES.md](REFERENCES.md)); the procedural scenes keep the uniform selection, which is faster there.
 - **Materials:** OpenPBR surfaces, image textures, normal maps, and a supported subset of MaterialX graphs.
 - **Scenes:** six procedural test scenes, OBJ import, and OpenUSD scene import with hierarchy, instances, materials, lights, and cameras. Imported meshes are traced as instances through a two-level acceleration structure: Metal hardware ray tracing where a launch-time check finds it watertight (Apple M4 does), otherwise an exact software 4-wide SAH hierarchy. Up to 1,000,000 stored and 64,000,000 rendered triangles.
 - **Lighting:** procedural skies, HDRI environments, editable area lights, and a thin-lens camera.
@@ -109,7 +109,7 @@ See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, a
 ## Known limitations
 
 - ReSTIR GI currently reuses the first diffuse indirect vertex. Deeper and glossy transport use ordinary path tracing; practical reservoir reuse is not a fully unbiased reference estimator. Use Standard MIS with fog and ring boost disabled for comparisons.
-- Compatibility-guided neighbour selection costs 3–26% more frame time than the earlier uniform selection. On imported meshes it lowers error substantially (40–61% at equal sample count in the measured fixtures). On the procedural scenes it is within about ±1%, or 7% lower on Cornell, which is 2–12% worse at equal time. Test builds (`-D VIBE_TESTING`) restore the uniform selection with `VIBE_SPATIAL_NEIGHBORS=uniform`; there is no UI setting.
+- Compatibility-guided neighbour selection costs 3–26% more frame time than the earlier uniform selection. On imported meshes it lowers error substantially (40–61% at equal sample count in the measured fixtures). On the procedural scenes it is within about ±1%, or 7% lower on Cornell, which is 2–12% worse at equal time, so the default (`SpatialNeighborSelection.automatic`) uses it only for imported scene graphs. Test builds (`-D VIBE_TESTING`) restore the uniform selection with `VIBE_SPATIAL_NEIGHBORS=uniform`; there is no UI setting.
 - HDRI sampling uses a luminance-weighted lat-long distribution; very small or high-contrast features can still require additional samples.
 - OpenUSD import is a scene snapshot, with partial material and light support. Animation, subdivision evaluation, volumes, curves, and USD export are unsupported.
 - MaterialX support is a bounded importer, with no node editor or graph export. OCIO/ACES color management, UDIMs, displacement, and several advanced material features are unsupported.

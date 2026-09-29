@@ -44,6 +44,8 @@ where d is the primary-hit distance, Ω = 0.05 sr and β = 8. It uses A-Chao for
 
 **Used in:** `SpatialNeighborSelection`, `PathTracerRenderer.spatialNeighbors`, `Uniforms.spatialNeighbors`, `restir_compatibility`, `concentric_disk`, `compat_candidate`, `select_compatible_neighbors`, `restir_di_in_support`, `restir_gi_in_support`, and the DI and GI spatial reuse loops of `shading_kernel`. `uniform_neighbor` and `restir2020_compatible` keep the earlier uniform selection.
 
+**Default (2026-09-29):** `SpatialNeighborSelection.automatic` resolves to compatibility-guided selection when `sceneIndex == 6` renders an imported scene graph and to the uniform `RESTIR2020` selection for the procedural scenes, following the equal-time measurements in `tests/PERFORMANCE.md`. Explicit `.uniform` / `.compatibility` settings are kept as given.
+
 **Implemented as in the paper:** Eqs. 14–15 with Ω = 0.05 and β = 8; the R2 plus concentric-map candidate taps; A-ES without replacement (its first rank is an A-Chao draw); early stopping above 0.5; K = 32.
 
 **Adaptations:**

@@ -3062,6 +3062,13 @@ enum SpatialNeighborSelection: UInt32 {
     case uniform = 0
     // COMPATRESTIR2026: neighbours drawn from 32 taps in proportion to a G-buffer score.
     case compatibility = 1
+    // Host-side default: compatibility for imported scene graphs, where it measured
+    // 28-51% lower equal-time MSE, and uniform for the procedural scenes, where the
+    // extra taps cost 2-12% at equal time (see tests/PERFORMANCE.md).
+    case automatic = 2
+    func resolved(importedSceneGraph: Bool) -> SpatialNeighborSelection {
+        self == .automatic ? (importedSceneGraph ? .compatibility : .uniform) : self
+    }
 }
 
 // REFERENCES.md: PBRT2023; local base-2/base-3 Halton jitter with a 1,024-frame period.
@@ -3688,7 +3695,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Test builds can run the whole suite with the earlier uniform selection.
         if ProcessInfo.processInfo.environment["VIBE_SPATIAL_NEIGHBORS"] == "uniform" { return .uniform }
 #endif
-        return .compatibility
+        return .automatic
     }
 
     var yaw: Float = 0.42 { didSet { if oldValue != yaw { resetAccumulation(resetDenoiser: false) } } }
@@ -4227,7 +4234,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             height: UInt32(h),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
-            spatialNeighbors: spatialNeighbors.rawValue,
+            spatialNeighbors: spatialNeighbors.resolved(importedSceneGraph: sceneIndex == 6 && materials.hasSceneGraph).rawValue,
             environment: SIMD4(options.environmentIntensity, options.environmentRotation * .pi / 180, materials.environmentData == nil ? 0 : 1, Float(materials.nodeCount)),
             lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,sceneIndex == 6 ? options.independentSunCone : 0),
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize)
