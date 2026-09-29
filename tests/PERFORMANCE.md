@@ -1,3 +1,130 @@
+# ReSTIR PT — September 29, 2026
+
+ReSTIR PT (`REFERENCES.md` `RESTIRPT2022`, `RESTIRPTE2026`; `IndirectReuse`) against the
+earlier bounded first-bounce ReSTIR GI (`IndirectReuse.restirGI`, `RESTIRGI2021`), on an Apple M4
+(10-core GPU, 16 GB), macOS 27.0 (26A428), Swift 6.4. Source: `ba3fd91` plus this change
+(uncommitted at measurement; the committed shaders are identical). "PT" is ReSTIR PT for paths
+of three or more vertices, with ReSTIR DI or MIS for direct light; "unified" is ReSTIR PT for
+every path (`restirPTUnified`, no DI pass). Both reuse temporally only while the view changes,
+unless noted ("T": temporal reuse on every frame, as in the papers' real-time renderers).
+
+The scratch driver used for the error figures is not part of the suite. It renders through the
+production `renderFrame` path at 320×240 and path depth 16. Each error is the mean over 4
+independent seed sequences (`restartSampleSequence(at:)`) of the accumulated image's MSE (linear
+RGB, all pixels) against a 1,024-frame MIS reference; "tone-mapped" applies x/(1+x) per channel
+first, which limits the weight of caustic fireflies (in Pavilion, 1% of the pixels hold 90% of the
+linear error). Frame times are medians of 30 frames over three interleaved rounds at 640×480,
+static camera (static accumulation: PT and unified skip temporal reuse there). The GPU was shared
+with other work at times, so times vary by up to ±10% between sessions; ratios within one table
+come from interleaved runs.
+
+## Equal-sample and equal-time error (64 accumulated frames)
+
+| Scene | GI MSE | PT | Unified | Unified T | GI ms | PT ms | Unified ms | Unified, equal time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pavilion | 0.2875 | −8% | −9% | +94% | 27.9 | 57.3 | 57.5 | +87% |
+| Pavilion close-up | 0.4130 | −9% | −12% | +99% | 30.9 | 69.0 | 72.0 | +105% |
+| Pavilion, coated OpenPBR floor | 0.3620 | −10% | −10% | +58% | 40.1 | 76.5 | 73.5 | +64% |
+| Cornell box | 1.781e-4 | −15% | −8% | +63% | 14.9 | 20.6 | 19.7 | +22% |
+| Cornell glass & mirror | 5.238e-3 | −21% | −20% | +65% | 14.7 | 29.7 | 29.0 | +57% |
+| Ring studio (scene 5) | 1.511e-3 | 0% | 0% | +180% | 12.9 | 24.6 | 22.2 | +72% |
+| Veach plates (scene 2) | 2.008e-2 | 0% | 0% | +2% | 6.3 | 12.8 | 12.5 | +99% |
+| Imported UV sphere on a floor | 1.966e-3 | −4% | **−53%** | −28% | 8.9 | 13.9 | 16.2 | **−14%** |
+| ASWF Standard Shader Ball | 3.130e-3 | −28% | **−43%** | +110% | 76.7 | 126.7 | 123.1 | **−8%** |
+
+Tone-mapped equal-sample changes (PT / unified against GI): Pavilion −4% / −17%, close-up −8% /
+−15%, coated floor −4% / −11%, Cornell −24% / −17%, glass & mirror −12% / −11%, ring studio −2% /
+−2%, plates +1% / −23%, UV sphere −2% / −57%, Shader Ball −26% / −37%. Equal time assumes MSE ∝
+1/frames. At equal time Standard MIS itself beats ReSTIR GI (by 1–49%) and unified ReSTIR PT
+(by 24–175%) on every scene except the Shader Ball, where unified ReSTIR PT is 7% below MIS and
+ReSTIR GI 1% above: converged accumulations gain little from reuse, whose value is per frame.
+
+Temporal reuse on every frame of a static accumulation ("T") doubles the error because
+consecutive frames reuse the same samples: in an ablation on Cornell / glass / Pavilion, capping
+the temporal confidence at 1–4 recovered most of the loss, and dropping temporal reuse was within
+7% of the best cap while saving two shifts per pixel, so ReSTIR PT reuses temporally only while
+the view changes (`restir_pt_temporal`). The papers recommend accumulating without temporal reuse
+for converged images.
+
+## Interactive preview (orbiting camera)
+
+The camera orbits every frame, which resets the accumulation and keeps ReSTIR history, so every
+frame uses temporal reuse. Tone-mapped MSE of the 16th single frame against a 1,024-frame MIS
+reference of that view, mean of 3 seed sequences, 320×240:
+
+| Scene | GI | PT | Unified | Frame ms (640×480) GI / PT / unified |
+| --- | ---: | ---: | ---: | --- |
+| Pavilion | 3.22e-2 | −37% | −69% | 27.9 / 89.2 / 72.4 |
+| Pavilion close-up | 3.32e-2 | −44% | −65% | 30.9 / 120.0 / 110.7 |
+| Coated floor | 3.55e-2 | −45% | −68% | 40.1 / 113.3 / 106.1 |
+| Cornell box | 1.64e-3 | −49% | −37% | 14.9 / 26.0 / 25.2 |
+| Cornell glass & mirror | 2.53e-3 | −18% | −7% | 14.7 / 47.2 / 38.4 |
+| Ring studio | 4.11e-4 | 0% | +8% | 12.9 / 43.5 / 30.7 |
+| Veach plates | 2.75e-3 | −1% | −58% | 6.3 / 33.2 / 19.5 |
+| Imported UV sphere | 7.65e-3 | −9% | −67% | 8.9 / 22.5 / 22.2 |
+| Shader Ball | 1.44e-2 | −58% | −75% | 76.7 / 158.3 / 152.1 |
+
+## Mean radiance against MIS (bias check)
+
+512 accumulated frames at 320×240 against the 1,024-frame MIS reference, all pixels, relative
+difference ± tile-clustered standard error. ReSTIR GI: Cornell +0.25 ± 0.03%, glass & mirror
++0.22 ± 0.08%, close-up +0.19 ± 0.09%, UV sphere +0.07 ± 0.01%, others within ±0.02%. ReSTIR PT and
+unified: every scene within ±0.09% and within 2.3 standard errors (Cornell +0.007 ± 0.010% /
++0.005 ± 0.010%, glass +0.07 ± 0.07% / +0.08 ± 0.07%, Pavilion −0.09 ± 0.06% / −0.07 ± 0.06%,
+UV sphere −0.02 ± 0.01% / +0.01 ± 0.01%, Shader Ball −0.01 ± 0.01% / −0.02 ± 0.01%).
+
+## Memory
+
+Reservoir storage per pixel (`FrameResourcePlan.reservoirBytesPerPixel`): ReSTIR GI 208 B (DI 96,
+GI 112); ReSTIR PT 418 B (DI 96, then two 64 B path reservoirs, three 16 B paired shifts, the
+16 B indirect estimate, a 128 B history `PrimarySurface` and the 2 B duplication map); unified
+322 B. The primary-surface cache grew from 120 to 128 B in every mode. At 1920×1080 unified
+ReSTIR PT needs 114 B/pixel (225 MiB) more than ReSTIR GI; the pairing textures take 316 KiB once.
+
+## Default
+
+`IndirectReuse.automatic` resolves to unified ReSTIR PT for scene 6 (imported meshes and scene
+graphs), where it wins at equal time (UV sphere −14%, Shader Ball −8%), and to ReSTIR GI for the
+procedural scenes, where the extra shifts cost 22–105% more error at equal time despite up to 20%
+lower error at equal sample count (none on the ring and plates scenes). Interactive (orbiting)
+frames have 37–75% lower error with unified ReSTIR PT in seven of nine scenes, but take 1.7–3.6×
+longer.
+
+## Equivalence and cost against `main`
+
+`VIBE_INDIRECT_REUSE=gi VIBE_ACCELERATION=flat python3 tests/benchmark.py --baseline <main.swift of
+ba3fd91> --rounds 1 --frames 8 --output-tolerance 0`: with ReSTIR GI forced, Cornell and both mesh
+scenarios render mean raw radiance identical to `ba3fd91`'s shaders. The three Pavilion scenarios
+differ by at most 5e-6 relative, from the renormalized mirror reflections in `sample_bsdf` (see
+`PBRT2023`); with that one change reverted all six scenarios were identical at zero tolerance and
+timings matched within 2.5% (Pavilion 25.30 vs 25.31 ms, instanced scene graph 44.61 vs 45.71 ms
+on the flat BVH). That report is [`PERFORMANCE-restir-pt-raw.txt`](PERFORMANCE-restir-pt-raw.txt),
+first section.
+
+## Benchmark (`tests/benchmark.py`)
+
+Default hardware traversal, `--rounds 2 --frames 12`, median GPU ms per frame, 640×480, with
+`VIBE_INDIRECT_REUSE` set to each mode (the default, `automatic`, gives the GI column for the
+procedural scenes and the unified column for scene 6). Unedited reports are in
+[`PERFORMANCE-restir-pt-raw.txt`](PERFORMANCE-restir-pt-raw.txt).
+
+| Scenario | MetalFX | ReSTIR GI | Unified ReSTIR PT | Change |
+| --- | --- | ---: | ---: | ---: |
+| Default Pavilion | off | 25.14 | 48.03 | +91% |
+| Default Pavilion | on | 29.27 | 52.07 | +78% |
+| Pavilion with coated OpenPBR floor | off | 31.74 | 61.81 | +95% |
+| Pavilion with coated OpenPBR floor | on | 36.00 | 65.84 | +83% |
+| Cornell box | off | 11.55 | 16.72 | +45% |
+| Cornell box | on | 14.97 | 20.38 | +36% |
+| Imported mesh (8,130 triangles) | off | 7.36 | 11.83 | +61% |
+| Imported mesh (8,130 triangles) | on | 12.54 | 15.42 | +23% |
+| Instanced scene graph | off | 17.20 | 20.09 | +17% |
+| Instanced scene graph | on | 20.75 | 23.70 | +14% |
+| Default Pavilion, MIS (no ReSTIR) | off | 21.35 | 21.29 | 0% |
+
+With the benchmark's 1.61× on the UV-sphere mesh, unified ReSTIR PT's equal-time error there is
+−25% (−14% with the interleaved 1.83× above).
+
 # ReSTIR spatial neighbour selection — September 29, 2026
 
 Compatibility-guided selection (`REFERENCES.md` `COMPATRESTIR2026`; the default for imported scene graphs through `SpatialNeighborSelection.automatic`, while procedural scenes keep uniform selection)
