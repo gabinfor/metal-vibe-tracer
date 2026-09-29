@@ -168,7 +168,8 @@
     let pool = renderer.splatCurrent!
     require(pool.capacity == capacity && pool.domains.length == capacity * 32 && pool.surfaces.length == capacity * 128
         && (pool.di?.length ?? 0) == (usesDI ? capacity * 48 : 0) && (pool.gi?.length ?? 0) == (usesGI ? capacity * 64 : 0)
-        && (pool.pt?.length ?? 0) == (usesPT ? capacity * 64 : 0) && renderer.splatLayers!.length == mw * mh * 48
+        && (pool.pt?.length ?? 0) == (usesPT ? capacity * 64 : 0) && (pool.controls?.length ?? 0) == (usesPT ? capacity * 16 : 0)
+        && renderer.splatLayers!.length == mw * mh * 48
         && renderer.splatSources!.length == (mw * mh + capacity) * 8,
       "\(reuse): splatting allocates two pools and the per-pixel state of its reservoirs")
     let plan = PathTracerRenderer.FrameResourcePlan(width: mw, height: mh, usesReSTIR: true, usesMetalFX: false, indirectReuse: reuse, splatting: true)
@@ -176,9 +177,10 @@
     print("\(reuse) with splatting: resident frame \(Int(resident)) B, plan \(Int(planned)) B")
     require(resident >= 0.95 * planned && resident <= 1.1 * planned, "\(reuse): the splatting resource plan matches the resident frame")
   }
+  // ReSTIR PT pools also hold 16 B ReSTCV estimates (RESTCV2026).
   require(PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirGI) == 198
-      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPT) == 198
-      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPTUnified) == 174,
+      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPT) == 206
+      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPTUnified) == 182,
     "reservoir-splatting bytes per pixel per mode")
   renderer.temporalReuse = .reprojection
   _ = render(makeUniforms(scene: 1, mode: 0, width: mw, height: mh), samples: 1)
@@ -284,7 +286,9 @@
       for i in image.indices { sums[f % 2][i] += image[i] }
       if f >= 8 {
         for i in image.indices where hidden[f % 2][i] {
-          let x = image[i] / (image[i] + 1), y = references[f % 2][i] / (references[f % 2][i] + 1), d = x - y
+          // Display-referred: the display clamps negative (ReSTCV, RESTCV2026) values to black.
+          let a = simd_max(image[i], .zero), b = simd_max(references[f % 2][i], .zero)
+          let x = a / (a + 1), y = b / (b + 1), d = x - y
           error += Double(d.x * d.x + d.y * d.y + d.z * d.z) / 3; samples += 1
         }
       }

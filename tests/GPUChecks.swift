@@ -241,7 +241,13 @@ var renderOutputs = [SIMD2<Int>: MTLTexture]()
     if usesMetalFX, let fx = r.metalFX { lastMotion = readTexture(fx.motion) }
     require(lastDisplay.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }, "finite denoised image")
     let pixels = readTexture(r.accumTexture!)
-    require(pixels.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite && $0.x >= 0 && $0.y >= 0 && $0.z >= 0 }, "finite nonnegative pixels")
+    // ReSTCV (Uniforms.indirectReuse bit 5; REFERENCES.md RESTCV2026) accumulates unclamped control-variate
+    // estimates, which can be negative before they converge; presentation, exports and OIDN clamp them,
+    // and the frame MetalFX consumes is clamped. Every other estimator is nonnegative.
+    let controlVariates = r.lastUniforms.map { $0.indirectReuse & 32 != 0 } ?? false
+    require(lastSamples.allSatisfy { $0.x >= 0 && $0.y >= 0 && $0.z >= 0 }, "nonnegative MetalFX input")
+    require(pixels.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite && (controlVariates || ($0.x >= 0 && $0.y >= 0 && $0.z >= 0)) },
+            "finite nonnegative pixels")
     r.onFrameUpdate = savedFrameUpdate; r.onError = savedError
     (r.samplingMode, r.enableSMS, r.skyMode, r.enableFog, r.viewportMode) = modes
     (r.yaw, r.pitch, r.distance, r.target, r.fov) = camera

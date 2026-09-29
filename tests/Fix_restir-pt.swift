@@ -287,17 +287,19 @@
         && (renderer.ptIndirect?.width == mw) == pt && (renderer.ptDuplication?.width == mw) == pt
         && (renderer.ptReservoirs?.length ?? 0) == (pt ? mw * mh * 64 : 0) && (renderer.ptShifts?.length ?? 0) == (pt ? mw * mh * (renderer.activeSpatialNeighbors == .stochasticPairwise
             ? PathTracerRenderer.spmisShiftBytesPerPixel : 48) : 0)
-        && (renderer.historyPrimarySurfaces?.length ?? 0) == (pt ? mw * mh * 128 : 0),
+        && (renderer.historyPrimarySurfaces?.length ?? 0) == (pt ? mw * mh * 128 : 0)
+        && (renderer.ptControls?.length ?? 0) == (pt ? mw * mh * 16 : 0),
       "\(reuse) allocates exactly its reservoir sets; the others are placeholders")
     let plan = PathTracerRenderer.FrameResourcePlan(width: mw, height: mh, usesReSTIR: true, usesMetalFX: false, indirectReuse: reuse)
     let resident = Double(renderer.residentFrameBytes), planned = Double(plan.bytes!)
     print("\(reuse): resident frame \(Int(resident)) B, plan \(Int(planned)) B")
     require(resident >= 0.95 * planned && resident <= 1.1 * planned, "\(reuse): the resource plan matches the resident frame")
   }
-  require(PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPT) == 96 + 322
-      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPTUnified) == 322
+  // 322 B of ReSTIR PT resources and the 16 B ReSTCV estimate (RESTCV2026).
+  require(PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPT) == 96 + 338
+      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPTUnified) == 338
       && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirGI) == 208
-      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.automatic) == 322, "reservoir bytes per pixel per mode")
+      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.automatic) == 338, "reservoir bytes per pixel per mode")
   renderer.indirectReuse = .restirGI
   _ = render(makeUniforms(scene: 1, mode: 0, width: mw, height: mh), samples: 1)
   renderer.indirectReuse = .restirPTUnified
@@ -394,10 +396,12 @@
   renderer.materials.settings = savedSettings
 
   // Interactive preview: after 12 orbiting frames (accumulation reset each frame, ReSTIR history
-  // kept), the tone-mapped error of the last frame against MIS at that view.
+  // kept), the tone-mapped error of the last frame against MIS at that view. Display-referred: the
+  // display clamps the negative values a ReSTCV frame can hold (RESTCV2026) to black.
   func toneMapped(_ a: [SIMD4<Float>], _ b: [SIMD4<Float>]) -> Double {
     zip(a, b).reduce(0.0) { sum, pair in
-      let x = pair.0 / (pair.0 + 1), y = pair.1 / (pair.1 + 1), d = x - y
+      let p = simd_max(pair.0, .zero), q = simd_max(pair.1, .zero)
+      let x = p / (p + 1), y = q / (q + 1), d = x - y
       return sum + Double(d.x * d.x + d.y * d.y + d.z * d.z) / 3 } / Double(a.count)
   }
   // Measured ratios at this size: about 0.8 (Cornell) and 0.46 (Pavilion).
