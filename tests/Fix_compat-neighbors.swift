@@ -6,6 +6,10 @@
 @MainActor func fixCompatNeighborsChecks() throws {
   let renderer = testRenderer
   let savedMode = renderer.spatialNeighbors
+  // Neighbour selection applies to ReSTIR DI and GI; unified ReSTIR PT (the automatic choice
+  // for scene 6) has no DI/GI spatial pass, so these checks pin the indirect reuse to ReSTIR GI.
+  let savedIndirect = renderer.indirectReuse
+  renderer.indirectReuse = .restirGI
 
   // Layout: the mode occupies former padding, so the 304-byte stride is unchanged.
   require(MemoryLayout<Uniforms>.stride == 304 && MemoryLayout<Uniforms>.offset(of: \Uniforms.spatialNeighbors) == 252,
@@ -355,5 +359,6 @@
     print("PASS: fix-compat-neighbors MetalFX preview error in both modes")
   }
   renderer.spatialNeighbors = savedMode
+  renderer.indirectReuse = savedIndirect
 }
 try fixCompatNeighborsChecks()

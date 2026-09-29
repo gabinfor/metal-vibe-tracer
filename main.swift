@@ -161,6 +161,7 @@ struct Uniforms {
     uint viewportMode;     // 0 = beauty, 1 = albedo, 2 = normals, 3 = depth, 4 = material
     uint width;
     uint height;
+    uint indirectReuse;    // IndirectReuse and ReSTIR PT options (former padding); see indirect_reuse_mode
     float2 jitter;         // Shared subpixel offset, in pixels, excluding the 0.5 pixel center.
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
     uint reservoirHistoryReset; // 1 = DI/GI history reservoirs were just allocated; skip temporal reuse
@@ -174,6 +175,22 @@ struct Uniforms {
 // lens.z = 1 renders scene 6 from the imported scene graph: per-triangle material
 // slots and emission, an identity root transform, and float-scaled ray offsets.
 bool uses_scene_graph(constant Uniforms &u) { return u.lens.z > 0; }
+
+// Uniforms.indirectReuse: bits 0-1 select IndirectReuse (0 ReSTIR GI, 1 ReSTIR PT for
+// paths of three or more vertices, 2 ReSTIR PT for every path); bit 2 enables the
+// duplication-map confidence reduction (RESTIRPTE2026 Sec. 5, biased); bit 3 keeps temporal
+// reuse on while a static view accumulates.
+uint indirect_reuse_mode(constant Uniforms &u) { return min(u.indirectReuse & 3u, 2u); }
+bool restir_gi_active(constant Uniforms &u) { return indirect_reuse_mode(u) == 0; }
+bool restir_pt_active(constant Uniforms &u) { return indirect_reuse_mode(u) != 0; }
+bool restir_pt_unified(constant Uniforms &u) { return indirect_reuse_mode(u) == 2; }
+bool restir_di_active(constant Uniforms &u) { return indirect_reuse_mode(u) != 2; }
+bool restir_pt_decorrelates(constant Uniforms &u) { return (u.indirectReuse & 4u) != 0; }
+// ReSTIR PT temporal reuse runs while the view changes (the first frame of an accumulation),
+// and on every frame only with bit 3 (PathTracerRenderer.ptTemporalWhileAccumulating). Over a
+// static accumulation it correlates frames (RESTIRPT2022 and RESTIRPTE2026 Sec. 7.4 recommend
+// accumulating without it); spatial reuse continues on every frame.
+bool restir_pt_temporal(constant Uniforms &u) { return u.frameIndex <= 1u || (u.indirectReuse & 8u) != 0u; }
 
 // ============================================================================
 // Procedural Physical Sky
@@ -1944,11 +1961,12 @@ struct PrimarySurface {
     float coat, anisotropy, fuzz, transmission;
     float coatRoughness, specularWeight, baseWeight, diffuseRoughness;
     uint triangle; float error;                   // HitRecord.triangle and position rounding bound
-    packed_float3 emission; float reserved;       // Material.emission (MaterialX emission for OPENPBR)
+    packed_float3 emission;                       // Material.emission (MaterialX emission for OPENPBR)
+    packed_float3 view;                           // primary ray direction (ReSTIR PT shifts into this pixel)
 };
-static_assert(sizeof(PrimarySurface) == 120, "Swift allocates 120-byte primary surfaces");
+static_assert(sizeof(PrimarySurface) == 128, "Swift allocates 128-byte primary surfaces");
 
-PrimarySurface store_primary_surface(HitRecord hit) {
+PrimarySurface store_primary_surface(HitRecord hit, float3 view = float3(0.0f)) {
     PrimarySurface s;
     Material m = hit.mat;
     s.normal = hit.normal; s.geometricNormal = hit.geometricNormal; s.tangent = m.tangent;
@@ -1959,7 +1977,7 @@ PrimarySurface store_primary_surface(HitRecord hit) {
     s.coat = m.coat; s.anisotropy = m.anisotropy; s.fuzz = m.fuzz; s.transmission = m.transmission;
     s.coatRoughness = m.coatRoughness; s.specularWeight = m.specularWeight;
     s.baseWeight = m.baseWeight; s.diffuseRoughness = m.diffuseRoughness;
-    s.emission = m.emission; s.reserved = 0.0f;
+    s.emission = m.emission; s.view = view;
     return s;
 }
 
@@ -2044,24 +2062,30 @@ kernel void restir_temporal_kernel(
     // Non-ReSTIR and inspection passes bind 1x1 placeholder reservoirs. They must
     // not read or write those resources, so the host need not allocate full-size
     // DI/GI history for these modes.
+    // ReSTIR PT modes leave the GI reservoirs as placeholders, and unified PT the DI ones.
     bool reservoirsBound = uniforms.viewportMode == 0 && uniforms.samplingMode == 0;
+    bool diBound = reservoirsBound && restir_di_active(uniforms);
+    bool giBound = reservoirsBound && restir_gi_active(uniforms);
     if (!hit) {
         gbufferPosDepth.write(float4(0.0f, 0.0f, 0.0f, -1.0f), gid);
         gbufferNormalMat.write(float4(0.0f, 0.0f, 0.0f, -1.0f), gid);
         gbufferAlbedoRough.write(float4(0.0f), gid);
-        if (!reservoirsBound) return;
-        outSamplePosDir.write(float4(0.0f), gid);
-        outSampleEmitPdf.write(float4(0.0f), gid);
-        outReservoirWeights.write(float4(0.0f), gid);
-        outGIPosPdf.write(float4(0.0f), gid);
-        outGINormal.write(float4(0.0f), gid);
-        outGIRadiance.write(float4(0.0f), gid);
-        outGIWeights.write(float4(0.0f), gid);
+        if (diBound) {
+            outSamplePosDir.write(float4(0.0f), gid);
+            outSampleEmitPdf.write(float4(0.0f), gid);
+            outReservoirWeights.write(float4(0.0f), gid);
+        }
+        if (giBound) {
+            outGIPosPdf.write(float4(0.0f), gid);
+            outGINormal.write(float4(0.0f), gid);
+            outGIRadiance.write(float4(0.0f), gid);
+            outGIWeights.write(float4(0.0f), gid);
+        }
         return;
     }
 
     resolve_material(rec, ray, uniforms, surfaceSettings, materialImages, rec.t * 2.0f * fov_scale / float(uniforms.height));
-    primarySurfaces[gid.y * uniforms.width + gid.x] = store_primary_surface(rec);
+    primarySurfaces[gid.y * uniforms.width + gid.x] = store_primary_surface(rec, ray.direction);
     gbufferPosDepth.write(float4(rec.position, rec.t), gid);
     gbufferNormalMat.write(float4(rec.normal, float(rec.mat.type)), gid);
     float3 surfaceColor = rec.mat.type == EMISSIVE ? rec.mat.emission : rec.mat.albedo;
@@ -2069,15 +2093,19 @@ kernel void restir_temporal_kernel(
         ? (rec.front_face ? rec.mat.ior : -rec.mat.ior) : rec.mat.roughness;
     gbufferAlbedoRough.write(float4(surfaceColor, surfaceParameter), gid);
 
-    if (!reservoirsBound) return;
+    if (!diBound && !giBound) return;
     if (rec.mat.type != DIFFUSE) {
-        outSamplePosDir.write(float4(0.0f), gid);
-        outSampleEmitPdf.write(float4(0.0f), gid);
-        outReservoirWeights.write(float4(0.0f), gid);
-        outGIPosPdf.write(float4(0.0f), gid);
-        outGINormal.write(float4(0.0f), gid);
-        outGIRadiance.write(float4(0.0f), gid);
-        outGIWeights.write(float4(0.0f), gid);
+        if (diBound) {
+            outSamplePosDir.write(float4(0.0f), gid);
+            outSampleEmitPdf.write(float4(0.0f), gid);
+            outReservoirWeights.write(float4(0.0f), gid);
+        }
+        if (giBound) {
+            outGIPosPdf.write(float4(0.0f), gid);
+            outGINormal.write(float4(0.0f), gid);
+            outGIRadiance.write(float4(0.0f), gid);
+            outGIWeights.write(float4(0.0f), gid);
+        }
         return;
     }
 
@@ -2158,6 +2186,8 @@ kernel void restir_temporal_kernel(
     outSamplePosDir.write(float4(storeDirPos, float(selectedSample.isDirectional)), gid);
     outSampleEmitPdf.write(float4(selectedSample.emission, selectedSample.pdf), gid);
     outReservoirWeights.write(float4(weightSum, M, W, 0.0f), gid);
+    // In ReSTIR PT mode (DI bound, GI placeholders) the restir_pt_* passes estimate longer paths.
+    if (!giBound) return;
 
     // Depth 1 has no indirect bounce for GI reservoirs to estimate.
     if (!restir_gi_enabled(uniforms.cameraTarget.w)) {
@@ -2381,6 +2411,883 @@ bool restir_gi_in_support(float3 x1, float3 qPosition, float3 qNormal, float3 x2
 }
 
 // ============================================================================
+// ReSTIR PT: path reservoirs, hybrid shift and GRIS reuse
+// REFERENCES.md: RESTIRPT2022 (GRIS, lobe-free hybrid shift of random replay and
+// reconnection, generalized Talbot and defensive pairwise resampling MIS) and
+// RESTIRPTE2026 (dual-footprint reconnection criteria, paired spatial reuse, forced NEE
+// reconnection, roulette outside replay, vector-weight shading, duplication maps, and
+// optionally unified DI + GI reservoirs). Local adaptations are listed there.
+// ============================================================================
+
+
+#define PT_MAX_VERTICES 255u
+#define PT_NEIGHBORS 3u
+// RESTIRPTE2026 Eq. 5 constant c, the single-vertex roughness threshold (Sec. 4.2 and
+// RESTIRPT2022's 0.2), and the temporal confidence cap c_Cap with its Sec. 5 minimum.
+constant float PT_FOOTPRINT_C = 0.02f;
+constant float PT_ROUGHNESS_MIN = 0.2f;
+constant float PT_CONFIDENCE_CAP = 20.0f;
+constant float PT_CONFIDENCE_MIN = 1.0f;
+constant float PT_DUPLICATION_EXPONENT = 0.1f;
+
+// One selected path per pixel, 64 bytes (RESTIRPTE2026 Algorithm 1 layout, with the
+// reconnection vertex stored as a position instead of instance/primitive/barycentrics).
+//   F           integrand of the path at this pixel (target p-hat = luminance(F))
+//   W, M        unbiased contribution weight and confidence
+//   rcPosition  reconnection vertex x_k (a direction when x_k is the environment)
+//   rcRadiance  L_k: the path contribution after x_k's scattering (MIS-free when k >= d - 1)
+//   rcJacobian  the base path's PSS Jacobian denominator p_{k-1}(w_{k-1}) G(x_{k-1} -> x_k) p_k(w_k)
+//   seed        random-replay seed; per-vertex streams come from pt_seed
+//   flags       d (bits 0-7), k (8-15, 0 = replay only), NEE-sampled end (16), environment
+//               x_k (17), non-delta continuations among x_1..x_{k-1} (18-23)
+//   rcDirection w_k, octahedral 2 x 16 bit;  lightPdf  NEE solid-angle PDF of the light
+//               vertex from x_{d-1}, kept for the final MIS weight when k = d - 1.
+struct PTReservoir {
+    packed_float3 F; float W;
+    packed_float3 rcPosition; float M;
+    packed_float3 rcRadiance; float rcJacobian;
+    uint seed; uint flags; uint rcDirection; float lightPdf;
+};
+static_assert(sizeof(PTReservoir) == 64, "Swift allocates 64-byte ReSTIR PT reservoirs");
+
+constant uint PT_NEE = 1u << 16;
+constant uint PT_ENVIRONMENT = 1u << 17;
+uint pt_length(PTReservoir r) { return r.flags & 255u; }
+uint pt_rc_index(PTReservoir r) { return (r.flags >> 8) & 255u; }
+uint pt_rc_scatter(PTReservoir r) { return (r.flags >> 18) & 63u; }
+uint pt_flags(uint length, uint k, bool nee, bool environment, int scatter) {
+    return length | (k << 8) | (nee ? PT_NEE : 0u) | (environment ? PT_ENVIRONMENT : 0u) | (uint(clamp(scatter, 0, 63)) << 18);
+}
+
+PTReservoir pt_empty() {
+    PTReservoir r;
+    r.F = float3(0.0f); r.W = 0.0f; r.rcPosition = float3(0.0f); r.M = 0.0f;
+    r.rcRadiance = float3(0.0f); r.rcJacobian = 0.0f;
+    r.seed = 0u; r.flags = 0u; r.rcDirection = 0u; r.lightPdf = 0.0f;
+    return r;
+}
+
+float pt_luminance(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+// Octahedral unit-vector encoding with two 16-bit unorm components.
+uint pt_encode_direction(float3 d) {
+    d /= max(abs(d.x) + abs(d.y) + abs(d.z), 1e-30f);
+    float2 e = d.z >= 0.0f ? d.xy : (1.0f - abs(d.yx)) * select(float2(-1.0f), float2(1.0f), d.xy >= 0.0f);
+    uint2 q = uint2(round(clamp(e * 0.5f + 0.5f, 0.0f, 1.0f) * 65535.0f));
+    return q.x | (q.y << 16);
+}
+float3 pt_decode_direction(uint v) {
+    float2 e = float2(float(v & 65535u), float(v >> 16)) * (2.0f / 65535.0f) - 1.0f;
+    float3 d = float3(e, 1.0f - abs(e.x) - abs(e.y));
+    float t = max(-d.z, 0.0f);
+    d.xy += select(float2(t), float2(-t), d.xy >= 0.0f);
+    return normalize(d);
+}
+
+// Random replay (RESTIRPT2022 Sec. 7.2): each sampling event at path vertex j draws from its
+// own stream (0 BSDF, 1 NEE, 2 roulette, 3-5 resampling), so replaying a prefix at another
+// pixel consumes the same numbers whatever the other events consumed.
+uint pt_seed(uint seed, uint pathVertex, uint stream) { return pcg_hash(seed ^ pcg_hash(pathVertex * 8u + stream + 1u)); }
+
+// RESTIRPTE2026 Eq. 5 right-hand side: c/100 times the squared primary footprint radius
+// |x0 - x1|^2 / (<n_x1, x1->x0> / 4 pi) (Mueller et al. 2021).
+float pt_footprint_threshold(float primaryDistance, float3 geometricNormal, float3 view) {
+    float c = max(abs(dot(geometricNormal, view)), 1e-4f);
+    return PT_FOOTPRINT_C * 0.01f * (4.0f * PI) * primaryDistance * primaryDistance / c;
+}
+
+// Single-vertex roughness threshold at x_{k-1} (RESTIRPTE2026 Sec. 4.2). Matte and metal
+// types use their parameter; layered OpenPBR, whose lobes this path space does not index,
+// uses the supplemental's PDF proxy 1 / p(w_{k-1})^2 >= alpha_min (its Eq. 26).
+bool pt_rough(Material m, float pdf) {
+    if (m.type == DIFFUSE) return true;
+    if (m.type == GLOSSY) return !is_delta(m) && m.roughness >= PT_ROUGHNESS_MIN;
+    if (m.type == OPENPBR) return pdf > 0.0f && pdf * pdf * PT_ROUGHNESS_MIN <= 1.0f;
+    return false;
+}
+
+// Reconnection criteria for the pair (x_{k-1}, x_k), without divisions:
+// the roughness guard at x_{k-1}, the ray footprint d^2 / (p_{k-1} |cos_k|) >= R and, when
+// x_k's continuation is BSDF sampled and x_k is not Lambertian, the inverse ray footprint
+// d^2 / (p_k |cos_{k-1}|) >= R (Eq. 5 and footnote 6). distance2 < 0 marks an environment x_k.
+bool pt_connectable(Material previous, float previousPdf, float distance2, float cosEnd, float cosStart,
+                    bool inverse, float endPdf, float threshold) {
+    if (!(previousPdf > 0.0f) || !pt_rough(previous, previousPdf)) return false;
+    if (distance2 < 0.0f) return true;
+    if (!(cosEnd > 0.0f) || distance2 < threshold * previousPdf * cosEnd) return false;
+    return !inverse || (endPdf > 0.0f && distance2 >= threshold * endPdf * cosStart);
+}
+
+// Unified DI + GI draws PT_NEE_CANDIDATES light samples at the primary hit and keeps one by
+// RIS on the unshadowed contribution (RESTIRPTE2026 Sec. 6.1 and supplemental Sec. 5): the
+// path keeps its single-sample PSS integrand with the M-sample MIS weight M p1 / (M p1 + p2)
+// (here in power-heuristic form), and W_RIS p1 enters the candidate's contribution weight.
+#define PT_NEE_CANDIDATES 4u
+float pt_nee_candidates(uint pathVertex, constant Uniforms &u) {
+    return restir_pt_unified(u) && pathVertex == 1u ? float(PT_NEE_CANDIDATES) : 1.0f;
+}
+
+// One vertex's BSDF, prepared once for its NEE evaluations and its continuation sample
+// (sample_bsdf and eval_bsdf_with_pdf prepare the layered OpenPBR BSDF on every call). The
+// results equal those functions': both prepare with the resolved Material's inside flag.
+struct PTBsdf { Material mat; float3 normal; float3 wo; bool layered; OpenPBR_PreparedBsdf prepared; };
+PTBsdf pt_prepare(Material m, float3 n, float3 wo) {
+    PTBsdf b;
+    b.mat = m; b.normal = n; b.wo = wo;
+    b.layered = m.type != DIFFUSE && m.type != EMISSIVE && !is_delta(m);
+    if (b.layered) b.prepared = prepare_openpbr(m, n, wo);
+    return b;
+}
+float3 pt_eval(thread const PTBsdf &b, float3 wi, thread float &pdf) {
+    if (!b.layered) return eval_bsdf_with_pdf(b.mat, b.normal, b.wo, wi, pdf);
+    pdf = 0.0f;
+    float cosine = abs(dot(b.normal, wi));
+    if (cosine < 1e-7f || dot(b.normal, b.wo) <= 0.0f) return float3(0.0f);
+    pdf = openpbr_pdf(b.prepared, wi);
+    float3 g = b.mat.geometricNormal;
+    if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(wi, g) <= 0.0f) return float3(0.0f);
+    return openpbr_get_sum_of_diffuse_specular(openpbr_eval(b.prepared, wi)) / cosine;
+}
+bool pt_sample(thread const PTBsdf &b, float3 incoming, bool frontFace, thread uint &seed,
+               thread float3 &direction, thread float3 &weight, thread float &pdf) {
+    if (!b.layered) return sample_bsdf(b.mat, b.normal, incoming, frontFace, seed, direction, weight, pdf);
+    OpenPBR_DiffuseSpecular result;
+    uint lobe;
+    float3 random = float3(rand_f(seed), rand_f(seed), rand_f(seed));
+    openpbr_sample(b.prepared, random, direction, result, pdf, lobe);
+    if (pdf <= 0.0f) return false;
+    float3 g = b.mat.geometricNormal;
+    if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(direction, g) <= 0.0f) return false;
+    weight = openpbr_get_sum_of_diffuse_specular(result);
+    return all(isfinite(weight)) && all(weight >= 0.0f);
+}
+
+// Resampling MIS weights of GRIS reuse. Arguments are target values of one path y in two
+// domains, each multiplied by the same shift Jacobian (so shifted values are used as stored).
+// Generalized Talbot with confidences (RESTIRPT2022 Eq. 36): the share of the domain whose
+// value is `own` among two domains.
+float pt_talbot(float own, float ownConfidence, float other, float otherConfidence) {
+    float a = ownConfidence * own;
+    return a > 0.0f ? a / (a + otherConfidence * other) : 0.0f;
+}
+// Defensive pairwise MIS with confidences (RESTIRPT2022 Eq. 38, weighted as its real-time
+// prototype does): for n neighbours, neighbour j's weight is b_j / (n + 1) and the canonical
+// weight is (1 + sum_j (1 - b_j)) / (n + 1), with b_j = c_j p_j / (c_j p_j + (c_c / n) p_c),
+// where p_j is y's value in neighbour j's domain and p_c its value in the canonical domain.
+float pt_pairwise(float neighbor, float neighborConfidence, float canonical, float canonicalConfidence, float count) {
+    float a = neighborConfidence * neighbor;
+    return a > 0.0f ? a / (a + canonicalConfidence * canonical / count) : 0.0f;
+}
+
+// Streaming RIS over the candidates of the initial path tree: each candidate (x-bar, technique)
+// is the only one covering its domain, so its resampling weight is p-hat / p(u), with the
+// PSS source density p(u) = product of roulette survival probabilities (RESTIRPTE2026 Sec. 6.2.4)
+// and, for RIS light sampling, W_RIS p1. Returns whether the candidate replaces the selection.
+bool pt_accept(thread float &weightSum, thread uint &risSeed, float3 F, float sourceWeight) {
+    float w = pt_luminance(F) * sourceWeight;
+    if (!(w > 0.0f) || !isfinite(w)) return false;
+    weightSum += w;
+    return rand_f(risSeed) * weightSum < w;
+}
+
+// Initial path tree at the primary hit x1 (RESTIRPT2022 Sec. 8; the same sampling decisions,
+// scattering budget and MIS weights as shading_kernel's path loop). Candidates are NEE and
+// BSDF-sampled emitter paths of at least three vertices (two with unified DI + GI).
+// Each records its reconnection vertex: the first x_k (k >= 2) whose pair passes
+// pt_connectable, a forced NEE light vertex (RESTIRPTE2026 Sec. 6.2.3), or none (replay only).
+PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, float coneSpread,
+                        constant Uniforms &u, constant SurfaceSettings *settings,
+                        constant MaterialResources &images, thread float &firstHitDistance) {
+    PTReservoir selected = pt_empty();
+    float weightSum = 0.0f;
+    uint risSeed = pt_seed(seed, 0u, 3u);
+    const int limit = scattering_limit(u.cameraTarget.w);
+    const uint minLength = restir_pt_unified(u) ? 2u : 3u;
+    HitRecord current = x1;
+    float3 incoming = view;
+    float3 throughput = float3(1.0f);   // roulette excluded (Sec. 6.2.4)
+    float inverseSurvival = 1.0f;
+    int scatter = 0;
+    float pathDistance = x1.t;
+    Material previous = x1.mat;
+    float previousPdf = 0.0f;
+    // x_{j-1}'s geometric normal and the traced length of x_{j-1} -> x_j. BSDF-sampled segments
+    // start at the offset ray origin, so the sampled direction, the traced distance and the
+    // shift's reconnection all describe the same segment.
+    float3 previousGeometric = float3(0.0f);
+    float previousDistance2 = 0.0f;
+    // Reconnection vertex of the shared prefix (pairs whose x_k continuation is BSDF sampled).
+    uint rcIndex = 0u; int rcScatter = 0;
+    float3 rcPosition = float3(0.0f), suffix = float3(1.0f);
+    float rcJacobian = 0.0f; uint rcDirection = 0u;
+    firstHitDistance = 0.0f;
+    for (uint j = 1u; j < PT_MAX_VERTICES; ++j) {
+        bool delta = is_delta(current.mat);
+        PTBsdf bsdf = pt_prepare(current.mat, current.normal, -incoming);
+        // Next-event estimation at x_j: a path of j + 1 vertices.
+        if (!delta && j + 1u >= minLength) {
+            uint neeSeed = pt_seed(seed, j, 1u);
+            float candidates = pt_nee_candidates(j, u), lightWeight = 1.0f;
+            LightSample ls = sample_direct_light(current.position, current.normal, u, neeSeed, images);
+            if (candidates > 1.0f) {
+                // RIS over light samples with target luminance(f cos Le); lightWeight = W_RIS p1.
+                float sum = 0.0f, chosenTarget = 0.0f;
+                for (uint i = 0u; i < PT_NEE_CANDIDATES; ++i) {
+                    LightSample candidate = i == 0u ? ls : sample_direct_light(current.position, current.normal, u, neeSeed, images);
+                    float target = 0.0f;
+                    if (candidate.pdf > 0.0f) {
+                        float ignored;
+                        float3 f = pt_eval(bsdf, candidate.wi, ignored);
+                        target = pt_luminance(f * abs(dot(current.normal, candidate.wi)) * candidate.emission);
+                    }
+                    float w = target > 0.0f && isfinite(target) ? target / candidate.pdf : 0.0f;
+                    sum += w;
+                    if (w > 0.0f && rand_f(neeSeed) * sum < w) { ls = candidate; chosenTarget = target; }
+                }
+                if (!(chosenTarget > 0.0f)) ls.pdf = 0.0f;
+                else lightWeight = sum / candidates / chosenTarget * ls.pdf;
+            }
+            if (light_visible(current.position, current.geometricNormal, ls, u.sceneIndex, images, u, current.error)) {
+                float bsdfPdf;
+                float3 f = pt_eval(bsdf, ls.wi, bsdfPdf);
+                float3 contribution = f * abs(dot(current.normal, ls.wi)) * ls.emission / ls.pdf;
+                float w = scatter < limit ? power_heuristic(candidates * ls.pdf, bsdfPdf) : 1.0f;
+                // Reconnection: the prefix's vertex, x_j itself (its NEE direction and light stay
+                // fixed), or else the NEE light vertex (forced; the shift then reuses the light
+                // sampler's geometry and PDF, a ReSTIR DI shift, and keeps LightSample.isDirectional).
+                bool atVertex = rcIndex == 0u && j >= 2u && pt_connectable(previous, previousPdf, previousDistance2,
+                    abs(dot(current.geometricNormal, incoming)), abs(dot(previousGeometric, incoming)), false, 0.0f, threshold);
+                float forcedJacobian = ls.pdf * light_geometry(current.position, ls, u.sceneIndex, u.light.w, images);
+                bool valid = rcIndex != 0u || atVertex || forcedJacobian > 0.0f;
+                float3 F = throughput * contribution * w;
+                if (valid && any(contribution > 0.0f) && all(isfinite(contribution)) &&
+                    pt_accept(weightSum, risSeed, F, inverseSurvival * lightWeight)) {
+                    selected = pt_empty();
+                    selected.F = F; selected.seed = seed;
+                    if (rcIndex != 0u) {
+                        selected.flags = pt_flags(j + 1u, rcIndex, true, false, rcScatter);
+                        selected.rcPosition = rcPosition; selected.rcJacobian = rcJacobian; selected.rcDirection = rcDirection;
+                        selected.rcRadiance = suffix * contribution * w;
+                    } else if (atVertex) {
+                        selected.flags = pt_flags(j + 1u, j, true, false, scatter);
+                        selected.rcPosition = current.position;
+                        selected.rcJacobian = previousPdf * abs(dot(current.geometricNormal, incoming)) / previousDistance2;
+                        selected.rcDirection = pt_encode_direction(ls.wi);
+                        selected.rcRadiance = ls.emission / ls.pdf;
+                        selected.lightPdf = ls.pdf;
+                    } else {
+                        bool directional = ls.isDirectional == 1u;
+                        selected.flags = pt_flags(j + 1u, j + 1u, true, directional, scatter);
+                        selected.rcPosition = directional ? ls.wi : ls.position;
+                        selected.rcJacobian = forcedJacobian;
+                        selected.rcRadiance = ls.emission;
+                        selected.lightPdf = as_type<float>(ls.isDirectional);
+                    }
+                }
+            }
+        }
+        // Roulette for the continuation (shading_kernel's policy), applied at initial
+        // sampling only: replay never terminates a path by roulette.
+        if (j >= 5u) {
+            float3 compensated = throughput * inverseSurvival;
+            float survival = clamp(max(compensated.x, max(compensated.y, compensated.z)), 0.05f, delta ? 0.99f : 0.95f);
+            uint rouletteSeed = pt_seed(seed, j, 2u);
+            if (rand_f(rouletteSeed) >= survival) break;
+            inverseSurvival /= survival;
+        }
+        if (!delta && scatter >= limit) break;
+        if (!delta) ++scatter;
+        uint bsdfSeed = pt_seed(seed, j, 0u);
+        float3 direction, weight;
+        float pdf;
+        if (!pt_sample(bsdf, incoming, current.front_face, bsdfSeed, direction, weight, pdf)) break;
+        if (rcIndex == 0u && j >= 2u && !delta &&
+            pt_connectable(previous, previousPdf, previousDistance2, abs(dot(current.geometricNormal, incoming)),
+                           abs(dot(previousGeometric, incoming)), current.mat.type != DIFFUSE, pdf, threshold)) {
+            rcIndex = j; rcScatter = scatter - 1;
+            rcPosition = current.position;
+            rcJacobian = previousPdf * abs(dot(current.geometricNormal, incoming)) / previousDistance2 * pdf;
+            rcDirection = pt_encode_direction(direction);
+            suffix = float3(1.0f);
+        } else if (rcIndex != 0u) {
+            suffix *= weight;
+        }
+        throughput *= weight;
+        if (!all(isfinite(throughput)) || max(throughput.x, max(throughput.y, throughput.z)) <= 0.0f) break;
+        Ray next;
+        next.origin = ray_origin(current.position, current.geometricNormal, direction, u, current.error);
+        next.direction = direction;
+        HitRecord hit;
+        bool found = trace_scene(next, u.sceneIndex, hit, images, u);
+        if (j == 1u) firstHitDistance = found ? hit.t : 10000.0f;
+        if (found) {
+            pathDistance += hit.t;
+            if (!delta) coneSpread = max(coneSpread, current.mat.type == DIFFUSE ? 0.25f : current.mat.roughness * 0.15f);
+            resolve_material(hit, next, u, settings, images, pathDistance * coneSpread);
+        }
+        // Emitter reached by the BSDF sample: a path of j + 1 vertices.
+        if (j + 1u >= minLength) {
+            float3 emitted = float3(0.0f);
+            float lightPdf = 0.0f;
+            bool environment = !found;
+            if (!found) {
+                if (u.sceneIndex == 0 || u.sceneIndex == 6) {
+                    emitted = eval_environment(direction, u, images);
+                    lightPdf = eval_environment_pdf(direction, current.normal, u, images);
+                }
+            } else if (hit.mat.type == EMISSIVE) {
+                emitted = hit.mat.emission;
+                lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
+            } else {
+                emitted = openpbr_emission(hit.mat, hit.normal, -direction);
+                if (u.sceneIndex == 6 && any(emitted > 0.0f))
+                    lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
+            }
+            float w = emission_weight(delta, !delta, true, pdf, lightPdf * pt_nee_candidates(j, u));
+            float3 F = throughput * emitted * w;
+            float distance2 = found ? hit.t * hit.t : -1.0f;
+            float endCosine = found ? abs(dot(hit.geometricNormal, direction)) : 1.0f;
+            // Reconnection: the prefix's vertex, this emitter (endpoint rule), or none (replay only).
+            bool atEnd = rcIndex == 0u && !delta && pt_connectable(current.mat, pdf, distance2, endCosine,
+                abs(dot(current.geometricNormal, direction)), false, 0.0f, threshold);
+            float endJacobian = environment ? pdf : pdf * endCosine / distance2;
+            if (any(emitted > 0.0f) && all(isfinite(emitted)) && (!atEnd || endJacobian > 0.0f) &&
+                pt_accept(weightSum, risSeed, F, inverseSurvival)) {
+                selected = pt_empty();
+                selected.F = F; selected.seed = seed;
+                if (rcIndex != 0u) {
+                    selected.flags = pt_flags(j + 1u, rcIndex, false, false, rcScatter);
+                    selected.rcPosition = rcPosition; selected.rcJacobian = rcJacobian; selected.rcDirection = rcDirection;
+                    // k = d - 1 keeps L_k MIS-free: the weight depends on the direction into x_k.
+                    selected.rcRadiance = rcIndex == j ? emitted : suffix * emitted * w;
+                    selected.lightPdf = lightPdf;
+                } else if (atEnd) {
+                    selected.flags = pt_flags(j + 1u, j + 1u, false, environment, scatter);
+                    selected.rcPosition = environment ? direction : hit.position;
+                    selected.rcJacobian = endJacobian;
+                } else {
+                    selected.flags = pt_flags(j + 1u, 0u, false, environment, scatter);
+                }
+            }
+        }
+        if (!found || hit.mat.type == EMISSIVE) break;
+        previous = current.mat; previousPdf = pdf;
+        previousGeometric = current.geometricNormal; previousDistance2 = hit.t * hit.t;
+        current = hit; incoming = direction;
+    }
+    float target = pt_luminance(selected.F);
+    if (target > 0.0f && weightSum > 0.0f) {
+        selected.W = weightSum / target;
+    } else {
+        selected = pt_empty();
+    }
+    selected.M = 1.0f;
+    return selected;
+}
+
+// Hybrid shift (RESTIRPT2022 Sec. 7.4; RESTIRPTE2026 Sec. 2.3 and Eq. 2) of reservoir r's
+// path into the pixel whose primary hit is y1 (seen along `view`): random replay of the
+// base random numbers for y_2..y_{k-1}, reconnection y_{k-1} -> x_k, then the stored suffix.
+// Returns the offset integrand times the PSS Jacobian, F(y) |dT/du|, and the offset path's own
+// Jacobian denominator (its rcJacobian as a base path). A shift is undefined (zero) when it is
+// not invertible: an earlier offset pair passes the criteria, the reconnection pair fails them,
+// the scattering budget differs, a replayed or reconnection vertex is missing or occluded.
+struct PTShift { float3 FJ; float jacobian; };
+
+PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, float coneSpread,
+                 constant Uniforms &u, constant SurfaceSettings *settings, constant MaterialResources &images) {
+    PTShift result = { float3(0.0f), 0.0f };
+    uint d = pt_length(r), k = pt_rc_index(r);
+    if (d < 2u || y1.mat.type == EMISSIVE) return result;
+    bool nee = (r.flags & PT_NEE) != 0u, environment = (r.flags & PT_ENVIRONMENT) != 0u;
+    if (k == 0u && nee) return result;
+    const int limit = scattering_limit(u.cameraTarget.w);
+    HitRecord current = y1;
+    float3 incoming = view;
+    float3 throughput = float3(1.0f);
+    int scatter = 0;
+    float pathDistance = y1.t;
+    Material previous = y1.mat;
+    float previousPdf = 0.0f;
+    float3 previousGeometric = float3(0.0f);
+    float previousDistance2 = 0.0f;
+    // Replay samples at y_1 .. y_{k-2} (reconnection) or y_1 .. y_{d-1} (replay only).
+    uint steps = k > 0u ? k - 2u : d - 1u;
+    for (uint j = 1u; j <= steps; ++j) {
+        bool delta = is_delta(current.mat);
+        if (!delta && scatter >= limit) return result;
+        if (!delta) ++scatter;
+        uint bsdfSeed = pt_seed(r.seed, j, 0u);
+        float3 direction, weight;
+        float pdf;
+        if (!sample_bsdf(current.mat, current.normal, incoming, current.front_face, bsdfSeed, direction, weight, pdf)) return result;
+        if (j >= 2u && !delta &&
+            pt_connectable(previous, previousPdf, previousDistance2, abs(dot(current.geometricNormal, incoming)),
+                           abs(dot(previousGeometric, incoming)), current.mat.type != DIFFUSE, pdf, threshold)) return result;
+        throughput *= weight;
+        if (!all(isfinite(throughput)) || max(throughput.x, max(throughput.y, throughput.z)) <= 0.0f) return result;
+        Ray next;
+        next.origin = ray_origin(current.position, current.geometricNormal, direction, u, current.error);
+        next.direction = direction;
+        HitRecord hit;
+        bool found = trace_scene(next, u.sceneIndex, hit, images, u);
+        if (found) {
+            pathDistance += hit.t;
+            if (!delta) coneSpread = max(coneSpread, current.mat.type == DIFFUSE ? 0.25f : current.mat.roughness * 0.15f);
+            resolve_material(hit, next, u, settings, images, pathDistance * coneSpread);
+        }
+        if (k == 0u && j == d - 1u) {
+            // Replay-only path: the offset must reach an emitter itself.
+            float3 emitted = float3(0.0f);
+            float lightPdf = 0.0f;
+            if (!found) {
+                if (u.sceneIndex == 0 || u.sceneIndex == 6) {
+                    emitted = eval_environment(direction, u, images);
+                    lightPdf = eval_environment_pdf(direction, current.normal, u, images);
+                }
+            } else if (hit.mat.type == EMISSIVE) {
+                emitted = hit.mat.emission;
+                lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
+            } else {
+                emitted = openpbr_emission(hit.mat, hit.normal, -direction);
+                if (u.sceneIndex == 6 && any(emitted > 0.0f))
+                    lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
+            }
+            if (!any(emitted > 0.0f) || !all(isfinite(emitted))) return result;
+            if (!delta && pt_connectable(current.mat, pdf, found ? hit.t * hit.t : -1.0f,
+                    found ? abs(dot(hit.geometricNormal, direction)) : 1.0f,
+                    abs(dot(current.geometricNormal, direction)), false, 0.0f, threshold)) return result;
+            result.FJ = throughput * emitted * emission_weight(delta, !delta, true, pdf, lightPdf * pt_nee_candidates(j, u));
+            result.jacobian = r.rcJacobian;
+            return result;
+        }
+        if (!found || hit.mat.type == EMISSIVE) return result;
+        previous = current.mat; previousPdf = pdf;
+        previousGeometric = current.geometricNormal; previousDistance2 = hit.t * hit.t;
+        current = hit; incoming = direction;
+    }
+    if (k == 0u || !(r.rcJacobian > 0.0f)) return result;
+    // Reconnection y_{k-1} -> x_k.
+    if (is_delta(current.mat)) return result;
+    bool bsdfSegment = !(nee && k == d);
+    if (bsdfSegment) {
+        if (scatter >= limit) return result;
+        ++scatter;
+    }
+    // A BSDF-sampled segment leaves y_{k-1}'s offset ray origin, as in the base path; an NEE
+    // segment is measured from the vertex itself, as sample_direct_light measures it.
+    float3 direction;
+    float distance2 = -1.0f;
+    Ray link;
+    if (environment) {
+        direction = normalize(float3(r.rcPosition));
+        link.origin = ray_origin(current.position, current.geometricNormal, direction, u, current.error);
+    } else {
+        float3 e = float3(r.rcPosition) - current.position;
+        if (!(dot(e, e) > 0.0f)) return result;
+        link.origin = ray_origin(current.position, current.geometricNormal, e, u, current.error);
+        if (bsdfSegment) e = float3(r.rcPosition) - link.origin;
+        distance2 = dot(e, e);
+        if (!(distance2 > 0.0f)) return result;
+        direction = e * rsqrt(distance2);
+    }
+    float startPdf;
+    float3 startBSDF = eval_bsdf_with_pdf(current.mat, current.normal, -incoming, direction, startPdf);
+    float3 start = startBSDF * abs(dot(current.normal, direction));
+    if (!any(start > 0.0f) || !(startPdf > 0.0f)) return result;
+    // The pair ending at y_{k-1} must fail the criteria with the reconnection direction.
+    if (k >= 3u) {
+        if (pt_connectable(previous, previousPdf, previousDistance2, abs(dot(current.geometricNormal, incoming)),
+                           abs(dot(previousGeometric, incoming)), bsdfSegment && current.mat.type != DIFFUSE, startPdf,
+                           threshold)) return result;
+    }
+    if (nee && k == d) {
+        // NEE light vertex: the light sampler's geometry, PDF and visibility test from y_{d-1}.
+        LightSample ls;
+        ls.isDirectional = as_type<uint>(r.lightPdf);
+        ls.position = environment ? current.position + direction * 1e6f : float3(r.rcPosition);
+        ls.wi = direction;
+        ls.dist = environment ? 1e6f : sqrt(distance2);
+        ls.emission = float3(r.rcRadiance);
+        ls.pdf = environment ? eval_environment_pdf(direction, current.normal, u, images)
+            : eval_light_pdf(current.position, ls.position, current.mat, u, images, ls.isDirectional >= 2u ? ls.isDirectional - 2u : 0xffffffffu);
+        float geometry = light_geometry(current.position, ls, u.sceneIndex, u.light.w, images);
+        if (!(ls.pdf > 0.0f) || !(geometry > 0.0f) || !any(ls.emission > 0.0f)) return result;
+        if (!light_visible(current.position, current.geometricNormal, ls, u.sceneIndex, images, u, current.error)) return result;
+        float w = scatter < limit ? power_heuristic(pt_nee_candidates(d - 1u, u) * ls.pdf, startPdf) : 1.0f;
+        result.FJ = throughput * start * ls.emission * (w * geometry) / r.rcJacobian;
+        if (!all(isfinite(result.FJ))) { result.FJ = float3(0.0f); return result; }
+        result.jacobian = ls.pdf * geometry;
+        return result;
+    }
+    HitRecord hit;
+    float geometry = 1.0f;
+    if (environment) {
+        link.direction = direction;
+        if (trace_scene(link, u.sceneIndex, hit, images, u)) return result;
+    } else {
+        float3 e = float3(r.rcPosition) - link.origin;
+        float expected = length(e);
+        link.direction = e / expected;
+        if (!trace_scene(link, u.sceneIndex, hit, images, u)) return result;
+        float tolerance = 2.0f * endpoint_tolerance(link.origin, float3(r.rcPosition), expected, u) + 1e-4f * expected;
+        if (abs(hit.t - expected) > tolerance) return result;
+        geometry = abs(dot(hit.geometricNormal, direction)) / distance2;
+        if (!(geometry > 0.0f)) return result;
+        resolve_material(hit, link, u, settings, images,
+            (pathDistance + hit.t) * max(coneSpread, current.mat.type == DIFFUSE ? 0.25f : current.mat.roughness * 0.15f));
+    }
+    float3 value;
+    float jacobian;
+    if (k == d) {
+        // x_k is an emitter the BSDF sample at y_{d-1} reaches.
+        float3 emitted;
+        float lightPdf;
+        if (environment) {
+            emitted = eval_environment(direction, u, images);
+            lightPdf = eval_environment_pdf(direction, current.normal, u, images);
+        } else {
+            emitted = hit.mat.type == EMISSIVE ? hit.mat.emission : openpbr_emission(hit.mat, hit.normal, -direction);
+            lightPdf = hit.mat.type == EMISSIVE || u.sceneIndex == 6
+                ? eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle) : 0.0f;
+        }
+        if (!any(emitted > 0.0f) || !all(isfinite(emitted))) return result;
+        if (!pt_connectable(current.mat, startPdf, distance2, environment ? 1.0f : abs(dot(hit.geometricNormal, direction)),
+                            abs(dot(current.geometricNormal, direction)), false, 0.0f, threshold)) return result;
+        jacobian = startPdf * geometry;
+        value = emitted * emission_weight(false, true, true, startPdf, lightPdf * pt_nee_candidates(d - 1u, u));
+    } else {
+        // x_k scatters towards the stored w_k; the suffix beyond it is L_k.
+        if (hit.mat.type == EMISSIVE || is_delta(hit.mat)) return result;
+        bool neeEnd = nee && k == d - 1u;
+        float3 wk = pt_decode_direction(r.rcDirection);
+        float endPdf;
+        float3 endBSDF = eval_bsdf_with_pdf(hit.mat, hit.normal, -direction, wk, endPdf);
+        float3 end = endBSDF * abs(dot(hit.normal, wk));
+        if (!any(end > 0.0f)) return result;
+        if (!pt_connectable(current.mat, startPdf, distance2, abs(dot(hit.geometricNormal, direction)),
+                            abs(dot(current.geometricNormal, direction)), !neeEnd && hit.mat.type != DIFFUSE, endPdf,
+                            threshold)) return result;
+        float w = 1.0f;
+        if (neeEnd) {
+            w = scatter < limit ? power_heuristic(r.lightPdf, endPdf) : 1.0f;
+            jacobian = startPdf * geometry;
+        } else {
+            if (!(endPdf > 0.0f) || scatter >= limit) return result;
+            ++scatter;
+            if (k + 1u == d) w = emission_weight(false, true, true, endPdf, r.lightPdf);
+            else if (scatter != int(pt_rc_scatter(r)) + 1) return result;
+            jacobian = startPdf * geometry * endPdf;
+        }
+        value = end * float3(r.rcRadiance) * w;
+    }
+    result.FJ = throughput * start * geometry * value / r.rcJacobian;
+    if (!all(isfinite(result.FJ))) { result.FJ = float3(0.0f); return result; }
+    result.jacobian = jacobian;
+    return result;
+}
+
+// Paired spatial reuse (RESTIRPTE2026 Sec. 3): PT_NEIGHBORS self-inverse pairing textures of
+// sides 254, 230 and 210 (PathTracerRenderer.makePairingTextures), each flipped, transposed and
+// offset per frame (Sec. 3.2). Pixel p's n-th partner q has p as its own n-th partner, so the
+// shift of p's path to q, computed once by restir_pt_shift_kernel, serves both pixels.
+constant int PT_PAIRING_SIDES[3] = { 254, 230, 210 };
+constant int PT_PAIRING_OFFSETS[3] = { 0, 254 * 254, 254 * 254 + 230 * 230 };
+int2 pt_partner(int2 p, uint n, constant Uniforms &u, const device char2 *pairing) {
+    uint h = pcg_hash(u.sampleIndex * 2654435761u + n * 0x9e3779b9u + 0x632be5abu);
+    int side = PT_PAIRING_SIDES[n];
+    int2 q = (h & 4u) != 0u ? p.yx : p;
+    if ((h & 1u) != 0u) q.x = -q.x;
+    if ((h & 2u) != 0u) q.y = -q.y;
+    int2 offset = int2(int((h >> 8) % uint(side)), int((h >> 20) % uint(side)));
+    int2 t = ((q + offset) % side + side) % side;
+    int2 delta = int2(pairing[PT_PAIRING_OFFSETS[n] + t.y * side + t.x]);
+    if ((h & 1u) != 0u) delta.x = -delta.x;
+    if ((h & 2u) != 0u) delta.y = -delta.y;
+    if ((h & 4u) != 0u) delta = delta.yx;
+    return p + delta;
+}
+
+// Symmetric G-buffer test for a pixel pair: both hold a scattering primary hit of the same
+// material type, within 10% depth and 37 degrees of normal. It depends on the G-buffer only.
+bool pt_pair_compatible(float4 a, float4 na, float4 b, float4 nb) {
+    return a.w > 0.0f && b.w > 0.0f && na.w == nb.w && na.w != float(EMISSIVE) &&
+        abs(a.w - b.w) <= 0.1f * max(a.w, b.w) && dot(na.xyz, nb.xyz) >= 0.8f;
+}
+
+bool pt_in_frame(int2 p, constant Uniforms &u) {
+    return p.x >= 0 && p.y >= 0 && p.x < int(u.width) && p.y < int(u.height);
+}
+
+float pt_primary_cone(constant Uniforms &u) {
+    return 2.0f * tan((u.cameraPos.w * 0.5f) * PI / 180.0f) / float(u.height);
+}
+
+// ReSTIR PT pass A: the initial path tree of every scattering primary hit (pt_generate).
+// It also records the first BSDF segment length for the MetalFX specular hit-distance guide.
+kernel void restir_pt_initial_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::write> ptIndirect [[texture(5)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    device PTReservoir *reservoirs [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    uint index = gid.y * u.width + gid.x;
+    float4 position = gbufferPosDepth.read(gid);
+    float4 normalMaterial = gbufferNormalMat.read(gid);
+    PTReservoir result = pt_empty();
+    float firstHit = 0.0f;
+    if (position.w > 0.0f && normalMaterial.w != float(EMISSIVE) ) {
+        HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
+        float3 view = float3(primarySurfaces[index].view);
+        uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2545f491u);
+        result = pt_generate(x1, view, seed, pt_footprint_threshold(position.w, x1.geometricNormal, view),
+                             pt_primary_cone(u), u, settings, images, firstHit);
+    }
+    reservoirs[index] = result;
+    ptIndirect.write(float4(0.0f, 0.0f, 0.0f, firstHit), gid);
+}
+
+// ReSTIR PT pass B: temporal reuse. The temporal neighbour's domain is the previous frame's
+// primary hit (history G-buffer and PrimarySurface); generalized Talbot MIS with confidences
+// (RESTIRPT2022 Eq. 36, Sec. 8.3) weighs the canonical and the temporal sample, each shifted
+// into the other domain. c_Cap = 20, optionally reduced by the duplication map (RESTIRPTE2026 Sec. 5).
+kernel void restir_pt_temporal_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::read> historyPosDepth [[texture(2)]],
+    texture2d<float, access::read> historyNormalMat [[texture(3)]],
+    texture2d<float, access::read> duplication [[texture(4)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device PrimarySurface *historySurfaces [[buffer(4)]],
+    device PTReservoir *reservoirs [[buffer(5)]],
+    const device PTReservoir *history [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    if (u.reservoirHistory <= 1 || u.reservoirHistoryReset != 0 || !restir_pt_temporal(u)) return;
+    uint index = gid.y * u.width + gid.x;
+    float4 position = gbufferPosDepth.read(gid);
+    float4 normalMaterial = gbufferNormalMat.read(gid);
+    if (!(position.w > 0.0f) || normalMaterial.w == float(EMISSIVE)) return;
+    float4 prevClip = u.prevViewProj * float4(position.xyz, 1.0f);
+    if (!(prevClip.w > 0.0f)) return;
+    float2 prevUV = prevClip.xy / prevClip.w * float2(0.5f, -0.5f) + 0.5f;
+    int2 prevCoord = int2(prevUV * float2(float(u.width), float(u.height)));
+    if (!all(prevUV >= 0.0f) || !all(prevUV < 1.0f) || !pt_in_frame(prevCoord, u)) return;
+    float4 oldPosition = historyPosDepth.read(uint2(prevCoord));
+    float4 oldNormal = historyNormalMat.read(uint2(prevCoord));
+    // The temporal domain is the reprojected pixel when it shows the same surface (the ReSTIR DI
+    // test, with the distance bound widened to three pixel footprints at low resolutions). GRIS
+    // stays unbiased for any neighbour; the test only avoids shifts into unrelated domains.
+    float footprint = 3.0f * pt_primary_cone(u) * position.w / max(abs(dot(normalMaterial.xyz, float3(primarySurfaces[index].view))), 0.25f);
+    bool sameSurface = oldPosition.w > 0.0f && oldNormal.w == normalMaterial.w &&
+        dot(oldNormal.xyz, normalMaterial.xyz) > 0.95f &&
+        distance(oldPosition.xyz, position.xyz) < max(max(0.01f, position.w * 0.01f), footprint);
+    uint prevIndex = uint(prevCoord.y) * u.width + uint(prevCoord.x);
+    PTReservoir t = history[prevIndex];
+    if (!sameSurface || !(t.M > 0.0f)) return;
+    PTReservoir c = reservoirs[index];
+    HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
+    float3 view = float3(primarySurfaces[index].view);
+    HitRecord y1 = load_primary_surface(historySurfaces[prevIndex], oldPosition);
+    float3 oldView = float3(historySurfaces[prevIndex].view);
+    float cone = pt_primary_cone(u);
+    float cap = PT_CONFIDENCE_CAP;
+    if (restir_pt_decorrelates(u)) {
+        float score = saturate(duplication.read(uint2(prevCoord)).x);
+        cap = mix(PT_CONFIDENCE_CAP, PT_CONFIDENCE_MIN, pow(score, PT_DUPLICATION_EXPONENT));
+    }
+    float cc = c.M, ct = min(t.M, cap);
+    float pc = pt_luminance(c.F), pt = pt_luminance(t.F);
+    PTShift toPrevious = { float3(0.0f), 0.0f }, toCurrent = { float3(0.0f), 0.0f };
+    if (pc > 0.0f) toPrevious = pt_shift(c, y1, oldView, pt_footprint_threshold(oldPosition.w, y1.geometricNormal, oldView),
+                                         cone, u, settings, images);
+    if (pt > 0.0f && t.W > 0.0f) toCurrent = pt_shift(t, x1, view, pt_footprint_threshold(position.w, x1.geometricNormal, view),
+                                                      cone, u, settings, images);
+    float pcPrevious = pt_luminance(toPrevious.FJ), ptCurrent = pt_luminance(toCurrent.FJ);
+    float wc = c.W > 0.0f ? pt_talbot(pc, cc, pcPrevious, ct) * pc * c.W : 0.0f;
+    float wt = pt_talbot(pt, ct, ptCurrent, cc) * ptCurrent * t.W;
+    float sum = wc + wt;
+    PTReservoir chosen = c;
+    float chosenTarget = pc;
+    uint selectSeed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
+    if (wt > 0.0f && rand_f(selectSeed) * sum < wt) {
+        chosen = t;
+        float jacobian = pt_rc_index(t) > 0u ? toCurrent.jacobian / t.rcJacobian : 1.0f;
+        chosen.F = toCurrent.FJ / jacobian;
+        if (pt_rc_index(t) > 0u) chosen.rcJacobian = toCurrent.jacobian;
+        chosenTarget = pt_luminance(chosen.F);
+    }
+    float W = chosenTarget > 0.0f && sum > 0.0f ? sum / chosenTarget : 0.0f;
+    if (!(W > 0.0f) || !isfinite(W)) chosen = pt_empty();
+    else chosen.W = W;
+    chosen.M = cc + ct;
+    reservoirs[index] = chosen;
+}
+
+// ReSTIR PT pass B: each pixel shifts its path to its PT_NEIGHBORS paired partners once.
+// The partner's primary hit is its PrimarySurface and G-buffer position, seen along its own
+// camera ray. Output: F(T x) |dT/du| and the shifted path's Jacobian denominator.
+kernel void restir_pt_shift_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device PTReservoir *reservoirs [[buffer(5)]],
+    device float4 *shifts [[buffer(7)]],
+    const device char2 *pairing [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    uint index = gid.y * u.width + gid.x;
+    float4 position = gbufferPosDepth.read(gid);
+    float4 normalMaterial = gbufferNormalMat.read(gid);
+    PTReservoir r = reservoirs[index];
+    bool hasPath = pt_length(r) > 0u && pt_luminance(r.F) > 0.0f;
+    float cone = pt_primary_cone(u);
+    for (uint n = 0u; n < PT_NEIGHBORS; ++n) {
+        float4 value = float4(0.0f);
+        int2 q = pt_partner(int2(gid), n, u, pairing);
+        if (hasPath && pt_in_frame(q, u)) {
+            float4 qPosition = gbufferPosDepth.read(uint2(q));
+            float4 qNormal = gbufferNormalMat.read(uint2(q));
+            if (pt_pair_compatible(position, normalMaterial, qPosition, qNormal)) {
+                uint qIndex = uint(q.y) * u.width + uint(q.x);
+                HitRecord y1 = load_primary_surface(primarySurfaces[qIndex], qPosition);
+                float3 view = float3(primarySurfaces[qIndex].view);
+                PTShift s = pt_shift(r, y1, view, pt_footprint_threshold(qPosition.w, y1.geometricNormal, view),
+                                     cone, u, settings, images);
+                value = float4(s.FJ, s.jacobian);
+            }
+        }
+        shifts[index * PT_NEIGHBORS + n] = value;
+    }
+}
+
+// ReSTIR PT pass C: spatial GRIS over the canonical reservoir and its paired partners with
+// defensive pairwise MIS and confidence weights (RESTIRPT2022 Eq. 38, as its real-time
+// prototype weighs it), shading with the vector-valued resampling weights (RESTIRPTE2026
+// Sec. 6.3). The selected path becomes the next frame's temporal history. The current
+// PrimarySurface is copied to the history buffer here, after pass A read the old one.
+kernel void restir_pt_spatial_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::read_write> ptIndirect [[texture(5)]],
+    constant Uniforms &u [[buffer(0)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    device PrimarySurface *historySurfaces [[buffer(4)]],
+    const device PTReservoir *reservoirs [[buffer(5)]],
+    device PTReservoir *output [[buffer(6)]],
+    const device float4 *shifts [[buffer(7)]],
+    const device char2 *pairing [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    uint index = gid.y * u.width + gid.x;
+    historySurfaces[index] = primarySurfaces[index];
+    float4 position = gbufferPosDepth.read(gid);
+    float4 normalMaterial = gbufferNormalMat.read(gid);
+    float firstHit = ptIndirect.read(gid).w;
+    PTReservoir c = reservoirs[index];
+    if (!(position.w > 0.0f) || normalMaterial.w == float(EMISSIVE) || !(c.M > 0.0f)) {
+        output[index] = pt_empty();
+        ptIndirect.write(float4(0.0f, 0.0f, 0.0f, firstHit), gid);
+        return;
+    }
+    uint partner[PT_NEIGHBORS];
+    bool valid[PT_NEIGHBORS];
+    float count = 0.0f;
+    for (uint n = 0u; n < PT_NEIGHBORS; ++n) {
+        int2 q = pt_partner(int2(gid), n, u, pairing);
+        valid[n] = false; partner[n] = 0u;
+        if (!pt_in_frame(q, u)) continue;
+        partner[n] = uint(q.y) * u.width + uint(q.x);
+        valid[n] = pt_pair_compatible(position, normalMaterial, gbufferPosDepth.read(uint2(q)), gbufferNormalMat.read(uint2(q)))
+            && reservoirs[partner[n]].M > 0.0f;
+        if (valid[n]) count += 1.0f;
+    }
+    uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x61c88647u);
+    float pc = pt_luminance(c.F);
+    float canonical = 1.0f, weightSum = 0.0f, confidence = c.M;
+    float3 color = float3(0.0f);
+    PTReservoir chosen = c;
+    float chosenTarget = pc;
+    for (uint n = 0u; n < PT_NEIGHBORS; ++n) {
+        if (!valid[n]) continue;
+        PTReservoir q = reservoirs[partner[n]];
+        confidence += q.M;
+        // Canonical sample shifted to q: p-hat_q(T x_c) |dT/dx_c|.
+        float toPartner = pt_luminance(shifts[index * PT_NEIGHBORS + n].xyz);
+        canonical += 1.0f - pt_pairwise(toPartner, q.M, pc, c.M, count);
+        // q's sample shifted here: F(T x_q) |dT/dx_q| and its own Jacobian denominator.
+        float4 fromPartner = shifts[partner[n] * PT_NEIGHBORS + n];
+        float pq = pt_luminance(q.F), pqc = pt_luminance(fromPartner.xyz);
+        if (pq > 0.0f && pqc > 0.0f && q.W > 0.0f) {
+            float m = pt_pairwise(pq, q.M, pqc, c.M, count);
+            float w = m * pqc * q.W;
+            color += m * fromPartner.xyz * q.W;
+            weightSum += w;
+            if (rand_f(seed) * weightSum < w) {
+                chosen = q;
+                float jacobian = pt_rc_index(q) > 0u ? fromPartner.w / q.rcJacobian : 1.0f;
+                chosen.F = fromPartner.xyz / jacobian;
+                if (pt_rc_index(q) > 0u) chosen.rcJacobian = fromPartner.w;
+                chosenTarget = pt_luminance(chosen.F);
+            }
+        }
+    }
+    if (pc > 0.0f && c.W > 0.0f) {
+        float w = canonical * pc * c.W;
+        color += canonical * float3(c.F) * c.W;
+        weightSum += w;
+        if (rand_f(seed) * weightSum < w) { chosen = c; chosenTarget = pc; }
+    }
+    float share = 1.0f / (count + 1.0f);
+    color *= share;
+    weightSum *= share;
+    float W = chosenTarget > 0.0f && weightSum > 0.0f ? weightSum / chosenTarget : 0.0f;
+    if (!(W > 0.0f) || !isfinite(W)) chosen = pt_empty();
+    else chosen.W = W;
+    chosen.M = confidence;
+    output[index] = chosen;
+    if (!all(isfinite(color))) color = float3(0.0f);
+    ptIndirect.write(float4(max(color, 0.0f), firstHit), gid);
+}
+
+// RESTIRPTE2026 Sec. 5: the share of the 17 x 17 neighbourhood (288 other pixels) whose final
+// reservoir holds a shifted copy of this pixel's path, detected by its replay seed.
+kernel void restir_pt_duplication_kernel(
+    texture2d<float, access::write> duplication [[texture(4)]],
+    constant Uniforms &u [[buffer(0)]],
+    const device PTReservoir *reservoirs [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    PTReservoir r = reservoirs[gid.y * u.width + gid.x];
+    float count = 0.0f;
+    if (pt_length(r) > 0u && r.W > 0.0f) {
+        for (int dy = -8; dy <= 8; ++dy) for (int dx = -8; dx <= 8; ++dx) {
+            int2 q = int2(gid) + int2(dx, dy);
+            if ((dx == 0 && dy == 0) || !pt_in_frame(q, u)) continue;
+            PTReservoir s = reservoirs[uint(q.y) * u.width + uint(q.x)];
+            if (s.seed == r.seed && pt_length(s) > 0u && s.W > 0.0f) count += 1.0f;
+        }
+    }
+    duplication.write(float4(count / 288.0f), gid);
+}
+
+// ============================================================================
 // PASS 2: Spatial Resampling & Full Path Tracing
 // ============================================================================
 
@@ -2399,6 +3306,7 @@ kernel void shading_kernel(
     texture2d<float, access::read> inGIWeights [[texture(11)]],
     texture2d<float, access::read_write> oidnAlbedoAccum [[texture(12)]],
     texture2d<float, access::read_write> oidnNormalAccum [[texture(13)]],
+    texture2d<float, access::read> ptIndirect [[texture(14)]],
     constant Uniforms &uniforms [[buffer(0)]],
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
@@ -2463,7 +3371,13 @@ kernel void shading_kernel(
         } else {
             // Camera rays see MaterialX emission directly; no light strategy samples them.
             radiance = openpbr_emission(mat, norm, -primaryRay.direction);
-            if (uniforms.samplingMode == 0 && mat.type == DIFFUSE) {
+            // ReSTIR PT (restir_pt_spatial_kernel) estimates paths of three or more vertices,
+            // or, unified, every path of two or more (RESTIRPTE2026 Sec. 6.1).
+            bool restirPT = uniforms.samplingMode == 0 && restir_pt_active(uniforms);
+            bool unifiedPT = restirPT && restir_pt_unified(uniforms);
+            if (unifiedPT) {
+                // Direct light is a two-vertex path of the PT reservoir; no NEE or DI here.
+            } else if (uniforms.samplingMode == 0 && mat.type == DIFFUSE) {
                 // ReSTIR Spatial Reuse on Primary Surface
                 float4 cPosDir = inSamplePosDir.read(gid);
                 float4 cEmitPdf = inSampleEmitPdf.read(gid);
@@ -2552,12 +3466,13 @@ kernel void shading_kernel(
                 }
 
                 // Spatial ReSTIR GI reuse for the first indirect diffuse vertex.
-                // Pass 1 writes empty GI reservoirs when the depth excludes it.
-                bool giEnabled = restir_gi_enabled(uniforms.cameraTarget.w);
-                float4 selectedGIPosPdf = inGIPosPdf.read(gid);
-                float4 selectedGINormal = inGINormal.read(gid);
-                float3 selectedGIRadiance = inGIRadiance.read(gid).xyz;
-                float4 currentGIWeights = inGIWeights.read(gid);
+                // Pass 1 writes empty GI reservoirs when the depth excludes it; ReSTIR PT
+                // binds placeholders instead.
+                bool giEnabled = restir_gi_enabled(uniforms.cameraTarget.w) && !restirPT;
+                float4 selectedGIPosPdf = giEnabled ? inGIPosPdf.read(gid) : float4(0.0f);
+                float4 selectedGINormal = giEnabled ? inGINormal.read(gid) : float4(0.0f);
+                float3 selectedGIRadiance = giEnabled ? inGIRadiance.read(gid).xyz : float3(0.0f);
+                float4 currentGIWeights = giEnabled ? inGIWeights.read(gid) : float4(0.0f);
                 float giTarget = selectedGINormal.w > 0.0f
                     ? eval_restir_gi_target(pos, norm, primaryRay.direction, mat,
                         selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
@@ -2649,7 +3564,14 @@ kernel void shading_kernel(
             int scatteringDepth = 0;
             const int scatteringLimit = scattering_limit(uniforms.cameraTarget.w);
             bool emissionOnly = false;
-            for (int bounce = 1; ; ++bounce) {
+            if (unifiedPT) {
+                float4 indirect = ptIndirect.read(gid);
+                radiance += indirect.rgb;
+                if (mat.type == GLOSSY || mat.type == DIELECTRIC || mat.type == OPENPBR) specularHitDistance = indirect.w;
+            } else if (restirPT) {
+                radiance += ptIndirect.read(gid).rgb;
+            }
+            for (int bounce = 1; !unifiedPT; ++bounce) {
                 float3 nextDirection, bsdfWeight;
                 float bsdfPDF;
                 bool previousDelta = is_delta(currentHit.mat);
@@ -2710,6 +3632,8 @@ kernel void shading_kernel(
                     radiance += throughput * weight * surfaceEmission;
                 }
                 if (emissionOnly) break;
+                // The x2 emission above is a two-vertex path; ReSTIR PT holds the longer ones.
+                if (restirPT) break;
 
                 bool restirGISecondary = uniforms.samplingMode == 0 && mat.type == DIFFUSE &&
                     bounce == 1 && rec.mat.type == DIFFUSE;
@@ -3039,6 +3963,8 @@ struct Uniforms {
     var viewportMode: UInt32
     var width: UInt32
     var height: UInt32
+    // IndirectReuse raw value (bits 0-1) and ReSTIR PT options (bits 2-3); occupies former padding (offset 228).
+    var indirectReuse: UInt32 = IndirectReuse.restirGI.rawValue
     var jitter: SIMD2<Float> = .zero
     var sampleIndex: UInt32 = 1
     var reservoirHistoryReset: UInt32 = 0
@@ -3070,6 +3996,79 @@ enum SpatialNeighborSelection: UInt32 {
     case automatic = 2
     func resolved(importedSceneGraph: Bool) -> SpatialNeighborSelection {
         self == .automatic ? (importedSceneGraph ? .compatibility : .uniform) : self
+    }
+}
+
+// Indirect-light reuse of the ReSTIR strategy (Uniforms.indirectReuse bits 0-1).
+// REFERENCES.md: RESTIRGI2021, RESTIRPT2022, RESTIRPTE2026.
+enum IndirectReuse: UInt32, Sendable {
+    // Bounded first-bounce diffuse ReSTIR GI; the ordinary path loop supplies deeper transport.
+    case restirGI = 0
+    // ReSTIR PT for every path of three or more vertices (all primary materials); ReSTIR DI
+    // (diffuse primaries) or MIS next-event estimation lights the primary hit.
+    case restirPT = 1
+    // ReSTIR PT for every path of two or more vertices: direct and indirect light share one
+    // reservoir and no ReSTIR DI pass runs (RESTIRPTE2026 Sec. 6.1).
+    case restirPTUnified = 2
+    // Host-side default: unified ReSTIR PT for imported meshes and scene graphs (scene 6), where it
+    // measured 8-25% lower equal-time MSE than ReSTIR GI, and ReSTIR GI for the procedural scenes,
+    // where its extra shifts cost 22-105% more error at equal time (see tests/PERFORMANCE.md).
+    case automatic = 3
+    func resolved(importedScene: Bool) -> IndirectReuse {
+        self == .automatic ? (importedScene ? .restirPTUnified : .restirGI) : self
+    }
+}
+
+// RESTIRPTE2026 Sec. 3.1: a tileable, self-inverse pairing of an even side x side torus. Link
+// indices start as consecutive pairs; n_sigma tiled 2 x 2 shuffles (every other one offset
+// diagonally by one, wrapping) random-walk them, so linked texels end up about sigma apart.
+// Each texel stores the wrapped offset (-side/2, side/2] to the texel sharing its link index.
+func makePairingTexture(side: Int, sigma: Double, seed: UInt64) -> [SIMD2<Int8>] {
+    precondition(side % 2 == 0 && side <= 254 && sigma >= 0.8)
+    var state = seed
+    func next() -> UInt64 {  // SplitMix64
+        state &+= 0x9e3779b97f4a7c15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xbf58476d1ce4e5b9
+        z = (z ^ (z >> 27)) &* 0x94d049bb133111eb
+        return z ^ (z >> 31)
+    }
+    var link = (0..<(side * side)).map { $0 / 2 }, block = [0, 0, 0, 0]
+    // Eq. 3; the negative powers are the paper's small-sigma correction.
+    let shuffles = Int(sigma * sigma / 2 + 1.46 / sigma + 1.76 / (sigma * sigma) + 0.656 / (sigma * sigma * sigma) + 0.5)
+    for iteration in 0..<max(1, shuffles) {
+        let shift = iteration % 2
+        for by in stride(from: shift, to: side + shift, by: 2) {
+            let row0 = (by % side) * side, row1 = ((by + 1) % side) * side
+            for bx in stride(from: shift, to: side + shift, by: 2) {
+                let c0 = row0 + bx % side, c1 = row0 + (bx + 1) % side, c2 = row1 + bx % side, c3 = row1 + (bx + 1) % side
+                block[0] = link[c0]; block[1] = link[c1]; block[2] = link[c2]; block[3] = link[c3]
+                // Fisher-Yates permutation of the block's four link indices.
+                for i in stride(from: 3, to: 0, by: -1) { block.swapAt(i, Int(next() % UInt64(i + 1))) }
+                link[c0] = block[0]; link[c1] = block[1]; link[c2] = block[2]; link[c3] = block[3]
+            }
+        }
+    }
+    var first = [Int](repeating: -1, count: side * side / 2), partner = [Int](repeating: -1, count: side * side)
+    for (texel, index) in link.enumerated() {
+        if first[index] < 0 { first[index] = texel } else { partner[texel] = first[index]; partner[first[index]] = texel }
+    }
+    func wrapped(_ d: Int) -> Int { d > side / 2 ? d - side : (d < -side / 2 ? d + side : d) }
+    return (0..<(side * side)).map { texel in
+        let other = partner[texel]
+        return SIMD2(Int8(wrapped(other % side - texel % side)), Int8(wrapped(other / side - texel / side)))
+    }
+}
+
+// The three pairing textures ReSTIR PT's spatial reuse reads (MSL PT_PAIRING_SIDES: 254, 230 and
+// 210, as in the paper's example, so their repeats do not align), built once on first use.
+// sigma = sqrt(8 / (9 pi)) R matches the mean neighbour distance of a radius-R disk (Sec. 7);
+// R = 20 pixels follows RESTIRPT2022's real-time setting.
+enum ReSTIRPTPairing {
+    static let sides = [254, 230, 210]
+    static let sigma = (8.0 / (9.0 * Double.pi)).squareRoot() * 20.0
+    static let deltas: [SIMD2<Int8>] = sides.enumerated().flatMap { index, side in
+        makePairingTexture(side: side, sigma: sigma, seed: 0x5eed_0000 + UInt64(index))
     }
 }
 
@@ -3592,16 +4591,32 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let usesMetalFX: Bool
         // Measured opaque MetalFX scaler allocations (see MetalFXDenoiser.scalerBytesPerPixel).
         var metalFXScalerBytesPerPixel: UInt64 = 0
+        // Indirect reuse of the ReSTIR strategy; it decides which reservoirs are full size.
+        var indirectReuse: IndirectReuse = PathTracerRenderer.defaultIndirectReuse
 
-        static let reservoirBytesPerPixel: UInt64 = 208
+        // DI: 6 RGBA32F. GI: 6 RGBA32F + 2 RGBA16F. ReSTIR PT: two 64 B path reservoirs,
+        // three 16 B paired shifts, the RGBA32F indirect estimate, a history PrimarySurface
+        // and the R16F duplication map.
+        static let diReservoirBytesPerPixel: UInt64 = 96
+        static let giReservoirBytesPerPixel: UInt64 = 112
+        static let ptReservoirBytesPerPixel: UInt64 = 2 * 64 + 3 * 16 + 16 + PathTracerRenderer.primarySurfaceStride + 2
+        static func reservoirBytesPerPixel(_ mode: IndirectReuse) -> UInt64 {
+            switch mode {
+            case .restirGI: return diReservoirBytesPerPixel + giReservoirBytesPerPixel
+            case .restirPT: return diReservoirBytesPerPixel + ptReservoirBytesPerPixel
+            case .restirPTUnified: return ptReservoirBytesPerPixel
+            // Unresolved: the larger of the two sets it can resolve to.
+            case .automatic: return max(reservoirBytesPerPixel(.restirGI), reservoirBytesPerPixel(.restirPTUnified))
+            }
+        }
         static let metalFXTextureBytesPerPixel: UInt64 = 55
         var bytesPerPixel: UInt64 {
             // Beauty/sample/position/OIDN accumulations: 6 RGBA32F; three
             // normal/material guides: 3 RGBA16F; resolved primary surfaces:
-            // 120 B. ReSTIR adds DI (6 RGBA32F) and GI (6 RGBA32F + 2 RGBA16F).
+            // 128 B. ReSTIR adds the reservoirs of its indirect-reuse mode.
             // MetalFX formats total 55 B/pixel plus the scaler's own history and
             // feature allocations.
-            120 + PathTracerRenderer.primarySurfaceStride + (usesReSTIR ? Self.reservoirBytesPerPixel : 0)
+            120 + PathTracerRenderer.primarySurfaceStride + (usesReSTIR ? Self.reservoirBytesPerPixel(indirectReuse) : 0)
                 + (usesMetalFX ? Self.metalFXTextureBytesPerPixel + metalFXScalerBytesPerPixel : 0)
         }
         var bytes: UInt64? {
@@ -3624,12 +4639,16 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     let presentPipeline: MTLComputePipelineState
     // The scene kernels. Scenes 0-5 use a library compiled with VIBE_MESHES=0: the imported-mesh
     // traversal is dead code there, but its registers slowed them by 13-17% (tests/PERFORMANCE.md).
-    struct SceneKernels { let temporal, shading, guides, pick: MTLComputePipelineState }
-    let proceduralKernels: SceneKernels
-    var sceneKernels: SceneKernels {
-        sceneIndex == 6 ? SceneKernels(temporal: restirTemporalPipeline, shading: shadingPipeline,
-                                       guides: metalFXGuidePipeline, pick: pickPipeline) : proceduralKernels
+    struct SceneKernels {
+        let temporal, shading, guides, pick: MTLComputePipelineState
+        // Nil for a library without them (tests/benchmark.py baselines), which then renders ReSTIR GI.
+        let pt: ReSTIRPTKernels?
     }
+    // ReSTIR PT passes: initial paths, temporal reuse, paired shifts, spatial reuse, duplication map.
+    struct ReSTIRPTKernels { let initial, temporal, shift, spatial, duplication: MTLComputePipelineState }
+    let proceduralKernels: SceneKernels
+    let meshKernels: SceneKernels
+    var sceneKernels: SceneKernels { sceneIndex == 6 ? meshKernels : proceduralKernels }
     let supportsMetalFX: Bool
     var materials: MaterialLibrary
     private(set) var metalFX: MetalFXDenoiser?
@@ -3647,7 +4666,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var gbufferNormalMat: MTLTexture?
     var gbufferAlbedoRough: MTLTexture?
     // MSL PrimarySurface per pixel: pass 1 writes it; shading and MetalFX guides read it.
-    nonisolated static let primarySurfaceStride: UInt64 = 120
+    nonisolated static let primarySurfaceStride: UInt64 = 128
     private(set) var primarySurfaces: MTLBuffer?
     var accumTexture: MTLTexture?
     var sampleTexture: MTLTexture?
@@ -3670,6 +4689,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var giNormalB: MTLTexture?
     var giRadianceB: MTLTexture?
     var giWeightsB: MTLTexture?
+    // ReSTIR PT (IndirectReuse.restirPT*): the temporal pass writes ptReservoirs, the spatial
+    // pass writes ptHistory (the next frame's temporal input); ptShifts holds each pixel's paths
+    // shifted to its three paired partners. Placeholders (1 x 1, nil buffers) in other modes.
+    var ptReservoirs: MTLBuffer?
+    var ptHistory: MTLBuffer?
+    var ptShifts: MTLBuffer?
+    var historyPrimarySurfaces: MTLBuffer?
+    var ptIndirect: MTLTexture?
+    var ptDuplication: MTLTexture?
+    private var ptPairing: MTLBuffer?
+    nonisolated static let ptReservoirStride = 64
 
     var prevViewProj = matrix_identity_float4x4
     var frameIndex: UInt32 = 0
@@ -3678,9 +4708,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // rejects disocclusions. Cuts and inspection/non-ReSTIR frames clear it.
     private(set) var reservoirHistory: UInt32 = 0
 #if VIBE_TESTING
-    // GPU checks replay one jitter/seed sequence to compare renders of a view, and
-    // exercise the unsupported-device presentation path on MetalFX-capable GPUs.
-    func restartSampleSequence() { sampleIndex = 0 }
+    // GPU checks replay one jitter/seed sequence to compare renders of a view (or start
+    // another at `index` for independent trials), and exercise the unsupported-device
+    // presentation path on MetalFX-capable GPUs.
+    func restartSampleSequence(at index: UInt32 = 0) { sampleIndex = index }
     static var simulateUnsupportedMetalFX = false
 #endif
 
@@ -3691,6 +4722,38 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var enableFog: UInt32 = 0 { didSet { if oldValue != enableFog { resetAccumulation() } } }
     var spatialNeighbors = PathTracerRenderer.defaultSpatialNeighbors {
         didSet { if oldValue != spatialNeighbors { resetAccumulation() } }
+    }
+    // Indirect reuse of the ReSTIR strategy. REFERENCES.md: RESTIRPT2022, RESTIRPTE2026.
+    var indirectReuse = PathTracerRenderer.defaultIndirectReuse {
+        didSet { if oldValue != indirectReuse { resetAccumulation() } }
+    }
+    // RESTIRPTE2026 Sec. 5 duplication-map confidence reduction for ReSTIR PT. It trades
+    // correlation for bias, so the progressive renderer leaves it off by default.
+    var ptDecorrelation = PathTracerRenderer.defaultPTDecorrelation {
+        didSet { if oldValue != ptDecorrelation { resetAccumulation() } }
+    }
+    // ReSTIR PT temporal reuse normally runs only while the view changes (restir_pt_temporal);
+    // true keeps it on every accumulated frame, as the papers' real-time renderers do.
+    var ptTemporalWhileAccumulating = false {
+        didSet { if oldValue != ptTemporalWhileAccumulating { resetAccumulation() } }
+    }
+    nonisolated static var defaultIndirectReuse: IndirectReuse {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with another indirect reuse.
+        switch ProcessInfo.processInfo.environment["VIBE_INDIRECT_REUSE"] {
+        case "gi": return .restirGI
+        case "pt": return .restirPT
+        case "unified": return .restirPTUnified
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultPTDecorrelation: Bool {
+#if VIBE_TESTING
+        if ProcessInfo.processInfo.environment["VIBE_PT_DECORRELATION"] == "1" { return true }
+#endif
+        return false
     }
     static var defaultSpatialNeighbors: SpatialNeighborSelection {
 #if VIBE_TESTING
@@ -3748,7 +4811,14 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return (near, max(100, min(1_000_000, distance * 2_000)))
     }
     private var rejectedRenderSize: SIMD2<Int>?
-    private var frameResourcesUseReSTIR: Bool?
+    // The reservoir set of the frame resources (reservoirSet): nil before the first frame.
+    private var frameReservoirs: UInt32?
+    // 0 for non-ReSTIR and inspection frames (1 x 1 placeholders), else 1 + IndirectReuse.
+    func reservoirSet(usesReSTIR: Bool) -> UInt32 { usesReSTIR ? activeIndirectReuse.rawValue + 1 : 0 }
+    // indirectReuse with .automatic resolved for the current scene.
+    var activeIndirectReuse: IndirectReuse {
+        sceneKernels.pt == nil ? .restirGI : indirectReuse.resolved(importedScene: sceneIndex == 6)
+    }
     // Set when only the reservoirs were reallocated; the next frame skips temporal reuse.
     private(set) var reservoirHistoryNeedsReset = false
     var concurrentRenderBytes: UInt64 = 0
@@ -3767,7 +4837,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             gbufferAlbedoRough, accumTexture, sampleTexture, oidnAlbedoAccum,
             oidnNormalAccum, resPosDirA, resEmitPdfA, resWeightsA, resPosDirB,
             resEmitPdfB, resWeightsB, giPosPdfA, giNormalA, giRadianceA,
-            giWeightsA, giPosPdfB, giNormalB, giRadianceB, giWeightsB,
+            giWeightsA, giPosPdfB, giNormalB, giRadianceB, giWeightsB, ptIndirect, ptDuplication,
         ]
         var seen = Set<ObjectIdentifier>()
         let metalFXTextures: [MTLTexture?] = metalFX.map { fx in
@@ -3780,14 +4850,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return (textures + metalFXTextures).compactMap { $0 }.reduce(scalerBytes) { total, texture in
             let id = ObjectIdentifier(texture as AnyObject)
             return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
-        } + UInt64(primarySurfaces?.allocatedSize ?? 0)
+        } + [primarySurfaces, historyPrimarySurfaces, ptReservoirs, ptHistory, ptShifts, ptPairing]
+            .reduce(UInt64(0)) { $0 + UInt64($1?.allocatedSize ?? 0) }
     }
 
     func renderMemoryError(width: Int, height: Int) -> String? {
         let usesReSTIR = samplingMode == 0 && viewportMode == 0
         let usesMetalFX = denoiserEnabled && supportsMetalFX && usesReSTIR
         let plan = FrameResourcePlan(width: width, height: height, usesReSTIR: usesReSTIR, usesMetalFX: usesMetalFX,
-            metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0)
+            metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0, indirectReuse: activeIndirectReuse)
         guard let frameBytes = plan.bytes else { return "Render dimensions are too large." }
         // Include the live frame set during resize/export, scene textures, the
         // measured MetalFX scaler internals, and modest command/display headroom
@@ -3798,10 +4869,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let resizes = accumTexture == nil || accumTexture?.width != width || accumTexture?.height != height
         let resident = resizes ? residentFrameBytes : 0
         let baseRequired = resizes ? frameBytes : residentFrameBytes
-        // A strategy or inspection change replaces only the reservoirs; the old
-        // ones stay live (in residentFrameBytes) for in-flight frames.
-        let reservoirs = pixels.multipliedReportingOverflow(by: FrameResourcePlan.reservoirBytesPerPixel)
-        let additionalReservoirs = !resizes && plan.usesReSTIR && frameResourcesUseReSTIR != true
+        // A strategy, indirect-reuse or inspection change replaces only the reservoirs; the
+        // old ones stay live (in residentFrameBytes) for in-flight frames.
+        let reservoirs = pixels.multipliedReportingOverflow(by: FrameResourcePlan.reservoirBytesPerPixel(activeIndirectReuse))
+        let additionalReservoirs = !resizes && plan.usesReSTIR && frameReservoirs != reservoirSet(usesReSTIR: true)
             ? reservoirs.partialValue : 0
         let withResident = baseRequired.addingReportingOverflow(resident)
         let required = withResident.partialValue.addingReportingOverflow(additionalReservoirs)
@@ -3860,20 +4931,31 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             self.shadingPipeline = try shared?.shadingPipeline ?? device.makeComputePipelineState(function: fnShading)
             self.metalFXGuidePipeline = try shared?.metalFXGuidePipeline ?? device.makeComputePipelineState(function: fnGuides)
             self.presentPipeline = try shared?.presentPipeline ?? device.makeComputePipelineState(function: fnPresent)
+            func pipeline(_ library: MTLLibrary, _ name: String) throws -> MTLComputePipelineState {
+                guard let function = library.makeFunction(name: name) else {
+                    throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
+                }
+                return try device.makeComputePipelineState(function: function)
+            }
+            func ptKernels(_ library: MTLLibrary) throws -> ReSTIRPTKernels? {
+                let names = ["restir_pt_initial_kernel", "restir_pt_temporal_kernel", "restir_pt_shift_kernel",
+                             "restir_pt_spatial_kernel", "restir_pt_duplication_kernel"]
+                guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
+                let p = try names.map { try pipeline(library, $0) }
+                return ReSTIRPTKernels(initial: p[0], temporal: p[1], shift: p[2], spatial: p[3], duplication: p[4])
+            }
             if let shared {
                 self.proceduralKernels = shared.proceduralKernels
+                self.meshKernels = shared.meshKernels
             } else {
                 let options = shaderCompileOptions()
                 options.preprocessorMacros = ["VIBE_MESHES": NSNumber(value: 0)]
                 let procedural = try device.makeLibrary(source: metalSource, options: options)
-                func pipeline(_ name: String) throws -> MTLComputePipelineState {
-                    guard let function = procedural.makeFunction(name: name) else {
-                        throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
-                    }
-                    return try device.makeComputePipelineState(function: function)
-                }
-                self.proceduralKernels = SceneKernels(temporal: try pipeline("restir_temporal_kernel"), shading: try pipeline("shading_kernel"),
-                                                      guides: try pipeline("metalfx_guides_kernel"), pick: try pipeline("pick_kernel"))
+                self.proceduralKernels = SceneKernels(temporal: try pipeline(procedural, "restir_temporal_kernel"),
+                    shading: try pipeline(procedural, "shading_kernel"), guides: try pipeline(procedural, "metalfx_guides_kernel"),
+                    pick: try pipeline(procedural, "pick_kernel"), pt: try ptKernels(procedural))
+                self.meshKernels = SceneKernels(temporal: restirTemporalPipeline, shading: shadingPipeline,
+                    guides: metalFXGuidePipeline, pick: pickPipeline, pt: try ptKernels(lib))
             }
         } catch {
             throw error
@@ -4108,8 +5190,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         if frameIndex >= 16_777_215 { resetAccumulation() }
 
         let needsReSTIR = samplingMode == 0 && viewportMode == 0
+        let indirectReuse = activeIndirectReuse
+        let usesPT = needsReSTIR && indirectReuse != .restirGI
+        let reservoirs = reservoirSet(usesReSTIR: needsReSTIR)
         let resized = accumTexture == nil || accumTexture?.width != w || accumTexture?.height != h
-        if resized || frameResourcesUseReSTIR != needsReSTIR {
+        if resized || frameReservoirs != reservoirs {
             let desc32 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
             desc32.usage = [.shaderRead, .shaderWrite]
             desc32.storageMode = .private
@@ -4117,14 +5202,30 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             desc16.usage = [.shaderRead, .shaderWrite]
             desc16.storageMode = .private
 
-            let reservoir32 = needsReSTIR ? desc32 : {
-                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: 1, height: 1, mipmapped: false)
+            func placeholder(_ format: MTLPixelFormat) -> MTLTextureDescriptor {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: 1, height: 1, mipmapped: false)
                 d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private; return d
-            }()
-            let reservoir16 = needsReSTIR ? desc16 : {
-                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
-                d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private; return d
-            }()
+            }
+            // Each reservoir set is full size only in the modes that read it.
+            let usesDI = needsReSTIR && indirectReuse != .restirPTUnified
+            let usesGI = needsReSTIR && indirectReuse == .restirGI
+            let reservoir32 = usesDI ? desc32 : placeholder(.rgba32Float)
+            let gi32 = usesGI ? desc32 : placeholder(.rgba32Float)
+            let gi16 = usesGI ? desc16 : placeholder(.rgba16Float)
+            let indirect32 = usesPT ? desc32 : placeholder(.rgba32Float)
+            let duplicationFormat = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: w, height: h, mipmapped: false)
+            duplicationFormat.usage = [.shaderRead, .shaderWrite]; duplicationFormat.storageMode = .private
+            let duplication16 = usesPT ? duplicationFormat : placeholder(.r16Float)
+            func ptBuffer(_ bytesPerPixel: Int) -> MTLBuffer? {
+                usesPT ? device.makeBuffer(length: w * h * bytesPerPixel, options: .storageModePrivate) : nil
+            }
+            let newPTReservoirs = ptBuffer(Self.ptReservoirStride), newPTHistory = ptBuffer(Self.ptReservoirStride)
+            let newPTShifts = ptBuffer(3 * 16), newHistorySurfaces = ptBuffer(Int(Self.primarySurfaceStride))
+            if usesPT && ptPairing == nil {
+                ptPairing = ReSTIRPTPairing.deltas.withUnsafeBytes {
+                    device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
+                }
+            }
 
             // Only the DI/GI reservoirs depend on the strategy and inspection view;
             // keep the accumulation, G-buffer, guides and sample count when just
@@ -4138,14 +5239,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let newPosB = device.makeTexture(descriptor: reservoir32),
                   let newEmitB = device.makeTexture(descriptor: reservoir32),
                   let newWeightB = device.makeTexture(descriptor: reservoir32),
-                  let newGIPosA = device.makeTexture(descriptor: reservoir32),
-                  let newGINormalA = device.makeTexture(descriptor: reservoir16),
-                  let newGIRadianceA = device.makeTexture(descriptor: reservoir32),
-                  let newGIWeightsA = device.makeTexture(descriptor: reservoir32),
-                  let newGIPosB = device.makeTexture(descriptor: reservoir32),
-                  let newGINormalB = device.makeTexture(descriptor: reservoir16),
-                  let newGIRadianceB = device.makeTexture(descriptor: reservoir32),
-                  let newGIWeightsB = device.makeTexture(descriptor: reservoir32),
+                  let newGIPosA = device.makeTexture(descriptor: gi32),
+                  let newGINormalA = device.makeTexture(descriptor: gi16),
+                  let newGIRadianceA = device.makeTexture(descriptor: gi32),
+                  let newGIWeightsA = device.makeTexture(descriptor: gi32),
+                  let newGIPosB = device.makeTexture(descriptor: gi32),
+                  let newGINormalB = device.makeTexture(descriptor: gi16),
+                  let newGIRadianceB = device.makeTexture(descriptor: gi32),
+                  let newGIWeightsB = device.makeTexture(descriptor: gi32),
+                  let newPTIndirect = device.makeTexture(descriptor: indirect32),
+                  let newDuplication = device.makeTexture(descriptor: duplication16),
+                  !usesPT || (newPTReservoirs != nil && newPTHistory != nil && newPTShifts != nil
+                              && newHistorySurfaces != nil && ptPairing != nil),
                   // Primary surfaces depend only on the frame size.
                   let newSurfaces = resized
                     ? device.makeBuffer(length: w * h * Int(Self.primarySurfaceStride), options: .storageModePrivate)
@@ -4171,7 +5276,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             giRadianceA = newGIRadianceA; giWeightsA = newGIWeightsA
             giPosPdfB = newGIPosB; giNormalB = newGINormalB
             giRadianceB = newGIRadianceB; giWeightsB = newGIWeightsB
-            frameResourcesUseReSTIR = needsReSTIR
+            ptIndirect = newPTIndirect; ptDuplication = newDuplication
+            ptReservoirs = newPTReservoirs; ptHistory = newPTHistory; ptShifts = newPTShifts
+            historyPrimarySurfaces = newHistorySurfaces
+            frameReservoirs = reservoirs
 
             if resized {
                 reservoirHistoryNeedsReset = false
@@ -4193,6 +5301,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
               let giRadA = giRadianceA, let giWeightA = giWeightsA,
               let giPosB = giPosPdfB, let giNormB = giNormalB,
               let giRadB = giRadianceB, let giWeightB = giWeightsB,
+              let ptOut = ptIndirect, let duplication = ptDuplication,
               let oidnAlbedo = oidnAlbedoAccum, let oidnNormal = oidnNormalAccum,
               let surfaces = primarySurfaceBuffer(width: w, height: h),
               let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
@@ -4234,6 +5343,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             viewportMode: viewportMode,
             width: UInt32(w),
             height: UInt32(h),
+            indirectReuse: indirectReuse.rawValue | (ptDecorrelation ? 4 : 0) | (ptTemporalWhileAccumulating ? 8 : 0),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
             spatialNeighbors: spatialNeighbors.resolved(importedSceneGraph: sceneIndex == 6 && materials.hasSceneGraph).rawValue,
@@ -4282,6 +5392,42 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc1.endEncoding()
         }
 
+        // ReSTIR PT (REFERENCES.md: RESTIRPT2022, RESTIRPTE2026): initial paths and temporal
+        // reuse, paired shifts, spatial reuse, then (optionally) the duplication map.
+        if usesPT {
+            guard let current = ptReservoirs, let history = ptHistory, let shifts = ptShifts,
+                  let historySurfaces = historyPrimarySurfaces, let pairing = ptPairing,
+                  let kernels = sceneKernels.pt else { return }
+            var passes: [(String, MTLComputePipelineState, Bool)] = [("ReSTIR PT: initial paths", kernels.initial, true)]
+            // Temporal reuse only while the view changes (MSL restir_pt_temporal).
+            if nextFrame <= 1 || ptTemporalWhileAccumulating {
+                passes.append(("ReSTIR PT: temporal reuse", kernels.temporal, true))
+            }
+            passes += [
+                ("ReSTIR PT: paired shifts", kernels.shift, true),
+                ("ReSTIR PT: spatial reuse", kernels.spatial, false)]
+            if ptDecorrelation { passes.append(("ReSTIR PT: duplication map", kernels.duplication, false)) }
+            for (label, pipeline, bindsMaterials) in passes {
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return }
+                encoder.label = label
+                encoder.setComputePipelineState(pipeline)
+                for (index, texture) in [gPos, gNorm, hPos, hNorm, duplication, ptOut].enumerated() { encoder.setTexture(texture, index: index) }
+                if bindsMaterials {
+                    guard materials.bind(encoder) else {
+                        encoder.endEncoding()
+                        onError?("Could not update material bindings.")
+                        return
+                    }
+                }
+                encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+                for (index, buffer) in [surfaces, historySurfaces, current, history, shifts, pairing].enumerated() {
+                    encoder.setBuffer(buffer, offset: 0, index: index + 3)
+                }
+                encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
+                encoder.endEncoding()
+            }
+        }
+
         // PASS 2: Spatial Resampling & Full Path Tracing
         guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return }
         do {
@@ -4301,6 +5447,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc2.setTexture(giWeightA, index: 11)
             enc2.setTexture(oidnAlbedo, index: 12)
             enc2.setTexture(oidnNormal, index: 13)
+            enc2.setTexture(ptOut, index: 14)
             guard materials.bind(enc2) else {
                 enc2.endEncoding()
                 onError?("Could not update material bindings.")

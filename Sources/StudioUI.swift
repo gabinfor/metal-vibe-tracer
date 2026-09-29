@@ -210,7 +210,7 @@ final class StudioController: NSViewController {
     "Cornell Fog Study", "Reflective Ring Study", "Imported Mesh Studio",
   ]
   static let strategyNames = [
-    "ReSTIR Direct + First-Bounce GI", "Standard MIS", "Light Only (NEE)", "BSDF Only",
+    "ReSTIR Direct + Indirect", "Standard MIS", "Light Only (NEE)", "BSDF Only",
   ]
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
@@ -452,7 +452,7 @@ final class StudioController: NSViewController {
       self.rebuild()
     }
     if renderer.samplingMode != 0 {
-      text("MetalFX is available with ReSTIR Direct + First-Bounce GI. This strategy displays raw accumulation.")
+      text("MetalFX is available with ReSTIR Direct + Indirect. This strategy displays raw accumulation.")
     }
     if !renderer.supportsMetalFX { text("MetalFX is not supported by this GPU.") }
     if renderer.offlineDenoisedPreview != nil {

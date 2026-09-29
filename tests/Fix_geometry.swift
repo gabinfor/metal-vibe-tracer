@@ -289,7 +289,7 @@
     u.cameraTarget = SIMD4(p, 16)
     let inputs = [texture(SIMD4(0, 0, 0, 1)), texture(SIMD4(p, 3)), texture(SIMD4(shading, 1)), texture(SIMD4(0.9, 0.9, 0.9, 0))]
     let outputs = (0..<9).map { _ in texture(.zero) }
-    // buffer(3) is the kernel's primary-surface cache: one 120-byte PrimarySurface per
+    // buffer(3) is the kernel's primary-surface cache: one 128-byte PrimarySurface per
     // pixel. Pass 1 stores the traced geometric normal (offset 16) and the rounding
     // bound mesh_hit_error (offset 100; vertices at |8|), which the guide rays offset by.
     _ = try dispatch("metalfx_guides_kernel", u, grid: MTLSize(width: 1, height: 1, depth: 1),

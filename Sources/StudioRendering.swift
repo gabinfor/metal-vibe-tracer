@@ -100,6 +100,9 @@ extension StudioController {
       r.sceneIndex = p.scene
       r.samplingMode = p.strategy
       r.spatialNeighbors = renderer.spatialNeighbors
+      r.indirectReuse = renderer.indirectReuse
+      r.ptDecorrelation = renderer.ptDecorrelation
+      r.ptTemporalWhileAccumulating = renderer.ptTemporalWhileAccumulating
       r.skyMode = p.sky
       r.enableFog = p.fog
       r.enableSMS = p.ring
@@ -119,7 +122,7 @@ extension StudioController {
         // OIDN runs after the render while the export and preview frames stay resident.
         let frames = PathTracerRenderer.FrameResourcePlan(
           width: p.options.outputWidth, height: p.options.outputHeight,
-          usesReSTIR: r.samplingMode == 0, usesMetalFX: false).bytes
+          usesReSTIR: r.samplingMode == 0, usesMetalFX: false, indirectReuse: r.activeIndirectReuse).bytes
         let resident = frames.map { $0.addingReportingOverflow(r.concurrentRenderBytes) }
         if let message = OIDNDenoiser.memoryError(
           width: p.options.outputWidth, height: p.options.outputHeight,
