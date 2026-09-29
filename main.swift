@@ -165,6 +165,7 @@ struct Uniforms {
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
     uint reservoirHistoryReset; // 1 = DI/GI history reservoirs were just allocated; skip temporal reuse
     uint reservoirHistory; // Consecutive ReSTIR frames; camera moves keep it, cuts reset it.
+    uint spatialNeighbors; // ReSTIR spatial neighbour selection: 0 = uniform, 1 = compatibility-guided
     float4 environment; // intensity, rotation, image enabled, BVH node count
     float4 lens; // aperture radius, focus distance, scene-graph mode (see uses_scene_graph), independent sun 1 - cos(half angle)
     float4 light; // RGB multiplier, size multiplier
@@ -2263,6 +2264,121 @@ kernel void restir_temporal_kernel(
 }
 
 // ============================================================================
+// Spatial neighbour selection for ReSTIR DI/GI (Uniforms.spatialNeighbors)
+// 0: RESTIR2020 uniform taps with a binary normal/depth/material test.
+// 1: COMPATRESTIR2026 compatibility-guided selection (Algorithm 1), with the
+//    RESTIR2020 Algorithm 6 (1/Z) normalization of the reused confidences.
+// ============================================================================
+
+// Uniform mode draws UNIFORM_TAPS taps per reservoir type; compatibility mode
+// reuses up to SPATIAL_NEIGHBORS neighbours per reservoir type (DI and GI select
+// independently), drawn from COMPAT_CANDIDATES G-buffer taps within
+// COMPAT_RADIUS pixels.
+constant int UNIFORM_TAPS = 4;
+#define SPATIAL_NEIGHBORS 4u
+#define COMPAT_CANDIDATES 32u
+#define COMPAT_RADIUS 24.0f
+
+// RESTIR2020 uniform tap: a 16-pixel box around the pixel, two random draws.
+int2 uniform_neighbor(uint2 gid, thread uint &seed) {
+    return int2(gid) + int2((rand_f2(seed) * 2.0f - 1.0f) * 16.0f);
+}
+// RESTIR2020's binary compatibility test (local thresholds: 0.95 normal cosine,
+// 5% depth), used by uniform mode.
+bool restir2020_compatible(float4 posDepth, float3 norm, MaterialType type, float4 nPosDepth, float4 nNormMat) {
+    return nPosDepth.w > 0.0f && nNormMat.w == float(type) && dot(norm, nNormMat.xyz) > 0.95f &&
+        abs(posDepth.w - nPosDepth.w) < 0.05f * posDepth.w;
+}
+
+// COMPATRESTIR2026 Eqs. 14-15: h = exp(-|x1 - y1| / s) max(n1 . ny, 0)^8, with
+// s = sqrt(Omega d^2 / pi) the world radius of Omega = 0.05 sr at hit distance d.
+float restir_compatibility(float3 x1, float3 n1, float depth, float3 y1, float3 ny) {
+    float s = depth * sqrt(0.05f / PI);
+    if (!(s > 0.0f)) return 0.0f;
+    float c = max(dot(n1, ny), 0.0f), c2 = c * c, c4 = c2 * c2;
+    return exp(-distance(x1, y1) / s) * (c4 * c4);
+}
+
+// Shirley-Chiu concentric map of [0,1)^2 onto the unit disk.
+float2 concentric_disk(float2 u) {
+    float2 o = 2.0f * u - 1.0f;
+    if (o.x == 0.0f && o.y == 0.0f) return float2(0.0f);
+    bool wide = abs(o.x) > abs(o.y);
+    float r = wide ? o.x : o.y;
+    float theta = wide ? (PI * 0.25f) * (o.y / o.x) : PI * 0.5f - (PI * 0.25f) * (o.x / o.y);
+    return r * float2(cos(theta), sin(theta));
+}
+
+// Candidate k: the R2 sequence (1/g, 1/g^2 for the plastic number g) with a
+// random start (Cranley-Patterson rotation), through the concentric map.
+int2 compat_candidate(uint2 gid, float2 start, uint k) {
+    const float2 r2 = float2(0.75487766624669276f, 0.56984029099805327f);
+    float2 offset = concentric_disk(fract(start + float(k) * r2)) * COMPAT_RADIUS;
+    return int2(gid) + int2(floor(offset + 0.5f));
+}
+
+struct SpatialNeighbors {
+    int2 coord[SPATIAL_NEIGHBORS];
+    uint count;
+};
+
+// COMPATRESTIR2026 Algorithm 1. The pixel itself, off-screen taps and pixels
+// without a diffuse primary hit (which hold no reservoirs) score zero. A-ES
+// keeps the SPATIAL_NEIGHBORS largest keys log(u)/h, a weighted sample without
+// replacement whose first rank is an A-Chao draw proportional to h; the search
+// stops once more than SPATIAL_NEIGHBORS taps score above 0.5. Only G-buffer
+// values and fresh random numbers decide the set, never reservoir contents.
+SpatialNeighbors select_compatible_neighbors(uint2 gid, float3 pos, float3 norm, float depth,
+                                             texture2d<float, access::read> gbufferPosDepth,
+                                             texture2d<float, access::read> gbufferNormalMat,
+                                             constant Uniforms &u, thread uint &seed) {
+    SpatialNeighbors result;
+    result.count = 0;
+    float keys[SPATIAL_NEIGHBORS];
+    float2 start = rand_f2(seed);
+    uint strong = 0;
+    for (uint k = 0; k < COMPAT_CANDIDATES && strong <= SPATIAL_NEIGHBORS; ++k) {
+        int2 c = compat_candidate(gid, start, k);
+        if (all(c == int2(gid)) || c.x < 0 || c.y < 0 || c.x >= int(u.width) || c.y >= int(u.height)) continue;
+        float4 p = gbufferPosDepth.read(uint2(c));
+        float4 n = gbufferNormalMat.read(uint2(c));
+        if (p.w <= 0.0f || n.w != float(DIFFUSE)) continue;
+        float h = restir_compatibility(pos, norm, depth, p.xyz, n.xyz);
+        if (!(h > 0.0f)) continue;
+        if (h > 0.5f) ++strong;
+        bool held = false;
+        for (uint i = 0; i < result.count; ++i) held = held || all(result.coord[i] == c);
+        if (held) continue;
+        float key = log(1.0f - rand_f(seed)) / h;
+        uint slot;
+        if (result.count < SPATIAL_NEIGHBORS) slot = result.count++;
+        else if (key > keys[SPATIAL_NEIGHBORS - 1]) slot = SPATIAL_NEIGHBORS - 1;
+        else continue;
+        for (; slot > 0 && keys[slot - 1] < key; --slot) {
+            keys[slot] = keys[slot - 1];
+            result.coord[slot] = result.coord[slot - 1];
+        }
+        keys[slot] = key;
+        result.coord[slot] = c;
+    }
+    return result;
+}
+
+// RESTIR2020 Algorithm 6, line 8: whether neighbour q's target can be nonzero at
+// the selected sample, so that q's confidence M belongs in Z. Local, geometric
+// form from q's G-buffer: the sample lies above q's shading normal (DI), or
+// faces q and reconnects to it within the Jacobian bound (GI; the bound is
+// symmetric in J and 1/J). q's albedo, geometric normal, view side and emitter
+// facing are not tested; see REFERENCES.md COMPATRESTIR2026.
+bool restir_di_in_support(float3 qPosition, float3 qNormal, LightSample y) {
+    float3 direction = y.isDirectional == 1 ? y.wi : normalize(y.position - qPosition);
+    return dot(qNormal, direction) > 0.0f;
+}
+bool restir_gi_in_support(float3 x1, float3 qPosition, float3 qNormal, float3 x2, float3 n2) {
+    return gi_geometry(qPosition, qNormal, x2, n2) > 0.0f && restir_gi_accepts_shift(x1, qPosition, x2, n2);
+}
+
+// ============================================================================
 // PASS 2: Spatial Resampling & Full Path Tracing
 // ============================================================================
 
@@ -2362,10 +2478,18 @@ kernel void shading_kernel(
                 float weightSum = p_hat_c * cWeights.z * cWeights.y;
                 float M = cWeights.y;
 
-                const float spatialRadius = 16.0f;
-                for (int i = 0; i < 4; ++i) {
-                    float2 offset = (rand_f2(seed) * 2.0f - 1.0f) * spatialRadius;
-                    int2 nCoord = int2(gid) + int2(offset);
+                // Uniform mode draws fresh taps in each loop below; compatibility mode
+                // selects independent neighbour sets for DI and for GI reuse.
+                bool compatibilityGuided = uniforms.spatialNeighbors == 1;
+                SpatialNeighbors neighbors;
+                neighbors.count = 0;
+                if (compatibilityGuided) {
+                    neighbors = select_compatible_neighbors(gid, pos, norm, posDepth.w,
+                        gbufferPosDepth, gbufferNormalMat, uniforms, seed);
+                }
+                int taps = compatibilityGuided ? int(neighbors.count) : UNIFORM_TAPS;
+                for (int i = 0; i < taps; ++i) {
+                    int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed);
 
                     if (nCoord.x >= 0 && nCoord.x < int(uniforms.width) &&
                         nCoord.y >= 0 && nCoord.y < int(uniforms.height)) {
@@ -2373,7 +2497,8 @@ kernel void shading_kernel(
                         float4 nPosDepth = gbufferPosDepth.read(uint2(nCoord));
                         float4 nNormMat = gbufferNormalMat.read(uint2(nCoord));
 
-                        if (nPosDepth.w > 0.0f && nNormMat.w == float(mat.type) && dot(norm, nNormMat.xyz) > 0.95f && abs(posDepth.w - nPosDepth.w) < 0.05f * posDepth.w) {
+                        // The selection's score replaces the binary test.
+                        if (compatibilityGuided || restir2020_compatible(posDepth, norm, mat.type, nPosDepth, nNormMat)) {
                             float4 nWeights = inReservoirWeights.read(uint2(nCoord));
                             if (nWeights.y > 0.0f && nWeights.z > 0.0f) {
                                 float4 nPosDir = inSamplePosDir.read(uint2(nCoord));
@@ -2400,6 +2525,17 @@ kernel void shading_kernel(
                 }
 
                 float final_p_hat = eval_restir_target_pdf(pos, norm, primaryRay.direction, mat, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
+                if (compatibilityGuided && final_p_hat > 0.0f) {
+                    // RESTIR2020 Alg. 6: Z counts every reused reservoir, empty ones
+                    // included, whose pixel could have produced the selected sample.
+                    M = cWeights.y;
+                    for (uint i = 0; i < neighbors.count; ++i) {
+                        uint2 q = uint2(neighbors.coord[i]);
+                        float qM = inReservoirWeights.read(q).y;
+                        if (qM > 0.0f && restir_di_in_support(gbufferPosDepth.read(q).xyz,
+                                gbufferNormalMat.read(q).xyz, selectedSample)) M += qM;
+                    }
+                }
                 float W = (M > 0.0f && final_p_hat > 0.0f) ? (weightSum / (M * final_p_hat)) : 0.0f;
 
                 // Direct Lighting: ReSTIR DI vs. Standard MIS
@@ -2425,18 +2561,19 @@ kernel void shading_kernel(
                         selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
                 float giWeightSum = giTarget * currentGIWeights.z * currentGIWeights.y;
                 float giM = currentGIWeights.y;
-                for (int i = 0; i < 4 && giEnabled; ++i) {
-                    float2 offset = (rand_f2(seed) * 2.0f - 1.0f) * spatialRadius;
-                    int2 nCoord = int2(gid) + int2(offset);
+                if (compatibilityGuided && giEnabled) {
+                    neighbors = select_compatible_neighbors(gid, pos, norm, posDepth.w,
+                        gbufferPosDepth, gbufferNormalMat, uniforms, seed);
+                    taps = int(neighbors.count);
+                }
+                for (int i = 0; i < taps && giEnabled; ++i) {
+                    int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed);
                     if (nCoord.x < 0 || nCoord.x >= int(uniforms.width) ||
                         nCoord.y < 0 || nCoord.y >= int(uniforms.height)) continue;
                     float4 neighborPrimary = gbufferPosDepth.read(uint2(nCoord));
                     float4 neighborPrimaryNormal = gbufferNormalMat.read(uint2(nCoord));
-                    bool compatible = neighborPrimary.w > 0.0f &&
-                        neighborPrimaryNormal.w == float(mat.type) &&
-                        dot(norm, neighborPrimaryNormal.xyz) > 0.95f &&
-                        abs(posDepth.w - neighborPrimary.w) < 0.05f * posDepth.w;
-                    if (!compatible) continue;
+                    if (!compatibilityGuided &&
+                        !restir2020_compatible(posDepth, norm, mat.type, neighborPrimary, neighborPrimaryNormal)) continue;
                     float4 neighborWeights = inGIWeights.read(uint2(nCoord));
                     float4 neighborPosPdf = inGIPosPdf.read(uint2(nCoord));
                     float4 neighborNormal = inGINormal.read(uint2(nCoord));
@@ -2459,6 +2596,15 @@ kernel void shading_kernel(
                 float finalGITarget = selectedGINormal.w > 0.0f
                     ? eval_restir_gi_target(pos, norm, primaryRay.direction, mat,
                         selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
+                if (compatibilityGuided && giEnabled && finalGITarget > 0.0f) {
+                    giM = currentGIWeights.y;
+                    for (int i = 0; i < taps; ++i) {
+                        uint2 q = uint2(neighbors.coord[i]);
+                        float qM = inGIWeights.read(q).y;
+                        if (qM > 0.0f && restir_gi_in_support(pos, gbufferPosDepth.read(q).xyz, gbufferNormalMat.read(q).xyz,
+                                selectedGIPosPdf.xyz, selectedGINormal.xyz)) giM += qM;
+                    }
+                }
                 float giW = giM > 0.0f && finalGITarget > 0.0f
                     ? giWeightSum / (giM * finalGITarget) : 0.0f;
                 if (giEnabled && giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
@@ -2896,6 +3042,8 @@ struct Uniforms {
     var reservoirHistoryReset: UInt32 = 0
     // Consecutive frames with written ReSTIR reservoirs; gates temporal reuse.
     var reservoirHistory: UInt32 = 0
+    // SpatialNeighborSelection raw value; occupies former padding (offset 252).
+    var spatialNeighbors: UInt32 = SpatialNeighborSelection.compatibility.rawValue
     var environment = SIMD4<Float>(1, 0, 0, 0)
     // Aperture radius, focus distance, scene-graph mode (sceneGraphMode), independent sun 1 - cos(half angle).
     var lens = SIMD4<Float>(0, 4, 0, 0)
@@ -2906,6 +3054,14 @@ struct Uniforms {
         get { lens.z > 0 }
         set { lens.z = newValue ? 1 : 0 }
     }
+}
+
+// ReSTIR DI/GI spatial reuse neighbours (shading_kernel). REFERENCES.md: COMPATRESTIR2026.
+enum SpatialNeighborSelection: UInt32 {
+    // RESTIR2020: uniform taps in a 16-pixel box, binary normal/depth/material test.
+    case uniform = 0
+    // COMPATRESTIR2026: neighbours drawn from 32 taps in proportion to a G-buffer score.
+    case compatibility = 1
 }
 
 // REFERENCES.md: PBRT2023; local base-2/base-3 Halton jitter with a 1,024-frame period.
@@ -3524,6 +3680,16 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var enableSMS: UInt32 = 0 { didSet { if oldValue != enableSMS { resetAccumulation() } } }
     var skyMode: UInt32 = 0 { didSet { if oldValue != skyMode { resetAccumulation() } } }
     var enableFog: UInt32 = 0 { didSet { if oldValue != enableFog { resetAccumulation() } } }
+    var spatialNeighbors = PathTracerRenderer.defaultSpatialNeighbors {
+        didSet { if oldValue != spatialNeighbors { resetAccumulation() } }
+    }
+    static var defaultSpatialNeighbors: SpatialNeighborSelection {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with the earlier uniform selection.
+        if ProcessInfo.processInfo.environment["VIBE_SPATIAL_NEIGHBORS"] == "uniform" { return .uniform }
+#endif
+        return .compatibility
+    }
 
     var yaw: Float = 0.42 { didSet { if oldValue != yaw { resetAccumulation(resetDenoiser: false) } } }
     var pitch: Float = 0.22 { didSet { if oldValue != pitch { resetAccumulation(resetDenoiser: false) } } }
@@ -4061,6 +4227,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             height: UInt32(h),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
+            spatialNeighbors: spatialNeighbors.rawValue,
             environment: SIMD4(options.environmentIntensity, options.environmentRotation * .pi / 180, materials.environmentData == nil ? 0 : 1, Float(materials.nodeCount)),
             lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,sceneIndex == 6 ? options.independentSunCone : 0),
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize)

@@ -99,6 +99,7 @@ extension StudioController {
       r.materials.hasSceneGraph = p.graph != nil
       r.sceneIndex = p.scene
       r.samplingMode = p.strategy
+      r.spatialNeighbors = renderer.spatialNeighbors
       r.skyMode = p.sky
       r.enableFog = p.fog
       r.enableSMS = p.ring
