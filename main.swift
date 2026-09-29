@@ -5350,8 +5350,8 @@ enum ControlVariates: UInt32, Sendable {
     // control variates with reservoir-based difference estimates (RESTCV2026).
     case restcv = 1
     // Host-side default: ReSTCV wherever it applies. With unified ReSTIR PT it lowered the per-frame
-    // error of a moving camera by 5-47% and the MetalFX display error by 4-18%, and static
-    // equal-sample MSE by 1-14%, at unchanged frame time (tests/PERFORMANCE.md).
+    // error of a moving camera by 5-47% and the MetalFX display error by 5-21%, and static
+    // equal-sample MSE by 1-14%, for 0-3% more frame time (tests/PERFORMANCE.md).
     case automatic = 2
     // ReSTCV needs ReSTIR PT with its paired (deterministic pairwise MIS) spatial reuse; ReSTIR GI
     // and stochastic pairwise MIS run without it.

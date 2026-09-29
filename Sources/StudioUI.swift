@@ -234,7 +234,7 @@ final class StudioController: NSViewController {
   static let temporalReuseHelp =
     "Reservoir splatting lowers noise in newly revealed areas while the camera moves, for 5–26% more frame time and about 200 B more GPU memory per pixel. Still views render identically."
   static let controlVariateHelp =
-    "ReSTIR PT only, with paired spatial reuse. Control variates (ReSTCV) shade each pixel from colour estimates accumulated over neighbouring pixels and frames: 5–47% less noise per frame while the camera moves and 1–14% less in still renders, at the same frame time. Single frames can hold a few dark pixels without the denoiser. Resampled shades from the reservoirs' samples."
+    "ReSTIR PT only, with paired spatial reuse. Control variates (ReSTCV) shade each pixel from colour estimates accumulated over neighbouring pixels and frames: 5–47% less noise per frame while the camera moves (5–21% under MetalFX) and 1–14% less in still renders, for 0–3% more frame time. Single frames can hold a few dark pixels without the denoiser. Resampled shades from the reservoirs' samples."
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 

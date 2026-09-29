@@ -1,3 +1,84 @@
+# Spatio-temporal control variates (ReSTCV) — September 29, 2026
+
+ReSTCV shading of ReSTIR PT (`REFERENCES.md` `RESTCV2026`; `ControlVariates.restcv`, **Path shading → Control variates**) compared with the resampled shading it replaces ("Resampled", the vector-valued resampling weights of `RESTIRPTE2026` Sec. 6.3). Both use paired spatial reuse and reprojection unless noted. Parameters: centre weight 1.6, equal weights for the partners' estimators, α = min(ρ_i / ρ_j, 2), temporal confidence cap 20.
+
+Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0 (26A428), Swift 6.4, source `428d383` plus this change (uncommitted at measurement; the committed shaders differ only by comments and, for the splatting runs, the deep-domain estimates, measured separately below). The scratch drivers of the earlier sections render through the production `renderFrame` path at 320×240 and path depth 16; they are not part of the suite. Other GPU work shared the machine, so frame times are medians of three interleaved rounds, and a repeat run is given where the two differed. Errors of single frames are display-referred: negative values, which a ReSTCV frame can hold, are clamped to zero before tone mapping, as the display does. The unedited results are in [`PERFORMANCE-restcv-raw.txt`](PERFORMANCE-restcv-raw.txt).
+
+## Moving camera (per-frame error, the paper's target)
+
+The orbit and back-and-forth paths of "Multi-layer reservoir splatting" below: tone-mapped MSE of the raw single frame and of the MetalFX output at frames 32 and 48, against 512-frame MIS references (384 for the Shader Ball), for all pixels and for pixels hidden in the previous frame ("new"), averaged over 3 seed sequences (2 for the Shader Ball). Each value is the change with ReSTCV.
+
+| Scene, path | Reuse | All | New | MetalFX all | MetalFX recent | Frame time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Cornell, orbit / back-and-forth | unified PT | −25% / −25% | −6% / −11% | −8% / −7% | −1% / −3% | −2% / +1% |
+| UV sphere, orbit / back-and-forth | unified PT | −47% / −46% | −8% / −8% | −18% / −21% | −1% / −7% | −3% / −5% |
+| Instanced patches, orbit / back-and-forth | unified PT | −11% / −10% | −3% / −3% | −6% / −5% | −3% / −2% | 0% / −1% |
+| Pavilion, orbit / back-and-forth | unified PT | −8% / −9% | −2% / −2% | −5% / −6% | −9% / −9% | 0% / +1% |
+| Shader Ball, orbit | unified PT | −5% | +1% | −8% | −2% | 0% |
+| Cornell, orbit / back-and-forth | ReSTIR PT | −16% / −16% | −1% / −2% | −5% / −3% | −4% / +2% | +1% / +1% |
+| UV sphere, orbit / back-and-forth | ReSTIR PT | −0.2% / −0.1% | 0% / 0% | −1% / −0.4% | 0% / +1% | +2% / 0% |
+| Instanced patches, orbit / back-and-forth | ReSTIR PT | −0.5% / −0.5% | 0% / 0% | −1% / −1% | −1% / −1% | +2% / +1% |
+| Pavilion, orbit / back-and-forth | ReSTIR PT | −2% / −3% | +1% / 0% | −4% / −6% | −4% / −9% | +1% / +1% |
+
+The whole-image error falls most where one resampled path decides a pixel's colour: coloured walls (Cornell) and the imported fixtures lit by the sky and the sun. ReSTIR PT (non-unified) lights diffuse primaries with ReSTIR DI, which ReSTCV does not change, so its gain is small except on Cornell. Newly disoccluded pixels gain little with reprojection: they have no history and borrow their partners' estimates. 0.05–2.1% of the pixels of a single frame have a negative channel (UV sphere 0.05%, Cornell 0.4–0.6%, patches 0.7–0.8%, Pavilion 1.2–1.3%, Shader Ball 2.1%); they show black without the denoiser and are counted in the display-referred figures above.
+
+With reservoir splatting (`HONG2026`; back-and-forth path), ReSTCV changed the error by −47% / −10% / −9% (all pixels) and −44% / −4% / −5% (new pixels) on the UV sphere, the patches and Pavilion, and the MetalFX error by −19% / −6% / −6%. Newly disoccluded pixels then had 64%, 8% and 26% less error than with reprojection and ReSTCV, since deep domains carry their estimates. Before deep domains carried them, `tests/Fix_splatting.swift` measured no disocclusion gain for splatting under ReSTCV (ratios 0.99–1.02 against 0.85–0.91).
+
+## Static accumulation (64 frames, 4 seed sequences, against a 1,024-frame MIS reference)
+
+MSE (linear RGB, all pixels), change with ReSTCV, tone-mapped (x/(1+x)) change, and frame time at 640×480. Equal time assumes MSE ∝ 1/frames and uses the repeat run's times where one exists.
+
+Unified ReSTIR PT:
+
+| Scene | Resampled MSE | ReSTCV | Tone-mapped | Resampled ms | ReSTCV ms | Equal time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pavilion | 0.2611 | −1.3% | −2.7% | 54.4 (repeat 54.6) | 55.4 (55.3) | 0% |
+| Pavilion close-up | 0.3628 | −1.2% | −1.9% | 66.9 | 66.8 | −1% |
+| Pavilion, coated OpenPBR floor | 0.3249 | −1.4% | −2.8% | 68.4 | 69.2 | 0% |
+| Cornell box | 1.636e-4 | −12% | −19% | 18.0 (19.1) | 19.2 (19.3) | **−11%** |
+| Cornell glass & mirror | 4.169e-3 | −3% | −2% | 25.6 | 26.2 | −1% |
+| Imported UV sphere | 9.207e-4 | −14% | −17% | 12.9 (12.9) | 13.1 (13.3) | **−12%** |
+| Instanced bumpy patches | 2.028e-3 | −8% | −10% | 21.8 (21.7) | 22.2 (21.8) | **−7%** |
+| ASWF Standard Shader Ball | 1.786e-3 | −5% | −6% | 128.6 | 129.8 | **−4%** |
+
+ReSTIR PT: −1.2% (Pavilion), −1.1% (close-up), −1.3% (coated floor), −5% (Cornell), −3% (glass), −0.7% (UV sphere), −0.2% (patches) and −3% (Shader Ball) at equal sample count, for 0.4–3.8% more frame time: −4% (Cornell) to +3% (UV sphere) at equal time.
+
+Static views accumulate without temporal reuse (`restir_pt_temporal`), so these frames use spatial control variates only. With temporal reuse on every frame (`ptTemporalWhileAccumulating`, the papers' real-time setting), ReSTCV lowered the 64-frame MSE by 35% (Cornell, 2.91e-4 → 1.90e-4), 47% (UV sphere, 1.42e-3 → 7.53e-4) and 16% (patches, 9.62e-3 → 8.09e-3). Only the UV sphere accumulates better that way than with the static policy (7.53e-4 against 7.88e-4; Cornell 1.90e-4 against 1.44e-4, patches 8.09e-3 against 1.87e-3), because temporal reuse correlates successive frames, so the policy is unchanged.
+
+## Parameters
+
+Moving camera, orbit, 2 seed sequences, 384-frame references, unified ReSTIR PT, all pixels (raw / MetalFX):
+
+- **Spatial compositing:** the paper's confidence weights (q_j = M_j, with the centre at 1.6 M_c) against equal weights (3 seed sequences, 512-frame references): new pixels +22% (Pavilion 2.74e-2 against 2.23e-2) and +15% (patches), where the partners' long histories outweigh a disoccluded pixel's own estimate; the patches' MetalFX error was +2.5% against resampled shading rather than −6%. Equal weights are used, as in the authors' code.
+- **Centre weight:** 1 instead of 1.6 raised the error by 8% (Cornell), 10% (UV sphere), 12% (Pavilion) and 12% (Shader Ball), and the MetalFX error by 0.6–1.6%.
+- **α:** fixing α = 1 changed the error by −0.2% to +0.4% and the MetalFX error by −0.7% to +0.1%; paired pixels of the measured fixtures share materials. The paper's reflectance ratio is kept.
+- **Clamping:** clamping each frame before accumulation biased mean radiance by up to +0.09% (patches with temporal reuse on every frame: +0.077 ± 0.022% against −0.010 ± 0.022%). The accumulation is therefore left unclamped.
+
+## Mean radiance (bias)
+
+512 accumulated frames at 320×240 against the 1,024-frame MIS reference, relative ± tile-clustered SE, resampled / ReSTCV. "Every frame" keeps temporal reuse on while accumulating, so the temporal control variates run on every frame.
+
+| Mode | Cornell | Cornell glass | UV sphere | Patches | Pavilion |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Unified PT | +0.005 / +0.004 ± 0.010% | +0.078 / +0.079 ± 0.072% | +0.012 / +0.012 ± 0.008% | −0.002 / −0.001 ± 0.010% | −0.074 / −0.073 ± 0.061% |
+| Unified PT, every frame | −0.011 / −0.021 ± 0.017% | −0.002 / +0.045 ± 0.097% | −0.033 / −0.020 ± 0.012% | −0.001 / −0.010 ± 0.022% | |
+| ReSTIR PT | +0.007 / +0.006 ± 0.010% | +0.074 / +0.077 ± 0.072% | −0.023 / −0.023 ± 0.010% | −0.063 / −0.062 ± 0.017% | |
+| ReSTIR PT, every frame | −0.001 / +0.025 ± 0.013% | −0.008 / +0.020 ± 0.092% | −0.025 / −0.033 ± 0.011% | −0.075 / −0.071 ± 0.018% | |
+
+Every difference between the two shadings is within twice the listed standard error. ReSTIR PT's patches bias comes from its ReSTIR DI pass (`RESTIR2020`).
+
+## Memory
+
+The estimate takes 16 B per pixel (`PTControl`), allocated with the ReSTIR PT resources: unified ReSTIR PT 338 B instead of 322 B per pixel (+5%), ReSTIR PT 434 B instead of 418 B, 31.6 MiB at 1920×1080. With splatting, the two deep-domain pools add 16 B per slot each: 182 B instead of 174 B per pixel (unified), 206 B instead of 198 B (ReSTIR PT).
+
+## Equivalence and cost against `main`
+
+`VIBE_CONTROL_VARIATES=off VIBE_ACCELERATION=flat python3 tests/benchmark.py --baseline <main.swift of 428d383> --rounds 1 --frames 8 --output-tolerance 0` rendered all ten scenarios with mean raw radiance identical to the baseline. With the defaults (ReSTCV on the imported scenes) and `--rounds 3 --frames 12`, the procedural (ReSTIR GI) scenarios were within ±1% of the baseline; the imported mesh took +0.3% (MetalFX off) and +5.5% (on), the orbiting mesh +3.3% and +1.2%, and the instanced scene graph +1.0% and +2.1%.
+
+## Default
+
+`ControlVariates.automatic` resolves to ReSTCV wherever it applies (ReSTIR PT and unified ReSTIR PT with paired reuse), which covers the imported scenes by default. While the camera moves, which is when the preview shows single low-sample frames, it lowered every measured whole-image error and the MetalFX display error by 5–21%, at unchanged frame time. In still accumulations it wins or ties at equal time (−12% to 0% with unified ReSTIR PT). **Resampled** remains selectable: for comparisons, and because raw single frames without the denoiser can show a few black pixels.
+
 # Stochastic pairwise MIS — September 29, 2026
 
 Stochastic pairwise MIS spatial reuse (`REFERENCES.md` `SPMIS2026`; `SpatialNeighborSelection.stochasticPairwise`) compared with the existing spatial reuse. With ReSTIR GI the baseline is the procedural default (uniform taps, "u"), plus compatibility-guided selection ("c") on imported meshes. With unified ReSTIR PT (the imported-scene default) the baseline is paired reuse ("p"). Parameters: 8 × 8 tiles, Ñ = 3, Ñc = 1, 12 search taps from max(1, height/120) pixels with 25% growth. The radius, Ñ for ReSTIR PT and the kernel split were chosen by the sweeps under "Parameters".
