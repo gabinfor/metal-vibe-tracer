@@ -236,9 +236,21 @@ frameDone=false
 testRenderer.onFrameUpdate={_ in frameDone=true}
 testRenderer.renderFrame(output:studioOutput);waitUntil({frameDone})
 require(testRenderer.accumTexture?.width==48 && testRenderer.metalFX?.output.width==48,"preview scale preserves native-resolution MetalFX")
-require(testRenderer.resPosDirA?.width==48 && testRenderer.giPosPdfA?.width==48
-    && testRenderer.residentFrameBytes > nonReSTIRBytes,
-  "ReSTIR transition allocates full-size reservoirs")
+// The full-size reservoirs depend on the resolved indirect reuse (VIBE_INDIRECT_REUSE in test builds):
+// ReSTIR GI keeps DI + GI textures; ReSTIR PT keeps DI textures + path reservoirs; unified PT keeps
+// only path reservoirs.
+let transitionReuse=testRenderer.resolvedIndirectReuse(testRenderer.indirectReuse)
+let transitionPixels=(testRenderer.accumTexture?.width ?? 0)*(testRenderer.accumTexture?.height ?? 0)
+let fullPathReservoirs=(testRenderer.ptReservoirs?.length ?? 0) >= transitionPixels*PathTracerRenderer.ptReservoirStride
+let fullDI=testRenderer.resPosDirA?.width==48, fullGI=testRenderer.giPosPdfA?.width==48
+let transitionReservoirs: Bool
+switch transitionReuse {
+case .restirPT: transitionReservoirs = fullDI && fullPathReservoirs
+case .restirPTUnified: transitionReservoirs = fullPathReservoirs
+default: transitionReservoirs = fullDI && fullGI
+}
+require(transitionPixels > 0 && transitionReservoirs && testRenderer.residentFrameBytes > nonReSTIRBytes,
+  "ReSTIR transition allocates full-size reservoirs for \(transitionReuse)")
 let beforeCount=testRenderer.frameIndex
 for enabled in [false,true] {
     testRenderer.denoiserEnabled=enabled

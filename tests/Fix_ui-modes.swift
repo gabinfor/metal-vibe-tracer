@@ -131,7 +131,10 @@
   exercise(temporal, StudioController.temporalReuseChoices) { testRenderer.temporalReuse }
   // An undo restoring different modes restarts accumulation even with nothing else changed.
   try reset(procedural)
-  pick(indirect, 2)
+  // Pick a mode that differs from the current one (VIBE_INDIRECT_REUSE may already select PT).
+  let differentIndirect = StudioController.indirectReuseChoices.firstIndex { $0.mode != .automatic
+    && $0.mode != testRenderer.resolvedIndirectReuse(testRenderer.indirectReuse) }!
+  pick(indirect, differentIndirect)
   renderOnce()
   let beforeUndo = testRenderer.interactionGeneration
   history.undo()
