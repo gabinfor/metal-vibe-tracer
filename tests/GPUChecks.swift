@@ -386,6 +386,10 @@ func metalFXEnergyRatio(_ output: [SIMD4<Float>], _ raw: [SIMD4<Float>], _ pixel
     mean(pixels.map { output[$0] }) / max(1e-6, mean(pixels.map { raw[$0] }))
 }
 let denoiseUniforms = makeUniforms(scene: 1, mode: 0, width: 128, height: 96)
+// The 0.8 error-ratio gate below was calibrated on uniform spatial neighbours; at this
+// size compatibility-guided reuse lowers the raw error itself by 18% (MetalFX is compared
+// in both modes at 640x480 in tests/Fix_compat-neighbors.swift).
+testRenderer.spatialNeighbors = .uniform
 let lowSamples = render(denoiseUniforms, samples: 4)
 require(lastGIWeights.contains { $0.y > 0 && $0.z > 0 }, "first-bounce ReSTIR GI produces valid reservoirs")
 let rawDisplay = lastDisplay
@@ -397,6 +401,7 @@ if metalFXAvailable {
 let filtered = lastDisplay
 require(lowSamples == lowWithFilter && rawDisplay == lowSamples, "denoise does not alter raw accumulation")
 let reference = render(denoiseUniforms, samples: 256)
+testRenderer.spatialNeighbors = PathTracerRenderer.defaultSpatialNeighbors
 func mse(_ a: [SIMD4<Float>], _ b: [SIMD4<Float>]) -> Float {
     zip(a, b).reduce(Float(0)) { sum, pair in
         let delta = SIMD3<Float>(pair.0.x - pair.1.x, pair.0.y - pair.1.y, pair.0.z - pair.1.z)
