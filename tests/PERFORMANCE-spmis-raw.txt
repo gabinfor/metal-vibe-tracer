@@ -1,0 +1,195 @@
+# Stochastic pairwise MIS — raw measurements, 2026-09-29
+
+## Static accumulation (static.swift: 64 frames x 4 seeds at 320x240 vs 1024-frame MIS; 640x480 median ms, 3 interleaved rounds)
+
+RES cornell gi-u: mse 1.7813e-04±1.1e-05 tmse 4.7705e-05 | 11.89 ms
+RES cornell gi-c: mse 1.6491e-04±1.1e-05 tmse 4.0202e-05 | 13.10 ms
+RES cornell gi-s: mse 1.8074e-04±1.1e-05 tmse 4.7610e-05 | 13.62 ms
+RES cornell uni-p: mse 1.6364e-04±1.1e-05 tmse 3.9385e-05 | 16.93 ms
+RES cornell uni-s: mse 1.3551e-04±1.1e-05 tmse 2.5422e-05 | 22.59 ms
+RES mesh gi-u: mse 1.9657e-03±8.9e-06 tmse 2.6186e-04 | 7.82 ms
+RES mesh gi-c: mse 1.2329e-03±6.1e-05 tmse 1.4349e-04 | 9.21 ms
+RES mesh gi-s: mse 2.0381e-03±5.5e-06 tmse 2.5046e-04 | 9.49 ms
+RES mesh uni-p: mse 9.2068e-04±2.5e-06 tmse 1.1301e-04 | 11.97 ms
+RES mesh uni-s: mse 6.1342e-04±1.6e-06 tmse 7.3902e-05 | 16.08 ms
+RES pavilion gi-u: mse 2.8754e-01±1.6e-02 tmse 1.5478e-03 | 25.69 ms
+RES pavilion gi-s: mse 2.9250e-01±1.1e-02 tmse 1.6591e-03 | 28.02 ms
+RES pavilion uni-p: mse 2.6112e-01±8.6e-03 tmse 1.2858e-03 | 47.97 ms
+RES pavilion uni-s: mse 2.4573e-01±5.9e-03 tmse 1.1428e-03 | 70.61 ms
+RES glass gi-u: mse 5.2384e-03±4.1e-05 tmse 1.3274e-03 | 12.50 ms
+RES glass gi-s: mse 5.2599e-03±1.3e-04 tmse 1.3385e-03 | 14.04 ms
+RES glass uni-p: mse 4.1690e-03±8.0e-05 tmse 1.1747e-03 | 23.45 ms
+RES glass uni-s: mse 3.6387e-03±6.4e-05 tmse 9.9796e-04 | 33.86 ms
+RES closeup gi-u: mse 4.1298e-01±1.7e-02 tmse 2.0977e-03 | 28.02 ms
+RES closeup gi-s: mse 4.0415e-01±1.4e-02 tmse 2.1398e-03 | 29.72 ms
+RES closeup uni-p: mse 3.6282e-01±2.4e-02 tmse 1.7896e-03 | 59.73 ms
+RES closeup uni-s: mse 3.4291e-01±2.5e-02 tmse 1.6090e-03 | 92.48 ms
+RES coated gi-u: mse 3.6204e-01±2.4e-02 tmse 1.5539e-03 | 32.54 ms
+RES coated gi-s: mse 3.7238e-01±2.4e-02 tmse 1.6614e-03 | 34.13 ms
+RES coated uni-p: mse 3.2493e-01±8.8e-03 tmse 1.3810e-03 | 62.26 ms
+RES coated uni-s: mse 3.0268e-01±1.2e-02 tmse 1.2097e-03 | 91.35 ms
+RES patches gi-u: mse 6.8056e-03±1.1e-05 tmse 6.6702e-04 | 14.62 ms
+RES patches gi-c: mse 2.5845e-03±8.0e-06 tmse 2.7256e-04 | 18.21 ms
+RES patches gi-s: mse 4.0159e-03±5.0e-06 tmse 4.2347e-04 | 17.18 ms
+RES patches uni-p: mse 2.0279e-03±6.4e-06 tmse 1.9936e-04 | 20.71 ms
+RES patches uni-s: mse 1.4698e-03±3.1e-06 tmse 1.3827e-04 | 27.35 ms
+RES shaderball uni-p: mse 1.7856e-03±8.0e-06 tmse 2.2478e-04 | 116.91 ms
+RES shaderball uni-s: mse 1.3802e-03±5.9e-06 tmse 1.7484e-04 | 132.08 ms
+
+## Camera motion (motion.swift: tone-mapped per-frame MSE at frames 32 and 48, 3 seeds (Shader Ball 2), 320x240)
+
+SEQ mesh orbit: disoccluded pixels new [152, 179] recent(<=8) [1535, 1541] of 76800
+RES mesh orbit gi-u all 8.0530e-03 new 2.1278e-02 recent 1.7995e-02 | fx all 1.4718e-04 fx recent 1.2438e-03 | ms 4.55 | pool 0 | meanDiff +0.0022
+RES mesh orbit gi-s all 7.3675e-03 new 1.9108e-02 recent 1.6032e-02 | fx all 1.4369e-04 fx recent 1.1933e-03 | ms 3.54 | pool 0 | meanDiff +0.0034
+RES mesh orbit uni-p all 2.5289e-03 new 1.0925e-02 recent 6.0106e-03 | fx all 1.5727e-04 fx recent 7.5171e-04 | ms 5.27 | pool 0 | meanDiff +0.0006
+RES mesh orbit uni-s all 2.0294e-03 new 6.7945e-03 recent 4.2911e-03 | fx all 1.8062e-04 fx recent 8.7235e-04 | ms 6.27 | pool 0 | meanDiff -0.0018
+SEQ mesh oscillate: disoccluded pixels new [222, 180] recent(<=8) [1507, 1541] of 76800
+RES mesh oscillate gi-u all 8.0316e-03 new 2.0603e-02 recent 1.7465e-02 | fx all 1.3764e-04 fx recent 8.2975e-04 | ms 3.28 | pool 0 | meanDiff +0.0030
+RES mesh oscillate gi-s all 7.3750e-03 new 1.6777e-02 recent 1.4967e-02 | fx all 1.3059e-04 fx recent 7.1189e-04 | ms 3.62 | pool 0 | meanDiff +0.0032
+RES mesh oscillate uni-p all 2.5363e-03 new 1.0616e-02 recent 5.7978e-03 | fx all 1.5624e-04 fx recent 6.5786e-04 | ms 5.36 | pool 0 | meanDiff -0.0003
+RES mesh oscillate uni-s all 2.0182e-03 new 5.4382e-03 recent 3.8465e-03 | fx all 1.6285e-04 fx recent 7.3580e-04 | ms 6.40 | pool 0 | meanDiff +0.0017
+SEQ patches orbit: disoccluded pixels new [702, 1076] recent(<=8) [5488, 5330] of 76800
+RES patches orbit gi-u all 1.7750e-02 new 4.4986e-02 recent 3.9082e-02 | fx all 1.7567e-03 fx recent 6.8494e-03 | ms 5.17 | pool 0 | meanDiff +0.0028
+RES patches orbit gi-s all 1.6548e-02 new 4.2666e-02 recent 3.7672e-02 | fx all 1.7171e-03 fx recent 7.0890e-03 | ms 5.55 | pool 0 | meanDiff +0.0035
+RES patches orbit uni-p all 6.9883e-03 new 2.5793e-02 recent 1.6834e-02 | fx all 1.0757e-03 fx recent 3.8214e-03 | ms 7.81 | pool 0 | meanDiff -0.0008
+RES patches orbit uni-s all 6.2977e-03 new 2.3025e-02 recent 1.4974e-02 | fx all 1.3277e-03 fx recent 4.2795e-03 | ms 9.58 | pool 0 | meanDiff +0.0017
+SEQ patches oscillate: disoccluded pixels new [1210, 1224] recent(<=8) [5598, 5763] of 76800
+RES patches oscillate gi-u all 1.8365e-02 new 4.4503e-02 recent 3.7567e-02 | fx all 1.9951e-03 fx recent 6.5925e-03 | ms 5.00 | pool 0 | meanDiff +0.0018
+RES patches oscillate gi-s all 1.7191e-02 new 4.3642e-02 recent 3.6477e-02 | fx all 1.9432e-03 fx recent 6.7174e-03 | ms 5.60 | pool 0 | meanDiff +0.0029
+RES patches oscillate uni-p all 7.5136e-03 new 2.6508e-02 recent 1.6722e-02 | fx all 1.3118e-03 fx recent 4.1013e-03 | ms 7.93 | pool 0 | meanDiff -0.0001
+RES patches oscillate uni-s all 6.7604e-03 new 2.3876e-02 recent 1.5013e-02 | fx all 1.5893e-03 fx recent 4.6777e-03 | ms 9.60 | pool 0 | meanDiff -0.0022
+SEQ pavilion orbit: disoccluded pixels new [236, 453] recent(<=8) [2703, 2785] of 76800
+RES pavilion orbit gi-u all 2.8895e-02 new 4.3790e-02 recent 3.7174e-02 | fx all 1.0753e-03 fx recent 1.3545e-03 | ms 8.08 | pool 0 | meanDiff +0.0103
+RES pavilion orbit gi-s all 2.8500e-02 new 3.9766e-02 recent 3.5610e-02 | fx all 1.0632e-03 fx recent 1.3227e-03 | ms 8.55 | pool 0 | meanDiff +0.0079
+RES pavilion orbit uni-p all 8.8938e-03 new 2.2783e-02 recent 1.4690e-02 | fx all 9.8534e-04 fx recent 1.5154e-03 | ms 17.88 | pool 0 | meanDiff -0.0004
+RES pavilion orbit uni-s all 7.7345e-03 new 1.8160e-02 recent 1.1741e-02 | fx all 9.8668e-04 fx recent 1.6394e-03 | ms 23.86 | pool 0 | meanDiff -0.0002
+SEQ cornell orbit: disoccluded pixels new [62, 119] recent(<=8) [1450, 1176] of 76800
+RES cornell orbit gi-u all 1.9817e-03 new 8.7744e-03 recent 8.6252e-03 | fx all 1.3936e-03 fx recent 7.1633e-03 | ms 4.51 | pool 0 | meanDiff +0.0056
+RES cornell orbit gi-s all 1.8473e-03 new 8.3272e-03 recent 7.7751e-03 | fx all 1.3973e-03 fx recent 7.1865e-03 | ms 4.80 | pool 0 | meanDiff +0.0057
+RES cornell orbit uni-p all 1.1600e-03 new 7.9887e-03 recent 6.5175e-03 | fx all 1.1145e-03 fx recent 6.4778e-03 | ms 6.95 | pool 0 | meanDiff +0.0015
+RES cornell orbit uni-s all 1.0400e-03 new 6.7932e-03 recent 5.6884e-03 | fx all 1.0999e-03 fx recent 6.4610e-03 | ms 8.30 | pool 0 | meanDiff +0.0001
+SEQ shaderball orbit: disoccluded pixels new [309, 332] recent(<=8) [2655, 2738] of 76800
+RES shaderball orbit uni-p all 4.1487e-03 new 1.1711e-02 recent 5.1721e-03 | fx all 8.6619e-04 fx recent 1.9280e-03 | ms 37.94 | pool 0 | meanDiff -0.0009
+RES shaderball orbit uni-s all 3.7256e-03 new 8.8187e-03 recent 4.0822e-03 | fx all 8.7705e-04 fx recent 2.0040e-03 | ms 41.32 | pool 0 | meanDiff -0.0005
+
+## Mean radiance against MIS (bias.swift; spatial-only = reservoir history cleared every frame)
+
+Frames: Cornell 512, UV sphere and glass 384, patches and Pavilion 256. The first Pavilion gi-s line predates the geometric-normal support test in spmis_gi_reuse; the last two lines were measured after it (Cornell's flat walls are unaffected).
+
+BIAS cornell gi-u: spatial-only +6.124%±0.171% full +0.251%±0.030%
+BIAS cornell gi-c: spatial-only -0.205%±0.012% full +0.073%±0.022%
+BIAS cornell gi-s: spatial-only +0.026%±0.010% full +0.274%±0.022%
+BIAS cornell uni-p: spatial-only -0.007%±0.009% full +0.005%±0.010%
+BIAS cornell uni-s: spatial-only -0.006%±0.009% full +0.006%±0.010%
+BIAS mesh gi-u: spatial-only +1.047%±0.058% full +0.091%±0.012%
+BIAS mesh gi-s: spatial-only +0.015%±0.010% full +0.110%±0.012%
+BIAS mesh uni-p: spatial-only +0.012%±0.009% full +0.012%±0.008%
+BIAS mesh uni-s: spatial-only +0.012%±0.008% full +0.011%±0.008%
+BIAS glass gi-u: spatial-only +3.327%±0.127% full +0.233%±0.086%
+BIAS glass gi-s: spatial-only +0.028%±0.074% full +0.260%±0.080%
+BIAS glass uni-p: spatial-only +0.006%±0.074% full +0.120%±0.080%
+BIAS glass uni-s: spatial-only +0.017%±0.072% full +0.116%±0.075%
+BIAS patches gi-s: spatial-only -0.000%±0.015% full +0.156%±0.023%
+BIAS patches uni-p: spatial-only +0.021%±0.012% full +0.008%±0.013%
+BIAS patches uni-s: spatial-only +0.023%±0.012% full +0.005%±0.012%
+BIAS pavilion gi-s: spatial-only -0.243%±0.087% full +0.190%±0.106%
+BIAS pavilion uni-p: spatial-only -0.086%±0.083% full -0.151%±0.078%
+BIAS pavilion uni-s: spatial-only -0.062%±0.081% full -0.153%±0.076%
+BIAS pavilion gi-s: spatial-only -0.053%±0.068%
+BIAS cornell gi-s: spatial-only +0.026%±0.010%
+
+## tests/benchmark.py --baseline cc88e24 --rounds 1 --frames 8, VIBE_ACCELERATION=flat, default modes, --output-tolerance 0
+
+RUN round=0 Default Pavilion | MetalFX off variant=baseline meanRadiance=1.1771001
+RUN round=0 Default Pavilion | MetalFX off variant=current meanRadiance=1.1771001
+RUN round=0 Default Pavilion | MetalFX on variant=baseline meanRadiance=1.1771001
+RUN round=0 Default Pavilion | MetalFX on variant=current meanRadiance=1.1771001
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=baseline meanRadiance=1.3303821
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3303821
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=baseline meanRadiance=1.3303821
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3303821
+RUN round=0 Cornell box | MetalFX off variant=baseline meanRadiance=0.1490202
+RUN round=0 Cornell box | MetalFX off variant=current meanRadiance=0.1490202
+RUN round=0 Cornell box | MetalFX on variant=baseline meanRadiance=0.1490202
+RUN round=0 Cornell box | MetalFX on variant=current meanRadiance=0.1490202
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=baseline meanRadiance=0.6099338
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6099338
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=baseline meanRadiance=0.6099338
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6099338
+RUN round=0 Default Pavilion, MIS | MetalFX off variant=baseline meanRadiance=1.1190857
+RUN round=0 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.1190857
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=baseline meanRadiance=0.650592
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.650592
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=baseline meanRadiance=0.650592
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.650592
+RUN round=0 Default Pavilion, orbiting | MetalFX off variant=baseline meanRadiance=1.1513603
+RUN round=0 Default Pavilion, orbiting | MetalFX off variant=current meanRadiance=1.1513603
+RUN round=0 Default Pavilion, orbiting | MetalFX on variant=baseline meanRadiance=1.1513603
+RUN round=0 Default Pavilion, orbiting | MetalFX on variant=current meanRadiance=1.1513603
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX off variant=baseline meanRadiance=0.6102985
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX off variant=current meanRadiance=0.6102985
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX on variant=baseline meanRadiance=0.6102985
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX on variant=current meanRadiance=0.6102985
+RESULT Cornell box | MetalFX off | baseline | medianMS=11.65 min=11.60 max=12.03 n=4
+RESULT Cornell box | MetalFX off | current | medianMS=12.03 min=11.62 max=12.35 n=4
+RESULT Cornell box | MetalFX on | baseline | medianMS=16.21 min=15.50 max=17.95 n=4
+RESULT Cornell box | MetalFX on | current | medianMS=16.64 min=15.86 max=17.41 n=4
+RESULT Default Pavilion | MetalFX off | baseline | medianMS=25.71 min=25.44 max=25.86 n=4
+RESULT Default Pavilion | MetalFX off | current | medianMS=25.73 min=25.64 max=26.41 n=4
+RESULT Default Pavilion | MetalFX on | baseline | medianMS=30.45 min=29.95 max=31.49 n=4
+RESULT Default Pavilion | MetalFX on | current | medianMS=30.34 min=28.91 max=31.83 n=4
+RESULT Default Pavilion, MIS | MetalFX off | baseline | medianMS=21.89 min=21.56 max=22.10 n=4
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=21.67 min=21.46 max=22.07 n=4
+RESULT Default Pavilion, orbiting | MetalFX off | baseline | medianMS=25.79 min=25.58 max=25.82 n=4
+RESULT Default Pavilion, orbiting | MetalFX off | current | medianMS=25.89 min=25.87 max=25.97 n=4
+RESULT Default Pavilion, orbiting | MetalFX on | baseline | medianMS=30.53 min=29.09 max=31.53 n=4
+RESULT Default Pavilion, orbiting | MetalFX on | current | medianMS=30.11 min=29.42 max=31.02 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | baseline | medianMS=28.89 min=28.69 max=29.12 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | current | medianMS=28.73 min=28.07 max=29.03 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | baseline | medianMS=32.15 min=31.38 max=32.74 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | current | medianMS=32.45 min=31.58 max=33.68 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | baseline | medianMS=21.91 min=21.83 max=22.08 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=22.17 min=21.70 max=22.45 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | baseline | medianMS=26.36 min=25.51 max=27.11 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=26.91 min=25.54 max=32.25 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | baseline | medianMS=55.06 min=54.89 max=56.18 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=54.92 min=54.39 max=55.95 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | baseline | medianMS=60.27 min=59.74 max=60.41 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=59.29 min=58.76 max=60.75 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | baseline | medianMS=32.67 min=32.49 max=32.80 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=32.58 min=32.25 max=32.87 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | baseline | medianMS=37.31 min=36.07 max=38.59 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=37.80 min=36.43 max=38.79 n=4
+
+## tests/benchmark.py --baseline cc88e24 --rounds 1 --frames 8, VIBE_SPATIAL_NEIGHBORS=stochastic (the baseline runs scene 6 on the flat BVH)
+
+RESULT Cornell box | MetalFX off | baseline | medianMS=11.82 min=11.66 max=12.18 n=4
+RESULT Cornell box | MetalFX off | current | medianMS=13.67 min=13.38 max=14.17 n=4
+RESULT Cornell box | MetalFX on | baseline | medianMS=15.37 min=15.10 max=17.10 n=4
+RESULT Cornell box | MetalFX on | current | medianMS=17.67 min=17.15 max=18.48 n=4
+RESULT Default Pavilion | MetalFX off | baseline | medianMS=25.80 min=25.55 max=25.87 n=4
+RESULT Default Pavilion | MetalFX off | current | medianMS=27.98 min=27.68 max=28.63 n=4
+RESULT Default Pavilion | MetalFX on | baseline | medianMS=31.68 min=30.04 max=32.48 n=4
+RESULT Default Pavilion | MetalFX on | current | medianMS=32.47 min=31.68 max=33.47 n=4
+RESULT Default Pavilion, MIS | MetalFX off | baseline | medianMS=21.91 min=21.71 max=22.14 n=4
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=21.91 min=21.55 max=22.13 n=4
+RESULT Default Pavilion, orbiting | MetalFX off | baseline | medianMS=25.82 min=25.39 max=26.29 n=4
+RESULT Default Pavilion, orbiting | MetalFX off | current | medianMS=28.23 min=27.91 max=29.00 n=4
+RESULT Default Pavilion, orbiting | MetalFX on | baseline | medianMS=31.22 min=30.34 max=32.23 n=4
+RESULT Default Pavilion, orbiting | MetalFX on | current | medianMS=32.53 min=31.26 max=33.46 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | baseline | medianMS=28.79 min=28.61 max=29.22 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | current | medianMS=20.53 min=19.62 max=20.88 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | baseline | medianMS=32.81 min=32.00 max=33.91 n=4
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | current | medianMS=24.77 min=23.28 max=25.58 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | baseline | medianMS=21.97 min=21.67 max=22.34 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=16.22 min=15.84 max=16.96 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | baseline | medianMS=25.47 min=25.31 max=27.29 n=4
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=20.57 min=19.66 max=21.38 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | baseline | medianMS=54.81 min=54.67 max=55.76 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=27.06 min=26.61 max=27.64 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | baseline | medianMS=60.29 min=59.55 max=60.37 n=4
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=31.86 min=30.62 max=32.88 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | baseline | medianMS=32.72 min=32.61 max=33.10 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=33.94 min=33.75 max=33.96 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | baseline | medianMS=37.58 min=36.53 max=38.69 n=4
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=39.04 min=38.72 max=39.77 n=4

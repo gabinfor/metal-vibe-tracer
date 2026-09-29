@@ -1,3 +1,98 @@
+# Stochastic pairwise MIS — September 29, 2026
+
+Stochastic pairwise MIS spatial reuse (`REFERENCES.md` `SPMIS2026`; `SpatialNeighborSelection.stochasticPairwise`) compared with the existing spatial reuse. With ReSTIR GI the baseline is the procedural default (uniform taps, "u"), plus compatibility-guided selection ("c") on imported meshes. With unified ReSTIR PT (the imported-scene default) the baseline is paired reuse ("p"). Parameters: 8 × 8 tiles, Ñ = 3, Ñc = 1, 12 search taps from max(1, height/120) pixels with 25% growth. The radius, Ñ for ReSTIR PT and the kernel split were chosen by the sweeps under "Parameters".
+
+Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0 (26A428), Swift 6.4, source `cc88e24` plus this change (uncommitted at measurement; the committed shaders differ only by comments and the GI geometric-normal support test). The scratch drivers render through the production `renderFrame` path at 320×240 and path depth 16, and are not part of the suite. Other GPU work shared the machine, so the frame times are medians of three interleaved rounds. The unedited results are in [`PERFORMANCE-spmis-raw.txt`](PERFORMANCE-spmis-raw.txt).
+
+## Static accumulation (64 frames, 4 seed sequences, against a 1,024-frame MIS reference)
+
+MSE (linear RGB, all pixels), change with SPMIS, tone-mapped (x/(1+x)) change, and the frame-time change at 640×480. Equal time assumes MSE ∝ 1/frames.
+
+Unified ReSTIR PT:
+
+| Scene | Paired MSE | SPMIS | Tone-mapped | Paired ms | SPMIS ms | Equal time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pavilion | 0.2611 | −6% | −11% | 48.0 | 70.6 | +38% |
+| Pavilion close-up | 0.3628 | −5% | −10% | 59.7 | 92.5 | +46% |
+| Pavilion, coated OpenPBR floor | 0.3249 | −7% | −12% | 62.3 | 91.4 | +37% |
+| Cornell box | 1.636e-4 | −17% | −35% | 16.9 | 22.6 | +10% |
+| Cornell glass & mirror | 4.169e-3 | −13% | −15% | 23.5 | 33.9 | +26% |
+| Imported UV sphere | 9.207e-4 | −33% | −35% | 12.0 | 16.1 | **−11%** |
+| Instanced bumpy patches | 2.028e-3 | −28% | −31% | 20.7 | 27.4 | **−4%** |
+| ASWF Standard Shader Ball | 1.786e-3 | −23% | −22% | 116.9 | 132.1 | **−13%** |
+
+ReSTIR GI (DI and GI spatial reuse):
+
+| Scene | Uniform MSE | SPMIS | Tone-mapped | Uniform ms | SPMIS ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pavilion | 0.2875 | +2% | +7% | 25.7 | 28.0 |
+| Pavilion close-up | 0.4130 | −2% | +2% | 28.0 | 29.7 |
+| Coated floor | 0.3620 | +3% | +7% | 32.5 | 34.1 |
+| Cornell box | 1.781e-4 | +1% | 0% | 11.9 | 13.6 |
+| Cornell glass & mirror | 5.238e-3 | 0% | +1% | 12.5 | 14.0 |
+| Imported UV sphere | 1.966e-3 | +4% (compatibility −37%) | −4% | 7.8 | 9.5 (compatibility 9.2) |
+| Instanced patches | 6.806e-3 | −41% (compatibility −62%) | −37% | 14.6 | 17.2 (compatibility 18.2) |
+
+ReSTIR GI's reservoirs already carry up to 20 frames of temporal history, and its uniform normalization is biased toward lower variance. Unbiased stochastic weights therefore gain nothing there. The Shader Ball has no diffuse primary hits, so ReSTIR GI does no spatial reuse on it.
+
+## Moving camera (per-frame error)
+
+These use the orbit and back-and-forth paths of "Multi-layer reservoir splatting" below: tone-mapped MSE of the raw single frame and of the MetalFX output at frames 32 and 48, against 512-frame MIS references (384 for the Shader Ball), for all pixels and for pixels hidden in the previous frame ("new"). Each value is the change with SPMIS.
+
+| Scene, path | Reuse | All | New | MetalFX all | MetalFX recent | Frame time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Pavilion, orbit | unified PT | −13% | −20% | +0.1% | +8% | +33% |
+| Cornell, orbit | unified PT | −10% | −15% | −1.3% | −0.3% | +19% |
+| UV sphere, orbit | unified PT | −20% | −38% | +15% | +16% | +19% |
+| UV sphere, back-and-forth | unified PT | −20% | −49% | +4% | +12% | +19% |
+| Instanced patches, orbit | unified PT | −10% | −11% | +23% | +12% | +23% |
+| Instanced patches, back-and-forth | unified PT | −10% | −10% | +21% | +14% | +21% |
+| Shader Ball, orbit | unified PT | −10% | −25% | +1.3% | +4% | +9% |
+| Pavilion, orbit | ReSTIR GI | −1.4% | −9% | −1.1% | −2% | +6% |
+| Cornell, orbit | ReSTIR GI | −7% | −5% | +0.3% | +0.3% | +6% |
+| UV sphere, orbit / back-and-forth | ReSTIR GI | −9% / −8% | −10% / −19% | −2% / −5% | −4% / −14% | ≈ +10% |
+| Instanced patches, orbit / back-and-forth | ReSTIR GI | −7% / −6% | −5% / −2% | −2% / −3% | +3% / +2% | +7% / +12% |
+
+The raw per-frame error falls, most in disocclusions: the paper's case. Within each reuse cell, however, many pixels pick the same few contributing samples, and the MetalFX denoiser keeps that structure. Its output therefore gets no better, and 4–23% worse on the mesh scenes with ReSTIR PT.
+
+## Mean radiance (bias)
+
+Spatial-only runs clear reservoir history every frame, so spatial reuse is the only reuse. They average 256–512 frames, and each difference is relative to MIS ± tile-clustered SE.
+
+| Mode | Cornell | Cornell glass | UV sphere | Patches | Pavilion |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ReSTIR GI, uniform | +6.12 ± 0.17% | +3.33 ± 0.13% | +1.05 ± 0.06% | | |
+| ReSTIR GI, compatibility | −0.205 ± 0.012% | | +0.009 ± 0.008% | | |
+| ReSTIR GI, SPMIS | +0.026 ± 0.010% | +0.03 ± 0.07% | +0.015 ± 0.010% | −0.000 ± 0.015% | −0.05 ± 0.07% |
+| Unified PT, paired | −0.007 ± 0.009% | +0.006 ± 0.074% | +0.012 ± 0.009% | +0.021 ± 0.012% | −0.09 ± 0.08% |
+| Unified PT, SPMIS | −0.006 ± 0.009% | +0.017 ± 0.072% | +0.012 ± 0.008% | +0.023 ± 0.012% | −0.06 ± 0.08% |
+
+Before the support tests (x2 visible from, and above the geometric normal of, the neighbour whose domain the canonical weight counts), SPMIS GI measured −0.078 ± 0.010% on Cornell.
+
+In full accumulation (temporal reuse included), ReSTIR GI with SPMIS measured +0.27 ± 0.02% on Cornell, +0.11 ± 0.01% on the UV sphere, +0.26 ± 0.08% on glass and +0.16 ± 0.02% on the patches. Uniform mode measured +0.25%, +0.09% and +0.23% on the first three. The remaining bias comes from the temporal merge, and compatibility mode's darkening happens to offset it (Cornell +0.07%). Unified ReSTIR PT with SPMIS agrees with MIS within noise: Cornell +0.006 ± 0.010%, UV sphere +0.011 ± 0.008%, patches +0.005 ± 0.012%, glass +0.12 ± 0.08%.
+
+## Parameters
+
+Unified ReSTIR PT, 64-frame MSE at 320×240:
+
+- **Search radius** (first tap), sweeping 16 → 8 → 4 → 2 → 1 pixels: Cornell 1.54, 1.46, 1.40, 1.36, 1.33e-4; UV sphere 7.04, 6.69, 6.36, 6.13, 5.97e-4; Pavilion 0.255, 0.252, 0.250, 0.246, 0.242.
+- **Own cell only:** lowest raw error, but MetalFX error while orbiting rose from 1.57e-4 (paired) to 2.86e-4 on the UV sphere and by 18% on Pavilion. At 1 pixel the rise was 22% and 3%; at 2 pixels, 15% and 0%. 2 pixels (height/120) is used.
+- **Ñ for ReSTIR PT** (1 + Ñ shifts per pixel against paired reuse's three): Ñ = 1 is worse than paired everywhere. Ñ = 2 cost +18–43% for −3% to −15% MSE, and did not win at equal time. Ñ = 3 is used.
+- **Kernel structure:** one shift per thread in a separate pass took 22.6 / 16.1 ms (Cornell / UV sphere) against 26.3 / 23.0 ms for four shifts per thread in the resampling kernel. Moving the cell search out of `shading_kernel` saved 0.7–0.9 ms per frame with ReSTIR GI.
+- **Why SPMIS costs more than its shift count suggests:** it draws neighbours that hold contributing paths, so almost every shift is a full shift. Paired reuse skips pixels without a path and incompatible pairs, and on Pavilion the drawn paths are often long caustic chains.
+
+## Memory
+
+The reuse cells take 44 B per pixel: a 16 B `SPMISPixel` and a 16 B `SPMISChoice` per pixel and a 12 B `SPMISSlot` per tile slot. With ReSTIR PT, `ptShifts` also grows from 48 to 96 B (four 24 B records), for 92 B per pixel in all. At 1920×1080 that is 87 MiB (ReSTIR GI) or 182 MiB (ReSTIR PT), allocated only in this mode.
+
+## Equivalence and cost against `main`
+
+`VIBE_ACCELERATION=flat python3 tests/benchmark.py --baseline <main.swift of cc88e24> --rounds 1 --frames 8 --output-tolerance 0` rendered all six scenarios with mean raw radiance identical to the baseline in the default modes, with timings within ±2% (Pavilion 25.71 vs 25.73 ms, Cornell 11.9 vs 12.0 ms). With `VIBE_SPATIAL_NEIGHBORS=stochastic`, the procedural ReSTIR GI scenarios took +16% (Cornell), +8% (Pavilion) and +4% (coated floor).
+
+## Default
+
+`SpatialNeighborSelection.automatic` is unchanged: uniform for the procedural scenes, compatibility-guided for imported scene graphs, and paired reuse for ReSTIR PT. SPMIS never wins with ReSTIR GI. With ReSTIR PT it wins at equal time only in static accumulations of the imported fixtures (4–13%). The interactive MetalFX preview, which those scenes show while the camera moves, gets no better. The mode is therefore listed on the Render page for final renders and for raw per-frame noise in disocclusions.
+
 # Multi-layer reservoir splatting — September 29, 2026
 
 Temporal reuse by multi-layer reservoir splatting (`REFERENCES.md` `HONG2026`, `LIU2025`;

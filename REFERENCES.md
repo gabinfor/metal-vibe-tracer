@@ -1,6 +1,6 @@
 # Metal Vibe Tracer references
 
-Last reviewed: **2026-09-29**, for the Render inspector's ReSTIR mode controls (see "September 29 ReSTIR mode controls"); earlier that day for multi-layer reservoir splatting (`HONG2026`, `LIU2025`; see "September 29 reservoir splatting"); earlier that day for ReSTIR PT (`RESTIRPT2022`, `RESTIRPTE2026`; see "September 29 ReSTIR PT") and, earlier that day, compatibility-guided ReSTIR spatial neighbour selection (`COMPATRESTIR2026`; see "September 29 spatial neighbour selection"); before that on 2026-09-28, for the follow-up fixes recorded in [docs/AUDIT_REMEDIATION_2026-09-26.md](docs/AUDIT_REMEDIATION_2026-09-26.md) ("Follow-up, 2026-09-28"), including MaterialX graph-driven emission and the two-level acceleration structure (`WALD2007`, `WIDEBVH2008`, `METALRT`; see "September 28 acceleration structure"). The audit remediation itself was reviewed on 2026-09-26. Web references below were checked on the dates recorded by each entry; entries touched by either review say so.
+Last reviewed: **2026-09-29**, for stochastic pairwise MIS spatial reuse (`SPMIS2026`; see "September 29 stochastic pairwise MIS"); earlier that day for the Render inspector's ReSTIR mode controls (see "September 29 ReSTIR mode controls"); earlier that day for multi-layer reservoir splatting (`HONG2026`, `LIU2025`; see "September 29 reservoir splatting"); earlier that day for ReSTIR PT (`RESTIRPT2022`, `RESTIRPTE2026`; see "September 29 ReSTIR PT") and, earlier that day, compatibility-guided ReSTIR spatial neighbour selection (`COMPATRESTIR2026`; see "September 29 spatial neighbour selection"); before that on 2026-09-28, for the follow-up fixes recorded in [docs/AUDIT_REMEDIATION_2026-09-26.md](docs/AUDIT_REMEDIATION_2026-09-26.md) ("Follow-up, 2026-09-28"), including MaterialX graph-driven emission and the two-level acceleration structure (`WALD2007`, `WIDEBVH2008`, `METALRT`; see "September 28 acceleration structure"). The audit remediation itself was reviewed on 2026-09-26. Web references below were checked on the dates recorded by each entry; entries touched by either review say so.
 
 This document records the algorithmic basis, identifiable formula sources, and API dependencies of the current renderer. It distinguishes implementation references from related work. The supplied `main.swift` did not include a complete bibliography, so matching an existing formula to a publication does not establish the original file's copying history or authorship.
 
@@ -20,6 +20,8 @@ Benedikt Bitterli, Chris Wyman, Matt Pharr, Peter Shirley, Aaron Lefohn, and Woj
 
 **Unbiased combination (2026-09-29):** in compatibility mode (`COMPATRESTIR2026`), `shading_kernel` normalizes spatially combined DI reservoirs with the paper's Algorithm 6 (1/Z; checked against the author PDF on 2026-09-29): Z adds the confidence M of every reused reservoir, including empty ones (W = 0), whose pixel's target can be nonzero at the selected sample (`restir_di_in_support`). The test is local and geometric (the sample lies above the neighbour's G-buffer shading normal). It does not test the neighbour's albedo, geometric normal, view side or emitter facing, so a neighbour whose target is zero for one of those reasons is still counted (a small darkening). Uniform mode keeps the earlier combination unchanged: M sums only over neighbours that pass the binary test and hold a nonzero W, which excludes zero-valued reservoirs and biases the estimate upward (measured +0.5% on Cornell diffuse pixels at 320×240, +4% at 96×64; see `COMPATRESTIR2026`). The temporal pass keeps that exclusion in both modes.
 
+**Stochastic pairwise MIS (2026-09-29):** with `SpatialNeighborSelection.stochasticPairwise`, `spmis_di_reuse` replaces the spatial loop and its normalization by `SPMIS2026`'s defensive pairwise MIS over a reuse cell, which is unbiased (spatial-only Cornell +0.026 ± 0.010% against uniform mode's +6.1%). Temporal reuse keeps its bias status.
+
 **Reservoir splatting (2026-09-29):** with `TemporalReuse.splatting`, `splat_temporal_kernel` runs the same temporal merge (`restir_di_merge`) while the view changes, with the history reservoir chosen by forward splatting, including occluded deep-layer domains (`HONG2026`); the merge keeps its bias status. Reprojection (`restir_backproject`, `restir_same_surface`) remains the default and the backup for splat holes.
 
 ### RESTIRGI2021 — First-indirect-bounce path reuse
@@ -37,6 +39,8 @@ Yaobin Ouyang, Shiqiu Liu, Markus Kettunen, Matt Pharr, and Jacopo Pantaleoni. *
 **Adaptations and limits:** this is a bounded first-indirect-bounce diffuse subset, not the complete paper implementation. It omits glossy/specular shift mappings, full path reconnection, pairwise/generalized MIS, and reuse beyond `x2`; uses simple normal/depth/material compatibility; caps temporal history; and accepts the bias from correlated practical reuse. Standard MIS remains the reference strategy.
 
 **Reconnection Jacobian (2026-09-26):** `restir_gi_jacobian` evaluates the solid-angle Jacobian of the paper's Equation 11 for reconnecting a source path `x1q → x2` at `x1r`. The area-measure target already applies it, so `restir_gi_accepts_shift` only rejects temporal and spatial shifts whose Jacobian lies outside [0.1, 10], mainly short contact-corner reconnections with heavy-tailed weights. This bound is a local choice; rejecting such shifts adds bias in exchange for bounded weights. `restir_gi_enabled` disables GI reuse when the path-depth budget allows no continuation (see `PBRT2023`). The paper's Equation 11 was checked against the author PDF on 2026-09-26.
+
+**Stochastic pairwise MIS (2026-09-29):** with `SpatialNeighborSelection.stochasticPairwise`, `spmis_gi_reuse` resamples the spatial GI candidates with `SPMIS2026`'s pairwise MIS. There, the Jacobian bound of `restir_gi_accepts_shift` becomes a domain restriction that the canonical weight shares, together with x2's visibility and geometric-normal side from the neighbour, so spatial GI reuse becomes unbiased. The temporal merge still rejects out-of-bound shifts without MIS weights.
 
 **Reservoir splatting (2026-09-29):** `restir_gi_merge` also serves `splat_temporal_kernel` (`HONG2026`); deep-layer domains get `restir_gi_initial` canonical samples and no spatial reuse.
 
@@ -75,7 +79,50 @@ where d is the primary-hit distance, Ω = 0.05 sr and β = 8. It uses A-Chao for
 
 **ReSTIR PT (2026-09-29):** imported scenes now default to unified ReSTIR PT (`IndirectReuse.automatic`), which has no DI or GI spatial pass and takes its spatial neighbours from `RESTIRPTE2026`'s pairing textures. This selection therefore applies where ReSTIR DI or GI runs: `IndirectReuse.restirGI` (the procedural default, where `SpatialNeighborSelection.automatic` picks uniform taps) and the DI pass of `IndirectReuse.restirPT`. `tests/Fix_compat-neighbors.swift` pins ReSTIR GI.
 
-**Related, not used:** NVIDIA's RTXDI SDK adds this selection to the Ultra mode of its ReSTIR PT ([ChangeLog](https://github.com/NVIDIA-RTX/RTXDI/blob/main/ChangeLog.md)). No RTXDI code is used. The stochastic pairwise MIS of Hedstrom et al. 2026 and the vMF similarity of Tokuyoshi 2023, both cited by the paper, are not implemented.
+**Related, not used:** NVIDIA's RTXDI SDK adds this selection to the Ultra mode of its ReSTIR PT ([ChangeLog](https://github.com/NVIDIA-RTX/RTXDI/blob/main/ChangeLog.md)). No RTXDI code is used. The vMF similarity of Tokuyoshi 2023, cited by the paper, is not implemented. The stochastic pairwise MIS of Hedstrom et al. 2026, also cited, is implemented as a separate selection (`SPMIS2026`), not combined with this score.
+
+### SPMIS2026 — Stochastic pairwise MIS for large-kernel spatial reuse
+
+Trevor Hedstrom, Markus Kettunen, Daqi Lin, Chris Wyman, and Tzu-Mao Li. **Stochastic Pairwise MIS for Unbiased Large-Kernel Reuse in Real-Time.** *Computer Graphics Forum* 45(2), 12 pages, 2026 (Eurographics 2026; open access, CC BY). [NVIDIA publication page](https://research.nvidia.com/labs/rtr/publication/hedstrom2026stochastic/), [author PDF](https://research.nvidia.com/labs/rtr/publication/hedstrom2026stochastic/hedstrom2026stochastic.pdf), [supplemental code (MiniSPMIS)](https://research.nvidia.com/labs/rtr/publication/hedstrom2026stochastic/hedstrom2026stochastic.zip). The paper was read in full from the author PDF on 2026-09-29, with no DOI printed in it. The supplemental MiniSPMIS code (Slang/C++, no license notice) was read to confirm the defensive pairwise formulas, the confidence scaling and the cell search. No code or figures were copied.
+
+**What the paper does:** GRIS spatial reuse normally resamples a few random neighbours. The paper defines M candidate domains, a large screen-space kernel, and evaluates only Ñ of them. The stochastic resampling MIS weight m̃_i = K(i) / (Ñ P(i)) · m_i (Eq. 15) is an unbiased estimate of any deterministic MIS weight m_i (proved in Appendix B), for Ñ draws with replacement and any P(i) that is positive where m_i is. Because P may depend on the samples, neighbours are drawn in proportion to c_i p̂(X_i) W_i (Eq. 17), so reuse focuses on pixels holding contributing samples. It is specialized to defensive pairwise MIS (Eq. 11): Eq. 16 gives the non-canonical weights, and Eqs. 18–19 estimate the canonical weight's sum from Ñc uniform pixels. The non-canonical confidences (and c_Σ) are scaled by Ñ/M against pepper noise (Sec. 4.3). The candidates are screen-space cells (Sec. 5): 8 × 8 tiles split by a hash of object ID and quantized normal. A pixel picks one cell by 12-tap weighted reservoir sampling of cell confidence sums, over a disk that starts at 30 pixels and grows by 25% per tap (Sec. 5.1). GPU multimaps list the cell's pixels (Algorithm 1). Algorithm 2 then applies Ñc = 1 and Ñ = 3 with M ≤ 64. The paper evaluates this in ReSTIR PT at 1080p and finds the main gain in disocclusions.
+
+**Used in:** `SpatialNeighborSelection.stochasticPairwise` (`Uniforms.spatialNeighbors` = 3), `PathTracerRenderer.SPMISKernels`, `spmisCells` / `spmisSlots` / `spmisChoices`, `spmisTile`, `spmisPTCandidates`, `FrameResourcePlan.spmisBytesPerPixel`, `SPMISPixel`, `SPMISSlot`, `SPMISChoice`, `SPMISShift`, `spmis_key`, `spmis_similar`, `spmis_cells_kernel`, `spmis_find_cell`, `spmis_select_kernel`, `spmis_draw`, `spmis_uniform_pixel`, `spmis_neighbor_weight`, `spmis_canonical_beta`, `spmis_canonical_share`, `restir_pt_spmis_shift_kernel`, `restir_pt_spmis_kernel`, `spmis_di_reuse`, `spmis_gi_reuse` and the DI/GI branch of `shading_kernel`.
+
+**Implemented as in the paper:** Eqs. 15–19 with defensive pairwise MIS; P(i) ∝ c_i p̂(X_i) W_i (Eq. 17); the Ñ/M confidence scaling (Sec. 4.3); Ñc = 1 and Ñ = 3; the canonical estimate from a uniform pixel of the cell, including pixels without a sample; 8 × 8 tiles split into cells by object (here material slot) and a normal quantized as floor(2n) per component, with candidate cells limited to one quantization step; the 12-tap confidence-weighted cell search with 25% radius growth, starting from the pixel's own cell; the pixel itself is a candidate when its own cell is chosen. It applies to ReSTIR DI and ReSTIR GI spatial reuse (`shading_kernel`) and to ReSTIR PT, where it replaces the paired reuse of `RESTIRPTE2026`.
+
+**Adaptations:**
+
+- Cells are built per tile in threadgroup memory (`spmis_cells_kernel`, one 8 × 8 threadgroup per tile), not with GPU hash multimaps. Each cell stores in-cell prefix sums of c_i p̂(X_i) W_i, so a neighbour is drawn by inverse-CDF search with its exact probability. MiniSPMIS instead estimates 1/P from an 8-sample RIS inside the cell.
+- A search tap's cell is accepted only when its own key is within one normal step of the centre's. MiniSPMIS clamps the tap's attributes and looks up the clamped key in that tile.
+- The search radius starts at max(1, height/120) pixels (2 at 320 × 240, 9 at 1080p), not 30. At preview resolutions an 8 × 8 tile already spans a large part of the scene. On unified ReSTIR PT (320 × 240, 64 frames), radii 16 → 8 → 4 → 2 lowered equal-sample MSE: Cornell 1.54 → 1.46 → 1.40 → 1.36e-4, UV sphere 7.04 → 6.69 → 6.36 → 6.13e-4, Pavilion 0.255 → 0.252 → 0.250 → 0.246. Searching only the own cell lowered raw error further, but MetalFX error on the UV sphere rose by 82%: the correlation artifacts that the paper's search avoids.
+- The search runs in its own pass (`spmis_select_kernel`) and chooses one cell per reservoir type (DI; GI or PT). Inside `shading_kernel`, its 12 dependent reads cost 20–40% of the frame.
+- The ReSTIR PT shifts run in their own pass, one shift per thread (`restir_pt_spmis_shift_kernel`: shift 0 is canonical, 1–3 are neighbours), as the paired reuse separates its shifts. This cut the SPMIS frame time by 11–29% against one kernel doing four shifts per pixel. Shifts into or from the pixel itself are identities.
+- ReSTIR DI: the shift is the identity on light samples. A domain's target is `eval_restir_target_pdf` at its cached primary surface (`PrimarySurface`, including its view direction). A neighbour's own target is its weight sum / (M W). DI candidates are light samples, drawn whether or not they are visible, so the unshadowed target is exact.
+- ReSTIR GI: the area-measure reconnection has Jacobian 1. In the canonical weight, y's target from domain i is zero unless `restir_gi_accepts_shift` accepts, x2 lies above x1_i's geometric normal (`sample_bsdf` rejects other directions) and x2 is visible from x1_i. The visibility test costs one ray per pixel, because GI samples are traced and so always visible from their source. Without these support tests, the canonical weight counted domains that cannot produce y (−0.08% on Cornell, spatial-only).
+- The output confidence of ReSTIR PT's spatial reuse is c_c + c_Σ (Ñ/M-scaled). MiniSPMIS writes (c_c + c_Σ)/(1 + Ñ); the paper does not specify it. DI and GI spatial results are not written back.
+- Shading keeps ReSTIR PT's vector-valued resampling weights Σ m̃ F W |∂T/∂x| (`RESTIRPTE2026` Sec. 6.3).
+
+**Bias status:** Spatial reuse by stochastic pairwise MIS is unbiased for ReSTIR DI, GI and PT, including the GI Jacobian bound. In pairwise MIS the bound restricts the shift's domain, and the canonical weight applies the same restriction, so it is no longer a biased rejection. It still bounds the weights. The earlier normalizations did not achieve this: uniform mode's M/ΣM excludes rejected and empty neighbours, and compatibility mode's 1/Z uses an approximate support test without visibility.
+
+Mean radiance against MIS (320 × 240, relative ± tile-clustered SE) was measured spatial-only, with reservoir history cleared every frame so spatial reuse is the only reuse:
+
+- ReSTIR GI, uniform: Cornell +6.12 ± 0.17%, UV sphere +1.05 ± 0.06%, glass +3.33 ± 0.13%
+- ReSTIR GI, compatibility: Cornell −0.205 ± 0.012%
+- ReSTIR GI, SPMIS: Cornell +0.026 ± 0.010%, UV sphere +0.015 ± 0.010%, glass +0.03 ± 0.07%, patches −0.000 ± 0.015%, Pavilion −0.05 ± 0.07%
+- Unified ReSTIR PT, SPMIS: every scene within ±0.06% and 2 SE; paired reuse also agrees there
+
+The whole ReSTIR GI pipeline stays biased, because its temporal pass still caps M without MIS weights and excludes zero-weight reservoirs. In full accumulation, SPMIS measured Cornell +0.27 ± 0.02%, UV sphere +0.11 ± 0.01%, glass +0.26 ± 0.08% and patches +0.16 ± 0.02%, against uniform's +0.25%, +0.09% and +0.23%. Compatibility mode's darkening partly cancels the temporal bias (Cornell +0.07%). Unified ReSTIR PT with SPMIS is unbiased within noise (Cornell +0.006 ± 0.010%, UV sphere +0.011 ± 0.008%, patches +0.005 ± 0.012%).
+
+**Default (2026-09-29):** SPMIS is opt-in (**Spatial neighbours → Stochastic pairwise MIS**, `VIBE_SPATIAL_NEIGHBORS=stochastic` in `-D VIBE_TESTING` builds), and `.automatic` is unchanged:
+
+- ReSTIR GI: it never wins. At equal samples it is −2% to +3% against uniform on the procedural scenes and trails compatibility-guided selection on the imported meshes, and it costs 5–21% more frame time.
+- Unified ReSTIR PT, static accumulation: it lowers equal-sample MSE by 6–33% (tone-mapped 10–35%) for 13–55% more frame time. At equal time it wins only on the imported fixtures (Shader Ball −13%, UV sphere −11%, patches −4%) and loses 10–46% on the procedural views.
+- Unified ReSTIR PT, moving camera: it lowers raw per-frame error by 10–20% (disoccluded pixels 11–49%) for 9–33% more frame time. The MetalFX display error does not improve (−1% to +23%; +4 to +23% on the meshes), because SPMIS spreads the same few samples over a cell.
+
+Details are in `tests/PERFORMANCE.md`. Exports copy the setting.
+
+**Related, not used:** stratified reuse from several cells (the paper's future work), the combination with MCMC decorrelation, and roughness in the cell key (disabled in MiniSPMIS as well). Combined with reservoir splatting (`HONG2026`), SPMIS runs on the front layer only; that combination was not measured.
 
 ### RESTIRPT2022 — Generalized resampled importance sampling and ReSTIR PT
 
@@ -126,6 +173,8 @@ Daqi Lin, Markus Kettunen, and Chris Wyman. **ReSTIR PT Enhanced: Algorithmic Ad
 
 **Default and measurements (2026-09-29):** see "September 29 ReSTIR PT" below and `tests/PERFORMANCE.md`.
 
+**Stochastic pairwise MIS (2026-09-29):** `SpatialNeighborSelection.stochasticPairwise` replaces the paired spatial reuse (`restir_pt_shift_kernel`, `restir_pt_spatial_kernel`) with `SPMIS2026`'s cell reuse (`restir_pt_spmis_shift_kernel`, `restir_pt_spmis_kernel`). The other selections keep paired reuse.
+
 ### HONG2026 — Multi-layer reservoir splatting
 
 Pengpei Hong, Song Zhang, Daqi Lin, Markus Kettunen, Chris Wyman, and Cem Yuksel. **Multi-Layer Reservoir Splatting for Temporal Reuse under Disocclusion.** *SIGGRAPH Conference Papers '26*, Los Angeles, July 19–23, 2026, 10 pages. [NVIDIA publication page](https://research.nvidia.com/labs/rtr/publication/hong2026multilayer/), [author PDF](https://research.nvidia.com/labs/rtr/publication/hong2026multilayer/hong2026multilayer.pdf), [Utah project page](https://graphics.cs.utah.edu/research/projects/multi-layer-restir/). [DOI: 10.1145/3799902.3811232](https://doi.org/10.1145/3799902.3811232). The full text was read from the author PDF on 2026-09-29. The paper is CC BY 4.0; no code (none is published) or figures were copied.
@@ -152,7 +201,7 @@ Pengpei Hong, Song Zhang, Daqi Lin, Markus Kettunen, Chris Wyman, and Cem Yuksel
 
 **Measured effect and default (2026-09-29):** see "September 29 reservoir splatting" below and `tests/PERFORMANCE.md`. `TemporalReuse.automatic` resolves to reprojection in every mode; `PathTracerRenderer.temporalReuse = .splatting`, or `VIBE_TEMPORAL_REUSE=splatting` in `-D VIBE_TESTING` builds, enables it. Exports accumulate a static view, which never splats, so the export renderer uses reprojection and allocates no splat resources. The Render inspector exposes the setting (**Temporal reuse**) and projects store it (`ProjectDocument.temporalReuse`); see "September 29 ReSTIR mode controls" for persistence and precedence.
 
-**Related, not used:** the paper's combination with stochastic pairwise MIS (Hedstrom et al. 2026), NRD denoising, and uniform (non-adaptive) k-layer domains.
+**Related, not used:** NRD denoising and uniform (non-adaptive) k-layer domains. Stochastic pairwise MIS (`SPMIS2026`) can be selected together with splatting and then reuses spatially on the front layer only. The combination was not measured.
 
 ### LIU2025 — Reservoir splatting
 
@@ -484,6 +533,17 @@ Amazon Lumberyard / NVIDIA ORCA. **Amazon Lumberyard Bistro**, 2017. [Primary do
 Tizian Zeltner, Iliyan Georgiev, and Wenzel Jakob. **Specular Manifold Sampling for Rendering High-Frequency Caustics and Glints.** *ACM Transactions on Graphics* 39(4), 2020. [Author publication page and errata](https://rgl.epfl.ch/publications/Zeltner2020Specular). [DOI: 10.1145/3386569.3392408](https://doi.org/10.1145/3386569.3392408).
 
 **Relationship:** explains the established method named by the legacy symbol `sample_specular_manifold_caustic`. The current **Ring boost** is an artistic approximation with a simplified Jacobian and empirical gain. It is not an implementation or validation of this paper's estimator, and its original derivation is undocumented. This citation is related-work context, not a claim that the paper's code was incorporated.
+
+## September 29 stochastic pairwise MIS
+
+`SPMIS2026` adds stochastic pairwise MIS spatial reuse for ReSTIR DI, GI and PT as a fourth spatial selection (`SpatialNeighborSelection.stochasticPairwise`, raw value 3; test seam `VIBE_SPATIAL_NEIGHBORS=stochastic`; Render inspector **Spatial neighbours → Stochastic pairwise MIS**, stored in projects as `spatialNeighbors` = 3). It is opt-in: `.automatic` resolves as before, following the equal-time measurements in `tests/PERFORMANCE.md`. With the other selections, all `tests/benchmark.py` scenarios render mean radiance identical to `cc88e24`'s shaders at zero tolerance.
+
+Changes that span entries:
+
+- ABI: `Uniforms.spatialNeighbors` = 3 selects it, and the 304-byte stride is unchanged. `shading_kernel` gains buffers 4–6 (cells, slots and choices; 64-byte placeholders in other modes).
+- Passes (`PathTracerRenderer.renderFrame`): `spmis_cells_kernel` (one threadgroup per 8 × 8 tile) and `spmis_select_kernel` run after the final temporal reservoirs exist. With ReSTIR PT they run after its temporal pass and are followed by `restir_pt_spmis_shift_kernel` and `restir_pt_spmis_kernel`; with ReSTIR GI they run before pass 2.
+- Memory: `FrameResourcePlan.spmisBytesPerPixel` adds 44 B per pixel (ReSTIR GI) or 92 B (ReSTIR PT, whose `ptShifts` grows to four 24 B records). This is allocated only in this mode, marked by bit 32 of `reservoirSet`, and preflighted by `renderMemoryError(…, spatialNeighbors:)` and `StudioController.setReSTIRModes`.
+- The checks are in `tests/Fix_spmis.swift`: layouts; the partition of unity and unbiased stochastic weights (z-test over 131,072 trials) with exact draw probabilities; reuse cells and the cell search on a synthetic G-buffer against a CPU rebuild; plumbing, memory, release and fallback equivalence; spatial-only mean radiance against MIS; and the equal-sample gain of unified ReSTIR PT on an imported mesh. `tests/Fix_ui-modes.swift` covers the popup item and persistence.
 
 ## September 29 reservoir splatting
 
