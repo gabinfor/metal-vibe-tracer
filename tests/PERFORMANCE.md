@@ -1,3 +1,67 @@
+# ReSTIR spatial neighbour selection — September 29, 2026
+
+Compatibility-guided selection (`REFERENCES.md` `COMPATRESTIR2026`, now the default)
+versus the earlier uniform selection (`PathTracerRenderer.spatialNeighbors = .uniform`),
+on an Apple M4 (10-core GPU, 16 GB), macOS 27.0 (26A428), Swift 6.4. Source: `d5a449f` plus
+this change (uncommitted at measurement; the committed shaders are identical).
+
+## Equivalence and cost against `main`
+
+`python3 tests/benchmark.py --baseline <main.swift of d5a449f> --rounds 2 --frames 12` with
+`VIBE_ACCELERATION=flat`, which puts both renderers on the flat BVH (the script forces it
+for the baseline). The raw report is [`PERFORMANCE-neighbors-raw.txt`](PERFORMANCE-neighbors-raw.txt).
+With `VIBE_SPATIAL_NEIGHBORS=uniform` and `--output-tolerance 0`, all six scenarios gave
+mean raw radiance identical to the baseline's, and timings matched within noise
+(for example, Pavilion 26.29 vs 26.33 ms). Default (compatibility) mode, median GPU ms per frame, 640×480:
+
+| Scene fixture | MetalFX | Baseline `d5a449f` | Current | Change |
+| --- | --- | ---: | ---: | ---: |
+| Default Pavilion | off | 26.29 | 27.83 | +5.9% |
+| Default Pavilion | on | 30.89 | 32.81 | +6.2% |
+| Pavilion with coated OpenPBR floor | off | 32.80 | 34.19 | +4.2% |
+| Pavilion with coated OpenPBR floor | on | 38.30 | 39.38 | +2.8% |
+| Cornell box | off | 11.85 | 13.51 | +14.0% |
+| Cornell box | on | 15.16 | 17.12 | +12.9% |
+| Default Pavilion, MIS (no ReSTIR) | off | 22.28 | 22.45 | +0.8% |
+| Imported mesh (8,130 triangles), flat BVH | off | 14.94 | 16.43 | +10.0% |
+| Imported mesh (8,130 triangles), flat BVH | on | 18.34 | 20.03 | +9.2% |
+| Instanced scene graph, flat BVH | off | 44.56 | 48.00 | +7.7% |
+| Instanced scene graph, flat BVH | on | 47.94 | 52.49 | +9.5% |
+
+With the default hardware traversal, paired interleaved runs (16 pairs of 10 frames,
+median of the per-pair ratios, MetalFX off) measured, at 640×480 and 320×240: Pavilion
++6.0% / +7.3%, Pavilion close-up — / +6.9%, coated floor +3.4% / +4.4%, Cornell +13.2% / +14.5%,
+Cornell glass & mirror +10.6% / +10.8%, imported UV sphere +20.1% / +33.6%, instanced
+patches +25.7% / +23.8%. Most of the extra time is spatial reuse that the uniform
+selection's rejections used to skip; the selection taps and the 1/Z support test add the rest.
+
+## Error at equal sample count and equal time
+
+The scratch driver used for these figures is not part of the suite. It renders through the
+production `render()` path at 320×240 and path depth 16. Each figure is the mean over 4
+independent seed sequences of the accumulated image's MSE (linear RGB, all pixels) against
+a 1,024-frame MIS reference. Equal-time figures scale by the 640×480 cost ratio above,
+assuming MSE ∝ 1/frames (the 16- to 64-frame ratios measured 3.7–4.7).
+
+| Scene | Uniform, 64 frames | Compatibility, 64 frames | Equal sample | Equal time |
+| --- | ---: | ---: | ---: | ---: |
+| Pavilion (default view) | 0.2879 | 0.2883 | +0.1% | +6% |
+| Pavilion close-up (copper sphere, floor) | 0.8680 | 0.8708 | +0.3% | +7% |
+| Pavilion, coated OpenPBR floor | 0.3457 | 0.3424 | −1.0% | +2% |
+| Cornell box | 1.855e-4 | 1.726e-4 | −7.0% | +5% |
+| Cornell glass & mirror | 5.283e-3 | 5.329e-3 | +0.9% | +12% |
+| Imported UV sphere on a floor | 1.967e-3 | 1.178e-3 | −40% | −28% |
+| Instanced bumpy patches (25 × 19,968 triangles) | 6.822e-3 | 2.673e-3 | −61% | −51% |
+
+On the "hard" 10% of diffuse pixels (the fewest uniform-box neighbours passing the binary
+test, as in the paper's Section 7), 64-frame MSE fell by 63% (sphere), 43% (patches) and 10%
+(Cornell). It rose by 30% on the coated-floor Pavilion. The ASWF Standard Shader Ball has no
+diffuse primary hits, so no ReSTIR spatial reuse runs there and both modes are identical.
+After 4 frames at 640×480, the MetalFX display error (tone-mapped, against a 1,024-frame MIS
+reference) was 6.39e-4 → 3.51e-4 on Cornell and 7.18e-4 → 7.68e-4 on Pavilion (uniform →
+compatibility); after 16 frames it was 3.93e-4 → 3.85e-4 and 8.59e-4 → 8.66e-4. Mean-radiance bias against MIS for both modes is listed under `COMPATRESTIR2026` in
+`REFERENCES.md`: compatibility mode is closer to MIS in six of seven scenes.
+
 # Renderer performance — September 28, 2026 (acceleration structure)
 
 Measured with `python3 tests/benchmark.py --baseline <main.swift of 192724f> --rounds 3 --frames 12

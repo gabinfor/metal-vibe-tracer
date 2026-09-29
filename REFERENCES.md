@@ -1,6 +1,6 @@
 # Metal Vibe Tracer references
 
-Last reviewed: **2026-09-28**, for the follow-up fixes recorded in [docs/AUDIT_REMEDIATION_2026-09-26.md](docs/AUDIT_REMEDIATION_2026-09-26.md) ("Follow-up, 2026-09-28"), including MaterialX graph-driven emission and the two-level acceleration structure (`WALD2007`, `WIDEBVH2008`, `METALRT`; see "September 28 acceleration structure"). The audit remediation itself was reviewed on 2026-09-26. Web references below were checked on the dates recorded by each entry; entries touched by either review say so.
+Last reviewed: **2026-09-29**, for compatibility-guided ReSTIR spatial neighbour selection (`COMPATRESTIR2026`; see "September 29 spatial neighbour selection"); before that on 2026-09-28, for the follow-up fixes recorded in [docs/AUDIT_REMEDIATION_2026-09-26.md](docs/AUDIT_REMEDIATION_2026-09-26.md) ("Follow-up, 2026-09-28"), including MaterialX graph-driven emission and the two-level acceleration structure (`WALD2007`, `WIDEBVH2008`, `METALRT`; see "September 28 acceleration structure"). The audit remediation itself was reviewed on 2026-09-26. Web references below were checked on the dates recorded by each entry; entries touched by either review say so.
 
 This document records the algorithmic basis, identifiable formula sources, and API dependencies of the current renderer. It distinguishes implementation references from related work. The supplied `main.swift` did not include a complete bibliography, so matching an existing formula to a publication does not establish the original file's copying history or authorship.
 
@@ -16,6 +16,8 @@ Benedikt Bitterli, Chris Wyman, Matt Pharr, Peter Shirley, Aaron Lefohn, and Woj
 
 **2026-09-26 adaptations:** both passes seed per pixel so that they share one lens sample; `decorrelate_shading_seed` then rehashes the shading-pass seed, so spatial-neighbour offsets no longer reuse the temporal pass's candidate draws. Temporal reuse and reprojection now also run while the camera moves: `Uniforms.reservoirHistory` counts consecutive ReSTIR frames (camera moves keep it; scene cuts and resets clear it), and `Uniforms.reservoirHistoryReset` skips temporal reuse on the first frame after only the reservoirs were reallocated. `restir_temporal_kernel` writes the resolved primary hit into the per-pixel `PrimarySurface` cache (`PathTracerRenderer.primarySurfaceStride`, 104 B/pixel); `shading_kernel` and `metalfx_guides_kernel` read it instead of re-tracing and re-resolving the primary ray.
 
+**Unbiased combination (2026-09-29):** in compatibility mode (`COMPATRESTIR2026`), `shading_kernel` normalizes spatially combined DI reservoirs with the paper's Algorithm 6 (1/Z; checked against the author PDF on 2026-09-29): Z adds the confidence M of every reused reservoir, including empty ones (W = 0), whose pixel's target can be nonzero at the selected sample (`restir_di_in_support`). The test is local and geometric (the sample lies above the neighbour's G-buffer shading normal). It does not test the neighbour's albedo, geometric normal, view side or emitter facing, so a neighbour whose target is zero for one of those reasons is still counted (a small darkening). Uniform mode keeps the earlier combination unchanged: M sums only over neighbours that pass the binary test and hold a nonzero W, which excludes zero-valued reservoirs and biases the estimate upward (measured +0.5% on Cornell diffuse pixels at 320×240, +4% at 96×64; see `COMPATRESTIR2026`). The temporal pass keeps that exclusion in both modes.
+
 ### RESTIRGI2021 — First-indirect-bounce path reuse
 
 Yaobin Ouyang, Shiqiu Liu, Markus Kettunen, Matt Pharr, and Jacopo Pantaleoni. **ReSTIR GI: Path Resampling for Real-Time Path Tracing.** *Computer Graphics Forum* 40(8), pp. 17–29, High-Performance Graphics 2021. [Official NVIDIA publication page](https://research.nvidia.com/publication/2021-06_restir-gi-path-resampling-real-time-path-tracing). [DOI: 10.1111/cgf.14378](https://doi.org/10.1111/cgf.14378).
@@ -24,9 +26,44 @@ Yaobin Ouyang, Shiqiu Liu, Markus Kettunen, Matt Pharr, and Jacopo Pantaleoni. *
 
 **Visibility correction (2026-09-08):** `gi_connection_visible` recomputes its direction from the offset origin to the stored secondary point, keeping the traced ray and endpoint distance consistent.
 
+**Spatial neighbours (2026-09-29):** GI spatial reuse selects its neighbours independently of DI, uniformly or by `COMPATRESTIR2026`. In compatibility mode, GI spatial reuse also uses the `RESTIR2020` Algorithm 6 normalization. `restir_gi_in_support` counts neighbour q's M when the selected secondary vertex faces q (`gi_geometry` > 0) and q's reconnection passes the Jacobian bound.
+
 **Adaptations and limits:** this is a bounded first-indirect-bounce diffuse subset, not the complete paper implementation. It omits glossy/specular shift mappings, full path reconnection, pairwise/generalized MIS, and reuse beyond `x2`; uses simple normal/depth/material compatibility; caps temporal history; and accepts the bias from correlated practical reuse. Standard MIS remains the reference strategy.
 
 **Reconnection Jacobian (2026-09-26):** `restir_gi_jacobian` evaluates the solid-angle Jacobian of the paper's Equation 11 for reconnecting a source path `x1q → x2` at `x1r`. The area-measure target already applies it, so `restir_gi_accepts_shift` only rejects temporal and spatial shifts whose Jacobian lies outside [0.1, 10], mainly short contact-corner reconnections with heavy-tailed weights. This bound is a local choice; rejecting such shifts adds bias in exchange for bounded weights. `restir_gi_enabled` disables GI reuse when the path-depth budget allows no continuation (see `PBRT2023`). The paper's Equation 11 was checked against the author PDF on 2026-09-26.
+
+### COMPATRESTIR2026 — Compatibility-guided spatial neighbour selection
+
+Orion Junkins, Markus Kettunen, Daqi Lin, Ravi Ramamoorthi, and Chris Wyman. **Compatibility-Guided Neighbor Selection for ReSTIR.** *Proceedings of the ACM on Computer Graphics and Interactive Techniques* 9(4), Article 52, 16 pages, July 2026 (High-Performance Graphics 2026; Wolfgang Straßer Award, per the [HPG 2026 awards page](https://www.highperformancegraphics.org/2026/awards/)). [NVIDIA publication page](https://research.nvidia.com/labs/rtr/publication/junkins2026compatibility/), [author PDF](https://research.nvidia.com/labs/rtr/publication/junkins2026compatibility/junkins2026compatibility.pdf). [DOI: 10.1145/3820024](https://doi.org/10.1145/3820024). The full text was read from the author PDF on 2026-09-28. The paper is CC BY 4.0; no code or figures were copied.
+
+**What the paper does:** it replaces `RESTIR2020`'s spatial neighbour selection (M uniform taps in a radius-R disk, with a binary normal/depth test that can reject every tap) with Algorithm 1. It takes K candidate taps from the disk and resamples M neighbours from them with weighted reservoir sampling, in proportion to a continuous G-buffer compatibility score (Eqs. 14–15):
+
+h = exp(−‖x₁ − y₁‖ / s) · max(n_x · n_y, 0)^β, with s = √(Ω d² / π),
+
+where d is the primary-hit distance, Ω = 0.05 sr and β = 8. It uses A-Chao for M = 1 and A-ES for M > 1. The search stops early once more than M candidates score above 0.5. Candidates follow an R2 sequence with a randomized start through the concentric map. The paper recommends 8 ≤ K ≤ 32 and 30 ≤ R ≤ 100 pixels at 1080p (Fast: K = 32, R = 30). Because the selection depends only on G-buffer values, it leaves GRIS unbiased when the resampling (MIS) weights are correct. The paper tried a material term and dropped it.
+
+**Used in:** `SpatialNeighborSelection`, `PathTracerRenderer.spatialNeighbors`, `Uniforms.spatialNeighbors`, `restir_compatibility`, `concentric_disk`, `compat_candidate`, `select_compatible_neighbors`, `restir_di_in_support`, `restir_gi_in_support`, and the DI and GI spatial reuse loops of `shading_kernel`. `uniform_neighbor` and `restir2020_compatible` keep the earlier uniform selection.
+
+**Implemented as in the paper:** Eqs. 14–15 with Ω = 0.05 and β = 8; the R2 plus concentric-map candidate taps; A-ES without replacement (its first rank is an A-Chao draw); early stopping above 0.5; K = 32.
+
+**Adaptations:**
+
+- M = 4 per reservoir type, matching the four uniform taps that DI and GI each drew before. The paper recommends M ≤ 3.
+- R = 24 pixels, at preview resolutions of about 320–800 pixels wide, against the paper's 30 at 1080p.
+- DI and GI select separate neighbour sets (two selections per pixel). One shared set was about 5% worse on Pavilion (64-frame MSE 0.303 vs 0.288).
+- The selection runs inline in `shading_kernel`, not as a separate pass.
+- The R2 sequence's random start is a random 2D offset (Cranley–Patterson rotation), and the 8,192 precomputed offsets are not used.
+- A binary material term is kept: only diffuse primary hits hold reservoirs, so other pixels score zero. Off-screen taps, the pixel itself and misses also score zero.
+- A candidate pixel already held in the reservoir is not inserted twice.
+- The binary `RESTIR2020` test no longer applies in compatibility mode. `restir_gi_accepts_shift` (the Jacobian bound, `RESTIRGI2021`) still rejects GI shifts.
+
+**Bias status:** the paper's unbiasedness argument assumes correct MIS weights, and this renderer's spatial combination used M/ΣM weights. With those weights, the continuous score (which admits neighbours that the binary test rejected) measured +1.1% on Cornell and −0.6% on the instanced patches, against +0.5% and +0.3% for uniform mode. Compatibility mode therefore also applies `RESTIR2020` Algorithm 6 (1/Z) to DI and GI spatial reuse, with the geometric support test described under `RESTIR2020`. Measured diffuse-pixel bias against MIS (320×240, 256 frames, relative, ± SE; uniform then compatibility): Pavilion +0.31 ± 0.06% vs +0.22 ± 0.06%, Pavilion close-up +0.44 ± 0.09% vs +0.24 ± 0.09%, coated floor +0.37 ± 0.08% vs +0.16 ± 0.07%, Cornell +0.54 ± 0.03% vs +0.27 ± 0.02%, Cornell glass +0.34 ± 0.14% vs +0.10 ± 0.14%, UV-sphere mesh +0.16 ± 0.02% vs +0.20 ± 0.01%, instanced patches +0.27 ± 0.03% vs −0.05 ± 0.02%. The remaining bias comes from the temporal pass (zero-weight exclusion, M cap), the GI Jacobian bound and the approximate support test. The whole ReSTIR path remains a practical, not an unbiased, estimator. Using the exact target at the neighbour (its full primary surface) instead of the geometric support test gave the same bias and MSE within noise, at 4–12% more frame time.
+
+**Measured effect** (Apple M4, `tests/PERFORMANCE.md`): at equal sample count (64 accumulated frames, 320×240, against a 1,024-frame MIS reference), MSE falls by 40% on the imported UV-sphere mesh, 61% on the instanced bumpy patches and 7% on Cornell. Pavilion views and Cornell glass are within ±1%. Frame time rises by 3–26%. At equal time (assuming MSE ∝ 1/frames), compatibility mode wins on the two mesh fixtures (−28% and −51%) and loses 2–12% on the procedural scenes. The ASWF Shader Ball has no diffuse primary hits, so no ReSTIR reuse runs there and both modes render identically. MetalFX display error after 4 frames at 640×480 changed by −45% (Cornell) and +7% (Pavilion). On a 128×96 Cornell view, raw error fell by 18% but the MetalFX output did not improve; `tests/GPUChecks.swift` therefore runs its MetalFX error-ratio gate, which was calibrated there, on the uniform selection. A larger radius (R = 48, the paper's Balanced setting) removed that small-image effect but cost 4–11 points more frame time, with unchanged 640×480 MetalFX error.
+
+**Selection:** compatibility mode is the default. `PathTracerRenderer.spatialNeighbors = .uniform`, or `VIBE_SPATIAL_NEIGHBORS=uniform` in `-D VIBE_TESTING` builds, restores the earlier path. With it, all six `tests/benchmark.py` scenarios gave mean radiance identical to `d5a449f`'s shaders at zero tolerance. Exports copy the interactive renderer's mode. The setting is not persisted in projects and has no UI.
+
+**Related, not used:** NVIDIA's RTXDI SDK adds this selection to the Ultra mode of its ReSTIR PT ([ChangeLog](https://github.com/NVIDIA-RTX/RTXDI/blob/main/ChangeLog.md)). No RTXDI code is used. The stochastic pairwise MIS of Hedstrom et al. 2026 and the vMF similarity of Tokuyoshi 2023, both cited by the paper, are not implemented.
 
 ### MIS1995 — Multiple importance sampling
 
@@ -346,6 +383,10 @@ Amazon Lumberyard / NVIDIA ORCA. **Amazon Lumberyard Bistro**, 2017. [Primary do
 Tizian Zeltner, Iliyan Georgiev, and Wenzel Jakob. **Specular Manifold Sampling for Rendering High-Frequency Caustics and Glints.** *ACM Transactions on Graphics* 39(4), 2020. [Author publication page and errata](https://rgl.epfl.ch/publications/Zeltner2020Specular). [DOI: 10.1145/3386569.3392408](https://doi.org/10.1145/3386569.3392408).
 
 **Relationship:** explains the established method named by the legacy symbol `sample_specular_manifold_caustic`. The current **Ring boost** is an artistic approximation with a simplified Jacobian and empirical gain. It is not an implementation or validation of this paper's estimator, and its original derivation is undocumented. This citation is related-work context, not a claim that the paper's code was incorporated.
+
+## September 29 spatial neighbour selection
+
+`COMPATRESTIR2026` adds compatibility-guided spatial neighbour selection to ReSTIR DI and GI, with `RESTIR2020` Algorithm 6 normalization in that mode (`RESTIR2020`, `RESTIRGI2021`). The ABI change: `Uniforms.spatialNeighbors` occupies former padding at offset 252, and the 304-byte stride is unchanged. The checks are in `tests/Fix_compat-neighbors.swift`: layout; the score and disk map; A-ES first-rank proportionality against a replayed candidate list (z-test over 65,536 trials); validity, uniqueness and early stopping; the uniform taps and binary test against the pre-change formula; an equal-sample MSE gain on an imported mesh over six views; and mean radiance against MIS in both modes. Timings are in `tests/PERFORMANCE.md`.
 
 ## Local methods and provenance limits
 

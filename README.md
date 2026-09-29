@@ -4,7 +4,7 @@ An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Expl
 
 ## Features
 
-- **Path tracing:** ReSTIR direct lighting and first-bounce diffuse GI, with Standard MIS, light-only, and BSDF-only comparison modes.
+- **Path tracing:** ReSTIR direct lighting and first-bounce diffuse GI, with Standard MIS, light-only, and BSDF-only comparison modes. Spatial reuse picks its neighbours by compatibility-guided selection (Junkins et al., HPG 2026; `COMPATRESTIR2026` in [REFERENCES.md](REFERENCES.md)).
 - **Materials:** OpenPBR surfaces, image textures, normal maps, and a supported subset of MaterialX graphs.
 - **Scenes:** six procedural test scenes, OBJ import, and OpenUSD scene import with hierarchy, instances, materials, lights, and cameras. Imported meshes are traced as instances through a two-level acceleration structure: Metal hardware ray tracing where a launch-time check finds it watertight (Apple M4 does), otherwise an exact software 4-wide SAH hierarchy. Up to 1,000,000 stored and 64,000,000 rendered triangles.
 - **Lighting:** procedural skies, HDRI environments, editable area lights, and a thin-lens camera.
@@ -102,13 +102,14 @@ The September 26, 2026 audit remediation and its validation are recorded in
 The application is currently distributed as an unsigned local build; signing,
 notarization, and clean-machine installation remain release packaging work.
 
-`python3 tests/benchmark.py [--baseline /path/to/previous/main.swift] [--report FILE] [--frames 12] [--rounds 2] [--output-tolerance 0.05]` times the production `renderFrame` path on fixed scenes. A baseline's shaders are compared only when their Uniforms layout, argument-buffer length and kernel bindings match the current host code, and each scenario's mean raw radiance agrees within `--output-tolerance`. Otherwise no timings are printed. Current measurements, from September 28, 2026 at `84db5e3`, are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md), with the unedited report in [tests/PERFORMANCE-raw.txt](tests/PERFORMANCE-raw.txt). Earlier speedup figures, which predate ReSTIR GI and could not be reproduced, have been withdrawn.
+`python3 tests/benchmark.py [--baseline /path/to/previous/main.swift] [--report FILE] [--frames 12] [--rounds 2] [--output-tolerance 0.05]` times the production `renderFrame` path on fixed scenes. A baseline's shaders are compared only when their Uniforms layout, argument-buffer length and kernel bindings match the current host code, and each scenario's mean raw radiance agrees within `--output-tolerance`. Otherwise no timings are printed. Current measurements, from September 28, 2026 at `84db5e3`, are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md), with the unedited report in [tests/PERFORMANCE-raw.txt](tests/PERFORMANCE-raw.txt). The September 29 spatial neighbour selection figures (error and time against the uniform selection) head that file, with their report in [tests/PERFORMANCE-neighbors-raw.txt](tests/PERFORMANCE-neighbors-raw.txt). Earlier speedup figures, which predate ReSTIR GI and could not be reproduced, have been withdrawn.
 
 See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
 
 ## Known limitations
 
 - ReSTIR GI currently reuses the first diffuse indirect vertex. Deeper and glossy transport use ordinary path tracing; practical reservoir reuse is not a fully unbiased reference estimator. Use Standard MIS with fog and ring boost disabled for comparisons.
+- Compatibility-guided neighbour selection costs 3–26% more frame time than the earlier uniform selection. On imported meshes it lowers error substantially (40–61% at equal sample count in the measured fixtures). On the procedural scenes it is within about ±1%, or 7% lower on Cornell, which is 2–12% worse at equal time. Test builds (`-D VIBE_TESTING`) restore the uniform selection with `VIBE_SPATIAL_NEIGHBORS=uniform`; there is no UI setting.
 - HDRI sampling uses a luminance-weighted lat-long distribution; very small or high-contrast features can still require additional samples.
 - OpenUSD import is a scene snapshot, with partial material and light support. Animation, subdivision evaluation, volumes, curves, and USD export are unsupported.
 - MaterialX support is a bounded importer, with no node editor or graph export. OCIO/ACES color management, UDIMs, displacement, and several advanced material features are unsupported.
