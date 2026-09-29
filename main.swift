@@ -179,7 +179,7 @@ bool uses_scene_graph(constant Uniforms &u) { return u.lens.z > 0; }
 // Uniforms.indirectReuse: bits 0-1 select IndirectReuse (0 ReSTIR GI, 1 ReSTIR PT for
 // paths of three or more vertices, 2 ReSTIR PT for every path); bit 2 enables the
 // duplication-map confidence reduction (RESTIRPTE2026 Sec. 5, biased); bit 3 keeps temporal
-// reuse on while a static view accumulates.
+// reuse on while a static view accumulates; bit 4 marks a reservoir-splatting frame (splat_frame).
 uint indirect_reuse_mode(constant Uniforms &u) { return min(u.indirectReuse & 3u, 2u); }
 bool restir_gi_active(constant Uniforms &u) { return indirect_reuse_mode(u) == 0; }
 bool restir_pt_active(constant Uniforms &u) { return indirect_reuse_mode(u) != 0; }
@@ -191,6 +191,9 @@ bool restir_pt_decorrelates(constant Uniforms &u) { return (u.indirectReuse & 4u
 // static accumulation it correlates frames (RESTIRPT2022 and RESTIRPTE2026 Sec. 7.4 recommend
 // accumulating without it); spatial reuse continues on every frame.
 bool restir_pt_temporal(constant Uniforms &u) { return u.frameIndex <= 1u || (u.indirectReuse & 8u) != 0u; }
+// Bit 4: this frame reuses temporally by multi-layer reservoir splatting (HONG2026) instead of
+// reprojection. The host sets it while the view changes (PathTracerRenderer.temporalReuse).
+bool splat_frame(constant Uniforms &u) { return (u.indirectReuse & 16u) != 0u; }
 
 // ============================================================================
 // Procedural Physical Sky
@@ -2001,6 +2004,187 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
     return hit;
 }
 
+// ReSTIR DI and GI reservoirs of one reuse domain (a primary hit and its view direction): the
+// selected sample, the running resampling-weight sum and the confidence M. restir_temporal_kernel
+// builds them for the front layer; the reservoir-splatting kernels also for deep layers (HONG2026).
+struct DIReservoir { LightSample sample; float weightSum; float M; };
+struct GIReservoir { float3 position, normal, radiance; float sourcePdf, weightSum, M; };
+
+// Initial light candidates (RIS M = 4) at a diffuse primary hit.
+DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, thread uint &seed,
+                              constant MaterialResources &images) {
+    DIReservoir r;
+    r.sample = {};
+    r.sample.pdf = 0.0f;
+    r.sample.position = float3(0.0f);
+    r.sample.wi = float3(0.0f);
+    r.sample.emission = float3(0.0f);
+    r.sample.isDirectional = 0;
+    r.weightSum = 0.0f;
+    r.M = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        LightSample cand = sample_direct_light(rec.position, rec.normal, u, seed, images);
+        r.M += 1.0f; // Zero-weight candidates still count in the estimator.
+        if (cand.pdf > 0.0f) {
+            float p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, cand, u.sceneIndex, u.light.w, images);
+            float proposalPDF = cand.pdf * light_geometry(rec.position, cand, u.sceneIndex, u.light.w, images);
+            float w_i = proposalPDF > 0.0f ? p_hat / proposalPDF : 0.0f;
+            r.weightSum += w_i;
+            if (rand_f(seed) * r.weightSum < w_i) {
+                r.sample = cand;
+            }
+        }
+    }
+    return r;
+}
+
+// A stored DI sample (the reservoir texture layout) seen from the shading point p.
+LightSample restir_di_stored_sample(float4 posDir, float4 emitPdf, float3 p) {
+    LightSample s = {};
+    s.position = posDir.xyz;
+    s.isDirectional = uint(posDir.w);
+    s.wi = (s.isDirectional == 1) ? s.position : normalize(s.position - p);
+    s.emission = emitPdf.xyz;
+    s.pdf = emitPdf.w;
+    return s;
+}
+
+// Temporal DI merge of a history reservoir (confidence M, contribution weight W) with the
+// history confidence capped at 20. The caller has checked M > 0 and W > 0.
+void restir_di_merge(thread DIReservoir &r, HitRecord rec, float3 view, float4 histPosDir, float4 histEmitPdf,
+                     float histM, float histW, constant Uniforms &u, thread uint &seed, constant MaterialResources &images) {
+    LightSample histSample = restir_di_stored_sample(histPosDir, histEmitPdf, rec.position);
+    float prev_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, histSample, u.sceneIndex, u.light.w, images);
+    float clampedM = min(histM, 20.0f);
+    float w_temporal = prev_p_hat * histW * clampedM;
+    r.M += clampedM;
+    r.weightSum += w_temporal;
+    if (rand_f(seed) * r.weightSum < w_temporal) {
+        r.sample = histSample;
+    }
+}
+
+// The reservoir's stored form: sample position (or direction) and type, emission and PDF, and
+// (weight sum, M, W, 0).
+void restir_di_encode(DIReservoir r, HitRecord rec, float3 view, constant Uniforms &u, constant MaterialResources &images,
+                      thread float4 &posDir, thread float4 &emitPdf, thread float4 &weights) {
+    float current_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, r.sample, u.sceneIndex, u.light.w, images);
+    float W = (r.M > 0.0f && current_p_hat > 0.0f) ? (r.weightSum / (r.M * current_p_hat)) : 0.0f;
+    float3 storeDirPos = (r.sample.isDirectional == 1) ? r.sample.wi : r.sample.position;
+    posDir = float4(storeDirPos, float(r.sample.isDirectional));
+    emitPdf = float4(r.sample.emission, r.sample.pdf);
+    weights = float4(r.weightSum, r.M, W, 0.0f);
+}
+
+// ReSTIR GI initial path: x0(camera) -> x1(primary diffuse) -> x2(diffuse) -> sampled light. It
+// stores x2 and its one-sample outgoing direct radiance; deeper transport remains in the ordinary
+// path continuation. fovScale is tan(fov / 2), for the texture footprint at x2.
+GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, constant Uniforms &u,
+                              constant SurfaceSettings *surfaceSettings, constant MaterialResources &images, thread uint &seed) {
+    GIReservoir r;
+    r.position = float3(0.0f);
+    r.normal = float3(0.0f);
+    r.radiance = float3(0.0f);
+    r.sourcePdf = 0.0f;
+    r.weightSum = 0.0f;
+    r.M = 1.0f;
+    float3 giDirection, giBSDFWeight;
+    float giBSDFPdf;
+    if (sample_bsdf(rec.mat, rec.normal, view, rec.front_face, seed,
+                    giDirection, giBSDFWeight, giBSDFPdf) && giBSDFPdf > 0.0f) {
+        Ray giRay;
+        giRay.origin = ray_origin(rec.position, rec.geometricNormal, giDirection, u, rec.error);
+        giRay.direction = giDirection;
+        HitRecord secondary;
+        if (trace_scene(giRay, u.sceneIndex, secondary, images, u)) {
+            resolve_material(secondary, giRay, u, surfaceSettings, images,
+                (rec.t + secondary.t) * 2.0f * fovScale / float(u.height));
+            if (secondary.mat.type == DIFFUSE) {
+                float3 secondaryRadiance = float3(0.0f);
+                LightSample giLight = sample_direct_light(secondary.position, secondary.normal, u, seed, images);
+                if (giLight.pdf > 0.0f && light_visible(secondary.position,
+                    secondary.geometricNormal, giLight, u.sceneIndex, images, u, secondary.error)) {
+                    float secondaryCosine = max(0.0f, dot(secondary.normal, giLight.wi));
+                    float secondaryBSDFPdf;
+                    float3 secondaryBSDF = eval_bsdf_with_pdf(secondary.mat, secondary.normal,
+                        -giRay.direction, giLight.wi, secondaryBSDFPdf);
+                    float mis = restir_gi_has_complementary_bsdf(u.cameraTarget.w)
+                        ? power_heuristic(giLight.pdf, secondaryBSDFPdf) : 1.0f;
+                    secondaryRadiance = secondaryBSDF * secondaryCosine * giLight.emission *
+                        (mis / giLight.pdf);
+                }
+                float3 giDelta = secondary.position - rec.position;
+                float d2 = dot(giDelta, giDelta);
+                float cosSecondary = max(0.0f, dot(secondary.normal, -giDirection));
+                float sourcePdfArea = d2 > 1e-10f ? giBSDFPdf * cosSecondary / d2 : 0.0f;
+                float pHat = eval_restir_gi_target(rec.position, rec.normal, view,
+                    rec.mat, secondary.position, secondary.normal, secondaryRadiance);
+                if (sourcePdfArea > 0.0f && pHat > 0.0f) {
+                    r.position = secondary.position;
+                    r.normal = secondary.normal;
+                    r.radiance = secondaryRadiance;
+                    r.sourcePdf = sourcePdfArea;
+                    r.weightSum = pHat / sourcePdfArea;
+                }
+            }
+        }
+    }
+    return r;
+}
+
+// Temporal GI merge: the stored secondary point of a history reservoir whose primary hit was
+// sourceX1 is reconnected and reweighted at rec. The caller has checked the reservoir's M, W,
+// source PDF and normal flag.
+void restir_gi_merge(thread GIReservoir &r, HitRecord rec, float3 view, float3 sourceX1, float4 oldGIPosPdf,
+                     float4 oldGINormal, float3 oldGIRadiance, float oldM, float oldW, thread uint &seed) {
+    if (!restir_gi_accepts_shift(rec.position, sourceX1, oldGIPosPdf.xyz, oldGINormal.xyz)) return;
+    float pHat = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat,
+        oldGIPosPdf.xyz, oldGINormal.xyz, oldGIRadiance);
+    float clampedM = min(oldM, 20.0f);
+    float temporalWeight = pHat * oldW * clampedM;
+    r.M += clampedM;
+    r.weightSum += temporalWeight;
+    if (rand_f(seed) * r.weightSum < temporalWeight) {
+        r.position = oldGIPosPdf.xyz;
+        r.normal = oldGINormal.xyz;
+        r.radiance = oldGIRadiance;
+        r.sourcePdf = oldGIPosPdf.w;
+    }
+}
+
+void restir_gi_encode(GIReservoir r, HitRecord rec, float3 view, thread float4 &posPdf, thread float4 &normal,
+                      thread float4 &radiance, thread float4 &weights) {
+    float target = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, r.position, r.normal, r.radiance);
+    float W = r.M > 0.0f && target > 0.0f ? r.weightSum / (r.M * target) : 0.0f;
+    posPdf = float4(r.position, r.sourcePdf);
+    normal = float4(r.normal, r.sourcePdf > 0.0f ? 1.0f : 0.0f);
+    radiance = float4(r.radiance, 0.0f);
+    weights = float4(r.weightSum, r.M, W, 0.0f);
+}
+
+// The ReSTIR DI same-surface test of temporal reprojection. position / oldPosition hold
+// (point, camera distance), normal / oldNormal (normal, material type).
+bool restir_same_surface(float4 position, float4 normal, float4 oldPos, float4 oldNormal) {
+    return oldPos.w > 0.0f && oldNormal.w == normal.w &&
+        dot(oldNormal.xyz, normal.xyz) > 0.95f &&
+        distance(oldPos.xyz, position.xyz) < max(0.01f, position.w * 0.01f);
+}
+bool restir_same_surface(float4 oldPos, float4 oldNormal, HitRecord rec) {
+    return restir_same_surface(float4(rec.position, rec.t), float4(rec.normal, float(rec.mat.type)), oldPos, oldNormal);
+}
+
+// Temporal reprojection (backprojection) of a primary hit into the previous frame: the pixel
+// whose reservoir is reused. Reservoir history survives camera motion; the same-surface test
+// rejects disocclusions.
+bool restir_backproject(float3 position, constant Uniforms &u, thread int2 &prevCoord) {
+    float4 prevClip = u.prevViewProj * float4(position, 1.0f);
+    if (!(prevClip.w > 0.0f) || u.reservoirHistory <= 1 || u.reservoirHistoryReset != 0) return false;
+    float2 prevUV = (prevClip.xy / prevClip.w) * float2(0.5f, -0.5f) + 0.5f;
+    prevCoord = int2(prevUV * float2(float(u.width), float(u.height)));
+    return all(prevUV >= 0.0f) && all(prevUV < 1.0f) && prevCoord.x >= 0 && prevCoord.x < int(u.width) &&
+        prevCoord.y >= 0 && prevCoord.y < int(u.height);
+}
+
 // ============================================================================
 // PASS 1: G-Buffer & ReSTIR Temporal Reuse Kernel
 // Reference: RESTIR2020; local reuse approximations are documented in REFERENCES.md.
@@ -2110,82 +2294,29 @@ kernel void restir_temporal_kernel(
     }
 
     // Initial Candidate Generation (RIS M = 4)
-    LightSample selectedSample = {};
-    selectedSample.pdf = 0.0f;
-    selectedSample.position = float3(0.0f);
-    selectedSample.wi = float3(0.0f);
-    selectedSample.emission = float3(0.0f);
-    selectedSample.isDirectional = 0;
-
-    float weightSum = 0.0f;
-    float M = 0.0f;
-
-    for (int i = 0; i < 4; ++i) {
-        LightSample cand = sample_direct_light(rec.position, rec.normal, uniforms, seed, materialImages);
-        M += 1.0f; // Zero-weight candidates still count in the estimator.
-        if (cand.pdf > 0.0f) {
-            float p_hat = eval_restir_target_pdf(rec.position, rec.normal, ray.direction, rec.mat, cand, uniforms.sceneIndex, uniforms.light.w,materialImages);
-            float proposalPDF = cand.pdf * light_geometry(rec.position, cand, uniforms.sceneIndex, uniforms.light.w,materialImages);
-            float w_i = proposalPDF > 0.0f ? p_hat / proposalPDF : 0.0f;
-            weightSum += w_i;
-            if (rand_f(seed) * weightSum < w_i) {
-                selectedSample = cand;
-            }
-        }
-    }
+    DIReservoir di = restir_di_initial(rec, ray.direction, uniforms, seed, materialImages);
 
     // Temporal Reprojection. Reservoir history survives camera motion; the
-    // reprojected surface test below rejects disocclusions.
-    float4 prevClip = uniforms.prevViewProj * float4(rec.position, 1.0f);
-    if (prevClip.w > 0.0f && uniforms.reservoirHistory > 1 && uniforms.reservoirHistoryReset == 0) {
-        float2 prevNDC = prevClip.xy / prevClip.w;
-        float2 prevUV = prevNDC * float2(0.5f, -0.5f) + 0.5f;
-        int2 prevCoord = int2(prevUV * float2(float(uniforms.width), float(uniforms.height)));
-
-        if (all(prevUV >= 0.0f) && all(prevUV < 1.0f) &&
-            prevCoord.x >= 0 && prevCoord.x < int(uniforms.width) &&
-            prevCoord.y >= 0 && prevCoord.y < int(uniforms.height)) {
-
-            float4 histWeights = histReservoirWeights.read(uint2(prevCoord));
-            float histM = histWeights.y;
-            float histW = histWeights.z;
-
-            float4 oldPos = histPosDepth.read(uint2(prevCoord));
-            float4 oldNormal = histNormalMat.read(uint2(prevCoord));
-            bool sameSurface = oldPos.w > 0.0f && oldNormal.w == float(rec.mat.type) &&
-                dot(oldNormal.xyz, rec.normal) > 0.95f &&
-                distance(oldPos.xyz, rec.position) < max(0.01f, rec.t * 0.01f);
-            if (sameSurface && histM > 0.0f && histW > 0.0f) {
-                float4 histPosDir = histSamplePosDir.read(uint2(prevCoord));
-                float4 histEmitPdf = histSampleEmitPdf.read(uint2(prevCoord));
-
-                LightSample histSample = {};
-                histSample.position = histPosDir.xyz;
-                histSample.isDirectional = uint(histPosDir.w);
-                histSample.wi = (histSample.isDirectional == 1) ? histSample.position : normalize(histSample.position - rec.position);
-                histSample.emission = histEmitPdf.xyz;
-                histSample.pdf = histEmitPdf.w;
-
-                float prev_p_hat = eval_restir_target_pdf(rec.position, rec.normal, ray.direction, rec.mat, histSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
-                float clampedM = min(histM, 20.0f);
-                float w_temporal = prev_p_hat * histW * clampedM;
-
-                M += clampedM;
-                weightSum += w_temporal;
-                if (rand_f(seed) * weightSum < w_temporal) {
-                    selectedSample = histSample;
-                }
-            }
+    // reprojected surface test below rejects disocclusions. With reservoir splatting
+    // (splat_frame), splat_temporal_kernel merges the temporal candidates instead.
+    int2 prevCoord;
+    bool temporal = !splat_frame(uniforms) && restir_backproject(rec.position, uniforms, prevCoord);
+    if (temporal) {
+        float4 histWeights = histReservoirWeights.read(uint2(prevCoord));
+        float histM = histWeights.y;
+        float histW = histWeights.z;
+        bool sameSurface = restir_same_surface(histPosDepth.read(uint2(prevCoord)), histNormalMat.read(uint2(prevCoord)), rec);
+        if (sameSurface && histM > 0.0f && histW > 0.0f) {
+            restir_di_merge(di, rec, ray.direction, histSamplePosDir.read(uint2(prevCoord)),
+                histSampleEmitPdf.read(uint2(prevCoord)), histM, histW, uniforms, seed, materialImages);
         }
     }
 
-    float current_p_hat = eval_restir_target_pdf(rec.position, rec.normal, ray.direction, rec.mat, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
-    float W = (M > 0.0f && current_p_hat > 0.0f) ? (weightSum / (M * current_p_hat)) : 0.0f;
-
-    float3 storeDirPos = (selectedSample.isDirectional == 1) ? selectedSample.wi : selectedSample.position;
-    outSamplePosDir.write(float4(storeDirPos, float(selectedSample.isDirectional)), gid);
-    outSampleEmitPdf.write(float4(selectedSample.emission, selectedSample.pdf), gid);
-    outReservoirWeights.write(float4(weightSum, M, W, 0.0f), gid);
+    float4 diPosDir, diEmitPdf, diWeights;
+    restir_di_encode(di, rec, ray.direction, uniforms, materialImages, diPosDir, diEmitPdf, diWeights);
+    outSamplePosDir.write(diPosDir, gid);
+    outSampleEmitPdf.write(diEmitPdf, gid);
+    outReservoirWeights.write(diWeights, gid);
     // In ReSTIR PT mode (DI bound, GI placeholders) the restir_pt_* passes estimate longer paths.
     if (!giBound) return;
 
@@ -2198,101 +2329,28 @@ kernel void restir_temporal_kernel(
         return;
     }
 
-    // ReSTIR GI initial path: x0(camera) -> x1(primary diffuse) -> x2(diffuse)
-    // -> sampled light. Store x2 and its one-sample outgoing direct radiance;
-    // deeper transport remains in the ordinary path continuation.
-    float3 selectedGIPos = float3(0.0f);
-    float3 selectedGINormal = float3(0.0f);
-    float3 selectedGIRadiance = float3(0.0f);
-    float selectedGISourcePdf = 0.0f;
-    float giWeightSum = 0.0f;
-    float giM = 1.0f;
-    float3 giDirection, giBSDFWeight;
-    float giBSDFPdf;
-    if (sample_bsdf(rec.mat, rec.normal, ray.direction, rec.front_face, seed,
-                    giDirection, giBSDFWeight, giBSDFPdf) && giBSDFPdf > 0.0f) {
-        Ray giRay;
-        giRay.origin = ray_origin(rec.position, rec.geometricNormal, giDirection, uniforms, rec.error);
-        giRay.direction = giDirection;
-        HitRecord secondary;
-        if (trace_scene(giRay, uniforms.sceneIndex, secondary, materialImages, uniforms)) {
-            resolve_material(secondary, giRay, uniforms, surfaceSettings, materialImages,
-                (rec.t + secondary.t) * 2.0f * fov_scale / float(uniforms.height));
-            if (secondary.mat.type == DIFFUSE) {
-                float3 secondaryRadiance = float3(0.0f);
-                LightSample giLight = sample_direct_light(secondary.position, secondary.normal,
-                    uniforms, seed, materialImages);
-                if (giLight.pdf > 0.0f && light_visible(secondary.position,
-                    secondary.geometricNormal, giLight, uniforms.sceneIndex, materialImages, uniforms, secondary.error)) {
-                    float secondaryCosine = max(0.0f, dot(secondary.normal, giLight.wi));
-                    float secondaryBSDFPdf;
-                    float3 secondaryBSDF = eval_bsdf_with_pdf(secondary.mat, secondary.normal,
-                        -giRay.direction, giLight.wi, secondaryBSDFPdf);
-                    float mis = restir_gi_has_complementary_bsdf(uniforms.cameraTarget.w)
-                        ? power_heuristic(giLight.pdf, secondaryBSDFPdf) : 1.0f;
-                    secondaryRadiance = secondaryBSDF * secondaryCosine * giLight.emission *
-                        (mis / giLight.pdf);
-                }
-                float3 giDelta = secondary.position - rec.position;
-                float d2 = dot(giDelta, giDelta);
-                float cosSecondary = max(0.0f, dot(secondary.normal, -giDirection));
-                float sourcePdfArea = d2 > 1e-10f ? giBSDFPdf * cosSecondary / d2 : 0.0f;
-                float pHat = eval_restir_gi_target(rec.position, rec.normal, ray.direction,
-                    rec.mat, secondary.position, secondary.normal, secondaryRadiance);
-                if (sourcePdfArea > 0.0f && pHat > 0.0f) {
-                    selectedGIPos = secondary.position;
-                    selectedGINormal = secondary.normal;
-                    selectedGIRadiance = secondaryRadiance;
-                    selectedGISourcePdf = sourcePdfArea;
-                    giWeightSum = pHat / sourcePdfArea;
-                }
-            }
-        }
-    }
+    GIReservoir gi = restir_gi_initial(rec, ray.direction, fov_scale, uniforms, surfaceSettings, materialImages, seed);
 
     // Temporal GI reservoir merge. Primary-surface reprojection defines the
     // reuse domain; the secondary point is reconnected and reweighted at x1.
-    float4 giPrevClip = uniforms.prevViewProj * float4(rec.position, 1.0f);
-    if (giPrevClip.w > 0.0f && uniforms.reservoirHistory > 1 && uniforms.reservoirHistoryReset == 0) {
-        float2 prevUV = (giPrevClip.xy / giPrevClip.w) * float2(0.5f, -0.5f) + 0.5f;
-        int2 prevCoord = int2(prevUV * float2(float(uniforms.width), float(uniforms.height)));
-        if (all(prevUV >= 0.0f) && all(prevUV < 1.0f) && prevCoord.x >= 0 &&
-            prevCoord.x < int(uniforms.width) && prevCoord.y >= 0 && prevCoord.y < int(uniforms.height)) {
-            float4 oldPos = histPosDepth.read(uint2(prevCoord));
-            float4 oldNormal = histNormalMat.read(uint2(prevCoord));
-            bool sameSurface = oldPos.w > 0.0f && oldNormal.w == float(rec.mat.type) &&
-                dot(oldNormal.xyz, rec.normal) > 0.95f &&
-                distance(oldPos.xyz, rec.position) < max(0.01f, rec.t * 0.01f);
-            float4 oldGIWeights = histGIWeights.read(uint2(prevCoord));
-            float4 oldGIPosPdf = histGIPosPdf.read(uint2(prevCoord));
-            float4 oldGINormal = histGINormal.read(uint2(prevCoord));
-            if (sameSurface && oldGIWeights.y > 0.0f && oldGIWeights.z > 0.0f &&
-                oldGIPosPdf.w > 0.0f && oldGINormal.w > 0.0f &&
-                restir_gi_accepts_shift(rec.position, oldPos.xyz, oldGIPosPdf.xyz, oldGINormal.xyz)) {
-                float3 oldGIRadiance = histGIRadiance.read(uint2(prevCoord)).xyz;
-                float pHat = eval_restir_gi_target(rec.position, rec.normal, ray.direction, rec.mat,
-                    oldGIPosPdf.xyz, oldGINormal.xyz, oldGIRadiance);
-                float clampedM = min(oldGIWeights.y, 20.0f);
-                float temporalWeight = pHat * oldGIWeights.z * clampedM;
-                giM += clampedM;
-                giWeightSum += temporalWeight;
-                if (rand_f(seed) * giWeightSum < temporalWeight) {
-                    selectedGIPos = oldGIPosPdf.xyz;
-                    selectedGINormal = oldGINormal.xyz;
-                    selectedGIRadiance = oldGIRadiance;
-                    selectedGISourcePdf = oldGIPosPdf.w;
-                }
-            }
+    if (temporal) {
+        float4 oldPos = histPosDepth.read(uint2(prevCoord));
+        bool sameSurface = restir_same_surface(oldPos, histNormalMat.read(uint2(prevCoord)), rec);
+        float4 oldGIWeights = histGIWeights.read(uint2(prevCoord));
+        float4 oldGIPosPdf = histGIPosPdf.read(uint2(prevCoord));
+        float4 oldGINormal = histGINormal.read(uint2(prevCoord));
+        if (sameSurface && oldGIWeights.y > 0.0f && oldGIWeights.z > 0.0f &&
+            oldGIPosPdf.w > 0.0f && oldGINormal.w > 0.0f) {
+            restir_gi_merge(gi, rec, ray.direction, oldPos.xyz, oldGIPosPdf, oldGINormal,
+                histGIRadiance.read(uint2(prevCoord)).xyz, oldGIWeights.y, oldGIWeights.z, seed);
         }
     }
-    float selectedGITarget = eval_restir_gi_target(rec.position, rec.normal, ray.direction,
-        rec.mat, selectedGIPos, selectedGINormal, selectedGIRadiance);
-    float giW = giM > 0.0f && selectedGITarget > 0.0f
-        ? giWeightSum / (giM * selectedGITarget) : 0.0f;
-    outGIPosPdf.write(float4(selectedGIPos, selectedGISourcePdf), gid);
-    outGINormal.write(float4(selectedGINormal, selectedGISourcePdf > 0.0f ? 1.0f : 0.0f), gid);
-    outGIRadiance.write(float4(selectedGIRadiance, 0.0f), gid);
-    outGIWeights.write(float4(giWeightSum, giM, giW, 0.0f), gid);
+    float4 giPosPdf, giNormal, giRadiance, giWeights;
+    restir_gi_encode(gi, rec, ray.direction, giPosPdf, giNormal, giRadiance, giWeights);
+    outGIPosPdf.write(giPosPdf, gid);
+    outGINormal.write(giNormal, gid);
+    outGIRadiance.write(giRadiance, gid);
+    outGIWeights.write(giWeights, gid);
 }
 
 // ============================================================================
@@ -3053,6 +3111,52 @@ kernel void restir_pt_initial_kernel(
     ptIndirect.write(float4(0.0f, 0.0f, 0.0f, firstHit), gid);
 }
 
+// The temporal domain is the reprojected pixel when it shows the same surface (the ReSTIR DI
+// test, with the distance bound widened to three pixel footprints at low resolutions). GRIS
+// stays unbiased for any neighbour; the test only avoids shifts into unrelated domains.
+// position / oldPosition hold (point, camera distance), normal / oldNormal (normal, material type).
+bool pt_same_surface(float4 position, float4 normalMaterial, float3 view, float4 oldPosition, float4 oldNormal,
+                     constant Uniforms &u) {
+    float footprint = 3.0f * pt_primary_cone(u) * position.w / max(abs(dot(normalMaterial.xyz, view)), 0.25f);
+    return oldPosition.w > 0.0f && oldNormal.w == normalMaterial.w &&
+        dot(oldNormal.xyz, normalMaterial.xyz) > 0.95f &&
+        distance(oldPosition.xyz, position.xyz) < max(max(0.01f, position.w * 0.01f), footprint);
+}
+
+// Generalized Talbot MIS with confidences (RESTIRPT2022 Eq. 36, Sec. 8.3) over the canonical
+// reservoir c of domain x1 and the temporal reservoir t of domain y1 (depths are camera
+// distances), each sample shifted into the other domain; the temporal confidence is capped at cap.
+PTReservoir pt_temporal_merge(PTReservoir c, HitRecord x1, float3 view, float depth, PTReservoir t, HitRecord y1,
+                              float3 oldView, float oldDepth, float cap, uint selectSeed, constant Uniforms &u,
+                              constant SurfaceSettings *settings, constant MaterialResources &images) {
+    float cone = pt_primary_cone(u);
+    float cc = c.M, ct = min(t.M, cap);
+    float pc = pt_luminance(c.F), pt = pt_luminance(t.F);
+    PTShift toPrevious = { float3(0.0f), 0.0f }, toCurrent = { float3(0.0f), 0.0f };
+    if (pc > 0.0f) toPrevious = pt_shift(c, y1, oldView, pt_footprint_threshold(oldDepth, y1.geometricNormal, oldView),
+                                         cone, u, settings, images);
+    if (pt > 0.0f && t.W > 0.0f) toCurrent = pt_shift(t, x1, view, pt_footprint_threshold(depth, x1.geometricNormal, view),
+                                                      cone, u, settings, images);
+    float pcPrevious = pt_luminance(toPrevious.FJ), ptCurrent = pt_luminance(toCurrent.FJ);
+    float wc = c.W > 0.0f ? pt_talbot(pc, cc, pcPrevious, ct) * pc * c.W : 0.0f;
+    float wt = pt_talbot(pt, ct, ptCurrent, cc) * ptCurrent * t.W;
+    float sum = wc + wt;
+    PTReservoir chosen = c;
+    float chosenTarget = pc;
+    if (wt > 0.0f && rand_f(selectSeed) * sum < wt) {
+        chosen = t;
+        float jacobian = pt_rc_index(t) > 0u ? toCurrent.jacobian / t.rcJacobian : 1.0f;
+        chosen.F = toCurrent.FJ / jacobian;
+        if (pt_rc_index(t) > 0u) chosen.rcJacobian = toCurrent.jacobian;
+        chosenTarget = pt_luminance(chosen.F);
+    }
+    float W = chosenTarget > 0.0f && sum > 0.0f ? sum / chosenTarget : 0.0f;
+    if (!(W > 0.0f) || !isfinite(W)) chosen = pt_empty();
+    else chosen.W = W;
+    chosen.M = cc + ct;
+    return chosen;
+}
+
 // ReSTIR PT pass B: temporal reuse. The temporal neighbour's domain is the previous frame's
 // primary hit (history G-buffer and PrimarySurface); generalized Talbot MIS with confidences
 // (RESTIRPT2022 Eq. 36, Sec. 8.3) weighs the canonical and the temporal sample, each shifted
@@ -3085,13 +3189,7 @@ kernel void restir_pt_temporal_kernel(
     if (!all(prevUV >= 0.0f) || !all(prevUV < 1.0f) || !pt_in_frame(prevCoord, u)) return;
     float4 oldPosition = historyPosDepth.read(uint2(prevCoord));
     float4 oldNormal = historyNormalMat.read(uint2(prevCoord));
-    // The temporal domain is the reprojected pixel when it shows the same surface (the ReSTIR DI
-    // test, with the distance bound widened to three pixel footprints at low resolutions). GRIS
-    // stays unbiased for any neighbour; the test only avoids shifts into unrelated domains.
-    float footprint = 3.0f * pt_primary_cone(u) * position.w / max(abs(dot(normalMaterial.xyz, float3(primarySurfaces[index].view))), 0.25f);
-    bool sameSurface = oldPosition.w > 0.0f && oldNormal.w == normalMaterial.w &&
-        dot(oldNormal.xyz, normalMaterial.xyz) > 0.95f &&
-        distance(oldPosition.xyz, position.xyz) < max(max(0.01f, position.w * 0.01f), footprint);
+    bool sameSurface = pt_same_surface(position, normalMaterial, float3(primarySurfaces[index].view), oldPosition, oldNormal, u);
     uint prevIndex = uint(prevCoord.y) * u.width + uint(prevCoord.x);
     PTReservoir t = history[prevIndex];
     if (!sameSurface || !(t.M > 0.0f)) return;
@@ -3100,38 +3198,14 @@ kernel void restir_pt_temporal_kernel(
     float3 view = float3(primarySurfaces[index].view);
     HitRecord y1 = load_primary_surface(historySurfaces[prevIndex], oldPosition);
     float3 oldView = float3(historySurfaces[prevIndex].view);
-    float cone = pt_primary_cone(u);
     float cap = PT_CONFIDENCE_CAP;
     if (restir_pt_decorrelates(u)) {
         float score = saturate(duplication.read(uint2(prevCoord)).x);
         cap = mix(PT_CONFIDENCE_CAP, PT_CONFIDENCE_MIN, pow(score, PT_DUPLICATION_EXPONENT));
     }
-    float cc = c.M, ct = min(t.M, cap);
-    float pc = pt_luminance(c.F), pt = pt_luminance(t.F);
-    PTShift toPrevious = { float3(0.0f), 0.0f }, toCurrent = { float3(0.0f), 0.0f };
-    if (pc > 0.0f) toPrevious = pt_shift(c, y1, oldView, pt_footprint_threshold(oldPosition.w, y1.geometricNormal, oldView),
-                                         cone, u, settings, images);
-    if (pt > 0.0f && t.W > 0.0f) toCurrent = pt_shift(t, x1, view, pt_footprint_threshold(position.w, x1.geometricNormal, view),
-                                                      cone, u, settings, images);
-    float pcPrevious = pt_luminance(toPrevious.FJ), ptCurrent = pt_luminance(toCurrent.FJ);
-    float wc = c.W > 0.0f ? pt_talbot(pc, cc, pcPrevious, ct) * pc * c.W : 0.0f;
-    float wt = pt_talbot(pt, ct, ptCurrent, cc) * ptCurrent * t.W;
-    float sum = wc + wt;
-    PTReservoir chosen = c;
-    float chosenTarget = pc;
     uint selectSeed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
-    if (wt > 0.0f && rand_f(selectSeed) * sum < wt) {
-        chosen = t;
-        float jacobian = pt_rc_index(t) > 0u ? toCurrent.jacobian / t.rcJacobian : 1.0f;
-        chosen.F = toCurrent.FJ / jacobian;
-        if (pt_rc_index(t) > 0u) chosen.rcJacobian = toCurrent.jacobian;
-        chosenTarget = pt_luminance(chosen.F);
-    }
-    float W = chosenTarget > 0.0f && sum > 0.0f ? sum / chosenTarget : 0.0f;
-    if (!(W > 0.0f) || !isfinite(W)) chosen = pt_empty();
-    else chosen.W = W;
-    chosen.M = cc + ct;
-    reservoirs[index] = chosen;
+    reservoirs[index] = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldPosition.w, cap, selectSeed,
+                                          u, settings, images);
 }
 
 // ReSTIR PT pass B: each pixel shifts its path to its PT_NEIGHBORS paired partners once.
@@ -3285,6 +3359,546 @@ kernel void restir_pt_duplication_kernel(
         }
     }
     duplication.write(float4(count / 288.0f), gid);
+}
+
+// ============================================================================
+// Multi-layer reservoir splatting for temporal reuse (REFERENCES.md HONG2026, LIU2025)
+// ============================================================================
+// While the view changes (splat_frame), temporal reuse maps previous-frame reuse domains
+// forward instead of reprojecting current pixels backwards. A domain is a pixel-layer pair: the
+// front layer is the pixel's primary hit; deep layer i (2 .. 1 + SPLAT_DEEP_LAYERS) is the i-th
+// front-facing hit along the pixel's camera ray, kept only where a surface that was visible
+// before is now occluded (active domains, Sec. 4.3), in a compacted pool. Each frame:
+//   splat_activate_kernel   splats the previous domains' representative hits and marks the
+//                           occluded ones' layers active (transitive activation, Sec. 5);
+//   splat_layers_kernel     traces the active deep layers of each pixel (after hole filling),
+//                           records its depth ranges (Sec. 4.2) and allocates their domains;
+//   splat_deep_restir_kernel / restir_pt_deep_initial_kernel   canonical samples of deep domains;
+//   splat_reservoirs_kernel splats every previous domain into the current domain whose depth
+//                           range and surface it matches, keeping the nearest splat per domain;
+//   splat_temporal_kernel / restir_pt_splat_temporal_kernel   merge that temporal candidate.
+// Domains stay point sampled (the renderer's reservoirs are not area reservoirs), so the splat
+// selects the temporal source domain from G-buffer geometry only and the existing DI, GI and PT
+// temporal merges shift its sample into the destination domain.
+#define SPLAT_DEEP_LAYERS 1u
+#define SPLAT_FILL_RADIUS 1
+constant float SPLAT_EPSILON = 0.01f;
+constant uint SPLAT_NONE = 0xffffffffu;
+constant uint SPLAT_PROPAGATES = 1u << 8;
+
+// A deep domain: its representative hit (position, camera distance), pixel index and flags
+// (layer in bits 0-7; SPLAT_PROPAGATES when splatted directly rather than by hole filling).
+struct SplatDomain { packed_float3 position; float depth; uint pixel; uint flags; uint2 padding; };
+// Per pixel: camera distances and depth-range half widths of deep layers 2.. (0 = not traced),
+// and their pool slots (SPLAT_NONE = inactive).
+struct SplatLayers { float4 depth; float4 halfWidth; uint4 slot; };
+// Deep-domain reservoirs in the texture layouts of restir_temporal_kernel.
+struct SplatDI { float4 posDir, emitPdf, weights; };
+struct SplatGI { float4 posPdf, normal, radiance, weights; };
+static_assert(sizeof(SplatDomain) == 32 && sizeof(SplatLayers) == 48 && sizeof(SplatDI) == 48 && sizeof(SplatGI) == 64,
+              "Swift allocates these splat layouts");
+static_assert(SPLAT_DEEP_LAYERS >= 1u && SPLAT_DEEP_LAYERS <= 4u, "SplatLayers holds up to four deep layers");
+
+// Pool counters: [0] allocated domains (may exceed the capacity), [1] overflowed domains,
+// [2] capacity (written by the host).
+uint splat_count(const device uint *counters) { return min(counters[0], counters[2]); }
+
+// Forward projection into the current frame's pixel grid (the camera math of restir_backproject).
+bool splat_project(float3 c, constant Uniforms &u, thread int2 &q) {
+    float4 clip = u.currentViewProj * float4(c, 1.0f);
+    if (!(clip.w > 0.0f)) return false;
+    float2 uv = clip.xy / clip.w * float2(0.5f, -0.5f) + 0.5f;
+    if (!all(uv >= 0.0f) || !all(uv < 1.0f)) return false;
+    q = int2(uv * float2(float(u.width), float(u.height)));
+    return pt_in_frame(q, u);
+}
+
+// Depth-range half width at camera distance t: epsilon t (Sec. 5, epsilon = 0.01), widened to twice
+// the pixel footprint's depth extent on slanted surfaces (cosine between normal and view ray).
+float splat_half_width(float t, float cosine, float cone) {
+    return t * max(SPLAT_EPSILON, 2.0f * cone / max(abs(cosine), 0.25f));
+}
+
+// The layer whose depth range holds camera distance d (Eq. 4): 0 for the front layer, i for deep
+// layer i + 1, or SPLAT_NONE. Overlapping neighbouring ranges meet at their midpoint (Sec. 5).
+uint splat_layer(float d, float front, float frontHalfWidth, SplatLayers layers) {
+    float t[1 + SPLAT_DEEP_LAYERS], h[1 + SPLAT_DEEP_LAYERS];
+    t[0] = front; h[0] = frontHalfWidth;
+    uint count = 1u;
+    for (uint i = 0u; i < SPLAT_DEEP_LAYERS && layers.depth[i] > 0.0f; ++i) {
+        t[count] = layers.depth[i]; h[count] = layers.halfWidth[i]; ++count;
+    }
+    for (uint i = 0u; i < count; ++i) {
+        float lo = t[i] - h[i], hi = t[i] + h[i];
+        if (i > 0u && t[i - 1u] + h[i - 1u] > lo) lo = 0.5f * (t[i - 1u] + h[i - 1u] + lo);
+        if (i + 1u < count && t[i + 1u] - h[i + 1u] < hi) hi = 0.5f * (hi + t[i + 1u] - h[i + 1u]);
+        if (d >= lo && d <= hi) return i;
+    }
+    return SPLAT_NONE;
+}
+
+// Deep domains hold reservoirs of the active reuse: DI and GI need a diffuse hit, PT a scattering one.
+bool splat_domain_useful(MaterialType type, constant Uniforms &u) {
+    return restir_gi_active(u) ? type == DIFFUSE : type != EMISSIVE;
+}
+
+uint splat_seed(uint pixel, uint layer, uint stream, constant Uniforms &u) {
+    return pcg_hash(pcg_hash(pixel * 8u + layer) ^ (u.sampleIndex * 1999999973u) ^ stream);
+}
+
+// Pass 1: splat the previous frame's representative hits (front layer: the history G-buffer;
+// deep: the previous pool's propagating domains). A hit behind the current front layer is
+// assigned the layer of its rank among front-facing hits along the camera ray towards it; that
+// layer becomes active in the pixel it lands in. If the ray's first hit (the immediate occluder)
+// is a different object than the pixel's front layer, the activation is dropped (Sec. 5, with
+// material slots in place of instance IDs).
+kernel void splat_activate_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::read> historyPosDepth [[texture(2)]],
+    texture2d<float, access::read> historyNormalMat [[texture(3)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device SplatDomain *previous [[buffer(9)]],
+    const device PrimarySurface *previousSurfaces [[buffer(10)]],
+    const device uint *previousCounters [[buffer(11)]],
+    device atomic_uint *mask [[buffer(15)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint pixels = u.width * u.height;
+    float3 c, n;
+    if (tid < pixels) {
+        uint2 p = uint2(tid % u.width, tid / u.width);
+        float4 old = historyPosDepth.read(p);
+        float4 oldNormal = historyNormalMat.read(p);
+        if (!(old.w > 0.0f) || oldNormal.w == float(EMISSIVE)) return;
+        c = old.xyz; n = oldNormal.xyz;
+    } else {
+        uint j = tid - pixels;
+        if (j >= splat_count(previousCounters) || (previous[j].flags & SPLAT_PROPAGATES) == 0u) return;
+        c = previous[j].position; n = previousSurfaces[j].normal;
+    }
+    int2 q;
+    if (!splat_project(c, u, q)) return;
+    uint qi = uint(q.y) * u.width + uint(q.x);
+    float4 front = gbufferPosDepth.read(uint2(q));
+    if (!(front.w > 0.0f)) return;
+    float3 eye = u.cameraPos.xyz;
+    float dist = distance(c, eye);
+    if (!(dist > 0.0f)) return;
+    float3 direction = (c - eye) / dist;
+    float cone = pt_primary_cone(u);
+    float frontHalfWidth = splat_half_width(front.w, dot(gbufferNormalMat.read(uint2(q)).xyz, float3(primarySurfaces[qi].view)), cone);
+    // Visible (the front layer), or in front of the pixel's first hit (off the pixel's ray).
+    if (dist <= front.w + frontHalfWidth) return;
+    float reach = dist - splat_half_width(dist, dot(n, direction), cone);
+    Ray ray;
+    ray.origin = eye;
+    ray.direction = direction;
+    uint layer = 0u;
+    for (uint k = 0u; k < 2u * (SPLAT_DEEP_LAYERS + 1u); ++k) {
+        HitRecord hit;
+        if (!trace_scene(ray, u.sceneIndex, hit, images, u)) return;
+        if (distance(eye, hit.position) >= reach) {
+            if (layer < 1u || layer > SPLAT_DEEP_LAYERS) return;
+            atomic_fetch_or_explicit(&mask[qi], 1u << (layer - 1u), memory_order_relaxed);
+            return;
+        }
+        if (k == 0u && hit.mat.slot != (primarySurfaces[qi].flags >> 16)) return;
+        if (k == 0u || hit.front_face) ++layer;
+        ray.origin = ray_origin(hit.position, hit.geometricNormal, direction, u, hit.error);
+    }
+}
+
+// Pass 2: per pixel, the deep layers to maintain are those activated within SPLAT_FILL_RADIUS
+// pixels (hole filling, Sec. 4.3; filled domains do not propagate). The pixel's camera ray is
+// continued past its front layer; front-facing hits define deep layers 2.., their depth ranges,
+// and, where active, a pool domain with its resolved surface.
+kernel void splat_layers_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    device SplatDomain *domains [[buffer(12)]],
+    device PrimarySurface *surfaces [[buffer(13)]],
+    device atomic_uint *counters [[buffer(14)]],
+    const device uint *mask [[buffer(15)]],
+    device SplatLayers *layers [[buffer(16)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    uint index = gid.y * u.width + gid.x;
+    SplatLayers out;
+    out.depth = float4(0.0f); out.halfWidth = float4(0.0f); out.slot = uint4(SPLAT_NONE);
+    uint direct = mask[index], active = 0u;
+    for (int dy = -SPLAT_FILL_RADIUS; dy <= SPLAT_FILL_RADIUS; ++dy) {
+        for (int dx = -SPLAT_FILL_RADIUS; dx <= SPLAT_FILL_RADIUS; ++dx) {
+            int2 q = int2(gid) + int2(dx, dy);
+            if (dx * dx + dy * dy <= SPLAT_FILL_RADIUS * SPLAT_FILL_RADIUS && pt_in_frame(q, u))
+                active |= mask[uint(q.y) * u.width + uint(q.x)];
+        }
+    }
+    active &= (1u << SPLAT_DEEP_LAYERS) - 1u;
+    float4 front = gbufferPosDepth.read(gid);
+    if (active == 0u || !(front.w > 0.0f)) { layers[index] = out; return; }
+    PrimarySurface s = primarySurfaces[index];
+    float3 eye = u.cameraPos.xyz, direction = float3(s.view);
+    uint needed = 32u - clz(active);  // deepest active layer is 1 + needed
+    uint capacity = atomic_load_explicit(&counters[2], memory_order_relaxed);
+    float cone = pt_primary_cone(u);
+    Ray ray;
+    ray.direction = direction;
+    ray.origin = ray_origin(front.xyz, float3(s.geometricNormal), direction, u, s.error);
+    uint layer = 1u;
+    for (uint k = 0u; k < 2u * SPLAT_DEEP_LAYERS && layer < 1u + needed; ++k) {
+        HitRecord hit;
+        if (!trace_scene(ray, u.sceneIndex, hit, images, u)) break;
+        ray.origin = ray_origin(hit.position, hit.geometricNormal, direction, u, hit.error);
+        if (!hit.front_face) continue;
+        uint i = layer - 1u;
+        ++layer;
+        float t = distance(eye, hit.position);
+        out.depth[i] = t;
+        out.halfWidth[i] = splat_half_width(t, dot(hit.geometricNormal, direction), cone);
+        if (((active >> i) & 1u) == 0u) continue;
+        Ray primary;
+        primary.origin = eye;
+        primary.direction = direction;
+        hit.t = t;
+        resolve_material(hit, primary, u, settings, images, t * cone);
+        if (!splat_domain_useful(hit.mat.type, u)) continue;
+        uint slot = atomic_fetch_add_explicit(&counters[0], 1u, memory_order_relaxed);
+        if (slot >= capacity) { atomic_fetch_add_explicit(&counters[1], 1u, memory_order_relaxed); continue; }
+        surfaces[slot] = store_primary_surface(hit, direction);
+        SplatDomain d;
+        d.position = hit.position; d.depth = t; d.pixel = index;
+        d.flags = (i + 2u) | (((direct >> i) & 1u) != 0u ? SPLAT_PROPAGATES : 0u);
+        d.padding = uint2(0u);
+        domains[slot] = d;
+        out.slot[i] = slot;
+    }
+    layers[index] = out;
+}
+
+// Pass 3 (ReSTIR DI / GI): canonical reservoirs of the deep domains, as restir_temporal_kernel
+// builds them for the front layer.
+kernel void splat_deep_restir_kernel(
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device SplatDomain *domains [[buffer(12)]],
+    const device PrimarySurface *surfaces [[buffer(13)]],
+    const device uint *counters [[buffer(14)]],
+    device SplatDI *di [[buffer(19)]],
+    device SplatGI *gi [[buffer(21)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= splat_count(counters)) return;
+    SplatDomain d = domains[tid];
+    PrimarySurface s = surfaces[tid];
+    bool diffuse = MaterialType(s.flags & 255u) == DIFFUSE;
+    HitRecord rec = load_primary_surface(s, float4(float3(d.position), d.depth));
+    float3 view = float3(s.view);
+    uint seed = splat_seed(d.pixel, d.flags & 255u, 0x7f4a7c15u, u);
+    if (restir_di_active(u)) {
+        SplatDI r = { float4(0.0f), float4(0.0f), float4(0.0f) };
+        if (diffuse) {
+            DIReservoir c = restir_di_initial(rec, view, u, seed, images);
+            restir_di_encode(c, rec, view, u, images, r.posDir, r.emitPdf, r.weights);
+        }
+        di[tid] = r;
+    }
+    if (restir_gi_active(u)) {
+        SplatGI r = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+        if (diffuse && restir_gi_enabled(u.cameraTarget.w)) {
+            GIReservoir c = restir_gi_initial(rec, view, tan((u.cameraPos.w * 0.5f) * PI / 180.0f), u, settings, images, seed);
+            restir_gi_encode(c, rec, view, r.posPdf, r.normal, r.radiance, r.weights);
+        }
+        gi[tid] = r;
+    }
+}
+
+// Pass 3 (ReSTIR PT): initial path trees of the deep domains (pt_generate).
+kernel void restir_pt_deep_initial_kernel(
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device SplatDomain *domains [[buffer(12)]],
+    const device PrimarySurface *surfaces [[buffer(13)]],
+    const device uint *counters [[buffer(14)]],
+    device PTReservoir *pt [[buffer(23)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= splat_count(counters)) return;
+    SplatDomain d = domains[tid];
+    PrimarySurface s = surfaces[tid];
+    PTReservoir r = pt_empty();
+    if (MaterialType(s.flags & 255u) != EMISSIVE) {
+        HitRecord x1 = load_primary_surface(s, float4(float3(d.position), d.depth));
+        float3 view = float3(s.view);
+        float firstHit = 0.0f;
+        r = pt_generate(x1, view, splat_seed(d.pixel, d.flags & 255u, 0x2545f491u, u),
+                        pt_footprint_threshold(d.depth, x1.geometricNormal, view), pt_primary_cone(u), u, settings, images, firstHit);
+    }
+    pt[tid] = r;
+}
+
+// Pass 4: every previous domain (front layer and deep pool) is splatted to the pixel its
+// representative hit projects to, assigned the layer whose depth range holds its camera distance,
+// and offered to that domain when it shows the same surface (the temporal test of the active reuse:
+// restir_same_surface for ReSTIR GI, pt_same_surface for ReSTIR PT). Each destination
+// keeps the splat nearest to its own representative hit (a 64-bit atomic minimum of distance and
+// source index), so its temporal source depends on geometry only, never on samples.
+kernel void splat_reservoirs_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::read> historyPosDepth [[texture(2)]],
+    texture2d<float, access::read> historyNormalMat [[texture(3)]],
+    constant Uniforms &u [[buffer(0)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device SplatDomain *previous [[buffer(9)]],
+    const device PrimarySurface *previousSurfaces [[buffer(10)]],
+    const device uint *previousCounters [[buffer(11)]],
+    const device SplatDomain *domains [[buffer(12)]],
+    const device PrimarySurface *surfaces [[buffer(13)]],
+    const device SplatLayers *layers [[buffer(16)]],
+    device atomic_ulong *sources [[buffer(17)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint pixels = u.width * u.height;
+    float3 c;
+    float4 n;
+    if (tid < pixels) {
+        uint2 p = uint2(tid % u.width, tid / u.width);
+        float4 old = historyPosDepth.read(p);
+        n = historyNormalMat.read(p);
+        if (!(old.w > 0.0f) || n.w == float(EMISSIVE)) return;
+        c = old.xyz;
+    } else {
+        uint j = tid - pixels;
+        if (j >= splat_count(previousCounters)) return;
+        c = previous[j].position;
+        n = float4(float3(previousSurfaces[j].normal), float(previousSurfaces[j].flags & 255u));
+    }
+    int2 q;
+    if (!splat_project(c, u, q)) return;
+    uint qi = uint(q.y) * u.width + uint(q.x);
+    float4 front = gbufferPosDepth.read(uint2(q));
+    if (!(front.w > 0.0f)) return;
+    float4 frontNormal = gbufferNormalMat.read(uint2(q));
+    float3 view = float3(primarySurfaces[qi].view);
+    SplatLayers l = layers[qi];
+    float dist = distance(c, u.cameraPos.xyz);
+    uint layer = splat_layer(dist, front.w, splat_half_width(front.w, dot(frontNormal.xyz, view), pt_primary_cone(u)), l);
+    if (layer == SPLAT_NONE) return;
+    float4 destination = front, destinationNormal = frontNormal;
+    uint target = qi;
+    if (layer > 0u) {
+        uint slot = l.slot[layer - 1u];
+        if (slot == SPLAT_NONE) return;
+        destination = float4(float3(domains[slot].position), domains[slot].depth);
+        destinationNormal = float4(float3(surfaces[slot].normal), float(surfaces[slot].flags & 255u));
+        view = float3(surfaces[slot].view);
+        target = pixels + slot;
+    }
+    bool same = restir_gi_active(u) ? restir_same_surface(destination, destinationNormal, float4(c, dist), n)
+                                    : pt_same_surface(destination, destinationNormal, view, float4(c, dist), n, u);
+    if (!same) return;
+    ulong key = (ulong(as_type<uint>(distance(c, destination.xyz))) << 32) | ulong(tid);
+    atomic_min_explicit(&sources[target], key, memory_order_relaxed);
+}
+
+// The temporal source of destination domain tid: its nearest splat or, for a front-layer domain
+// that no splat reached (a splatting hole), the reprojected pixel when it shows the same surface
+// (the backup sample of LIU2025 Sec. 4.2). Sources below the pixel count are previous front-layer
+// pixels; the others previous pool slots (offset by the pixel count).
+uint splat_source(uint tid, bool deep, bool sameSurfaceBackup, const device ulong *sources,
+                  constant Uniforms &u, thread int2 &prevCoord) {
+    ulong key = sources[tid];
+    if (key != 0xfffffffffffffffful) return uint(key & 0xffffffffu);
+    if (deep || !sameSurfaceBackup) return SPLAT_NONE;
+    return uint(prevCoord.y) * u.width + uint(prevCoord.x);
+}
+
+// Pass 5 (ReSTIR DI / GI): the temporal merge of restir_temporal_kernel, with the source domain
+// chosen by the splat, for front-layer pixels (in place, in the current reservoir textures) and
+// deep domains (in the pool).
+kernel void splat_temporal_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> historyPosDepth [[texture(2)]],
+    texture2d<float, access::read> historyNormalMat [[texture(3)]],
+    texture2d<float, access::read_write> samplePosDir [[texture(5)]],
+    texture2d<float, access::read_write> sampleEmitPdf [[texture(6)]],
+    texture2d<float, access::read_write> reservoirWeights [[texture(7)]],
+    texture2d<float, access::read> histSamplePosDir [[texture(8)]],
+    texture2d<float, access::read> histSampleEmitPdf [[texture(9)]],
+    texture2d<float, access::read> histReservoirWeights [[texture(10)]],
+    texture2d<float, access::read_write> giPosPdf [[texture(11)]],
+    texture2d<float, access::read_write> giNormal [[texture(12)]],
+    texture2d<float, access::read_write> giRadiance [[texture(13)]],
+    texture2d<float, access::read_write> giWeights [[texture(14)]],
+    texture2d<float, access::read> histGIPosPdf [[texture(15)]],
+    texture2d<float, access::read> histGINormal [[texture(16)]],
+    texture2d<float, access::read> histGIRadiance [[texture(17)]],
+    texture2d<float, access::read> histGIWeights [[texture(18)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device SplatDomain *previous [[buffer(9)]],
+    const device SplatDomain *domains [[buffer(12)]],
+    const device PrimarySurface *surfaces [[buffer(13)]],
+    const device uint *counters [[buffer(14)]],
+    const device ulong *sources [[buffer(17)]],
+    const device SplatDI *previousDI [[buffer(18)]],
+    device SplatDI *di [[buffer(19)]],
+    const device SplatGI *previousGI [[buffer(20)]],
+    device SplatGI *gi [[buffer(21)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint pixels = u.width * u.height;
+    bool deep = tid >= pixels;
+    uint j = tid - pixels;
+    uint2 p = uint2(tid % u.width, tid / u.width);
+    PrimarySurface s;
+    float4 position;
+    if (!deep) {
+        position = gbufferPosDepth.read(p);
+        if (!(position.w > 0.0f)) return;
+        s = primarySurfaces[tid];
+    } else {
+        if (j >= splat_count(counters)) return;
+        s = surfaces[j];
+        position = float4(float3(domains[j].position), domains[j].depth);
+    }
+    if (MaterialType(s.flags & 255u) != DIFFUSE) return;
+    HitRecord rec = load_primary_surface(s, position);
+    float3 view = float3(s.view);
+    int2 prevCoord = int2(0);
+    bool backup = !deep && sources[tid] == 0xfffffffffffffffful && restir_backproject(rec.position, u, prevCoord) &&
+        restir_same_surface(historyPosDepth.read(uint2(prevCoord)), historyNormalMat.read(uint2(prevCoord)), rec);
+    uint source = splat_source(tid, deep, backup, sources, u, prevCoord);
+    if (source == SPLAT_NONE) return;
+    float3 sourceX1;
+    SplatDI h;
+    SplatGI hg = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+    if (source < pixels) {
+        uint2 sp = uint2(source % u.width, source / u.width);
+        sourceX1 = historyPosDepth.read(sp).xyz;
+        h.posDir = histSamplePosDir.read(sp); h.emitPdf = histSampleEmitPdf.read(sp); h.weights = histReservoirWeights.read(sp);
+        if (restir_gi_active(u)) {
+            hg.posPdf = histGIPosPdf.read(sp); hg.normal = histGINormal.read(sp);
+            hg.radiance = histGIRadiance.read(sp); hg.weights = histGIWeights.read(sp);
+        }
+    } else {
+        uint k = source - pixels;
+        sourceX1 = previous[k].position;
+        h = previousDI[k];
+        if (restir_gi_active(u)) hg = previousGI[k];
+    }
+    uint seed = pcg_hash(tid ^ (u.sampleIndex * 1999999973u) ^ 0x3c6ef372u);
+    SplatDI c = deep ? di[j] : SplatDI{ samplePosDir.read(p), sampleEmitPdf.read(p), reservoirWeights.read(p) };
+    DIReservoir r;
+    r.sample = restir_di_stored_sample(c.posDir, c.emitPdf, rec.position);
+    r.weightSum = c.weights.x; r.M = c.weights.y;
+    if (h.weights.y > 0.0f && h.weights.z > 0.0f)
+        restir_di_merge(r, rec, view, h.posDir, h.emitPdf, h.weights.y, h.weights.z, u, seed, images);
+    restir_di_encode(r, rec, view, u, images, c.posDir, c.emitPdf, c.weights);
+    if (deep) di[j] = c;
+    else { samplePosDir.write(c.posDir, p); sampleEmitPdf.write(c.emitPdf, p); reservoirWeights.write(c.weights, p); }
+    if (!restir_gi_active(u) || !restir_gi_enabled(u.cameraTarget.w)) return;
+    SplatGI g = deep ? gi[j] : SplatGI{ giPosPdf.read(p), giNormal.read(p), giRadiance.read(p), giWeights.read(p) };
+    GIReservoir e;
+    e.position = g.posPdf.xyz; e.sourcePdf = g.posPdf.w; e.normal = g.normal.xyz; e.radiance = g.radiance.xyz;
+    e.weightSum = g.weights.x; e.M = g.weights.y;
+    if (hg.weights.y > 0.0f && hg.weights.z > 0.0f && hg.posPdf.w > 0.0f && hg.normal.w > 0.0f)
+        restir_gi_merge(e, rec, view, sourceX1, hg.posPdf, hg.normal, hg.radiance.xyz, hg.weights.y, hg.weights.z, seed);
+    restir_gi_encode(e, rec, view, g.posPdf, g.normal, g.radiance, g.weights);
+    if (deep) gi[j] = g;
+    else { giPosPdf.write(g.posPdf, p); giNormal.write(g.normal, p); giRadiance.write(g.radiance, p); giWeights.write(g.weights, p); }
+}
+
+// Pass 5 (ReSTIR PT): the generalized Talbot temporal merge (pt_temporal_merge) with the source
+// domain chosen by the splat, for front-layer pixels and deep domains; it replaces
+// restir_pt_temporal_kernel on splat frames. Deep domains skip spatial reuse (Sec. 5).
+kernel void restir_pt_splat_temporal_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::read> historyPosDepth [[texture(2)]],
+    texture2d<float, access::read> historyNormalMat [[texture(3)]],
+    texture2d<float, access::read> duplication [[texture(4)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device PrimarySurface *historySurfaces [[buffer(4)]],
+    device PTReservoir *reservoirs [[buffer(5)]],
+    const device PTReservoir *history [[buffer(6)]],
+    const device SplatDomain *previous [[buffer(9)]],
+    const device PrimarySurface *previousSurfaces [[buffer(10)]],
+    const device SplatDomain *domains [[buffer(12)]],
+    const device PrimarySurface *surfaces [[buffer(13)]],
+    const device uint *counters [[buffer(14)]],
+    const device ulong *sources [[buffer(17)]],
+    const device PTReservoir *previousPT [[buffer(22)]],
+    device PTReservoir *pt [[buffer(23)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint pixels = u.width * u.height;
+    bool deep = tid >= pixels;
+    uint j = tid - pixels;
+    PrimarySurface s;
+    float4 position, normalMaterial;
+    PTReservoir c;
+    if (!deep) {
+        uint2 p = uint2(tid % u.width, tid / u.width);
+        position = gbufferPosDepth.read(p);
+        normalMaterial = gbufferNormalMat.read(p);
+        if (!(position.w > 0.0f) || normalMaterial.w == float(EMISSIVE)) return;
+        s = primarySurfaces[tid];
+        c = reservoirs[tid];
+    } else {
+        if (j >= splat_count(counters)) return;
+        s = surfaces[j];
+        position = float4(float3(domains[j].position), domains[j].depth);
+        normalMaterial = float4(float3(s.normal), float(s.flags & 255u));
+        if (normalMaterial.w == float(EMISSIVE)) return;
+        c = pt[j];
+    }
+    float3 view = float3(s.view);
+    int2 prevCoord = int2(0);
+    bool backup = !deep && sources[tid] == 0xfffffffffffffffful && restir_backproject(position.xyz, u, prevCoord) &&
+        pt_same_surface(position, normalMaterial, view, historyPosDepth.read(uint2(prevCoord)), historyNormalMat.read(uint2(prevCoord)), u);
+    uint source = splat_source(tid, deep, backup, sources, u, prevCoord);
+    if (source == SPLAT_NONE) return;
+    PTReservoir t;
+    HitRecord y1;
+    float3 oldView;
+    float oldDepth;
+    float cap = PT_CONFIDENCE_CAP;
+    if (source < pixels) {
+        uint2 sp = uint2(source % u.width, source / u.width);
+        float4 oldPosition = historyPosDepth.read(sp);
+        t = history[source];
+        y1 = load_primary_surface(historySurfaces[source], oldPosition);
+        oldView = float3(historySurfaces[source].view);
+        oldDepth = oldPosition.w;
+        if (restir_pt_decorrelates(u))
+            cap = mix(PT_CONFIDENCE_CAP, PT_CONFIDENCE_MIN, pow(saturate(duplication.read(sp).x), PT_DUPLICATION_EXPONENT));
+    } else {
+        uint k = source - pixels;
+        t = previousPT[k];
+        y1 = load_primary_surface(previousSurfaces[k], float4(float3(previous[k].position), previous[k].depth));
+        oldView = float3(previousSurfaces[k].view);
+        oldDepth = previous[k].depth;
+    }
+    if (!(t.M > 0.0f)) return;
+    HitRecord x1 = load_primary_surface(s, position);
+    uint selectSeed = pcg_hash(tid ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
+    PTReservoir chosen = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldDepth, cap, selectSeed, u, settings, images);
+    if (deep) pt[j] = chosen;
+    else reservoirs[tid] = chosen;
 }
 
 // ============================================================================
@@ -4019,6 +4633,24 @@ enum IndirectReuse: UInt32, Sendable {
     }
 }
 
+// Temporal reuse of ReSTIR DI, GI and PT while the view changes (Uniforms.indirectReuse bit 4 on
+// those frames). REFERENCES.md: HONG2026, LIU2025.
+enum TemporalReuse: UInt32, Sendable {
+    // Backprojection of each pixel's primary hit into the previous frame (RESTIR2020, RESTIRPT2022).
+    case reprojection = 0
+    // Multi-layer reservoir splatting: previous front-layer and occluded deep-layer domains are
+    // splatted forward, so disoccluded pixels receive temporal candidates (HONG2026).
+    case splatting = 1
+    // Host-side default: reprojection in every mode. Splatting lowered the per-frame error of newly
+    // disoccluded pixels by up to 9-39% per scene with unified ReSTIR PT (little with ReSTIR GI), but
+    // left whole-image and MetalFX errors within a few percent at 5-26% more frame time, so it loses
+    // at equal time (tests/PERFORMANCE.md).
+    case automatic = 2
+    func resolved(indirectReuse: IndirectReuse) -> TemporalReuse {
+        self == .automatic ? .reprojection : self
+    }
+}
+
 // RESTIRPTE2026 Sec. 3.1: a tileable, self-inverse pairing of an even side x side torus. Link
 // indices start as consecutive pairs; n_sigma tiled 2 x 2 shuffles (every other one offset
 // diagonally by one, wrapping) random-walk them, so linked texels end up about sigma apart.
@@ -4593,6 +5225,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var metalFXScalerBytesPerPixel: UInt64 = 0
         // Indirect reuse of the ReSTIR strategy; it decides which reservoirs are full size.
         var indirectReuse: IndirectReuse = PathTracerRenderer.defaultIndirectReuse
+        // Whether the reservoir-splatting resources are allocated (temporal reuse by splatting).
+        var splatting: Bool? = nil
+        var usesSplatting: Bool {
+            splatting ?? (PathTracerRenderer.defaultTemporalReuse.resolved(indirectReuse: indirectReuse) == .splatting)
+        }
 
         // DI: 6 RGBA32F. GI: 6 RGBA32F + 2 RGBA16F. ReSTIR PT: two 64 B path reservoirs,
         // three 16 B paired shifts, the RGBA32F indirect estimate, a history PrimarySurface
@@ -4609,14 +5246,34 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             case .automatic: return max(reservoirBytesPerPixel(.restirGI), reservoirBytesPerPixel(.restirPTUnified))
             }
         }
+        // Reservoir splatting (HONG2026): per pixel an activation mask (4 B), SplatLayers (48 B) and a
+        // splat source (8 B); per deep-domain slot a splat source (8 B) and, in each of two pools,
+        // a SplatDomain (32 B), a PrimarySurface (128 B) and the active reuse's reservoirs (DI 48 B,
+        // GI 64 B, PT 64 B), with PathTracerRenderer.splatSlotsPerPixel slots per pixel.
+        static func splatBytesPerPixel(_ mode: IndirectReuse) -> UInt64 {
+            let reservoirs: UInt64
+            switch mode {
+            case .restirGI: reservoirs = 48 + 64
+            case .restirPT: reservoirs = 48 + 64
+            case .restirPTUnified: reservoirs = 64
+            case .automatic: return max(splatBytesPerPixel(.restirGI), splatBytesPerPixel(.restirPTUnified))
+            }
+            return 60 + (8 + 2 * (32 + PathTracerRenderer.primarySurfaceStride + reservoirs)) / PathTracerRenderer.splatSlotDivisor
+        }
+        // Everything a mode switch reallocates: the reservoirs and, when splatting, its resources.
+        static func reservoirSetBytesPerPixel(_ mode: IndirectReuse, splatting: Bool) -> UInt64 {
+            reservoirBytesPerPixel(mode) + (splatting ? splatBytesPerPixel(mode) : 0)
+        }
         static let metalFXTextureBytesPerPixel: UInt64 = 55
         var bytesPerPixel: UInt64 {
             // Beauty/sample/position/OIDN accumulations: 6 RGBA32F; three
             // normal/material guides: 3 RGBA16F; resolved primary surfaces:
-            // 128 B. ReSTIR adds the reservoirs of its indirect-reuse mode.
+            // 128 B. ReSTIR adds the reservoirs of its indirect-reuse mode and,
+            // when temporal reuse splats, the reservoir-splatting resources.
             // MetalFX formats total 55 B/pixel plus the scaler's own history and
             // feature allocations.
-            120 + PathTracerRenderer.primarySurfaceStride + (usesReSTIR ? Self.reservoirBytesPerPixel(indirectReuse) : 0)
+            120 + PathTracerRenderer.primarySurfaceStride
+                + (usesReSTIR ? Self.reservoirSetBytesPerPixel(indirectReuse, splatting: usesSplatting) : 0)
                 + (usesMetalFX ? Self.metalFXTextureBytesPerPixel + metalFXScalerBytesPerPixel : 0)
         }
         var bytes: UInt64? {
@@ -4643,9 +5300,14 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let temporal, shading, guides, pick: MTLComputePipelineState
         // Nil for a library without them (tests/benchmark.py baselines), which then renders ReSTIR GI.
         let pt: ReSTIRPTKernels?
+        // Nil for a library without them, which then reuses temporally by reprojection.
+        let splat: SplatKernels?
     }
     // ReSTIR PT passes: initial paths, temporal reuse, paired shifts, spatial reuse, duplication map.
     struct ReSTIRPTKernels { let initial, temporal, shift, spatial, duplication: MTLComputePipelineState }
+    // Multi-layer reservoir splatting (HONG2026): domain activation, deep layers, deep-domain canonical
+    // samples (DI/GI and PT), reservoir splats, and the DI/GI and PT temporal merges.
+    struct SplatKernels { let activate, layers, deepReSTIR, deepPT, reservoirs, temporal, ptTemporal: MTLComputePipelineState }
     let proceduralKernels: SceneKernels
     let meshKernels: SceneKernels
     var sceneKernels: SceneKernels { sceneIndex == 6 ? meshKernels : proceduralKernels }
@@ -4700,6 +5362,28 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var ptDuplication: MTLTexture?
     private var ptPairing: MTLBuffer?
     nonisolated static let ptReservoirStride = 64
+    // Multi-layer reservoir splatting (TemporalReuse.splatting; REFERENCES.md HONG2026): two pools of
+    // deep-layer domains, `splatCurrent` written this frame and `splatPrevious` read from the last,
+    // swapped after every frame; per-pixel activation masks, SplatLayers and the splat sources of
+    // every destination domain. Nil unless temporal reuse splats.
+    struct SplatPool {
+        let domains, surfaces, counters: MTLBuffer   // SplatDomain, PrimarySurface; counters are shared
+        let di, gi, pt: MTLBuffer?                   // SplatDI, SplatGI, PTReservoir of the active reuse
+        let capacity: Int
+        var buffers: [MTLBuffer] { [domains, surfaces, counters] + [di, gi, pt].compactMap { $0 } }
+    }
+    private(set) var splatCurrent: SplatPool?
+    private(set) var splatPrevious: SplatPool?
+    private(set) var splatMask: MTLBuffer?
+    private(set) var splatLayers: MTLBuffer?
+    private(set) var splatSources: MTLBuffer?
+    private var splatPlaceholder: MTLBuffer?
+    // Deep-domain slots per pool: one per splatSlotDivisor pixels. Domains beyond it are dropped
+    // (counted in the pool counters) and lose only their history.
+    nonisolated static let splatSlotDivisor: UInt64 = 4
+    nonisolated static func splatCapacity(width: Int, height: Int) -> Int { max(64, width * height / Int(splatSlotDivisor)) }
+    // Whether the last submitted frame reused temporally by splatting.
+    private(set) var lastFrameSplatted = false
 
     var prevViewProj = matrix_identity_float4x4
     var frameIndex: UInt32 = 0
@@ -4727,6 +5411,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var indirectReuse = PathTracerRenderer.defaultIndirectReuse {
         didSet { if oldValue != indirectReuse { resetAccumulation() } }
     }
+    // Temporal reuse while the view changes: reprojection or multi-layer reservoir splatting (HONG2026).
+    var temporalReuse = PathTracerRenderer.defaultTemporalReuse {
+        didSet { if oldValue != temporalReuse { resetAccumulation() } }
+    }
     // RESTIRPTE2026 Sec. 5 duplication-map confidence reduction for ReSTIR PT. It trades
     // correlation for bias, so the progressive renderer leaves it off by default.
     var ptDecorrelation = PathTracerRenderer.defaultPTDecorrelation {
@@ -4744,6 +5432,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         case "gi": return .restirGI
         case "pt": return .restirPT
         case "unified": return .restirPTUnified
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultTemporalReuse: TemporalReuse {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with either temporal reuse.
+        switch ProcessInfo.processInfo.environment["VIBE_TEMPORAL_REUSE"] {
+        case "reprojection": return .reprojection
+        case "splatting": return .splatting
         default: break
         }
 #endif
@@ -4813,11 +5512,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     private var rejectedRenderSize: SIMD2<Int>?
     // The reservoir set of the frame resources (reservoirSet): nil before the first frame.
     private var frameReservoirs: UInt32?
-    // 0 for non-ReSTIR and inspection frames (1 x 1 placeholders), else 1 + IndirectReuse.
-    func reservoirSet(usesReSTIR: Bool) -> UInt32 { usesReSTIR ? activeIndirectReuse.rawValue + 1 : 0 }
+    // 0 for non-ReSTIR and inspection frames (1 x 1 placeholders), else 1 + IndirectReuse,
+    // plus 16 with the reservoir-splatting resources.
+    func reservoirSet(usesReSTIR: Bool) -> UInt32 {
+        usesReSTIR ? (activeIndirectReuse.rawValue + 1) | (activeTemporalReuse == .splatting ? 16 : 0) : 0
+    }
     // indirectReuse with .automatic resolved for the current scene.
     var activeIndirectReuse: IndirectReuse {
         sceneKernels.pt == nil ? .restirGI : indirectReuse.resolved(importedScene: sceneIndex == 6)
+    }
+    // temporalReuse with .automatic resolved; reprojection for a library without the splat kernels.
+    var activeTemporalReuse: TemporalReuse {
+        sceneKernels.splat == nil ? .reprojection : temporalReuse.resolved(indirectReuse: activeIndirectReuse)
     }
     // Set when only the reservoirs were reallocated; the next frame skips temporal reuse.
     private(set) var reservoirHistoryNeedsReset = false
@@ -4850,15 +5556,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return (textures + metalFXTextures).compactMap { $0 }.reduce(scalerBytes) { total, texture in
             let id = ObjectIdentifier(texture as AnyObject)
             return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
-        } + [primarySurfaces, historyPrimarySurfaces, ptReservoirs, ptHistory, ptShifts, ptPairing]
+        } + ([primarySurfaces, historyPrimarySurfaces, ptReservoirs, ptHistory, ptShifts, ptPairing,
+              splatMask, splatLayers, splatSources] + (splatCurrent?.buffers ?? []) + (splatPrevious?.buffers ?? []))
             .reduce(UInt64(0)) { $0 + UInt64($1?.allocatedSize ?? 0) }
     }
 
     func renderMemoryError(width: Int, height: Int) -> String? {
         let usesReSTIR = samplingMode == 0 && viewportMode == 0
         let usesMetalFX = denoiserEnabled && supportsMetalFX && usesReSTIR
+        let splatting = activeTemporalReuse == .splatting
         let plan = FrameResourcePlan(width: width, height: height, usesReSTIR: usesReSTIR, usesMetalFX: usesMetalFX,
-            metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0, indirectReuse: activeIndirectReuse)
+            metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0, indirectReuse: activeIndirectReuse,
+            splatting: splatting)
         guard let frameBytes = plan.bytes else { return "Render dimensions are too large." }
         // Include the live frame set during resize/export, scene textures, the
         // measured MetalFX scaler internals, and modest command/display headroom
@@ -4869,9 +5578,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let resizes = accumTexture == nil || accumTexture?.width != width || accumTexture?.height != height
         let resident = resizes ? residentFrameBytes : 0
         let baseRequired = resizes ? frameBytes : residentFrameBytes
-        // A strategy, indirect-reuse or inspection change replaces only the reservoirs; the
-        // old ones stay live (in residentFrameBytes) for in-flight frames.
-        let reservoirs = pixels.multipliedReportingOverflow(by: FrameResourcePlan.reservoirBytesPerPixel(activeIndirectReuse))
+        // A strategy, indirect-reuse, temporal-reuse or inspection change replaces only the reservoirs
+        // (and splat resources); the old ones stay live (in residentFrameBytes) for in-flight frames.
+        let reservoirs = pixels.multipliedReportingOverflow(
+            by: FrameResourcePlan.reservoirSetBytesPerPixel(activeIndirectReuse, splatting: splatting))
         let additionalReservoirs = !resizes && plan.usesReSTIR && frameReservoirs != reservoirSet(usesReSTIR: true)
             ? reservoirs.partialValue : 0
         let withResident = baseRequired.addingReportingOverflow(resident)
@@ -4944,6 +5654,14 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 let p = try names.map { try pipeline(library, $0) }
                 return ReSTIRPTKernels(initial: p[0], temporal: p[1], shift: p[2], spatial: p[3], duplication: p[4])
             }
+            func splatKernels(_ library: MTLLibrary) throws -> SplatKernels? {
+                let names = ["splat_activate_kernel", "splat_layers_kernel", "splat_deep_restir_kernel", "restir_pt_deep_initial_kernel",
+                             "splat_reservoirs_kernel", "splat_temporal_kernel", "restir_pt_splat_temporal_kernel"]
+                guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
+                let p = try names.map { try pipeline(library, $0) }
+                return SplatKernels(activate: p[0], layers: p[1], deepReSTIR: p[2], deepPT: p[3], reservoirs: p[4],
+                                    temporal: p[5], ptTemporal: p[6])
+            }
             if let shared {
                 self.proceduralKernels = shared.proceduralKernels
                 self.meshKernels = shared.meshKernels
@@ -4953,9 +5671,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 let procedural = try device.makeLibrary(source: metalSource, options: options)
                 self.proceduralKernels = SceneKernels(temporal: try pipeline(procedural, "restir_temporal_kernel"),
                     shading: try pipeline(procedural, "shading_kernel"), guides: try pipeline(procedural, "metalfx_guides_kernel"),
-                    pick: try pipeline(procedural, "pick_kernel"), pt: try ptKernels(procedural))
+                    pick: try pipeline(procedural, "pick_kernel"), pt: try ptKernels(procedural), splat: try splatKernels(procedural))
                 self.meshKernels = SceneKernels(temporal: restirTemporalPipeline, shading: shadingPipeline,
-                    guides: metalFXGuidePipeline, pick: pickPipeline, pt: try ptKernels(lib))
+                    guides: metalFXGuidePipeline, pick: pickPipeline, pt: try ptKernels(lib), splat: try splatKernels(lib))
             }
         } catch {
             throw error
@@ -5226,6 +5944,29 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
                 }
             }
+            // Reservoir splatting (HONG2026): two deep-domain pools and the per-pixel splat state.
+            var newSplat: (current: SplatPool, previous: SplatPool, mask: MTLBuffer, layers: MTLBuffer, sources: MTLBuffer)?
+            if needsReSTIR && activeTemporalReuse == .splatting {
+                let capacity = Self.splatCapacity(width: w, height: h)
+                func buffer(_ length: Int) -> MTLBuffer? { device.makeBuffer(length: max(16, length), options: .storageModePrivate) }
+                func pool() -> SplatPool? {
+                    guard let domains = buffer(capacity * 32), let surfaces = buffer(capacity * Int(Self.primarySurfaceStride)),
+                          let counters = device.makeBuffer(length: 16, options: .storageModeShared) else { return nil }
+                    let words = counters.contents().bindMemory(to: UInt32.self, capacity: 4)
+                    words[0] = 0; words[1] = 0; words[2] = UInt32(capacity); words[3] = 0
+                    let di = usesDI ? buffer(capacity * 48) : nil, gi = usesGI ? buffer(capacity * 64) : nil
+                    let pt = usesPT ? buffer(capacity * Self.ptReservoirStride) : nil
+                    guard di != nil || !usesDI, gi != nil || !usesGI, pt != nil || !usesPT else { return nil }
+                    return SplatPool(domains: domains, surfaces: surfaces, counters: counters, di: di, gi: gi, pt: pt, capacity: capacity)
+                }
+                guard let a = pool(), let b = pool(), let mask = buffer(w * h * 4), let layers = buffer(w * h * 48),
+                      let sources = buffer((w * h + capacity) * 8) else {
+                    onError?("Could not allocate render textures. Try a smaller window.")
+                    return
+                }
+                newSplat = (a, b, mask, layers, sources)
+            }
+            if splatPlaceholder == nil { splatPlaceholder = device.makeBuffer(length: 64, options: .storageModePrivate) }
 
             // Only the DI/GI reservoirs depend on the strategy and inspection view;
             // keep the accumulation, G-buffer, guides and sample count when just
@@ -5279,6 +6020,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             ptIndirect = newPTIndirect; ptDuplication = newDuplication
             ptReservoirs = newPTReservoirs; ptHistory = newPTHistory; ptShifts = newPTShifts
             historyPrimarySurfaces = newHistorySurfaces
+            splatCurrent = newSplat?.current; splatPrevious = newSplat?.previous
+            splatMask = newSplat?.mask; splatLayers = newSplat?.layers; splatSources = newSplat?.sources
             frameReservoirs = reservoirs
 
             if resized {
@@ -5303,13 +6046,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
               let giRadB = giRadianceB, let giWeightB = giWeightsB,
               let ptOut = ptIndirect, let duplication = ptDuplication,
               let oidnAlbedo = oidnAlbedoAccum, let oidnNormal = oidnNormalAccum,
-              let surfaces = primarySurfaceBuffer(width: w, height: h),
+              let surfaces = primarySurfaceBuffer(width: w, height: h), let placeholder = splatPlaceholder,
               let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
 
         let nextFrame = frameIndex + 1
         let nextSample = sampleIndex == UInt32.max ? 1 : sampleIndex + 1
         // Inspection and non-ReSTIR frames leave reservoirs unwritten.
         let nextHistory = needsReSTIR ? min(reservoirHistory, 1 << 24) + 1 : 0
+        // Reservoir splatting replaces reprojection on frames where the view changed and history is
+        // valid (as ReSTIR PT reuses temporally only then); a thin lens is not splatted (HONG2026 Sec. 7).
+        let splatState = splatCurrent.flatMap { current in splatPrevious.map { (current, $0) } }
+        let splatFrame = splatState != nil && needsReSTIR && nextFrame <= 1 && nextHistory > 1
+            && !reservoirHistoryNeedsReset && options.aperture <= 0 && sceneKernels.splat != nil
 
         let camX = target.x + distance * cos(pitch) * sin(yaw)
         let camY = target.y + distance * sin(pitch)
@@ -5343,7 +6091,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             viewportMode: viewportMode,
             width: UInt32(w),
             height: UInt32(h),
-            indirectReuse: indirectReuse.rawValue | (ptDecorrelation ? 4 : 0) | (ptTemporalWhileAccumulating ? 8 : 0),
+            indirectReuse: indirectReuse.rawValue | (ptDecorrelation ? 4 : 0) | (ptTemporalWhileAccumulating ? 8 : 0)
+                | (splatFrame ? 16 : 0),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
             spatialNeighbors: spatialNeighbors.resolved(importedSceneGraph: sceneIndex == 6 && materials.hasSceneGraph).rawValue,
@@ -5356,6 +6105,29 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 
         let threadsPerGroup = MTLSize(width: 8, height: 8, depth: 1)
         let gridSize = MTLSize(width: w, height: h, depth: 1)
+
+        // Splat state: this frame's pool starts empty (so a frame that does not splat leaves the next
+        // one no deep domains); a splat frame also clears the activation masks and splat sources.
+        if let (current, _) = splatState, let mask = splatMask, let sources = splatSources {
+            guard let blit = cmdBuffer.makeBlitCommandEncoder() else { return }
+            blit.label = "Splat: clear"
+            blit.fill(buffer: current.counters, range: 0..<8, value: 0)
+            if splatFrame {
+                blit.fill(buffer: mask, range: 0..<mask.length, value: 0)
+                blit.fill(buffer: sources, range: 0..<sources.length, value: 0xff)
+            }
+            blit.endEncoding()
+        }
+        // Buffers 9-23 of the splat kernels (MSL "Multi-layer reservoir splatting").
+        func bindSplatBuffers(_ encoder: MTLComputeCommandEncoder) {
+            guard let (current, previous) = splatState else { return }
+            let buffers: [(Int, MTLBuffer?)] = [
+                (9, previous.domains), (10, previous.surfaces), (11, previous.counters),
+                (12, current.domains), (13, current.surfaces), (14, current.counters),
+                (15, splatMask), (16, splatLayers), (17, splatSources),
+                (18, previous.di), (19, current.di), (20, previous.gi), (21, current.gi), (22, previous.pt), (23, current.pt)]
+            for (index, buffer) in buffers { encoder.setBuffer(buffer ?? placeholder, offset: 0, index: index) }
+        }
 
         // PASS 1: G-Buffer & ReSTIR Temporal Reuse
         guard let enc1 = cmdBuffer.makeComputeCommandEncoder() else { return }
@@ -5392,6 +6164,45 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc1.endEncoding()
         }
 
+        // Multi-layer reservoir splatting (REFERENCES.md: HONG2026): domain activation, deep layers,
+        // deep-domain canonical samples, reservoir splats and the DI/GI temporal merge. ReSTIR PT's
+        // temporal merge runs with its passes below.
+        let usesDIReservoirs = needsReSTIR && indirectReuse != .restirPTUnified
+        if splatFrame, let kernels = sceneKernels.splat, let (current, _) = splatState {
+            let pixels = w * h, slots = current.capacity
+            // Grid: nil for one thread per pixel (2D), else a 1D thread count.
+            var passes: [(String, MTLComputePipelineState, Int?)] = [
+                ("Splat: domain activation", kernels.activate, pixels + slots), ("Splat: deep layers", kernels.layers, nil)]
+            if usesDIReservoirs { passes.append(("Splat: deep DI/GI samples", kernels.deepReSTIR, slots)) }
+            if usesPT { passes.append(("Splat: deep ReSTIR PT paths", kernels.deepPT, slots)) }
+            passes.append(("Splat: reservoir splats", kernels.reservoirs, pixels + slots))
+            if usesDIReservoirs { passes.append(("Splat: DI/GI temporal reuse", kernels.temporal, pixels + slots)) }
+            for (label, pipeline, count) in passes {
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return }
+                encoder.label = label
+                encoder.setComputePipelineState(pipeline)
+                let textures: [MTLTexture] = [gPos, gNorm, hPos, hNorm, duplication, rPosA, rEmitA, rWeightA, rPosB, rEmitB, rWeightB,
+                                              giPosA, giNormA, giRadA, giWeightA, giPosB, giNormB, giRadB, giWeightB]
+                for (index, texture) in textures.enumerated() { encoder.setTexture(texture, index: index) }
+                guard materials.bind(encoder) else {
+                    encoder.endEncoding()
+                    onError?("Could not update material bindings.")
+                    return
+                }
+                encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+                for (index, buffer) in [surfaces, historyPrimarySurfaces, ptReservoirs, ptHistory].enumerated() {
+                    encoder.setBuffer(buffer ?? placeholder, offset: 0, index: index + 3)
+                }
+                bindSplatBuffers(encoder)
+                if let count {
+                    encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                } else {
+                    encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
+                }
+                encoder.endEncoding()
+            }
+        }
+
         // ReSTIR PT (REFERENCES.md: RESTIRPT2022, RESTIRPTE2026): initial paths and temporal
         // reuse, paired shifts, spatial reuse, then (optionally) the duplication map.
         if usesPT {
@@ -5399,8 +6210,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                   let historySurfaces = historyPrimarySurfaces, let pairing = ptPairing,
                   let kernels = sceneKernels.pt else { return }
             var passes: [(String, MTLComputePipelineState, Bool)] = [("ReSTIR PT: initial paths", kernels.initial, true)]
-            // Temporal reuse only while the view changes (MSL restir_pt_temporal).
-            if nextFrame <= 1 || ptTemporalWhileAccumulating {
+            // Temporal reuse only while the view changes (MSL restir_pt_temporal); by splatting on splat frames.
+            let splatTemporal = splatFrame ? sceneKernels.splat?.ptTemporal : nil
+            if let splatTemporal {
+                passes.append(("ReSTIR PT: splat temporal reuse", splatTemporal, true))
+            } else if nextFrame <= 1 || ptTemporalWhileAccumulating {
                 passes.append(("ReSTIR PT: temporal reuse", kernels.temporal, true))
             }
             passes += [
@@ -5423,7 +6237,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 for (index, buffer) in [surfaces, historySurfaces, current, history, shifts, pairing].enumerated() {
                     encoder.setBuffer(buffer, offset: 0, index: index + 3)
                 }
-                encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
+                if pipeline === splatTemporal, let slots = splatState?.0.capacity {
+                    bindSplatBuffers(encoder)
+                    encoder.dispatchThreads(MTLSize(width: w * h + slots, height: 1, depth: 1),
+                                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                } else {
+                    encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
+                }
                 encoder.endEncoding()
             }
         }
@@ -5473,6 +6293,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 
         swap(&gbufferPosDepth, &historyPosDepth)
         swap(&gbufferNormalMat, &historyNormalMat)
+        swap(&splatCurrent, &splatPrevious)
+        lastFrameSplatted = splatFrame
         self.prevViewProj = currViewProj
         frameIndex = nextFrame
         sampleIndex = nextSample
