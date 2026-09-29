@@ -99,8 +99,12 @@ extension StudioController {
       r.materials.hasSceneGraph = p.graph != nil
       r.sceneIndex = p.scene
       r.samplingMode = p.strategy
-      r.spatialNeighbors = renderer.spatialNeighbors
-      r.indirectReuse = renderer.indirectReuse
+      // The project's ReSTIR modes. Temporal reuse acts only while the view changes and an
+      // export accumulates one still view, which renders identically with either mode, so the
+      // export keeps reprojection and does not allocate the splatting resources.
+      r.spatialNeighbors = p.restirModes.spatialNeighbors
+      r.indirectReuse = p.restirModes.indirectReuse
+      r.temporalReuse = .reprojection
       r.ptDecorrelation = renderer.ptDecorrelation
       r.ptTemporalWhileAccumulating = renderer.ptTemporalWhileAccumulating
       r.skyMode = p.sky
@@ -122,7 +126,8 @@ extension StudioController {
         // OIDN runs after the render while the export and preview frames stay resident.
         let frames = PathTracerRenderer.FrameResourcePlan(
           width: p.options.outputWidth, height: p.options.outputHeight,
-          usesReSTIR: r.samplingMode == 0, usesMetalFX: false, indirectReuse: r.activeIndirectReuse).bytes
+          usesReSTIR: r.samplingMode == 0, usesMetalFX: false, indirectReuse: r.activeIndirectReuse,
+          splatting: r.activeTemporalReuse == .splatting).bytes
         let resident = frames.map { $0.addingReportingOverflow(r.concurrentRenderBytes) }
         if let message = OIDNDenoiser.memoryError(
           width: p.options.outputWidth, height: p.options.outputHeight,

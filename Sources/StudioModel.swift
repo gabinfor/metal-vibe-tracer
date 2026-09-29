@@ -77,6 +77,34 @@ extension StudioOptions {
       && focusDistance == o.focusDistance && sunAngle == o.sunAngle
   }
 }
+// The ReSTIR strategy's reuse modes (Render inspector). Each one changes the image, so a
+// difference restarts accumulation like a radiance-affecting option (StudioController.applyProject).
+struct ReSTIRModes: Equatable, Sendable {
+  var indirectReuse: IndirectReuse
+  var spatialNeighbors: SpatialNeighborSelection
+  var temporalReuse: TemporalReuse
+  // Projects without a stored choice use these: .automatic, or in -D VIBE_TESTING builds the
+  // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE override. A stored choice wins.
+  static var defaults: ReSTIRModes {
+    ReSTIRModes(
+      indirectReuse: PathTracerRenderer.defaultIndirectReuse,
+      spatialNeighbors: PathTracerRenderer.defaultSpatialNeighbors,
+      temporalReuse: PathTracerRenderer.defaultTemporalReuse)
+  }
+  init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse) {
+    self.indirectReuse = indirectReuse
+    self.spatialNeighbors = spatialNeighbors
+    self.temporalReuse = temporalReuse
+  }
+  @MainActor init(_ r: PathTracerRenderer) {
+    self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse)
+  }
+  @MainActor func apply(_ r: PathTracerRenderer) {
+    r.indirectReuse = indirectReuse
+    r.spatialNeighbors = spatialNeighbors
+    r.temporalReuse = temporalReuse
+  }
+}
 struct OIDNOptions: Codable, Equatable {
   // UI indices map to OIDN FAST (4), BALANCED (5), and HIGH (6).
   var quality: UInt32 = 2
@@ -116,8 +144,29 @@ struct ProjectDocument: Codable {
   // Optional so version 1/2 projects written before these controls remain readable.
   var oidn: OIDNOptions?
   var viewportMode: UInt32?
+  // Raw values of IndirectReuse, SpatialNeighborSelection and TemporalReuse; optional so
+  // projects written before the Render inspector exposed them open with the default (automatic).
+  var indirectReuse: UInt32?
+  var spatialNeighbors: UInt32?
+  var temporalReuse: UInt32?
   // Written only into autosaves: the document's file association and unsaved state.
   var recovery: AutosaveRecovery?
+
+  // The stored ReSTIR modes; a missing (or, before validate(), unknown) value is the default.
+  var restirModes: ReSTIRModes {
+    get {
+      let fallback = ReSTIRModes.defaults
+      return ReSTIRModes(
+        indirectReuse: indirectReuse.flatMap(IndirectReuse.init(rawValue:)) ?? fallback.indirectReuse,
+        spatialNeighbors: spatialNeighbors.flatMap(SpatialNeighborSelection.init(rawValue:)) ?? fallback.spatialNeighbors,
+        temporalReuse: temporalReuse.flatMap(TemporalReuse.init(rawValue:)) ?? fallback.temporalReuse)
+    }
+    set {
+      indirectReuse = newValue.indirectReuse.rawValue
+      spatialNeighbors = newValue.spatialNeighbors.rawValue
+      temporalReuse = newValue.temporalReuse.rawValue
+    }
+  }
 
   // Aggregate embedded asset bytes (maps, MaterialX images, environment) across all scenes.
   static let embeddedAssetLimit = 512 * 1024 * 1024
@@ -191,6 +240,10 @@ struct ProjectDocument: Codable {
     if let viewportMode {
       guard viewportMode <= 4 else { try bad(); return }
     }
+    guard indirectReuse.map({ IndirectReuse(rawValue: $0) != nil }) ?? true,
+      spatialNeighbors.map({ SpatialNeighborSelection(rawValue: $0) != nil }) ?? true,
+      temporalReuse.map({ TemporalReuse(rawValue: $0) != nil }) ?? true
+    else { try bad(); return }
     func cameraOK(_ c: CameraState) -> Bool {
       c.yaw.isFinite && (-1.5...1.5).contains(c.pitch) && (0.0001...1_000_000).contains(c.distance)
         && (5...150).contains(c.fov) && (0..<3).allSatisfy { c.target[$0].isFinite }

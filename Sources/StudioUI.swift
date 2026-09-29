@@ -212,6 +212,23 @@ final class StudioController: NSViewController {
   static let strategyNames = [
     "ReSTIR Direct + Indirect", "Standard MIS", "Light Only (NEE)", "BSDF Only",
   ]
+  // Render inspector choices for the ReSTIR reuse modes; index 0 is always .automatic.
+  static let indirectReuseChoices: [(mode: IndirectReuse, title: String)] = [
+    (.automatic, "Automatic"), (.restirGI, "ReSTIR GI"), (.restirPT, "ReSTIR PT"),
+    (.restirPTUnified, "ReSTIR PT (unified)"),
+  ]
+  static let spatialNeighborChoices: [(mode: SpatialNeighborSelection, title: String)] = [
+    (.automatic, "Automatic"), (.uniform, "Uniform"), (.compatibility, "Compatibility-guided"),
+  ]
+  static let temporalReuseChoices: [(mode: TemporalReuse, title: String)] = [
+    (.automatic, "Automatic"), (.reprojection, "Reprojection"), (.splatting, "Reservoir splatting"),
+  ]
+  static let indirectReuseHelp =
+    "ReSTIR GI is fastest and reuses the first diffuse bounce; ReSTIR PT reuses whole paths (better glossy, mirror and deep light) at about 1.3–2.3× the GPU time and +114–210 B per pixel; unified also merges direct light."
+  static let spatialNeighborHelp =
+    "Compatibility-guided reuse prefers neighbours with a similar surface: lower noise on imported meshes for 3–26% more frame time. It applies to ReSTIR DI and GI, not unified ReSTIR PT."
+  static let temporalReuseHelp =
+    "Reservoir splatting lowers noise in newly revealed areas while the camera moves, for 5–26% more frame time and about 200 B more GPU memory per pixel. Still views render identically."
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 
@@ -444,6 +461,7 @@ final class StudioController: NSViewController {
       self.changed()
       self.rebuild()
     }
+    restirModeControls()
     button(renderer.denoiserEnabled ? "MetalFX: On" : "MetalFX: Off") { [weak self] in
       guard let self else { return }
       self.checkpoint("MetalFX")
@@ -486,6 +504,82 @@ final class StudioController: NSViewController {
       "The left side shows raw accumulation. Exposure and white balance affect the display and PNG export; EXR preserves linear radiance."
     )
     text("Inspection views bypass tone mapping and denoising, and do not reset the progressive render.")
+  }
+
+  // The three ReSTIR reuse popups. They apply only to ReSTIR Direct + Indirect and are
+  // disabled (with a note) for the other strategies, like the MetalFX note above.
+  func restirModeControls() {
+    let r = renderer, enabled = r.samplingMode == 0
+    func choice<Mode: Equatable>(
+      _ title: String, _ choices: [(mode: Mode, title: String)], current: Mode, automatic: String,
+      help: String, _ set: @escaping (inout ReSTIRModes, Mode) -> Void
+    ) {
+      let label = NSTextField(labelWithString: title)
+      label.font = .systemFont(ofSize: 12)
+      label.textColor = enabled ? .labelColor : .disabledControlTextColor
+      add(label)
+      let titles = choices.map { $0.title == "Automatic" ? "Automatic (currently: \(automatic))" : $0.title }
+      let popup = ActionPopup(titles, selected: choices.firstIndex { $0.mode == current } ?? 0, label: title) {
+        [weak self] i in
+        guard let self, self.acceptsEdits else { return }
+        let mode = choices[i].mode
+        self.setReSTIRModes(title) { set(&$0, mode) }
+      }
+      popup.toolTip = help
+      popup.setAccessibilityHelp(help)
+      popup.isEnabled = enabled
+      add(popup)
+    }
+    func name<Mode: Equatable>(_ mode: Mode, _ choices: [(mode: Mode, title: String)]) -> String {
+      choices.first { $0.mode == mode }?.title ?? "\(mode)"
+    }
+    choice(
+      "Indirect reuse", Self.indirectReuseChoices, current: r.indirectReuse,
+      automatic: name(r.resolvedIndirectReuse(.automatic), Self.indirectReuseChoices),
+      help: Self.indirectReuseHelp
+    ) { $0.indirectReuse = $1 }
+    choice(
+      "Spatial neighbours", Self.spatialNeighborChoices, current: r.spatialNeighbors,
+      automatic: name(r.resolvedSpatialNeighbors(.automatic), Self.spatialNeighborChoices),
+      help: Self.spatialNeighborHelp
+    ) { $0.spatialNeighbors = $1 }
+    choice(
+      "Temporal reuse", Self.temporalReuseChoices, current: r.temporalReuse,
+      automatic: name(r.resolvedTemporalReuse(.automatic, indirectReuse: r.indirectReuse), Self.temporalReuseChoices),
+      help: Self.temporalReuseHelp
+    ) { $0.temporalReuse = $1 }
+    if !enabled {
+      text("Indirect reuse, spatial neighbours and temporal reuse apply only to ReSTIR Direct + Indirect.")
+    }
+  }
+  // The render size a mode switch is preflighted at: the live accumulation, else the viewport.
+  var previewRenderSize: (width: Int, height: Int)? {
+    if let accum = renderer.accumTexture { return (accum.width, accum.height) }
+    let size = viewport.drawableSize, scale = renderer.options.previewScale
+    guard size.width >= 1, size.height >= 1 else { return nil }
+    return (max(1, Int(Float(size.width) * scale)), max(1, Int(Float(size.height) * scale)))
+  }
+  // Applies a ReSTIR mode change as one undo step, after the GPU memory preflight. A switch
+  // the budget cannot hold (when the current modes fit) is refused: the error is shown, the
+  // popup reverts and rendering continues with the current modes.
+  func setReSTIRModes(_ name: String, _ update: (inout ReSTIRModes) -> Void) {
+    guard acceptsEdits else { return }
+    var modes = ReSTIRModes(renderer)
+    update(&modes)
+    guard modes != ReSTIRModes(renderer) else { return }
+    if let size = previewRenderSize,
+      let message = renderer.renderMemoryError(
+        width: size.width, height: size.height, indirectReuse: modes.indirectReuse, temporalReuse: modes.temporalReuse),
+      renderer.renderMemoryError(width: size.width, height: size.height) == nil
+    {
+      showError("\(name) was not changed. \(message)")
+      rebuild()
+      return
+    }
+    checkpoint(name)
+    modes.apply(renderer)
+    changed()
+    rebuild()
   }
 
   func settingsPanel() {
@@ -1043,6 +1137,7 @@ final class StudioController: NSViewController {
     p.denoise = renderer.denoiserEnabled
     p.oidn = renderer.oidnOptions
     p.viewportMode = renderer.viewportMode
+    p.restirModes = ReSTIRModes(renderer)
     p.options = renderer.options
     p.camera = CameraState(renderer)
     p.scenes[Int(renderer.sceneIndex)] = renderer.materials.state()
@@ -1191,7 +1286,7 @@ final class StudioController: NSViewController {
     let radianceChanged =
       resourcesChanged || r.sceneIndex != p.scene || r.samplingMode != p.strategy
       || r.skyMode != p.sky || r.enableFog != p.fog || r.enableSMS != p.ring
-      || !r.options.sameRadiance(as: p.options)
+      || !r.options.sameRadiance(as: p.options) || ReSTIRModes(r) != p.restirModes
     let oidn = p.oidn ?? OIDNOptions()
     if oidn != r.oidnOptions, r.offlineDenoisedPreview != nil {
       r.offlineDenoisedPreview = nil
@@ -1210,6 +1305,7 @@ final class StudioController: NSViewController {
     r.denoiserEnabled = p.denoise && r.supportsMetalFX
     r.oidnOptions = oidn
     r.viewportMode = p.viewportMode ?? 0
+    p.restirModes.apply(r)
     r.options = p.options
     // Camera properties reset accumulation (keeping MetalFX history) only when they change.
     p.camera.apply(r)

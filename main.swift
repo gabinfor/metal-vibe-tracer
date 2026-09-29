@@ -4599,7 +4599,7 @@ struct Uniforms {
 }
 
 // ReSTIR DI/GI spatial reuse neighbours (shading_kernel). REFERENCES.md: COMPATRESTIR2026.
-enum SpatialNeighborSelection: UInt32 {
+enum SpatialNeighborSelection: UInt32, Sendable {
     // RESTIR2020: uniform taps in a 16-pixel box, binary normal/depth/material test.
     case uniform = 0
     // COMPATRESTIR2026: neighbours drawn from 32 taps in proportion to a G-buffer score.
@@ -5454,7 +5454,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 #endif
         return false
     }
-    static var defaultSpatialNeighbors: SpatialNeighborSelection {
+    nonisolated static var defaultSpatialNeighbors: SpatialNeighborSelection {
 #if VIBE_TESTING
         // Test builds can run the whole suite with the earlier uniform selection.
         if ProcessInfo.processInfo.environment["VIBE_SPATIAL_NEIGHBORS"] == "uniform" { return .uniform }
@@ -5518,12 +5518,22 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         usesReSTIR ? (activeIndirectReuse.rawValue + 1) | (activeTemporalReuse == .splatting ? 16 : 0) : 0
     }
     // indirectReuse with .automatic resolved for the current scene.
-    var activeIndirectReuse: IndirectReuse {
-        sceneKernels.pt == nil ? .restirGI : indirectReuse.resolved(importedScene: sceneIndex == 6)
-    }
+    var activeIndirectReuse: IndirectReuse { resolvedIndirectReuse(indirectReuse) }
     // temporalReuse with .automatic resolved; reprojection for a library without the splat kernels.
     var activeTemporalReuse: TemporalReuse {
-        sceneKernels.splat == nil ? .reprojection : temporalReuse.resolved(indirectReuse: activeIndirectReuse)
+        resolvedTemporalReuse(temporalReuse, indirectReuse: indirectReuse)
+    }
+    // spatialNeighbors with .automatic resolved for the current scene.
+    var activeSpatialNeighbors: SpatialNeighborSelection { resolvedSpatialNeighbors(spatialNeighbors) }
+    // What a mode would run as in the current scene (the inspector's "Automatic (currently: …)").
+    func resolvedIndirectReuse(_ mode: IndirectReuse) -> IndirectReuse {
+        sceneKernels.pt == nil ? .restirGI : mode.resolved(importedScene: sceneIndex == 6)
+    }
+    func resolvedTemporalReuse(_ mode: TemporalReuse, indirectReuse: IndirectReuse) -> TemporalReuse {
+        sceneKernels.splat == nil ? .reprojection : mode.resolved(indirectReuse: resolvedIndirectReuse(indirectReuse))
+    }
+    func resolvedSpatialNeighbors(_ mode: SpatialNeighborSelection) -> SpatialNeighborSelection {
+        mode.resolved(importedSceneGraph: sceneIndex == 6 && materials.hasSceneGraph)
     }
     // Set when only the reservoirs were reallocated; the next frame skips temporal reuse.
     private(set) var reservoirHistoryNeedsReset = false
@@ -5561,12 +5571,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             .reduce(UInt64(0)) { $0 + UInt64($1?.allocatedSize ?? 0) }
     }
 
-    func renderMemoryError(width: Int, height: Int) -> String? {
+    // `indirectReuse` and `temporalReuse` preflight a mode switch before it is applied (the
+    // Render inspector); nil uses the current setting.
+    func renderMemoryError(width: Int, height: Int, indirectReuse candidateIndirect: IndirectReuse? = nil,
+                           temporalReuse candidateTemporal: TemporalReuse? = nil) -> String? {
         let usesReSTIR = samplingMode == 0 && viewportMode == 0
         let usesMetalFX = denoiserEnabled && supportsMetalFX && usesReSTIR
-        let splatting = activeTemporalReuse == .splatting
+        let indirectMode = candidateIndirect ?? indirectReuse
+        let activeIndirect = resolvedIndirectReuse(indirectMode)
+        let splatting = resolvedTemporalReuse(candidateTemporal ?? temporalReuse, indirectReuse: indirectMode) == .splatting
         let plan = FrameResourcePlan(width: width, height: height, usesReSTIR: usesReSTIR, usesMetalFX: usesMetalFX,
-            metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0, indirectReuse: activeIndirectReuse,
+            metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0, indirectReuse: activeIndirect,
             splatting: splatting)
         guard let frameBytes = plan.bytes else { return "Render dimensions are too large." }
         // Include the live frame set during resize/export, scene textures, the
@@ -5581,8 +5596,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // A strategy, indirect-reuse, temporal-reuse or inspection change replaces only the reservoirs
         // (and splat resources); the old ones stay live (in residentFrameBytes) for in-flight frames.
         let reservoirs = pixels.multipliedReportingOverflow(
-            by: FrameResourcePlan.reservoirSetBytesPerPixel(activeIndirectReuse, splatting: splatting))
-        let additionalReservoirs = !resizes && plan.usesReSTIR && frameReservoirs != reservoirSet(usesReSTIR: true)
+            by: FrameResourcePlan.reservoirSetBytesPerPixel(activeIndirect, splatting: splatting))
+        let candidateSet = (activeIndirect.rawValue + 1) | (splatting ? 16 : 0)  // reservoirSet(usesReSTIR: true)
+        let additionalReservoirs = !resizes && plan.usesReSTIR && frameReservoirs != candidateSet
             ? reservoirs.partialValue : 0
         let withResident = baseRequired.addingReportingOverflow(resident)
         let required = withResident.partialValue.addingReportingOverflow(additionalReservoirs)
@@ -6095,7 +6111,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 | (splatFrame ? 16 : 0),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
-            spatialNeighbors: spatialNeighbors.resolved(importedSceneGraph: sceneIndex == 6 && materials.hasSceneGraph).rawValue,
+            spatialNeighbors: activeSpatialNeighbors.rawValue,
             environment: SIMD4(options.environmentIntensity, options.environmentRotation * .pi / 180, materials.environmentData == nil ? 0 : 1, Float(materials.nodeCount)),
             lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,sceneIndex == 6 ? options.independentSunCone : 0),
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize)
