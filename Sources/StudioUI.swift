@@ -219,6 +219,7 @@ final class StudioController: NSViewController {
   ]
   static let spatialNeighborChoices: [(mode: SpatialNeighborSelection, title: String)] = [
     (.automatic, "Automatic"), (.uniform, "Uniform"), (.compatibility, "Compatibility-guided"),
+    (.stochasticPairwise, "Stochastic pairwise MIS"),
   ]
   static let temporalReuseChoices: [(mode: TemporalReuse, title: String)] = [
     (.automatic, "Automatic"), (.reprojection, "Reprojection"), (.splatting, "Reservoir splatting"),
@@ -226,7 +227,7 @@ final class StudioController: NSViewController {
   static let indirectReuseHelp =
     "ReSTIR GI is fastest and reuses the first diffuse bounce; ReSTIR PT reuses whole paths (better glossy, mirror and deep light) at about 1.3–2.3× the GPU time and +114–210 B per pixel; unified also merges direct light."
   static let spatialNeighborHelp =
-    "Compatibility-guided reuse prefers neighbours with a similar surface: lower noise on imported meshes for 3–26% more frame time. It applies to ReSTIR DI and GI, not unified ReSTIR PT."
+    "Compatibility-guided reuse prefers neighbours with a similar surface: lower noise on imported meshes for 3–26% more frame time. It applies to ReSTIR DI and GI, not unified ReSTIR PT. Stochastic pairwise MIS reuses DI, GI and PT samples without bias from 64-pixel cells: 6–33% lower noise per sample with ReSTIR PT for 13–55% more frame time and 44–92 B more per pixel."
   static let temporalReuseHelp =
     "Reservoir splatting lowers noise in newly revealed areas while the camera moves, for 5–26% more frame time and about 200 B more GPU memory per pixel. Still views render identically."
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
@@ -569,7 +570,8 @@ final class StudioController: NSViewController {
     guard modes != ReSTIRModes(renderer) else { return }
     if let size = previewRenderSize,
       let message = renderer.renderMemoryError(
-        width: size.width, height: size.height, indirectReuse: modes.indirectReuse, temporalReuse: modes.temporalReuse),
+        width: size.width, height: size.height, indirectReuse: modes.indirectReuse, temporalReuse: modes.temporalReuse,
+        spatialNeighbors: modes.spatialNeighbors),
       renderer.renderMemoryError(width: size.width, height: size.height) == nil
     {
       showError("\(name) was not changed. \(message)")
