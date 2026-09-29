@@ -166,7 +166,7 @@ struct Uniforms {
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
     uint reservoirHistoryReset; // 1 = DI/GI history reservoirs were just allocated; skip temporal reuse
     uint reservoirHistory; // Consecutive ReSTIR frames; camera moves keep it, cuts reset it.
-    uint spatialNeighbors; // ReSTIR spatial neighbour selection: 0 = uniform, 1 = compatibility-guided
+    uint spatialNeighbors; // ReSTIR spatial reuse: 0 = uniform, 1 = compatibility-guided, 3 = stochastic pairwise MIS
     float4 environment; // intensity, rotation, image enabled, BVH node count
     float4 lens; // aperture radius, focus distance, scene-graph mode (see uses_scene_graph), independent sun 1 - cos(half angle)
     float4 light; // RGB multiplier, size multiplier
@@ -3339,6 +3339,527 @@ kernel void restir_pt_spatial_kernel(
     ptIndirect.write(float4(max(color, 0.0f), firstHit), gid);
 }
 
+// ============================================================================
+// Stochastic pairwise MIS (REFERENCES.md: SPMIS2026; Uniforms.spatialNeighbors == 3)
+// Spatial reuse of ReSTIR DI, GI and PT from one screen-space reuse cell of up to 64 pixels.
+// Each pixel estimates the defensive pairwise MIS weights over every pixel of the cell (M
+// candidates) from Ñ neighbours drawn in proportion to c_i p-hat(X_i) W_i (Eqs. 15-17) and Ñc
+// uniform canonical shifts (Eqs. 18-19), with the non-canonical confidences scaled by Ñ / M
+// (Sec. 4.3). The weights are unbiased estimates of the deterministic ones (Appendix B), so the
+// reuse keeps GRIS unbiased whatever the neighbours' contributions.
+// ============================================================================
+
+// Cells: 8 x 8 tiles split by material type, material slot (the paper's object ID) and the
+// normal quantized to floor(2n) per component (Sec. 5). Reservoir type 0 is ReSTIR DI, type 1
+// ReSTIR GI (IndirectReuse.restirGI) or the ReSTIR PT path reservoir.
+#define SPMIS_TILE 8u
+#define SPMIS_CANDIDATES 3u      // Ñ for ReSTIR DI and GI (the paper's Ñ = 3)
+#define SPMIS_PT_CANDIDATES 3u   // Ñ for ReSTIR PT
+#define SPMIS_SEARCH 12u         // cell-search taps (Sec. 5.1)
+#define SPMIS_RADIUS (1.0f / 120.0f) // first tap radius as a fraction of the image height (at least
+                                  // one pixel), grown by SPMIS_GROWTH per tap
+#define SPMIS_GROWTH 1.25f
+constant uint SPMIS_START_MASK = (1u << 25) - 1u;
+
+// Per pixel: its cell (first slot of the cell in `slots`, bits 0-24; pixel count, bits 25-31;
+// 0 when the pixel has no reuse domain), its cell key and the cell's confidence sums per
+// reservoir type (Algorithm 1, cellConfidenceSums).
+struct SPMISPixel { uint cell; uint key; float confidence[2]; };
+// Per slot (64 per tile, grouped by cell): the pixel index and, per reservoir type, the
+// running sum of c_i p-hat(X_i) W_i within the cell (Eq. 17), for inverse-CDF selection.
+struct SPMISSlot { uint pixel; float cdf[2]; };
+// Per pixel: the reuse cell chosen for each reservoir type (spmis_select_kernel), as the cell
+// word of its SPMISPixel and that type's confidence sum.
+struct SPMISChoice { uint cell[2]; float confidence[2]; };
+static_assert(sizeof(SPMISPixel) == 16 && sizeof(SPMISSlot) == 12 && sizeof(SPMISChoice) == 16,
+              "Swift allocates 16 + 12 + 16 bytes per pixel");
+
+uint spmis_count(SPMISPixel c) { return c.cell >> 25; }
+uint spmis_start(SPMISPixel c) { return c.cell & SPMIS_START_MASK; }
+
+// Key: material type (bits 0-3), quantized normal (2 bits per component, bits 4-9), slot (10-25).
+uint spmis_key(float4 normalMaterial, uint slot) {
+    int3 q = clamp(int3(floor(normalMaterial.xyz * 2.0f)), int3(-2), int3(1)) + 2;
+    return (uint(normalMaterial.w) & 15u) | (uint(q.x) << 4) | (uint(q.y) << 6) | (uint(q.z) << 8) | ((slot & 65535u) << 10);
+}
+// A candidate cell of the search must have the centre's material type and slot and a normal
+// within one quantization step per component (the paper's clamp of the attributes to +-1).
+bool spmis_similar(uint a, uint b) {
+    if ((a & ~0x3f0u) != (b & ~0x3f0u)) return false;
+    for (uint c = 0u; c < 3u; ++c) {
+        if (abs(int((a >> (4u + 2u * c)) & 3u) - int((b >> (4u + 2u * c)) & 3u)) > 1) return false;
+    }
+    return true;
+}
+
+// Algorithm 1 (CreateReuseCells), one threadgroup per 8 x 8 tile: every pixel with a reuse
+// domain (a scattering primary hit) joins the cell of its key; the tile's slots list the cells'
+// pixels contiguously, with in-cell prefix sums of c_i p-hat(X_i) W_i per reservoir type. The
+// paper builds the same per-cell lists with GPU hash multimaps and sorting; a tile holds at most
+// 64 pixels, so threadgroup memory replaces them.
+kernel void spmis_cells_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::read> diWeights [[texture(2)]],
+    texture2d<float, access::read> giWeights [[texture(3)]],
+    constant Uniforms &u [[buffer(0)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device PTReservoir *ptReservoirs [[buffer(5)]],
+    device SPMISPixel *cells [[buffer(9)]],
+    device SPMISSlot *slots [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint2 tiles [[threadgroups_per_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    threadgroup uint keys[SPMIS_TILE * SPMIS_TILE];
+    threadgroup uint leaders[SPMIS_TILE * SPMIS_TILE];
+    threadgroup float2 confidences[SPMIS_TILE * SPMIS_TILE];
+    threadgroup float2 importances[SPMIS_TILE * SPMIS_TILE];
+    const uint none = 0xffffffffu;
+    bool inside = gid.x < u.width && gid.y < u.height;
+    uint index = gid.y * u.width + gid.x;
+    uint key = none;
+    float2 confidence = float2(0.0f), importance = float2(0.0f);
+    if (inside) {
+        float4 position = gbufferPosDepth.read(gid);
+        float4 normalMaterial = gbufferNormalMat.read(gid);
+        if (position.w > 0.0f && normalMaterial.w != float(EMISSIVE)) {
+            key = spmis_key(normalMaterial, primarySurfaces[index].flags >> 16);
+            // DI and GI weights hold (weight sum, M, W): c p-hat(X) W is the weight sum when W > 0.
+            if (normalMaterial.w == float(DIFFUSE) && restir_di_active(u)) {
+                float4 w = diWeights.read(gid);
+                confidence.x = max(w.y, 0.0f);
+                importance.x = w.z > 0.0f && w.y > 0.0f ? max(w.x, 0.0f) : 0.0f;
+            }
+            if (normalMaterial.w == float(DIFFUSE) && restir_gi_active(u)) {
+                float4 w = giWeights.read(gid);
+                confidence.y = max(w.y, 0.0f);
+                importance.y = w.z > 0.0f && w.y > 0.0f ? max(w.x, 0.0f) : 0.0f;
+            }
+            if (restir_pt_active(u)) {
+                PTReservoir r = ptReservoirs[index];
+                confidence.y = max(r.M, 0.0f);
+                float i = r.M * pt_luminance(r.F) * r.W;
+                importance.y = i > 0.0f && isfinite(i) ? i : 0.0f;
+            }
+        }
+    }
+    keys[lane] = key;
+    confidences[lane] = confidence;
+    importances[lane] = importance;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint leader = lane, rank = 0u, count = 0u;
+    float2 sum = float2(0.0f), prefix = float2(0.0f);
+    if (key != none) {
+        for (uint j = 0u; j < SPMIS_TILE * SPMIS_TILE; ++j) {
+            if (keys[j] != key) continue;
+            if (count == 0u) leader = j;
+            ++count;
+            sum += confidences[j];
+            if (j < lane) ++rank;
+            if (j <= lane) prefix += importances[j];
+        }
+    }
+    leaders[lane] = leader;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!inside) return;
+    SPMISPixel cell;
+    cell.cell = 0u; cell.key = key; cell.confidence[0] = sum.x; cell.confidence[1] = sum.y;
+    if (key != none) {
+        // Cells are ordered by their first pixel in the tile.
+        uint start = 0u;
+        for (uint j = 0u; j < SPMIS_TILE * SPMIS_TILE; ++j) {
+            if (keys[j] != none && leaders[j] < leader) ++start;
+        }
+        uint first = (tile.y * tiles.x + tile.x) * SPMIS_TILE * SPMIS_TILE + start;
+        cell.cell = first | (count << 25);
+        SPMISSlot s;
+        s.pixel = index; s.cdf[0] = prefix.x; s.cdf[1] = prefix.y;
+        slots[first + rank] = s;
+    }
+    cells[index] = cell;
+}
+
+// Sec. 5.1: weighted reservoir sampling of one cell, by its confidence sum, among the centre's
+// own cell and the cells of SPMIS_SEARCH uniform disk taps whose radius grows by 25% per tap.
+// Only G-buffer keys and confidences decide, never the samples.
+SPMISPixel spmis_find_cell(uint2 gid, SPMISPixel center, uint type, const device SPMISPixel *cells,
+                           constant Uniforms &u, thread uint &seed) {
+    SPMISPixel selected = center;
+    float sum = center.confidence[type];
+    float radius = max(1.0f, float(u.height) * SPMIS_RADIUS);
+    for (uint i = 0u; i < SPMIS_SEARCH; ++i, radius *= SPMIS_GROWTH) {
+        int2 q = int2(gid) + int2(floor(concentric_disk(rand_f2(seed)) * radius + 0.5f));
+        q = clamp(q, int2(0), int2(int(u.width) - 1, int(u.height) - 1));
+        SPMISPixel c = cells[uint(q.y) * u.width + uint(q.x)];
+        if (spmis_count(c) == 0u || c.cell == center.cell || !spmis_similar(center.key, c.key)) continue;
+        float w = c.confidence[type];
+        if (!(w > 0.0f)) continue;
+        sum += w;
+        if (rand_f(seed) * sum < w) selected = c;
+    }
+    return selected;
+}
+
+// The cell search runs in its own light pass (its 12 dependent random reads per reservoir type
+// cost 20-40% of the frame inside shading_kernel). Each pixel with a reuse domain chooses one
+// cell per reservoir type it holds; the cell of a type without reservoirs is its own.
+kernel void spmis_select_kernel(
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    constant Uniforms &u [[buffer(0)]],
+    const device SPMISPixel *cells [[buffer(9)]],
+    device SPMISChoice *choices [[buffer(11)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    uint index = gid.y * u.width + gid.x;
+    SPMISPixel own = cells[index];
+    SPMISChoice choice;
+    choice.cell[0] = own.cell; choice.cell[1] = own.cell;
+    choice.confidence[0] = own.confidence[0]; choice.confidence[1] = own.confidence[1];
+    if (spmis_count(own) > 0u) {
+        bool diffuse = gbufferNormalMat.read(gid).w == float(DIFFUSE);
+        uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x7feb352du);
+        for (uint type = 0u; type < 2u; ++type) {
+            bool holds = type == 0u ? diffuse && restir_di_active(u) : restir_pt_active(u) || (diffuse && restir_gi_active(u));
+            if (!holds) continue;
+            SPMISPixel c = spmis_find_cell(gid, own, type, cells, u, seed);
+            choice.cell[type] = c.cell;
+            choice.confidence[type] = c.confidence[type];
+        }
+    }
+    choices[index] = choice;
+}
+SPMISPixel spmis_chosen(SPMISChoice c, uint type) {
+    SPMISPixel p;
+    p.cell = c.cell[type]; p.key = 0u; p.confidence[0] = c.confidence[type]; p.confidence[1] = c.confidence[type];
+    return p;
+}
+
+// Draws a pixel of the cell in proportion to c_i p-hat(X_i) W_i (Eq. 17) by inverse-CDF search
+// of the in-cell prefix sums; probability is the exact selection probability. False when no
+// pixel of the cell holds a contributing sample.
+bool spmis_draw(const device SPMISSlot *slots, SPMISPixel cell, uint type, float xi,
+                thread uint &pixel, thread float &probability) {
+    uint start = spmis_start(cell), count = spmis_count(cell);
+    if (count == 0u) return false;
+    float total = slots[start + count - 1u].cdf[type];
+    if (!(total > 0.0f) || !isfinite(total)) return false;
+    float x = xi * total;
+    uint lo = 0u, hi = count - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2u;
+        if (slots[start + mid].cdf[type] > x) hi = mid; else lo = mid + 1u;
+    }
+    float below = lo > 0u ? slots[start + lo - 1u].cdf[type] : 0.0f;
+    probability = (slots[start + lo].cdf[type] - below) / total;
+    pixel = slots[start + lo].pixel;
+    return probability > 0.0f;
+}
+// A uniformly chosen pixel of the cell (the canonical estimate's P_c = 1/M, Sec. 4.2).
+uint spmis_uniform_pixel(const device SPMISSlot *slots, SPMISPixel cell, float xi) {
+    uint count = spmis_count(cell);
+    return slots[spmis_start(cell) + min(uint(xi * float(count)), count - 1u)].pixel;
+}
+
+// Defensive pairwise MIS (Eq. 11; WKL*23 Eq. 7.8) with confidence sum cS of the non-canonical
+// candidates and canonical confidence cc. `from` is y's Jacobian-corrected target from domain i,
+// `canonical` its target in the canonical domain. Neighbour weight, Eq. 11a / 16 (before the
+// K / (Ñ P) factor):
+float spmis_neighbor_weight(float ci, float cS, float cc, float from, float canonical) {
+    float d = cS * from + cc * canonical;
+    return d > 0.0f ? (cS / (cS + cc)) * (ci * from / d) : 0.0f;
+}
+// One term beta_i of the canonical weight's sum, Eq. 19.
+float spmis_canonical_beta(float ci, float cS, float cc, float from, float canonical) {
+    float d = cS * from + cc * canonical;
+    return d > 0.0f ? (ci / (cS + cc)) * (cc * canonical / d) : 0.0f;
+}
+// The canonical weight's defensive term cc / (cS + cc), Eq. 18.
+float spmis_canonical_share(float cS, float cc) { return cS + cc > 0.0f ? cc / (cS + cc) : 1.0f; }
+
+// ReSTIR PT spatial reuse by stochastic pairwise MIS (Algorithm 2), replacing the paired shift
+// and resampling passes (restir_pt_shift_kernel, restir_pt_spatial_kernel) when
+// Uniforms.spatialNeighbors == 3. As there, the shifts run in their own pass, here one per
+// thread (grid depth 1 + SPMIS_PT_CANDIDATES): shift 0 moves the canonical path into one
+// uniform pixel of the chosen cell, for the canonical weight (Eq. 18, Ñc = 1); shifts 1..Ñ move
+// importance-drawn neighbour paths into this pixel (Eq. 16). Shifts into or from this pixel
+// itself are identities. Each record keeps F(T x) |dT/dx|, the shifted path's Jacobian
+// denominator, the other pixel and its selection probability.
+struct SPMISShift { packed_float3 FJ; float jacobian; uint pixel; float probability; };
+static_assert(sizeof(SPMISShift) == 24, "Swift allocates 24-byte stochastic pairwise MIS shift records");
+constant uint SPMIS_NO_PIXEL = 0xffffffffu;
+
+kernel void restir_pt_spmis_shift_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    constant Uniforms &u [[buffer(0)]],
+    constant SurfaceSettings *settings [[buffer(1)]],
+    constant MaterialResources &images [[buffer(2)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device PTReservoir *reservoirs [[buffer(5)]],
+    device SPMISShift *shifts [[buffer(7)]],
+    const device SPMISPixel *cells [[buffer(9)]],
+    const device SPMISSlot *slots [[buffer(10)]],
+    const device SPMISChoice *choices [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height || gid.z > SPMIS_PT_CANDIDATES) return;
+    uint index = gid.y * u.width + gid.x, k = gid.z;
+    SPMISShift record = { float3(0.0f), 0.0f, SPMIS_NO_PIXEL, 0.0f };
+    float4 position = gbufferPosDepth.read(gid.xy);
+    float4 normalMaterial = gbufferNormalMat.read(gid.xy);
+    PTReservoir c = reservoirs[index];
+    if (position.w > 0.0f && normalMaterial.w != float(EMISSIVE) && c.M > 0.0f && spmis_count(cells[index]) > 0u) {
+        SPMISPixel cell = spmis_chosen(choices[index], 1u);
+        uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ pcg_hash(k * 0x9e3779b9u + 0x61c88647u));
+        PTReservoir path = c;
+        HitRecord y1 = load_primary_surface(primarySurfaces[index], position);
+        float3 view = float3(primarySurfaces[index].view);
+        float depth = position.w;
+        uint z = SPMIS_NO_PIXEL;
+        float probability = 1.0f;
+        if (k == 0u) {
+            if (pt_luminance(c.F) > 0.0f && c.W > 0.0f) {
+                z = spmis_uniform_pixel(slots, cell, rand_f(seed));
+                if (z != index) {
+                    float4 zPosition = gbufferPosDepth.read(uint2(z % u.width, z / u.width));
+                    y1 = load_primary_surface(primarySurfaces[z], zPosition);
+                    view = float3(primarySurfaces[z].view);
+                    depth = zPosition.w;
+                }
+            }
+        } else if (spmis_draw(slots, cell, 1u, rand_f(seed), z, probability)) {
+            path = reservoirs[z];
+            if (!(pt_luminance(path.F) > 0.0f) || !(path.W > 0.0f)) z = SPMIS_NO_PIXEL;
+        } else {
+            z = SPMIS_NO_PIXEL;
+        }
+        if (z != SPMIS_NO_PIXEL) {
+            PTShift s = { float3(path.F), path.rcJacobian };
+            if (z != index) s = pt_shift(path, y1, view, pt_footprint_threshold(depth, y1.geometricNormal, view),
+                                         pt_primary_cone(u), u, settings, images);
+            record.FJ = all(isfinite(s.FJ)) ? s.FJ : float3(0.0f);
+            record.jacobian = s.jacobian;
+            record.pixel = z;
+            record.probability = probability;
+        }
+    }
+    shifts[index * (SPMIS_PT_CANDIDATES + 1u) + k] = record;
+}
+
+// Resampling over the shift records with the stochastic pairwise MIS weights. Shading uses the
+// vector-valued resampling weights (RESTIRPTE2026 Sec. 6.3), and the selected path becomes the
+// next frame's temporal history with confidence c_c + c_Sigma (Ñ/M-scaled).
+kernel void restir_pt_spmis_kernel(
+    texture2d<float, access::read> gbufferPosDepth [[texture(0)]],
+    texture2d<float, access::read> gbufferNormalMat [[texture(1)]],
+    texture2d<float, access::read_write> ptIndirect [[texture(5)]],
+    constant Uniforms &u [[buffer(0)]],
+    const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    device PrimarySurface *historySurfaces [[buffer(4)]],
+    const device PTReservoir *reservoirs [[buffer(5)]],
+    device PTReservoir *output [[buffer(6)]],
+    const device SPMISShift *shifts [[buffer(7)]],
+    const device SPMISPixel *cells [[buffer(9)]],
+    const device SPMISChoice *choices [[buffer(11)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    uint index = gid.y * u.width + gid.x;
+    historySurfaces[index] = primarySurfaces[index];
+    float4 position = gbufferPosDepth.read(gid);
+    float4 normalMaterial = gbufferNormalMat.read(gid);
+    float firstHit = ptIndirect.read(gid).w;
+    PTReservoir c = reservoirs[index];
+    if (!(position.w > 0.0f) || normalMaterial.w == float(EMISSIVE) || !(c.M > 0.0f) || spmis_count(cells[index]) == 0u) {
+        output[index] = pt_empty();
+        ptIndirect.write(float4(0.0f, 0.0f, 0.0f, firstHit), gid);
+        return;
+    }
+    uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2c1b3c6du);
+    SPMISPixel cell = spmis_chosen(choices[index], 1u);
+    float M = float(spmis_count(cell));
+    float scale = float(SPMIS_PT_CANDIDATES) / M;       // Sec. 4.3
+    float cS = cell.confidence[1] * scale, cc = c.M;
+    float pc = pt_luminance(c.F);
+    float weightSum = 0.0f;
+    float3 color = float3(0.0f);
+    PTReservoir chosen = c;
+    float chosenTarget = pc;
+    const device SPMISShift *records = shifts + index * (SPMIS_PT_CANDIDATES + 1u);
+    SPMISShift canonical = records[0];
+    if (canonical.pixel != SPMIS_NO_PIXEL) {
+        float m = spmis_canonical_share(cS, cc)
+            + M * spmis_canonical_beta(reservoirs[canonical.pixel].M * scale, cS, cc, pt_luminance(canonical.FJ), pc);
+        color += m * float3(c.F) * c.W;
+        weightSum += m * pc * c.W;
+    }
+    for (uint k = 1u; k <= SPMIS_PT_CANDIDATES; ++k) {
+        SPMISShift s = records[k];
+        if (s.pixel == SPMIS_NO_PIXEL) continue;
+        float shifted = pt_luminance(s.FJ);
+        if (!(shifted > 0.0f)) continue;
+        PTReservoir q = reservoirs[s.pixel];
+        float m = spmis_neighbor_weight(q.M * scale, cS, cc, pt_luminance(q.F), shifted)
+            / (float(SPMIS_PT_CANDIDATES) * s.probability);
+        float w = m * shifted * q.W;
+        if (!(w > 0.0f) || !isfinite(w)) continue;
+        color += m * float3(s.FJ) * q.W;
+        weightSum += w;
+        if (rand_f(seed) * weightSum < w) {
+            chosen = q;
+            float jacobian = pt_rc_index(q) > 0u ? s.jacobian / q.rcJacobian : 1.0f;
+            chosen.F = float3(s.FJ) / jacobian;
+            if (pt_rc_index(q) > 0u) chosen.rcJacobian = s.jacobian;
+            chosenTarget = pt_luminance(chosen.F);
+        }
+    }
+    float W = chosenTarget > 0.0f && weightSum > 0.0f ? weightSum / chosenTarget : 0.0f;
+    if (!(W > 0.0f) || !isfinite(W)) chosen = pt_empty();
+    else chosen.W = W;
+    chosen.M = cc + cS;
+    output[index] = chosen;
+    if (!all(isfinite(color))) color = float3(0.0f);
+    ptIndirect.write(float4(max(color, 0.0f), firstHit), gid);
+}
+
+// ReSTIR DI spatial reuse by stochastic pairwise MIS (Algorithm 2) at the diffuse primary hit
+// `rec`, seen along `view`, whose reservoir holds `canonical` with weights (weight sum, M, W).
+// The shift is the identity on light samples (Jacobian 1); a domain's target is
+// eval_restir_target_pdf at its primary surface (unshadowed; shading tests visibility), and a
+// neighbour's own target is its weight sum / (M W). Returns the selected sample and its W.
+LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonicalPosDir, float4 canonicalEmitPdf,
+                           float4 canonicalWeights, texture2d<float, access::read> gbufferPosDepth,
+                           texture2d<float, access::read> samplePosDir, texture2d<float, access::read> sampleEmitPdf,
+                           texture2d<float, access::read> reservoirWeights, const device PrimarySurface *primarySurfaces,
+                           const device SPMISPixel *cells, const device SPMISSlot *slots,
+                           const device SPMISChoice *choices, constant Uniforms &u,
+                           constant MaterialResources &images, thread uint &seed, thread float &W) {
+    uint index = gid.y * u.width + gid.x;
+    LightSample selected = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, rec.position);
+    float pc = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, selected, u.sceneIndex, u.light.w, images);
+    W = 0.0f;
+    SPMISPixel own = cells[index];
+    if (spmis_count(own) == 0u) {
+        W = pc > 0.0f ? canonicalWeights.z : 0.0f;
+        return selected;
+    }
+    SPMISPixel cell = spmis_chosen(choices[index], 0u);
+    float M = float(spmis_count(cell));
+    float scale = float(SPMIS_CANDIDATES) / M;
+    float cS = cell.confidence[0] * scale, cc = canonicalWeights.y;
+    float weightSum = 0.0f;
+    if (pc > 0.0f && canonicalWeights.z > 0.0f) {
+        uint z = spmis_uniform_pixel(slots, cell, rand_f(seed));
+        uint2 zc = uint2(z % u.width, z / u.width);
+        float from = pc;
+        if (z != index) {
+            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
+            LightSample y = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, y1.position);
+            from = eval_restir_target_pdf(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat, y,
+                                          u.sceneIndex, u.light.w, images);
+        }
+        float m = spmis_canonical_share(cS, cc) + M * spmis_canonical_beta(reservoirWeights.read(zc).y * scale, cS, cc, from, pc);
+        weightSum = m * pc * canonicalWeights.z;
+    }
+    for (uint k = 0u; k < SPMIS_CANDIDATES; ++k) {
+        uint z;
+        float probability;
+        if (!spmis_draw(slots, cell, 0u, rand_f(seed), z, probability)) break;
+        uint2 zc = uint2(z % u.width, z / u.width);
+        float4 w = reservoirWeights.read(zc);
+        if (!(w.y > 0.0f) || !(w.z > 0.0f) || !(w.x > 0.0f)) continue;
+        LightSample y = restir_di_stored_sample(samplePosDir.read(zc), sampleEmitPdf.read(zc), rec.position);
+        float here = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, y, u.sceneIndex, u.light.w, images);
+        if (!(here > 0.0f)) continue;
+        float source = w.x / (w.y * w.z);
+        float m = spmis_neighbor_weight(w.y * scale, cS, cc, source, here) / (float(SPMIS_CANDIDATES) * probability);
+        float wi = m * here * w.z;
+        if (!(wi > 0.0f) || !isfinite(wi)) continue;
+        weightSum += wi;
+        if (rand_f(seed) * weightSum < wi) selected = y;
+    }
+    float target = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, selected, u.sceneIndex, u.light.w, images);
+    W = target > 0.0f && weightSum > 0.0f && isfinite(weightSum) ? weightSum / target : 0.0f;
+    return selected;
+}
+
+// ReSTIR GI spatial reuse by stochastic pairwise MIS at the diffuse primary hit `rec`. The
+// reconnection shift keeps x2, so in the area-measure target (eval_restir_gi_target) its
+// Jacobian is 1; restir_gi_accepts_shift restricts the domain of the shift from pixel i into
+// this pixel to solid-angle Jacobians within [0.1, 10]. The canonical weight applies the same
+// restriction to its terms (y's target from domain i is zero outside it), so the bound is a
+// domain restriction of an unbiased estimator here, not a rejection. Pixel i's GI samples are
+// traced from its primary hit, so they are always visible from it and above its geometric
+// normal: y's target from domain i also needs both (one ray per pixel). Without that test the canonical weight
+// counts domains that cannot produce y, which darkened Cornell by 0.08%. Shifts into this pixel
+// need no test: shading applies visibility, and an occluded y contributes nothing.
+void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf, thread float4 &normal,
+                    thread float3 &radiance, float4 canonicalWeights, texture2d<float, access::read> gbufferPosDepth,
+                    texture2d<float, access::read> giPosPdf, texture2d<float, access::read> giNormal,
+                    texture2d<float, access::read> giRadiance, texture2d<float, access::read> giWeights,
+                    const device PrimarySurface *primarySurfaces, const device SPMISPixel *cells,
+                    const device SPMISSlot *slots, const device SPMISChoice *choices, constant Uniforms &u,
+                    constant MaterialResources &images, thread uint &seed, thread float &W) {
+    uint index = gid.y * u.width + gid.x;
+    float pc = normal.w > 0.0f ? eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, posPdf.xyz, normal.xyz, radiance) : 0.0f;
+    W = 0.0f;
+    SPMISPixel own = cells[index];
+    if (spmis_count(own) == 0u) {
+        W = pc > 0.0f ? canonicalWeights.z : 0.0f;
+        return;
+    }
+    SPMISPixel cell = spmis_chosen(choices[index], 1u);
+    float M = float(spmis_count(cell));
+    float scale = float(SPMIS_CANDIDATES) / M;
+    float cS = cell.confidence[1] * scale, cc = canonicalWeights.y;
+    float weightSum = 0.0f;
+    if (pc > 0.0f && canonicalWeights.z > 0.0f) {
+        uint z = spmis_uniform_pixel(slots, cell, rand_f(seed));
+        uint2 zc = uint2(z % u.width, z / u.width);
+        float from = pc;
+        if (z != index) {
+            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
+            from = restir_gi_accepts_shift(rec.position, y1.position, posPdf.xyz, normal.xyz)
+                ? eval_restir_gi_target(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat,
+                                        posPdf.xyz, normal.xyz, radiance) : 0.0f;
+            // restir_gi_initial samples x2 by sample_bsdf, which rejects directions below the
+            // geometric normal, and by tracing, so x2 must also be visible from x1_i.
+            float3 g = y1.geometricNormal;
+            if (from > 0.0f && dot(g, g) > 0.5f && !(dot(posPdf.xyz - y1.position, g) > 0.0f)) from = 0.0f;
+            if (from > 0.0f && !gi_connection_visible(y1.position, y1.geometricNormal, posPdf.xyz, u, images, y1.error))
+                from = 0.0f;
+        }
+        float m = spmis_canonical_share(cS, cc) + M * spmis_canonical_beta(giWeights.read(zc).y * scale, cS, cc, from, pc);
+        weightSum = m * pc * canonicalWeights.z;
+    }
+    for (uint k = 0u; k < SPMIS_CANDIDATES; ++k) {
+        uint z;
+        float probability;
+        if (!spmis_draw(slots, cell, 1u, rand_f(seed), z, probability)) break;
+        uint2 zc = uint2(z % u.width, z / u.width);
+        float4 w = giWeights.read(zc);
+        float4 zPosPdf = giPosPdf.read(zc), zNormal = giNormal.read(zc);
+        if (!(w.y > 0.0f) || !(w.z > 0.0f) || !(w.x > 0.0f) || zPosPdf.w <= 0.0f || zNormal.w <= 0.0f) continue;
+        if (z != index && !restir_gi_accepts_shift(rec.position, gbufferPosDepth.read(zc).xyz, zPosPdf.xyz, zNormal.xyz)) continue;
+        float3 zRadiance = giRadiance.read(zc).xyz;
+        float here = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, zPosPdf.xyz, zNormal.xyz, zRadiance);
+        if (!(here > 0.0f)) continue;
+        float source = w.x / (w.y * w.z);
+        float m = spmis_neighbor_weight(w.y * scale, cS, cc, source, here) / (float(SPMIS_CANDIDATES) * probability);
+        float wi = m * here * w.z;
+        if (!(wi > 0.0f) || !isfinite(wi)) continue;
+        weightSum += wi;
+        if (rand_f(seed) * weightSum < wi) {
+            posPdf = zPosPdf; normal = zNormal; radiance = zRadiance;
+        }
+    }
+    float target = normal.w > 0.0f ? eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, posPdf.xyz, normal.xyz, radiance) : 0.0f;
+    W = target > 0.0f && weightSum > 0.0f && isfinite(weightSum) ? weightSum / target : 0.0f;
+}
+
 // RESTIRPTE2026 Sec. 5: the share of the 17 x 17 neighbourhood (288 other pixels) whose final
 // reservoir holds a shifted copy of this pixel's path, detected by its replay seed.
 kernel void restir_pt_duplication_kernel(
@@ -3925,6 +4446,9 @@ kernel void shading_kernel(
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
     const device PrimarySurface *primarySurfaces [[buffer(3)]],
+    const device SPMISPixel *spmisCells [[buffer(4)]],
+    const device SPMISSlot *spmisSlots [[buffer(5)]],
+    const device SPMISChoice *spmisChoices [[buffer(6)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
@@ -4009,7 +4533,9 @@ kernel void shading_kernel(
                 float M = cWeights.y;
 
                 // Uniform mode draws fresh taps in each loop below; compatibility mode
-                // selects independent neighbour sets for DI and for GI reuse.
+                // selects independent neighbour sets for DI and for GI reuse. Stochastic
+                // pairwise MIS (SPMIS2026) replaces both loops and their normalization.
+                bool stochasticPairwise = uniforms.spatialNeighbors == 3;
                 bool compatibilityGuided = uniforms.spatialNeighbors == 1;
                 SpatialNeighbors neighbors;
                 neighbors.count = 0;
@@ -4017,7 +4543,7 @@ kernel void shading_kernel(
                     neighbors = select_compatible_neighbors(gid, pos, norm, posDepth.w,
                         gbufferPosDepth, gbufferNormalMat, uniforms, seed);
                 }
-                int taps = compatibilityGuided ? int(neighbors.count) : UNIFORM_TAPS;
+                int taps = stochasticPairwise ? 0 : compatibilityGuided ? int(neighbors.count) : UNIFORM_TAPS;
                 for (int i = 0; i < taps; ++i) {
                     int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed);
 
@@ -4067,6 +4593,11 @@ kernel void shading_kernel(
                     }
                 }
                 float W = (M > 0.0f && final_p_hat > 0.0f) ? (weightSum / (M * final_p_hat)) : 0.0f;
+                if (stochasticPairwise) {
+                    selectedSample = spmis_di_reuse(gid, primaryHit, primaryRay.direction, cPosDir, cEmitPdf, cWeights,
+                        gbufferPosDepth, inSamplePosDir, inSampleEmitPdf, inReservoirWeights, primarySurfaces,
+                        spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed, W);
+                }
 
                 // Direct Lighting: ReSTIR DI vs. Standard MIS
                 if (W > 0.0f) {
@@ -4097,6 +4628,7 @@ kernel void shading_kernel(
                         gbufferPosDepth, gbufferNormalMat, uniforms, seed);
                     taps = int(neighbors.count);
                 }
+                if (stochasticPairwise) taps = 0;
                 for (int i = 0; i < taps && giEnabled; ++i) {
                     int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed);
                     if (nCoord.x < 0 || nCoord.x >= int(uniforms.width) ||
@@ -4138,6 +4670,11 @@ kernel void shading_kernel(
                 }
                 float giW = giM > 0.0f && finalGITarget > 0.0f
                     ? giWeightSum / (giM * finalGITarget) : 0.0f;
+                if (stochasticPairwise && giEnabled) {
+                    spmis_gi_reuse(gid, primaryHit, primaryRay.direction, selectedGIPosPdf, selectedGINormal,
+                        selectedGIRadiance, currentGIWeights, gbufferPosDepth, inGIPosPdf, inGINormal, inGIRadiance,
+                        inGIWeights, primarySurfaces, spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed, giW);
+                }
                 if (giEnabled && giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
                     selectedGIPosPdf.xyz, uniforms, materialImages, primaryHit.error)) {
                     float3 direction = normalize(selectedGIPosPdf.xyz - pos);
@@ -4598,7 +5135,8 @@ struct Uniforms {
     }
 }
 
-// ReSTIR DI/GI spatial reuse neighbours (shading_kernel). REFERENCES.md: COMPATRESTIR2026.
+// ReSTIR spatial reuse neighbours (shading_kernel for DI/GI; ReSTIR PT pairs its neighbours
+// unless stochastic pairwise MIS is selected). REFERENCES.md: COMPATRESTIR2026, SPMIS2026.
 enum SpatialNeighborSelection: UInt32, Sendable {
     // RESTIR2020: uniform taps in a 16-pixel box, binary normal/depth/material test.
     case uniform = 0
@@ -4608,6 +5146,9 @@ enum SpatialNeighborSelection: UInt32, Sendable {
     // 28-51% lower equal-time MSE, and uniform for the procedural scenes, where the
     // extra taps cost 2-12% at equal time (see tests/PERFORMANCE.md).
     case automatic = 2
+    // SPMIS2026: stochastic pairwise MIS over a screen-space reuse cell of up to 64 pixels, with
+    // neighbours drawn by contribution, for ReSTIR DI, GI and PT (replacing PT's paired reuse).
+    case stochasticPairwise = 3
     func resolved(importedSceneGraph: Bool) -> SpatialNeighborSelection {
         self == .automatic ? (importedSceneGraph ? .compatibility : .uniform) : self
     }
@@ -5230,6 +5771,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var usesSplatting: Bool {
             splatting ?? (PathTracerRenderer.defaultTemporalReuse.resolved(indirectReuse: indirectReuse) == .splatting)
         }
+        // Whether the stochastic pairwise MIS reuse cells are allocated (SPMIS2026).
+        var stochasticPairwise: Bool? = nil
+        var usesStochasticPairwise: Bool {
+            stochasticPairwise ?? (PathTracerRenderer.defaultSpatialNeighbors.resolved(importedSceneGraph: true) == .stochasticPairwise)
+        }
 
         // DI: 6 RGBA32F. GI: 6 RGBA32F + 2 RGBA16F. ReSTIR PT: two 64 B path reservoirs,
         // three 16 B paired shifts, the RGBA32F indirect estimate, a history PrimarySurface
@@ -5260,9 +5806,22 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
             return 60 + (8 + 2 * (32 + PathTracerRenderer.primarySurfaceStride + reservoirs)) / PathTracerRenderer.splatSlotDivisor
         }
-        // Everything a mode switch reallocates: the reservoirs and, when splatting, its resources.
-        static func reservoirSetBytesPerPixel(_ mode: IndirectReuse, splatting: Bool) -> UInt64 {
-            reservoirBytesPerPixel(mode) + (splatting ? splatBytesPerPixel(mode) : 0)
+        // Stochastic pairwise MIS (SPMIS2026): a 16 B SPMISPixel and a 16 B SPMISChoice per pixel and
+        // a 12 B SPMISSlot per tile slot (the tiles cover the frame, so borders round the slot count up);
+        // with ReSTIR PT, ptShifts grows from three 16 B paired shifts to 1 + Ñ 24 B shift records.
+        static func spmisBytesPerPixel(_ mode: IndirectReuse) -> UInt64 {
+            let cells: UInt64 = 16 + 16 + 12
+            let shifts = UInt64(max(0, PathTracerRenderer.spmisShiftBytesPerPixel - PathTracerRenderer.ptShiftBytesPerPixel))
+            switch mode {
+            case .restirGI: return cells
+            case .restirPT, .restirPTUnified: return cells + shifts
+            case .automatic: return max(spmisBytesPerPixel(.restirGI), spmisBytesPerPixel(.restirPTUnified))
+            }
+        }
+        // Everything a mode switch reallocates: the reservoirs and, when splatting or using stochastic
+        // pairwise MIS, their resources.
+        static func reservoirSetBytesPerPixel(_ mode: IndirectReuse, splatting: Bool, stochasticPairwise: Bool = false) -> UInt64 {
+            reservoirBytesPerPixel(mode) + (splatting ? splatBytesPerPixel(mode) : 0) + (stochasticPairwise ? spmisBytesPerPixel(mode) : 0)
         }
         static let metalFXTextureBytesPerPixel: UInt64 = 55
         var bytesPerPixel: UInt64 {
@@ -5273,7 +5832,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             // MetalFX formats total 55 B/pixel plus the scaler's own history and
             // feature allocations.
             120 + PathTracerRenderer.primarySurfaceStride
-                + (usesReSTIR ? Self.reservoirSetBytesPerPixel(indirectReuse, splatting: usesSplatting) : 0)
+                + (usesReSTIR ? Self.reservoirSetBytesPerPixel(indirectReuse, splatting: usesSplatting,
+                                                               stochasticPairwise: usesStochasticPairwise) : 0)
                 + (usesMetalFX ? Self.metalFXTextureBytesPerPixel + metalFXScalerBytesPerPixel : 0)
         }
         var bytes: UInt64? {
@@ -5302,12 +5862,16 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let pt: ReSTIRPTKernels?
         // Nil for a library without them, which then reuses temporally by reprojection.
         let splat: SplatKernels?
+        // Nil for a library without them, which then selects spatial neighbours as .automatic does.
+        let spmis: SPMISKernels?
     }
     // ReSTIR PT passes: initial paths, temporal reuse, paired shifts, spatial reuse, duplication map.
     struct ReSTIRPTKernels { let initial, temporal, shift, spatial, duplication: MTLComputePipelineState }
     // Multi-layer reservoir splatting (HONG2026): domain activation, deep layers, deep-domain canonical
     // samples (DI/GI and PT), reservoir splats, and the DI/GI and PT temporal merges.
     struct SplatKernels { let activate, layers, deepReSTIR, deepPT, reservoirs, temporal, ptTemporal: MTLComputePipelineState }
+    // Stochastic pairwise MIS (SPMIS2026): reuse-cell construction and ReSTIR PT spatial reuse.
+    struct SPMISKernels { let cells, select, ptShift, pt: MTLComputePipelineState }
     let proceduralKernels: SceneKernels
     let meshKernels: SceneKernels
     var sceneKernels: SceneKernels { sceneIndex == 6 ? meshKernels : proceduralKernels }
@@ -5362,6 +5926,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var ptDuplication: MTLTexture?
     private var ptPairing: MTLBuffer?
     nonisolated static let ptReservoirStride = 64
+    // Stochastic pairwise MIS reuse cells (SpatialNeighborSelection.stochasticPairwise; REFERENCES.md
+    // SPMIS2026): an SPMISPixel and an SPMISChoice per pixel and an SPMISSlot per tile slot. Nil in
+    // other modes.
+    private(set) var spmisCells: MTLBuffer?
+    private(set) var spmisSlots: MTLBuffer?
+    private(set) var spmisChoices: MTLBuffer?
+    nonisolated static let spmisTile = 8
+    // MSL SPMIS_PT_CANDIDATES (Ñ of ReSTIR PT); ptShifts then holds 1 + Ñ 24-byte SPMISShift records.
+    nonisolated static let spmisPTCandidates = 3
+    nonisolated static var ptShiftBytesPerPixel: Int { 3 * 16 }
+    nonisolated static var spmisShiftBytesPerPixel: Int { (spmisPTCandidates + 1) * 24 }
     // Multi-layer reservoir splatting (TemporalReuse.splatting; REFERENCES.md HONG2026): two pools of
     // deep-layer domains, `splatCurrent` written this frame and `splatPrevious` read from the last,
     // swapped after every frame; per-pixel activation masks, SplatLayers and the splat sources of
@@ -5456,8 +6031,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     }
     nonisolated static var defaultSpatialNeighbors: SpatialNeighborSelection {
 #if VIBE_TESTING
-        // Test builds can run the whole suite with the earlier uniform selection.
-        if ProcessInfo.processInfo.environment["VIBE_SPATIAL_NEIGHBORS"] == "uniform" { return .uniform }
+        // Test builds can run the whole suite with the earlier uniform selection or with
+        // stochastic pairwise MIS.
+        switch ProcessInfo.processInfo.environment["VIBE_SPATIAL_NEIGHBORS"] {
+        case "uniform": return .uniform
+        case "stochastic": return .stochasticPairwise
+        default: break
+        }
 #endif
         return .automatic
     }
@@ -5513,9 +6093,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // The reservoir set of the frame resources (reservoirSet): nil before the first frame.
     private var frameReservoirs: UInt32?
     // 0 for non-ReSTIR and inspection frames (1 x 1 placeholders), else 1 + IndirectReuse,
-    // plus 16 with the reservoir-splatting resources.
+    // plus 16 with the reservoir-splatting resources and 32 with the stochastic pairwise MIS cells.
     func reservoirSet(usesReSTIR: Bool) -> UInt32 {
-        usesReSTIR ? (activeIndirectReuse.rawValue + 1) | (activeTemporalReuse == .splatting ? 16 : 0) : 0
+        usesReSTIR ? (activeIndirectReuse.rawValue + 1) | (activeTemporalReuse == .splatting ? 16 : 0)
+            | (activeSpatialNeighbors == .stochasticPairwise ? 32 : 0) : 0
     }
     // indirectReuse with .automatic resolved for the current scene.
     var activeIndirectReuse: IndirectReuse { resolvedIndirectReuse(indirectReuse) }
@@ -5533,7 +6114,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         sceneKernels.splat == nil ? .reprojection : mode.resolved(indirectReuse: resolvedIndirectReuse(indirectReuse))
     }
     func resolvedSpatialNeighbors(_ mode: SpatialNeighborSelection) -> SpatialNeighborSelection {
-        mode.resolved(importedSceneGraph: sceneIndex == 6 && materials.hasSceneGraph)
+        let imported = sceneIndex == 6 && materials.hasSceneGraph
+        let resolved = mode.resolved(importedSceneGraph: imported)
+        return resolved == .stochasticPairwise && sceneKernels.spmis == nil
+            ? SpatialNeighborSelection.automatic.resolved(importedSceneGraph: imported) : resolved
     }
     // Set when only the reservoirs were reallocated; the next frame skips temporal reuse.
     private(set) var reservoirHistoryNeedsReset = false
@@ -5567,22 +6151,24 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             let id = ObjectIdentifier(texture as AnyObject)
             return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
         } + ([primarySurfaces, historyPrimarySurfaces, ptReservoirs, ptHistory, ptShifts, ptPairing,
-              splatMask, splatLayers, splatSources] + (splatCurrent?.buffers ?? []) + (splatPrevious?.buffers ?? []))
+              splatMask, splatLayers, splatSources, spmisCells, spmisSlots, spmisChoices] + (splatCurrent?.buffers ?? []) + (splatPrevious?.buffers ?? []))
             .reduce(UInt64(0)) { $0 + UInt64($1?.allocatedSize ?? 0) }
     }
 
-    // `indirectReuse` and `temporalReuse` preflight a mode switch before it is applied (the
-    // Render inspector); nil uses the current setting.
+    // `indirectReuse`, `temporalReuse` and `spatialNeighbors` preflight a mode switch before it is
+    // applied (the Render inspector); nil uses the current setting.
     func renderMemoryError(width: Int, height: Int, indirectReuse candidateIndirect: IndirectReuse? = nil,
-                           temporalReuse candidateTemporal: TemporalReuse? = nil) -> String? {
+                           temporalReuse candidateTemporal: TemporalReuse? = nil,
+                           spatialNeighbors candidateSpatial: SpatialNeighborSelection? = nil) -> String? {
         let usesReSTIR = samplingMode == 0 && viewportMode == 0
         let usesMetalFX = denoiserEnabled && supportsMetalFX && usesReSTIR
         let indirectMode = candidateIndirect ?? indirectReuse
         let activeIndirect = resolvedIndirectReuse(indirectMode)
         let splatting = resolvedTemporalReuse(candidateTemporal ?? temporalReuse, indirectReuse: indirectMode) == .splatting
+        let stochasticPairwise = resolvedSpatialNeighbors(candidateSpatial ?? spatialNeighbors) == .stochasticPairwise
         let plan = FrameResourcePlan(width: width, height: height, usesReSTIR: usesReSTIR, usesMetalFX: usesMetalFX,
             metalFXScalerBytesPerPixel: usesMetalFX ? metalFXScalerBytesPerPixel : 0, indirectReuse: activeIndirect,
-            splatting: splatting)
+            splatting: splatting, stochasticPairwise: stochasticPairwise)
         guard let frameBytes = plan.bytes else { return "Render dimensions are too large." }
         // Include the live frame set during resize/export, scene textures, the
         // measured MetalFX scaler internals, and modest command/display headroom
@@ -5596,8 +6182,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // A strategy, indirect-reuse, temporal-reuse or inspection change replaces only the reservoirs
         // (and splat resources); the old ones stay live (in residentFrameBytes) for in-flight frames.
         let reservoirs = pixels.multipliedReportingOverflow(
-            by: FrameResourcePlan.reservoirSetBytesPerPixel(activeIndirect, splatting: splatting))
-        let candidateSet = (activeIndirect.rawValue + 1) | (splatting ? 16 : 0)  // reservoirSet(usesReSTIR: true)
+            by: FrameResourcePlan.reservoirSetBytesPerPixel(activeIndirect, splatting: splatting, stochasticPairwise: stochasticPairwise))
+        // reservoirSet(usesReSTIR: true)
+        let candidateSet = (activeIndirect.rawValue + 1) | (splatting ? 16 : 0) | (stochasticPairwise ? 32 : 0)
         let additionalReservoirs = !resizes && plan.usesReSTIR && frameReservoirs != candidateSet
             ? reservoirs.partialValue : 0
         let withResident = baseRequired.addingReportingOverflow(resident)
@@ -5678,6 +6265,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 return SplatKernels(activate: p[0], layers: p[1], deepReSTIR: p[2], deepPT: p[3], reservoirs: p[4],
                                     temporal: p[5], ptTemporal: p[6])
             }
+            func spmisKernels(_ library: MTLLibrary) throws -> SPMISKernels? {
+                let names = ["spmis_cells_kernel", "spmis_select_kernel", "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
+                guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
+                let p = try names.map { try pipeline(library, $0) }
+                return SPMISKernels(cells: p[0], select: p[1], ptShift: p[2], pt: p[3])
+            }
             if let shared {
                 self.proceduralKernels = shared.proceduralKernels
                 self.meshKernels = shared.meshKernels
@@ -5687,9 +6280,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 let procedural = try device.makeLibrary(source: metalSource, options: options)
                 self.proceduralKernels = SceneKernels(temporal: try pipeline(procedural, "restir_temporal_kernel"),
                     shading: try pipeline(procedural, "shading_kernel"), guides: try pipeline(procedural, "metalfx_guides_kernel"),
-                    pick: try pipeline(procedural, "pick_kernel"), pt: try ptKernels(procedural), splat: try splatKernels(procedural))
+                    pick: try pipeline(procedural, "pick_kernel"), pt: try ptKernels(procedural), splat: try splatKernels(procedural),
+                    spmis: try spmisKernels(procedural))
                 self.meshKernels = SceneKernels(temporal: restirTemporalPipeline, shading: shadingPipeline,
-                    guides: metalFXGuidePipeline, pick: pickPipeline, pt: try ptKernels(lib), splat: try splatKernels(lib))
+                    guides: metalFXGuidePipeline, pick: pickPipeline, pt: try ptKernels(lib), splat: try splatKernels(lib),
+                    spmis: try spmisKernels(lib))
             }
         } catch {
             throw error
@@ -5954,7 +6549,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 usesPT ? device.makeBuffer(length: w * h * bytesPerPixel, options: .storageModePrivate) : nil
             }
             let newPTReservoirs = ptBuffer(Self.ptReservoirStride), newPTHistory = ptBuffer(Self.ptReservoirStride)
-            let newPTShifts = ptBuffer(3 * 16), newHistorySurfaces = ptBuffer(Int(Self.primarySurfaceStride))
+            // Stochastic pairwise MIS stores its shift records in the paired shifts' buffer.
+            let usesSPMISShifts = needsReSTIR && activeSpatialNeighbors == .stochasticPairwise
+            let newPTShifts = ptBuffer(usesSPMISShifts ? max(Self.ptShiftBytesPerPixel, Self.spmisShiftBytesPerPixel) : Self.ptShiftBytesPerPixel)
+            let newHistorySurfaces = ptBuffer(Int(Self.primarySurfaceStride))
             if usesPT && ptPairing == nil {
                 ptPairing = ReSTIRPTPairing.deltas.withUnsafeBytes {
                     device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
@@ -5983,6 +6581,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 newSplat = (a, b, mask, layers, sources)
             }
             if splatPlaceholder == nil { splatPlaceholder = device.makeBuffer(length: 64, options: .storageModePrivate) }
+            // Stochastic pairwise MIS reuse cells (SPMIS2026).
+            let usesSPMIS = needsReSTIR && activeSpatialNeighbors == .stochasticPairwise
+            let tileSlots = ((w + Self.spmisTile - 1) / Self.spmisTile) * ((h + Self.spmisTile - 1) / Self.spmisTile)
+                * Self.spmisTile * Self.spmisTile
+            let newSPMISCells = usesSPMIS ? device.makeBuffer(length: w * h * 16, options: .storageModePrivate) : nil
+            let newSPMISSlots = usesSPMIS ? device.makeBuffer(length: tileSlots * 12, options: .storageModePrivate) : nil
+            let newSPMISChoices = usesSPMIS ? device.makeBuffer(length: w * h * 16, options: .storageModePrivate) : nil
+            if usesSPMIS && (newSPMISCells == nil || newSPMISSlots == nil || newSPMISChoices == nil) {
+                onError?("Could not allocate render textures. Try a smaller window.")
+                return
+            }
 
             // Only the DI/GI reservoirs depend on the strategy and inspection view;
             // keep the accumulation, G-buffer, guides and sample count when just
@@ -6038,6 +6647,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             historyPrimarySurfaces = newHistorySurfaces
             splatCurrent = newSplat?.current; splatPrevious = newSplat?.previous
             splatMask = newSplat?.mask; splatLayers = newSplat?.layers; splatSources = newSplat?.sources
+            spmisCells = newSPMISCells; spmisSlots = newSPMISSlots; spmisChoices = newSPMISChoices
             frameReservoirs = reservoirs
 
             if resized {
@@ -6219,13 +6829,49 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        // Stochastic pairwise MIS (REFERENCES.md: SPMIS2026): the reuse cells, built from the final
+        // temporal reservoirs just before spatial reuse (ReSTIR PT's below, DI/GI's in pass 2).
+        let spmis = spmisCells.flatMap { cells in spmisSlots.flatMap { slots in spmisChoices.map { (cells, slots, $0) } } }
+        func bindSPMIS(_ encoder: MTLComputeCommandEncoder) {
+            guard let (cells, slots, choices) = spmis else { return }
+            encoder.setBuffer(cells, offset: 0, index: 9)
+            encoder.setBuffer(slots, offset: 0, index: 10)
+            encoder.setBuffer(choices, offset: 0, index: 11)
+        }
+        // Reuse cells (spmis_cells_kernel, one threadgroup per tile), then each pixel's cell choice.
+        func encodeSPMISCells(ptReservoirs: MTLBuffer?) -> Bool {
+            guard spmis != nil, let kernels = sceneKernels.spmis else { return true }
+            for (label, pipeline) in [("Stochastic pairwise MIS: reuse cells", kernels.cells),
+                                      ("Stochastic pairwise MIS: cell choice", kernels.select)] {
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return false }
+                encoder.label = label
+                encoder.setComputePipelineState(pipeline)
+                for (index, texture) in [gPos, gNorm, rWeightA, giWeightA].enumerated() { encoder.setTexture(texture, index: index) }
+                encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+                encoder.setBuffer(surfaces, offset: 0, index: 3)
+                encoder.setBuffer(ptReservoirs ?? placeholder, offset: 0, index: 5)
+                bindSPMIS(encoder)
+                if pipeline === kernels.cells {
+                    let tile = Self.spmisTile
+                    encoder.dispatchThreadgroups(MTLSize(width: (w + tile - 1) / tile, height: (h + tile - 1) / tile, depth: 1),
+                                                 threadsPerThreadgroup: MTLSize(width: tile, height: tile, depth: 1))
+                } else {
+                    encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
+                }
+                encoder.endEncoding()
+            }
+            return true
+        }
+
         // ReSTIR PT (REFERENCES.md: RESTIRPT2022, RESTIRPTE2026): initial paths and temporal
-        // reuse, paired shifts, spatial reuse, then (optionally) the duplication map.
+        // reuse, paired shifts, spatial reuse, then (optionally) the duplication map. With stochastic
+        // pairwise MIS, the reuse cells and restir_pt_spmis_kernel replace the paired passes.
         if usesPT {
             guard let current = ptReservoirs, let history = ptHistory, let shifts = ptShifts,
                   let historySurfaces = historyPrimarySurfaces, let pairing = ptPairing,
                   let kernels = sceneKernels.pt else { return }
-            var passes: [(String, MTLComputePipelineState, Bool)] = [("ReSTIR PT: initial paths", kernels.initial, true)]
+            // A nil pipeline is the reuse-cell pass of stochastic pairwise MIS (encodeSPMISCells).
+            var passes: [(String, MTLComputePipelineState?, Bool)] = [("ReSTIR PT: initial paths", kernels.initial, true)]
             // Temporal reuse only while the view changes (MSL restir_pt_temporal); by splatting on splat frames.
             let splatTemporal = splatFrame ? sceneKernels.splat?.ptTemporal : nil
             if let splatTemporal {
@@ -6233,11 +6879,23 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             } else if nextFrame <= 1 || ptTemporalWhileAccumulating {
                 passes.append(("ReSTIR PT: temporal reuse", kernels.temporal, true))
             }
-            passes += [
-                ("ReSTIR PT: paired shifts", kernels.shift, true),
-                ("ReSTIR PT: spatial reuse", kernels.spatial, false)]
+            let spmisShift = spmis != nil ? sceneKernels.spmis?.ptShift : nil
+            if let spmisShift, let spmisPT = sceneKernels.spmis?.pt {
+                passes += [
+                    ("Stochastic pairwise MIS: reuse cells", nil, false),
+                    ("ReSTIR PT: stochastic pairwise MIS shifts", spmisShift, true),
+                    ("ReSTIR PT: stochastic pairwise MIS spatial reuse", spmisPT, false)]
+            } else {
+                passes += [
+                    ("ReSTIR PT: paired shifts", kernels.shift, true),
+                    ("ReSTIR PT: spatial reuse", kernels.spatial, false)]
+            }
             if ptDecorrelation { passes.append(("ReSTIR PT: duplication map", kernels.duplication, false)) }
-            for (label, pipeline, bindsMaterials) in passes {
+            for (label, step, bindsMaterials) in passes {
+                guard let pipeline = step else {
+                    guard encodeSPMISCells(ptReservoirs: current) else { return }
+                    continue
+                }
                 guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
@@ -6253,16 +6911,23 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 for (index, buffer) in [surfaces, historySurfaces, current, history, shifts, pairing].enumerated() {
                     encoder.setBuffer(buffer, offset: 0, index: index + 3)
                 }
+                bindSPMIS(encoder)
                 if pipeline === splatTemporal, let slots = splatState?.0.capacity {
                     bindSplatBuffers(encoder)
                     encoder.dispatchThreads(MTLSize(width: w * h + slots, height: 1, depth: 1),
                                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                } else if pipeline === spmisShift {
+                    encoder.dispatchThreads(MTLSize(width: w, height: h, depth: Self.spmisPTCandidates + 1),
+                                            threadsPerThreadgroup: threadsPerGroup)
                 } else {
                     encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
                 }
                 encoder.endEncoding()
             }
         }
+
+        // ReSTIR GI: the reuse cells of the DI and GI reservoirs.
+        if !usesPT && needsReSTIR { guard encodeSPMISCells(ptReservoirs: nil) else { return } }
 
         // PASS 2: Spatial Resampling & Full Path Tracing
         guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return }
@@ -6291,6 +6956,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
             enc2.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             enc2.setBuffer(surfaces, offset: 0, index: 3)
+            enc2.setBuffer(spmis?.0 ?? placeholder, offset: 0, index: 4)
+            enc2.setBuffer(spmis?.1 ?? placeholder, offset: 0, index: 5)
+            enc2.setBuffer(spmis?.2 ?? placeholder, offset: 0, index: 6)
             enc2.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
             enc2.endEncoding()
         }
