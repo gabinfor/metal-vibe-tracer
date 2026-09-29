@@ -83,26 +83,33 @@ struct ReSTIRModes: Equatable, Sendable {
   var indirectReuse: IndirectReuse
   var spatialNeighbors: SpatialNeighborSelection
   var temporalReuse: TemporalReuse
+  var controlVariates: ControlVariates
   // Projects without a stored choice use these: .automatic, or in -D VIBE_TESTING builds the
-  // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE override. A stored choice wins.
+  // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE / VIBE_CONTROL_VARIATES
+  // override. A stored choice wins.
   static var defaults: ReSTIRModes {
     ReSTIRModes(
       indirectReuse: PathTracerRenderer.defaultIndirectReuse,
       spatialNeighbors: PathTracerRenderer.defaultSpatialNeighbors,
-      temporalReuse: PathTracerRenderer.defaultTemporalReuse)
+      temporalReuse: PathTracerRenderer.defaultTemporalReuse,
+      controlVariates: PathTracerRenderer.defaultControlVariates)
   }
-  init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse) {
+  init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse,
+       controlVariates: ControlVariates = PathTracerRenderer.defaultControlVariates) {
     self.indirectReuse = indirectReuse
     self.spatialNeighbors = spatialNeighbors
     self.temporalReuse = temporalReuse
+    self.controlVariates = controlVariates
   }
   @MainActor init(_ r: PathTracerRenderer) {
-    self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse)
+    self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse,
+              controlVariates: r.controlVariates)
   }
   @MainActor func apply(_ r: PathTracerRenderer) {
     r.indirectReuse = indirectReuse
     r.spatialNeighbors = spatialNeighbors
     r.temporalReuse = temporalReuse
+    r.controlVariates = controlVariates
   }
 }
 struct OIDNOptions: Codable, Equatable {
@@ -144,11 +151,12 @@ struct ProjectDocument: Codable {
   // Optional so version 1/2 projects written before these controls remain readable.
   var oidn: OIDNOptions?
   var viewportMode: UInt32?
-  // Raw values of IndirectReuse, SpatialNeighborSelection and TemporalReuse; optional so
-  // projects written before the Render inspector exposed them open with the default (automatic).
+  // Raw values of IndirectReuse, SpatialNeighborSelection, TemporalReuse and ControlVariates; optional
+  // so projects written before the Render inspector exposed them open with the default (automatic).
   var indirectReuse: UInt32?
   var spatialNeighbors: UInt32?
   var temporalReuse: UInt32?
+  var controlVariates: UInt32?
   // Written only into autosaves: the document's file association and unsaved state.
   var recovery: AutosaveRecovery?
 
@@ -159,12 +167,14 @@ struct ProjectDocument: Codable {
       return ReSTIRModes(
         indirectReuse: indirectReuse.flatMap(IndirectReuse.init(rawValue:)) ?? fallback.indirectReuse,
         spatialNeighbors: spatialNeighbors.flatMap(SpatialNeighborSelection.init(rawValue:)) ?? fallback.spatialNeighbors,
-        temporalReuse: temporalReuse.flatMap(TemporalReuse.init(rawValue:)) ?? fallback.temporalReuse)
+        temporalReuse: temporalReuse.flatMap(TemporalReuse.init(rawValue:)) ?? fallback.temporalReuse,
+        controlVariates: controlVariates.flatMap(ControlVariates.init(rawValue:)) ?? fallback.controlVariates)
     }
     set {
       indirectReuse = newValue.indirectReuse.rawValue
       spatialNeighbors = newValue.spatialNeighbors.rawValue
       temporalReuse = newValue.temporalReuse.rawValue
+      controlVariates = newValue.controlVariates.rawValue
     }
   }
 
@@ -242,7 +252,8 @@ struct ProjectDocument: Codable {
     }
     guard indirectReuse.map({ IndirectReuse(rawValue: $0) != nil }) ?? true,
       spatialNeighbors.map({ SpatialNeighborSelection(rawValue: $0) != nil }) ?? true,
-      temporalReuse.map({ TemporalReuse(rawValue: $0) != nil }) ?? true
+      temporalReuse.map({ TemporalReuse(rawValue: $0) != nil }) ?? true,
+      controlVariates.map({ ControlVariates(rawValue: $0) != nil }) ?? true
     else { try bad(); return }
     func cameraOK(_ c: CameraState) -> Bool {
       c.yaw.isFinite && (-1.5...1.5).contains(c.pitch) && (0.0001...1_000_000).contains(c.distance)

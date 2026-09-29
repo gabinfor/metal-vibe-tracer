@@ -224,12 +224,17 @@ final class StudioController: NSViewController {
   static let temporalReuseChoices: [(mode: TemporalReuse, title: String)] = [
     (.automatic, "Automatic"), (.reprojection, "Reprojection"), (.splatting, "Reservoir splatting"),
   ]
+  static let controlVariateChoices: [(mode: ControlVariates, title: String)] = [
+    (.automatic, "Automatic"), (.restcv, "Control variates"), (.off, "Resampled"),
+  ]
   static let indirectReuseHelp =
     "ReSTIR GI is fastest and reuses the first diffuse bounce; ReSTIR PT reuses whole paths (better glossy, mirror and deep light) at about 1.3–2.3× the GPU time and +114–210 B per pixel; unified also merges direct light."
   static let spatialNeighborHelp =
     "Compatibility-guided reuse prefers neighbours with a similar surface: lower noise on imported meshes for 3–26% more frame time. It applies to ReSTIR DI and GI, not unified ReSTIR PT. Stochastic pairwise MIS reuses DI, GI and PT samples without bias from 64-pixel cells: 6–33% lower noise per sample with ReSTIR PT for 13–55% more frame time and 44–92 B more per pixel."
   static let temporalReuseHelp =
     "Reservoir splatting lowers noise in newly revealed areas while the camera moves, for 5–26% more frame time and about 200 B more GPU memory per pixel. Still views render identically."
+  static let controlVariateHelp =
+    "ReSTIR PT only, with paired spatial reuse. Control variates (ReSTCV) shade each pixel from colour estimates accumulated over neighbouring pixels and frames: 5–47% less noise per frame while the camera moves and 1–14% less in still renders, at the same frame time. Single frames can hold a few dark pixels without the denoiser. Resampled shades from the reservoirs' samples."
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 
@@ -507,7 +512,7 @@ final class StudioController: NSViewController {
     text("Inspection views bypass tone mapping and denoising, and do not reset the progressive render.")
   }
 
-  // The three ReSTIR reuse popups. They apply only to ReSTIR Direct + Indirect and are
+  // The four ReSTIR reuse popups. They apply only to ReSTIR Direct + Indirect and are
   // disabled (with a note) for the other strategies, like the MetalFX note above.
   func restirModeControls() {
     let r = renderer, enabled = r.samplingMode == 0
@@ -549,8 +554,13 @@ final class StudioController: NSViewController {
       automatic: name(r.resolvedTemporalReuse(.automatic, indirectReuse: r.indirectReuse), Self.temporalReuseChoices),
       help: Self.temporalReuseHelp
     ) { $0.temporalReuse = $1 }
+    choice(
+      "Path shading", Self.controlVariateChoices, current: r.controlVariates,
+      automatic: name(r.resolvedControlVariates(.automatic), Self.controlVariateChoices),
+      help: Self.controlVariateHelp
+    ) { $0.controlVariates = $1 }
     if !enabled {
-      text("Indirect reuse, spatial neighbours and temporal reuse apply only to ReSTIR Direct + Indirect.")
+      text("Indirect reuse, spatial neighbours, temporal reuse and path shading apply only to ReSTIR Direct + Indirect.")
     }
   }
   // The render size a mode switch is preflighted at: the live accumulation, else the viewport.

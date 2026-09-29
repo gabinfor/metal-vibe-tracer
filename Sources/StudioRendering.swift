@@ -105,6 +105,7 @@ extension StudioController {
       r.spatialNeighbors = p.restirModes.spatialNeighbors
       r.indirectReuse = p.restirModes.indirectReuse
       r.temporalReuse = .reprojection
+      r.controlVariates = p.restirModes.controlVariates
       r.ptDecorrelation = renderer.ptDecorrelation
       r.ptTemporalWhileAccumulating = renderer.ptTemporalWhileAccumulating
       r.skyMode = p.sky
