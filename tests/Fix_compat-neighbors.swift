@@ -18,7 +18,7 @@
   require(blank.spatialNeighbors == SpatialNeighborSelection.compatibility.rawValue,
     "uniforms default to compatibility-guided selection")
   let environmentDefault: SpatialNeighborSelection =
-    ProcessInfo.processInfo.environment["VIBE_SPATIAL_NEIGHBORS"] == "uniform" ? .uniform : .automatic
+    ["uniform": .uniform, "stochastic": .stochasticPairwise][ProcessInfo.processInfo.environment["VIBE_SPATIAL_NEIGHBORS"] ?? ""] ?? .automatic
   require(PathTracerRenderer.defaultSpatialNeighbors == environmentDefault,
     "the default selection follows the VIBE_SPATIAL_NEIGHBORS test seam")
   require(SpatialNeighborSelection.automatic.resolved(importedSceneGraph: true) == .compatibility

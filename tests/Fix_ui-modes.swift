@@ -74,7 +74,7 @@
     "the test library has the ReSTIR PT and splatting kernels")
   require(ReSTIRModes(testRenderer) == defaults, "a project without stored modes restores the defaults")
   require(titles(indirect) == ["Automatic (currently: ReSTIR GI)", "ReSTIR GI", "ReSTIR PT", "ReSTIR PT (unified)"]
-    && titles(spatial) == ["Automatic (currently: Uniform)", "Uniform", "Compatibility-guided"]
+    && titles(spatial) == ["Automatic (currently: Uniform)", "Uniform", "Compatibility-guided", "Stochastic pairwise MIS"]
     && titles(temporal) == ["Automatic (currently: Reprojection)", "Reprojection", "Reservoir splatting"],
     "procedural scenes list the modes and resolve Automatic to ReSTIR GI, uniform neighbours and reprojection")
   for label in [indirect, spatial, temporal] {
@@ -221,7 +221,14 @@
   let plainDecoded = try ProjectDocument.decodeProject(plain, near: nil)
   require(!plainText.contains("indirectReuse") && plainDecoded.indirectReuse == nil && plainDecoded.restirModes == defaults,
     "a format 3 project without the fields opens as the default")
-  for (key, value) in [("indirectReuse", 4), ("spatialNeighbors", 3), ("temporalReuse", 3)] {
+  // Stochastic pairwise MIS (raw value 3) round-trips like the other spatial selections.
+  var stochastic = ProjectDocument()
+  stochastic.restirModes = ReSTIRModes(indirectReuse: .automatic, spatialNeighbors: .stochasticPairwise, temporalReuse: .automatic)
+  let stochasticDecoded = try ProjectDocument.decodeProject(stochastic.encodeForSaving(), near: nil)
+  try stochasticDecoded.validate()
+  require(stochasticDecoded.spatialNeighbors == 3 && stochasticDecoded.restirModes.spatialNeighbors == .stochasticPairwise,
+    "a project stores and reopens stochastic pairwise MIS")
+  for (key, value) in [("indirectReuse", 4), ("spatialNeighbors", 4), ("temporalReuse", 3)] {
     var bad = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ProjectDocument())) as! [String: Any]
     bad[key] = value
     var rejected = false

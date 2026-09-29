@@ -285,7 +285,8 @@
     let pt = reuse != .restirGI
     require((renderer.resPosDirA?.width == mw) == (reuse != .restirPTUnified) && (renderer.giPosPdfA?.width == mw) == !pt
         && (renderer.ptIndirect?.width == mw) == pt && (renderer.ptDuplication?.width == mw) == pt
-        && (renderer.ptReservoirs?.length ?? 0) == (pt ? mw * mh * 64 : 0) && (renderer.ptShifts?.length ?? 0) == (pt ? mw * mh * 48 : 0)
+        && (renderer.ptReservoirs?.length ?? 0) == (pt ? mw * mh * 64 : 0) && (renderer.ptShifts?.length ?? 0) == (pt ? mw * mh * (renderer.activeSpatialNeighbors == .stochasticPairwise
+            ? PathTracerRenderer.spmisShiftBytesPerPixel : 48) : 0)
         && (renderer.historyPrimarySurfaces?.length ?? 0) == (pt ? mw * mh * 128 : 0),
       "\(reuse) allocates exactly its reservoir sets; the others are placeholders")
     let plan = PathTracerRenderer.FrameResourcePlan(width: mw, height: mh, usesReSTIR: true, usesMetalFX: false, indirectReuse: reuse)
