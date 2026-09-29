@@ -6,7 +6,8 @@ Usage: python3 tests/benchmark.py [--baseline /path/to/previous/main.swift] [--r
                                   [--frames 12] [--rounds 2] [--output-tolerance 0.05]
 
 Timings are median GPU command-buffer times (tracing, MetalFX and display, no readback)
-of each run's frames after the first four. A baseline is accepted only when its Uniforms
+of each run's frames after the first four. The ", orbiting" scenarios move the camera every frame,
+so that temporal reuse (reprojection or reservoir splatting, VIBE_TEMPORAL_REUSE) runs on every frame. A baseline is accepted only when its Uniforms
 size and field offsets, material argument-buffer length and kernel bindings match what
 the current host code binds, and each scenario's mean raw radiance agrees with the current
 shaders within --output-tolerance; otherwise no timings are printed.
@@ -160,7 +161,10 @@ do {
 }
 let scenarios: [(String, UInt32, UInt32)] = [("Default Pavilion", 0, 0), ("Pavilion with coated OpenPBR floor", 0, 0),
     ("Cornell box", 1, 0), ("Imported mesh (scene 6, \(mesh.count) triangles)", 6, 0), ("Default Pavilion, MIS", 0, 1),
-    ("Instanced scene graph (scene 6, 25 x 19,968 triangles)", 6, 0)]
+    ("Instanced scene graph (scene 6, 25 x 19,968 triangles)", 6, 0),
+    ("Default Pavilion, orbiting", 0, 0), ("Imported mesh (scene 6), orbiting", 6, 0)]
+// Orbiting scenarios move the camera every frame (render(orbit:)): temporal reuse runs on every frame.
+func orbiting(_ scenario: Int) -> Bool { scenarios[scenario].0.hasSuffix(", orbiting") }
 @MainActor func prepare(_ renderer: PathTracerRenderer, _ scenario: Int) throws {
     renderer.materials.settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
     if scenario == 1 {
@@ -192,7 +196,7 @@ for round in 0..<rounds {
                 testRenderer = renderer
                 try prepare(renderer, scenario)
                 frameMilliseconds = []
-                let output = render(view(scenario), samples: frames, denoise: fx)
+                let output = render(view(scenario), samples: frames, denoise: fx, orbit: orbiting(scenario))
                 let key = "\(scenarios[scenario].0) | MetalFX \(fx ? "on" : "off")"
                 timings[key + " | " + name, default: []] += frameMilliseconds.dropFirst(4)
                 radiance[key, default: [:]][name, default: []].append(mean(output))

@@ -45,6 +45,7 @@ PARTS = [
     ('Fix_accel.swift', ALL),
     ('Fix_compat-neighbors.swift', {'full'}),
     ('Fix_restir-pt.swift', {'full'}),
+    ('Fix_splatting.swift', {'full'}),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()
