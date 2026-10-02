@@ -74,7 +74,7 @@
         uint2 gid [[thread_position_in_grid]]) {
         if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
         uint index = gid.y * uniforms.width + gid.x;
-        uint seed = index ^ (uniforms.sampleIndex * 1999999973u);
+        Sampler seed = pixel_sampler(gid, uniforms);  // pass 1's sampler (PCG or Z++)
         float aspect = float(uniforms.width) / float(uniforms.height);
         float fov_scale = tan((uniforms.cameraPos.w * 0.5f) * PI / 180.0f);
         float2 jitter = uniforms.jitter + 0.5f;
