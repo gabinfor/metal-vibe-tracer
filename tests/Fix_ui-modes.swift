@@ -1,5 +1,5 @@
 // Render inspector controls for the ReSTIR reuse modes (IndirectReuse, SpatialNeighborSelection,
-// TemporalReuse, ControlVariates): popup items, labels and state; one undo step and an accumulation reset per
+// TemporalReuse, ControlVariates) and the sampler (SamplerMode, every strategy): popup items, labels and state; one undo step and an accumulation reset per
 // change; strategy gating and edit guards; project round trips, including projects written
 // without the fields; "Automatic (currently: …)" per scene; exports; the GPU memory preflight.
 @MainActor func fixUIModesChecks() throws {
@@ -60,19 +60,23 @@
     grouped { control.invoke() }
   }
   let indirect = "Indirect reuse", spatial = "Spatial neighbours", temporal = "Temporal reuse", shading = "Path shading"
+  let samplerLabel = "Sampler"
   let defaults = ReSTIRModes.defaults
   let environment = ProcessInfo.processInfo.environment
-  if ["VIBE_INDIRECT_REUSE", "VIBE_SPATIAL_NEIGHBORS", "VIBE_TEMPORAL_REUSE", "VIBE_CONTROL_VARIATES"]
+  if ["VIBE_INDIRECT_REUSE", "VIBE_SPATIAL_NEIGHBORS", "VIBE_TEMPORAL_REUSE", "VIBE_CONTROL_VARIATES", "VIBE_SAMPLER"]
     .allSatisfy({ environment[$0] == nil })
   {
     require(defaults == ReSTIRModes(indirectReuse: .automatic, spatialNeighbors: .automatic, temporalReuse: .automatic,
-                                    controlVariates: .automatic),
+                                    controlVariates: .automatic, sampler: .automatic),
       "without test overrides every mode defaults to Automatic")
   }
   // Path shading's Automatic resolves with the current reuse modes (ReSTCV needs ReSTIR PT with
   // paired spatial reuse), which the suite-wide overrides may change.
   func automaticShading() -> String {
     testRenderer.resolvedControlVariates(.automatic) == .restcv ? "Control variates" : "Resampled"
+  }
+  func automaticSampler() -> String {
+    StudioController.samplerChoices.first { $0.mode == testRenderer.resolvedSampler(.automatic) }!.title
   }
   // Items, labels, tooltips and state on a procedural scene.
   var procedural = ProjectDocument()
@@ -84,18 +88,19 @@
   require(titles(indirect) == ["Automatic (currently: ReSTIR GI)", "ReSTIR GI", "ReSTIR PT", "ReSTIR PT (unified)"]
     && titles(spatial) == ["Automatic (currently: Uniform)", "Uniform", "Compatibility-guided", "Stochastic pairwise MIS"]
     && titles(temporal) == ["Automatic (currently: Reprojection)", "Reprojection", "Reservoir splatting"]
-    && titles(shading) == ["Automatic (currently: \(automaticShading()))", "Control variates", "Resampled"],
+    && titles(shading) == ["Automatic (currently: \(automaticShading()))", "Control variates", "Resampled"]
+    && titles(samplerLabel) == ["Automatic (currently: \(automaticSampler()))", "Z++ (blue-noise LD)", "Independent (PCG)"],
     "procedural scenes list the modes and resolve Automatic to ReSTIR GI, uniform neighbours and reprojection")
   if testRenderer.resolvedIndirectReuse(testRenderer.indirectReuse) == .restirGI {
     require(titles(shading)[0] == "Automatic (currently: Resampled)", "ReSTIR GI resolves path shading to resampled")
   }
-  for label in [indirect, spatial, temporal, shading] {
+  for label in [samplerLabel, indirect, spatial, temporal, shading] {
     let control = popup(label)
     require(control.isEnabled && !(control.toolTip ?? "").isEmpty && control.accessibilityHelp() == control.toolTip,
       "“\(label)” is enabled with ReSTIR and explains its trade-off")
   }
   let labels = views(NSTextField.self, in: controller.stack).map(\.stringValue)
-  require([indirect, spatial, temporal, shading].allSatisfy(labels.contains), "each popup has a visible label")
+  require([samplerLabel, indirect, spatial, temporal, shading].allSatisfy(labels.contains), "each popup has a visible label")
   func reflects() -> Bool {
     popup(indirect).indexOfSelectedItem == StudioController.indirectReuseChoices.firstIndex { $0.mode == testRenderer.indirectReuse }
       && popup(spatial).indexOfSelectedItem
@@ -104,6 +109,8 @@
         == StudioController.temporalReuseChoices.firstIndex { $0.mode == testRenderer.temporalReuse }
       && popup(shading).indexOfSelectedItem
         == StudioController.controlVariateChoices.firstIndex { $0.mode == testRenderer.controlVariates }
+      && popup(samplerLabel).indexOfSelectedItem
+        == StudioController.samplerChoices.firstIndex { $0.mode == testRenderer.sampler }
   }
   require(reflects(), "the popups show the renderer's modes")
   print("PASS: fix-ui-modes popup items, labels, tooltips and state")
@@ -144,6 +151,7 @@
   exercise(spatial, StudioController.spatialNeighborChoices) { testRenderer.spatialNeighbors }
   exercise(temporal, StudioController.temporalReuseChoices) { testRenderer.temporalReuse }
   exercise(shading, StudioController.controlVariateChoices) { testRenderer.controlVariates }
+  exercise(samplerLabel, StudioController.samplerChoices) { testRenderer.sampler }
   // An undo restoring different modes restarts accumulation even with nothing else changed.
   try reset(procedural)
   // Pick a mode that differs from the current one (VIBE_INDIRECT_REUSE may already select PT).
@@ -164,6 +172,8 @@
   require([indirect, spatial, temporal, shading].allSatisfy { !popup($0).isEnabled }
     && views(NSTextField.self, in: controller.stack).contains { $0.stringValue.contains("apply only to ReSTIR") },
     "non-ReSTIR strategies disable the reuse popups with a note")
+  require(popup(samplerLabel).isEnabled, "the sampler applies to every strategy")
+  exercise(samplerLabel, StudioController.samplerChoices) { testRenderer.sampler }
   testRenderer.samplingMode = 0
   controller.rebuild()
   let restoringCheckpoint = controller.lastCheckpoint
@@ -210,15 +220,16 @@
   pick(spatial, 1)
   pick(temporal, 2)
   pick(shading, 2)
+  pick(samplerLabel, 2)
   let chosen = ReSTIRModes(indirectReuse: .restirPTUnified, spatialNeighbors: .uniform, temporalReuse: .splatting,
-                           controlVariates: .off)
-  require(ReSTIRModes(testRenderer) == chosen, "four picks set four modes")
+                           controlVariates: .off, sampler: .pcg)
+  require(ReSTIRModes(testRenderer) == chosen, "five picks set five modes")
   let saved = try controller.snapshot().encodeForSaving()
   let savedObject = try JSONSerialization.jsonObject(with: saved) as! [String: Any]
   require(savedObject["version"] as? Int == 3 && savedObject["indirectReuse"] as? Int == 2
     && savedObject["spatialNeighbors"] as? Int == 0 && savedObject["temporalReuse"] as? Int == 1
-    && savedObject["controlVariates"] as? Int == 0,
-    "format 3 stores the four raw modes")
+    && savedObject["controlVariates"] as? Int == 0 && savedObject["sampler"] as? Int == 0,
+    "format 3 stores the five raw modes")
   let reopened = try ProjectDocument.decodeProject(saved, near: nil)
   require(reopened.restirModes == chosen, "a saved project reopens with its modes")
   try reset(procedural)
@@ -232,11 +243,11 @@
   require(fromAutosave.restirModes == chosen, "autosaves keep the modes")
   // Older files: a version 2 project and a format 3 project without the fields.
   var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(controller.snapshot())) as! [String: Any]
-  for key in ["indirectReuse", "spatialNeighbors", "temporalReuse", "controlVariates"] { legacy[key] = nil }
+  for key in ["indirectReuse", "spatialNeighbors", "temporalReuse", "controlVariates", "sampler"] { legacy[key] = nil }
   legacy["version"] = 2
   let old = try ProjectDocument.decodeProject(JSONSerialization.data(withJSONObject: legacy), near: nil)
   require(old.indirectReuse == nil && old.spatialNeighbors == nil && old.temporalReuse == nil && old.controlVariates == nil
-    && old.restirModes == defaults, "a version 2 project without the fields decodes as the default")
+    && old.sampler == nil && old.restirModes == defaults, "a version 2 project without the fields decodes as the default")
   // A format 3 project written before path shading was stored opens with its other modes and the
   // default shading.
   var beforeShading = try JSONSerialization.jsonObject(with: saved) as! [String: Any]
@@ -245,12 +256,19 @@
   require(withoutShading.controlVariates == nil && withoutShading.restirModes.indirectReuse == .restirPTUnified
     && withoutShading.restirModes.controlVariates == defaults.controlVariates,
     "a project without the path shading field keeps its other modes and uses the default shading")
+  var beforeSampler = try JSONSerialization.jsonObject(with: saved) as! [String: Any]
+  beforeSampler["sampler"] = nil
+  let withoutSampler = try ProjectDocument.decodeProject(JSONSerialization.data(withJSONObject: beforeSampler), near: nil)
+  require(withoutSampler.sampler == nil && withoutSampler.restirModes.controlVariates == .off
+    && withoutSampler.restirModes.sampler == defaults.sampler,
+    "a project without the sampler field keeps its other modes and uses the default sampler")
   try controller.restore(old)
   require(ReSTIRModes(testRenderer) == defaults, "opening it resets the renderer to Automatic")
   let plain = try ProjectDocument().encodeForSaving()
   let plainText = String(decoding: plain, as: UTF8.self)
   let plainDecoded = try ProjectDocument.decodeProject(plain, near: nil)
-  require(!plainText.contains("indirectReuse") && !plainText.contains("controlVariates") && plainDecoded.indirectReuse == nil
+  require(!plainText.contains("indirectReuse") && !plainText.contains("controlVariates") && !plainText.contains("\"sampler\"")
+    && plainDecoded.indirectReuse == nil
     && plainDecoded.restirModes == defaults,
     "a format 3 project without the fields opens as the default")
   // Stochastic pairwise MIS (raw value 3) round-trips like the other spatial selections.
@@ -260,7 +278,7 @@
   try stochasticDecoded.validate()
   require(stochasticDecoded.spatialNeighbors == 3 && stochasticDecoded.restirModes.spatialNeighbors == .stochasticPairwise,
     "a project stores and reopens stochastic pairwise MIS")
-  for (key, value) in [("indirectReuse", 4), ("spatialNeighbors", 4), ("temporalReuse", 3), ("controlVariates", 3)] {
+  for (key, value) in [("indirectReuse", 4), ("spatialNeighbors", 4), ("temporalReuse", 3), ("controlVariates", 3), ("sampler", 3)] {
     var bad = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ProjectDocument())) as! [String: Any]
     bad[key] = value
     var rejected = false
@@ -277,6 +295,7 @@
   pick(spatial, 2)
   pick(temporal, 2)
   pick(shading, 2)
+  pick(samplerLabel, 1)
   let savedOutput = (testRenderer.options.outputWidth, testRenderer.options.outputHeight, testRenderer.options.exportSamples)
   let savedExport = (controller.exportDenoise, controller.exportRaw)
   testRenderer.options.outputWidth = 32
@@ -288,7 +307,8 @@
   controller.startExport(url: exportURL, hdr: false)
   let export = controller.exportRenderer
   require(export?.indirectReuse == .restirPT && export?.spatialNeighbors == .compatibility
-    && export?.temporalReuse == .reprojection && export?.controlVariates == .off, "the export renderer copies the chosen modes")
+    && export?.temporalReuse == .reprojection && export?.controlVariates == .off && export?.sampler == .zSampling,
+    "the export renderer copies the chosen modes")
   waitUntil({ controller.exportRenderer == nil }, seconds: 45)
   require(FileManager.default.fileExists(atPath: exportURL.path), "the export with the chosen modes completes")
   (testRenderer.options.outputWidth, testRenderer.options.outputHeight, testRenderer.options.exportSamples) = savedOutput

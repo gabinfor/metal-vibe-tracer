@@ -106,6 +106,8 @@ extension StudioController {
       r.indirectReuse = p.restirModes.indirectReuse
       r.temporalReuse = .reprojection
       r.controlVariates = p.restirModes.controlVariates
+      r.sampler = p.restirModes.sampler
+      r.zTemporal = renderer.zTemporal
       r.ptDecorrelation = renderer.ptDecorrelation
       r.ptTemporalWhileAccumulating = renderer.ptTemporalWhileAccumulating
       r.skyMode = p.sky

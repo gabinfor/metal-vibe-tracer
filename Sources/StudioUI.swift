@@ -235,6 +235,11 @@ final class StudioController: NSViewController {
     "Reservoir splatting lowers noise in newly revealed areas while the camera moves, for 5–26% more frame time and about 200 B more GPU memory per pixel. Still views render identically."
   static let controlVariateHelp =
     "ReSTIR PT only, with paired spatial reuse. Control variates (ReSTCV) shade each pixel from colour estimates accumulated over neighbouring pixels and frames: 5–47% less noise per frame while the camera moves (5–21% under MetalFX) and 1–14% less in still renders, for 0–3% more frame time. Single frames can hold a few dark pixels without the denoiser. Resampled shades from the reservoirs' samples."
+  static let samplerChoices: [(mode: SamplerMode, title: String)] = [
+    (.automatic, "Automatic"), (.zSampling, "Z++ (blue-noise LD)"), (.pcg, "Independent (PCG)"),
+  ]
+  static let samplerHelp =
+    "Z++ draws low-discrepancy samples ordered along a shuffled Z curve, so neighbouring pixels complement each other and every pixel's samples over a still render are stratified: 2–87% less noise at the same sample count (least through glass) for 0.4–5% more frame time, and finer-grained noise in each frame. Independent draws per-pixel random numbers, as before."
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 
@@ -512,13 +517,13 @@ final class StudioController: NSViewController {
     text("Inspection views bypass tone mapping and denoising, and do not reset the progressive render.")
   }
 
-  // The four ReSTIR reuse popups. They apply only to ReSTIR Direct + Indirect and are
-  // disabled (with a note) for the other strategies, like the MetalFX note above.
+  // The sampler popup (every strategy) and the four ReSTIR reuse popups, which apply only to
+  // ReSTIR Direct + Indirect and are disabled (with a note) for the other strategies.
   func restirModeControls() {
-    let r = renderer, enabled = r.samplingMode == 0
+    let r = renderer, restir = r.samplingMode == 0
     func choice<Mode: Equatable>(
       _ title: String, _ choices: [(mode: Mode, title: String)], current: Mode, automatic: String,
-      help: String, _ set: @escaping (inout ReSTIRModes, Mode) -> Void
+      help: String, enabled: Bool = restir, _ set: @escaping (inout ReSTIRModes, Mode) -> Void
     ) {
       let label = NSTextField(labelWithString: title)
       label.font = .systemFont(ofSize: 12)
@@ -539,6 +544,12 @@ final class StudioController: NSViewController {
     func name<Mode: Equatable>(_ mode: Mode, _ choices: [(mode: Mode, title: String)]) -> String {
       choices.first { $0.mode == mode }?.title ?? "\(mode)"
     }
+    // The sampler applies to every strategy.
+    choice(
+      "Sampler", Self.samplerChoices, current: r.sampler,
+      automatic: name(r.resolvedSampler(.automatic), Self.samplerChoices),
+      help: Self.samplerHelp, enabled: true
+    ) { $0.sampler = $1 }
     choice(
       "Indirect reuse", Self.indirectReuseChoices, current: r.indirectReuse,
       automatic: name(r.resolvedIndirectReuse(.automatic), Self.indirectReuseChoices),
@@ -559,7 +570,7 @@ final class StudioController: NSViewController {
       automatic: name(r.resolvedControlVariates(.automatic), Self.controlVariateChoices),
       help: Self.controlVariateHelp
     ) { $0.controlVariates = $1 }
-    if !enabled {
+    if !restir {
       text("Indirect reuse, spatial neighbours, temporal reuse and path shading apply only to ReSTIR Direct + Indirect.")
     }
   }

@@ -77,39 +77,45 @@ extension StudioOptions {
       && focusDistance == o.focusDistance && sunAngle == o.sunAngle
   }
 }
-// The ReSTIR strategy's reuse modes (Render inspector). Each one changes the image, so a
-// difference restarts accumulation like a radiance-affecting option (StudioController.applyProject).
+// The ReSTIR strategy's reuse modes and the sampler (Render inspector; the sampler applies to
+// every strategy). Each one changes the image, so a difference restarts accumulation like a
+// radiance-affecting option (StudioController.applyProject).
 struct ReSTIRModes: Equatable, Sendable {
   var indirectReuse: IndirectReuse
   var spatialNeighbors: SpatialNeighborSelection
   var temporalReuse: TemporalReuse
   var controlVariates: ControlVariates
+  var sampler: SamplerMode
   // Projects without a stored choice use these: .automatic, or in -D VIBE_TESTING builds the
-  // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE / VIBE_CONTROL_VARIATES
-  // override. A stored choice wins.
+  // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE / VIBE_CONTROL_VARIATES /
+  // VIBE_SAMPLER override. A stored choice wins.
   static var defaults: ReSTIRModes {
     ReSTIRModes(
       indirectReuse: PathTracerRenderer.defaultIndirectReuse,
       spatialNeighbors: PathTracerRenderer.defaultSpatialNeighbors,
       temporalReuse: PathTracerRenderer.defaultTemporalReuse,
-      controlVariates: PathTracerRenderer.defaultControlVariates)
+      controlVariates: PathTracerRenderer.defaultControlVariates,
+      sampler: PathTracerRenderer.defaultSampler)
   }
   init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse,
-       controlVariates: ControlVariates = PathTracerRenderer.defaultControlVariates) {
+       controlVariates: ControlVariates = PathTracerRenderer.defaultControlVariates,
+       sampler: SamplerMode = PathTracerRenderer.defaultSampler) {
     self.indirectReuse = indirectReuse
     self.spatialNeighbors = spatialNeighbors
     self.temporalReuse = temporalReuse
     self.controlVariates = controlVariates
+    self.sampler = sampler
   }
   @MainActor init(_ r: PathTracerRenderer) {
     self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse,
-              controlVariates: r.controlVariates)
+              controlVariates: r.controlVariates, sampler: r.sampler)
   }
   @MainActor func apply(_ r: PathTracerRenderer) {
     r.indirectReuse = indirectReuse
     r.spatialNeighbors = spatialNeighbors
     r.temporalReuse = temporalReuse
     r.controlVariates = controlVariates
+    r.sampler = sampler
   }
 }
 struct OIDNOptions: Codable, Equatable {
@@ -151,12 +157,14 @@ struct ProjectDocument: Codable {
   // Optional so version 1/2 projects written before these controls remain readable.
   var oidn: OIDNOptions?
   var viewportMode: UInt32?
-  // Raw values of IndirectReuse, SpatialNeighborSelection, TemporalReuse and ControlVariates; optional
-  // so projects written before the Render inspector exposed them open with the default (automatic).
+  // Raw values of IndirectReuse, SpatialNeighborSelection, TemporalReuse, ControlVariates and
+  // SamplerMode; optional so projects written before the Render inspector exposed them open with
+  // the default (automatic).
   var indirectReuse: UInt32?
   var spatialNeighbors: UInt32?
   var temporalReuse: UInt32?
   var controlVariates: UInt32?
+  var sampler: UInt32?
   // Written only into autosaves: the document's file association and unsaved state.
   var recovery: AutosaveRecovery?
 
@@ -168,13 +176,15 @@ struct ProjectDocument: Codable {
         indirectReuse: indirectReuse.flatMap(IndirectReuse.init(rawValue:)) ?? fallback.indirectReuse,
         spatialNeighbors: spatialNeighbors.flatMap(SpatialNeighborSelection.init(rawValue:)) ?? fallback.spatialNeighbors,
         temporalReuse: temporalReuse.flatMap(TemporalReuse.init(rawValue:)) ?? fallback.temporalReuse,
-        controlVariates: controlVariates.flatMap(ControlVariates.init(rawValue:)) ?? fallback.controlVariates)
+        controlVariates: controlVariates.flatMap(ControlVariates.init(rawValue:)) ?? fallback.controlVariates,
+        sampler: sampler.flatMap(SamplerMode.init(rawValue:)) ?? fallback.sampler)
     }
     set {
       indirectReuse = newValue.indirectReuse.rawValue
       spatialNeighbors = newValue.spatialNeighbors.rawValue
       temporalReuse = newValue.temporalReuse.rawValue
       controlVariates = newValue.controlVariates.rawValue
+      sampler = newValue.sampler.rawValue
     }
   }
 
@@ -253,7 +263,8 @@ struct ProjectDocument: Codable {
     guard indirectReuse.map({ IndirectReuse(rawValue: $0) != nil }) ?? true,
       spatialNeighbors.map({ SpatialNeighborSelection(rawValue: $0) != nil }) ?? true,
       temporalReuse.map({ TemporalReuse(rawValue: $0) != nil }) ?? true,
-      controlVariates.map({ ControlVariates(rawValue: $0) != nil }) ?? true
+      controlVariates.map({ ControlVariates(rawValue: $0) != nil }) ?? true,
+      sampler.map({ SamplerMode(rawValue: $0) != nil }) ?? true
     else { try bad(); return }
     func cameraOK(_ c: CameraState) -> Bool {
       c.yaw.isFinite && (-1.5...1.5).contains(c.pitch) && (0.0001...1_000_000).contains(c.distance)
