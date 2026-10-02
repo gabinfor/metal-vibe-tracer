@@ -103,3 +103,57 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## CIE colorimetric datasets (spectral tables; not yet bundled)
+
+Colour-matching functions of the CIE 1931 standard colorimetric observer (CIE 2019,
+doi:10.25039/CIE.DS.xvudnb9b), CIE standard illuminants D65 (CIE 2019,
+doi:10.25039/CIE.DS.hjfjmt59) and A (CIE 2018, doi:10.25039/CIE.DS.8jsxjrsn), and the CIE
+fluorescent (doi:10.25039/CIE.DS.54hy6srn), high-pressure discharge
+(doi:10.25039/CIE.DS.f6rvvnev) and LED (doi:10.25039/CIE.DS.dhcw57sd) illuminant tables
+(CIE 2018). International Commission on Illumination (CIE), Vienna, AT.
+Licensed under Creative Commons Attribution-ShareAlike 4.0 International
+(https://creativecommons.org/licenses/by-sa/4.0/).
+
+Unmodified copies with their metadata are in `Vendor/Spectral/CIE`. The tables that
+`scripts/generate_spectral_tables.py` writes to `build/SpectralTables` (resampled to 1 nm,
+normalized to luminance Y = 1, zero outside the tabulated range, combined into wavelength
+sampling tables and a sRGB-to-spectrum lookup) are adapted material and are licensed under
+CC BY-SA 4.0. Details, checksums and changes: `Vendor/Spectral/UPSTREAM.md`; see REFERENCES.md
+(CIEDATA).
+
+## Phase warp from Christoph Peters' bounded-MESE code (spectral tables; not yet bundled)
+
+`Vendor/Spectral/Peters2019/XYZWarp.h`, unmodified, from the supplementary code of
+"Spectral Rendering with the Bounded MESE and sRGB Data" (MAM 2019) and "Using Moments to
+Represent Bounded Signals for Spectral Rendering" (SIGGRAPH 2019):
+https://momentsingraphics.de/MAM2019.html. The generator reads its 95-entry `pXYZWarpEven`
+table, which `build/SpectralTables/SpectralTables.metal` reproduces. All other spectral code
+is a local implementation from the papers; see REFERENCES.md (PETERS2019, FOURIERSRGB2019).
+
+```text
+Copyright (c) 2019, Christoph Peters
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the Karlsruhe Institute of Technology nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
