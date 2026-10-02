@@ -1,3 +1,59 @@
+# Z++ sampler — October 2, 2026
+
+The Z++ sampler (`REFERENCES.md` `ZPP2026`; `SamplerMode.zSampling`, **Sampler → Z++**) against the earlier per-pixel PCG streams (`SamplerMode.pcg`). Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `1124b00` plus this change (uncommitted at measurement; the shaders measured equal the committed ones except that the static and timing runs used the PerPixel temporal model, which renders still views statistically identically to the default ReShuffle-like model; and, before the last change, every accumulation shared one Owen scramble, which leaves error magnitudes unchanged; the bias runs below use the final shaders). Scratch drivers render through the production `renderFrame` path at 320×240 (errors) and 640×480 (times), path depth 16; other GPU work shared the machine. The unedited figures are in [`PERFORMANCE-zsampling-raw.txt`](PERFORMANCE-zsampling-raw.txt).
+
+## Static accumulation (equal sample count)
+
+Change of linear MSE against an 8,192-frame MIS (PCG) reference at 16 / 64 / 256 accumulated frames, mean of 3 seed sequences (Shader Ball 2), and frame time at 640×480 (median of 3 interleaved rounds):
+
+| Scene | MIS | ReSTIR GI | Unified ReSTIR PT | Frame time MIS / GI / PT |
+| --- | ---: | ---: | ---: | ---: |
+| Pavilion | −38% / +2% / −13% | −30% / +5% / −12% | −2% / 0% / −12% | +3.2% / +3.6% / +3.1% |
+| Pavilion close-up | −38% / −24% / −40% | −37% / −24% / −39% | −11% / −6% / −26% | +3.2% / +2.9% / +2.0% |
+| Pavilion, coated floor | −21% / −16% / −8% | −20% / −15% / −9% | +6% / +8% / −7% | +2.1% / +3.0% / +2.9% |
+| Cornell box | −23% / −31% / −44% | −9% / −11% / −16% | −8% / −9% / −12% | +2.6% / +1.2% / +2.9% |
+| Cornell glass & mirror | −9% / −4% / −1% | −4% / −4% / 0% | +8% / −1% / −3% | +3.8% / +3.6% / +4.9% |
+| Imported UV sphere | −79% / −86% / −87% | −28% / −27% / −26% | −35% / −36% / −28% | +3.4% / +2.1% / +2.7% |
+| Instanced bumpy patches | −62% / −70% / −71% | −10% / −8% / −9% | −29% / −30% / −28% | +2.6% / +1.1% / +0.4% |
+| ASWF Shader Ball | −35% / −43% / −48% | (ran as MIS) | −15% / −15% / −6% | +4.2% / — / +4.8% |
+
+The Pavilion views' linear MSE is dominated by caustic fireflies through the chrome sphere (seed-to-seed spread up to ±15%); their tone-mapped MSE at 256 frames fell by 3–10%. Gains are largest where the first vertices decide the pixel (sky and sun light on matte imported surfaces, area-lit Cornell walls) and under MIS, whose per-pixel samples stay intact; ReSTIR resampling mixes neighbours' samples, which keeps part of the gain. Cornell glass & mirror, dominated by long specular chains, is the break-even case: within ±3% at equal time. Everywhere else the gain exceeds the 0.4–4.9% time cost. The Shader Ball fixture restores its document's strategy, so its ReSTIR GI rows repeat MIS and are omitted.
+
+## Moving camera (per-frame and MetalFX error)
+
+Orbit and back-and-forth paths of "Multi-layer reservoir splatting" below, frames 24 and 40, 2 seed sequences, 384-frame MIS references. The raw frame's whole-image tone-mapped error is unchanged (−4% to +1%) with every temporal model: one sample per pixel cannot be stratified. Its error at the 4 × 4-pixel scale, which MetalFX and the eye average, fell by 12–36% with MIS, 2–10% with ReSTIR GI and up to 7% with unified ReSTIR PT (the screen-space dithering of Z sampling). MetalFX display error, change against PCG (orbit / back-and-forth):
+
+| Scene | ReSTIR GI, PerPixel / TZ / ReShuffle | Unified PT, PerPixel / TZ / ReShuffle |
+| --- | ---: | ---: |
+| Cornell | +1.2 / +0.8 / −0.4%, +2.5 / +1.6 / 0.0% | +1.0 / +1.0 / −0.6%, +1.5 / +0.5 / +0.8% |
+| Pavilion | −2.7 / −2.5 / −4.9%, −4.2 / −4.5 / −5.1% | −1.2 / −1.8 / −1.9%, +1.5 / −1.1 / −6.1% |
+| Instanced patches | −2.4 / −2.1 / −3.5%, −0.4 / −1.1 / −0.3% | +1.8 / 0.0 / −2.3%, +0.8 / −1.1 / −3.4% |
+| Imported UV sphere | −8.9 / −9.5 / −11.5%, +0.2 / −0.8 / −4.5% | +2.9 / +1.3 / −4.4%, +1.8 / −2.1 / −6.7% |
+
+PerPixel and TZ hand a pixel's neighbours' samples to it in the next frames (Z++ Sec. 4.1), which MetalFX's reprojection partly re-averages; the ReShuffle-like model gives each moving frame a fresh block and was best or tied in every case, so it is the default `ZTemporal`. Still views accumulate aligned nets in all models. STZ, checked only in an earlier Cornell orbit run (an earlier shader revision with a quadrant shuffle per dimension), was within 1% of TZ.
+
+## Mean radiance (bias)
+
+Relative mean-radiance difference against the 8,192-frame MIS (PCG) reference, mean ± standard error over 6 independent 256-frame accumulations at 320×240 (PCG / Z++ with the default ReShuffle-like model; each Z++ accumulation is its own scramble, so the standard error is taken across accumulations rather than tiles):
+
+| Scene | MIS | ReSTIR GI | Unified ReSTIR PT |
+| --- | ---: | ---: | ---: |
+| Cornell | −0.002 ± 0.005% / −0.030 ± 0.029% | +0.383 ± 0.004% / +0.345 ± 0.030% | −0.002 ± 0.004% / +0.034 ± 0.027% |
+| Cornell glass & mirror | −0.036 ± 0.040% / −0.30 ± 0.27% | +0.221 ± 0.035% / −0.11 ± 0.27% | 0.000 ± 0.038% / +0.03 ± 0.25% |
+| Imported UV sphere | +0.004 ± 0.007% / +0.029 ± 0.007% | +0.129 ± 0.006% / +0.126 ± 0.011% | 0.000 ± 0.004% / +0.037 ± 0.033% |
+| Instanced patches | −0.011 ± 0.006% / +0.003 ± 0.005% | −0.052 ± 0.014% / −0.058 ± 0.014% | −0.003 ± 0.004% / +0.028 ± 0.027% |
+| Pavilion | −0.030 ± 0.024% / −0.04 ± 0.11% | +0.320 ± 0.054% / +0.27 ± 0.11% | −0.047 ± 0.026% / −0.11 ± 0.09% |
+
+ReSTIR GI keeps its own bias (`RESTIRGI2021`) under either sampler. The Z++ means agree with MIS within 1–2 standard errors except the UV sphere under MIS (+0.029 ± 0.007%, 4 SE from six accumulations; 0.03% of mean radiance). The standard error of one accumulation's image mean is larger with Z++ than with PCG, because all pixels of an accumulation share one Owen randomization: its integration error is correlated across pixels, while its per-pixel error is lower. A first run that fixed one scramble for every accumulation showed apparent offsets of up to −0.11% (patches, unified PT) with tile-clustered errors that did not account for that correlation; scrambles now also depend on the key's top bits (one of 256 per accumulation), which is what makes accumulations independent.
+
+## Memory and equivalence
+
+No GPU memory is added: the sampler state lives in registers, and ReSTIR PT keeps its 64-byte reservoirs, whose seed now holds the 32-bit Z key. With **Sampler → Independent (PCG)** every procedural `tests/benchmark.py` scenario renders mean radiance identical to `1124b00` at zero tolerance (all strategies, MetalFX on and off). The scene-6 scenarios differ from the baseline by up to 0.7% because the benchmark forces the baseline onto the flat BVH: `1124b00` benchmarked against itself shows exactly the same differences. The PCG mode costs 1–3% over `1124b00` on the Pavilion scenarios (Cornell −3%), from the runtime sampler branch.
+
+## Default
+
+`SamplerMode.automatic` resolves to Z++ for every strategy and scene: it lowered static equal-sample MSE in 22 of 23 measured scene/strategy pairs (Cornell glass & mirror with ReSTIR GI: +0.3%) at 256 frames, for 0.4–4.9% more frame time, and kept moving-camera errors within about +1% (MetalFX −12% to +1%). `VIBE_SAMPLER=pcg|z` and `VIBE_Z_TEMPORAL=perpixel|tz|stz|reshuffle` select the variants in `-D VIBE_TESTING` builds.
+
 # Spatio-temporal control variates (ReSTCV) — September 29, 2026
 
 ReSTCV shading of ReSTIR PT (`REFERENCES.md` `RESTCV2026`; `ControlVariates.restcv`, **Path shading → Control variates**) compared with the resampled shading it replaces ("Resampled", the vector-valued resampling weights of `RESTIRPTE2026` Sec. 6.3). Both use paired spatial reuse and reprojection unless noted. Parameters: centre weight 1.6, equal weights for the partners' estimators, α = min(ρ_i / ρ_j, 2), temporal confidence cap 20.
