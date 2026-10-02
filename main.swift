@@ -86,6 +86,163 @@ float2 rand_f2(thread uint &seed) {
 void decorrelate_shading_seed(thread uint &seed) {
     seed = pcg_hash(seed ^ 0x27d4eb2fu);
 }
+float3 rand_f3(thread uint &seed) {
+    return float3(rand_f(seed), rand_f(seed), rand_f(seed));
+}
+// Resampling decisions (reservoir updates, neighbour and cell choices) always draw from the
+// PCG stream, in either sampler mode; see Sampler.
+float rand_decision(thread uint &seed) { return rand_f(seed); }
+// Sampling events of the Z sampler; a PCG stream ignores them (it is one sequential stream).
+void sampler_event(thread uint &, uint, uint) {}
+void sampler_candidate(thread uint &, uint, uint, uint, uint) {}
+
+// --- Z++ sampler (REFERENCES.md: ZPP2026, ZSAMPLING2020, PBRT2023) ---
+// Owen-scrambled low-discrepancy constituents indexed along a recursively shuffled Morton
+// (Z) curve of the image, so that the Monte Carlo error of neighbouring pixels complements
+// (blue-noise-like "Z noise") while every pixel's samples over successive frames form
+// consecutive blocks of the sequence (Z++ temporal Z sampling). One 32-bit key per pixel
+// and frame identifies all of its samples: dimension d's sequence index is a per-dimension
+// base-4 digit shuffle of the key, so ReSTIR PT's random replay stores the key as its seed.
+// 1D constituents are van der Corput points, 2D ones the first two Sobol' dimensions and 3D
+// ones the O2m3 sequence of ZPP2026 Sec. 4.3 (Fig. 15), which is a (0, 2m, 3)-net over
+// every aligned block of 4^m points, with (0, 2m, 2)-net pairwise projections.
+uint z_mix(uint v) {
+    // 32-bit integer finalizer (Wellons' lowbias32); local constants.
+    v ^= v >> 16; v *= 0x7feb352du; v ^= v >> 15; v *= 0x846ca68bu; v ^= v >> 16;
+    return v;
+}
+// The six permutations of four quadrants that fix quadrant 0, 8 bits each (digit -> 2-bit
+// image). Any permutation of four is one of them followed by an XOR with a digit (S4 = S3 V4).
+constant ulong Z_PERMUTATIONS = 0x6c9c78d8b4e4ul;
+// Recursive quadrant shuffle of a Z index (PBRT2023 ZSobolSampler::GetSampleIndex): each of the
+// low Z_SHUFFLE_DIGITS base-4 digits is permuted by one of the 24 permutations of four, chosen by
+// a hash of the digits above it and of `dimension`. It maps every aligned block of 4^m indices
+// onto an aligned block, so Z-order stratification survives the shuffle. The digits above
+// (index bits 24-31: frames beyond 2^24 of one accumulation, or ReShuffle's hashed block) are
+// kept; they only move samples within their first 2^-24.
+#define Z_SHUFFLE_DIGITS 12u
+uint z_shuffle(uint index, uint dimension) {
+    uint seed = z_mix(dimension * 0x9e3779b9u + 0x632be5abu);
+    uint result = index & ~((1u << (2u * Z_SHUFFLE_DIGITS)) - 1u);
+    for (uint digitIndex = Z_SHUFFLE_DIGITS; digitIndex-- > 0u; ) {
+        uint shift = 2u * digitIndex, digit = (index >> shift) & 3u;
+        uint h = z_mix((index >> (shift + 2u)) ^ seed);
+        uint sigma = ((h >> 16) * 6u) >> 16;
+        uint image = uint(Z_PERMUTATIONS >> (8u * sigma + 2u * digit)) & 3u;
+        result |= (image ^ (h & 3u)) << shift;
+    }
+    return result;
+}
+// Nested uniform (Owen) scrambling of a 0.32 fixed-point coordinate: the Laine-Karras hash
+// with the constants of PBRT2023's FastOwenScrambler. Bit k flips depending only on bits
+// above it, so every dyadic net stays a net.
+uint z_owen(uint v, uint seed) {
+    v = reverse_bits(v);
+    v ^= v * 0x3d20adeau;
+    v += seed;
+    v *= (seed >> 16) | 1u;
+    v ^= v * 0x05526c56u;
+    v ^= v * 0x53a22864u;
+    return reverse_bits(v);
+}
+uint z_owen_seed(uint dimension, uint axis) {
+    uint h = (dimension ^ (axis << 24)) * 0x9e3779b9u;
+    return (h ^ (h >> 16)) * 0x85ebca6bu;
+}
+// Second Sobol' dimension (the binary Pascal matrix) of sequence index i, as a 0.32 fraction.
+// Digit r + 1 is the coefficient of x^r in sum_j i_j (x + 1)^j, a Taylor shift by one in GF(2),
+// which five shift-XOR steps compute (a local derivation of the O(log m) evaluation that
+// ZPP2026 Sec. 5.3.6 obtains for O2m3 by diagonal factoring).
+uint z_sobol1(uint i) {
+    i ^= (i & 0xAAAAAAAAu) >> 1;
+    i ^= (i & 0xCCCCCCCCu) >> 2;
+    i ^= (i & 0xF0F0F0F0u) >> 4;
+    i ^= (i & 0xFF00FF00u) >> 8;
+    i ^= (i & 0xFFFF0000u) >> 16;
+    return reverse_bits(i);
+}
+// O2m3 (ZPP2026 Fig. 15): the three coordinates of the point with bit-reversed index V.
+uint z_o2m3_x(uint V) {
+    V ^= ((V << 2) & 0xF3CF3CF3u) ^ ((V << 3) & 0x41041041u);
+    V ^= (V << 4) & 0x3F03F03Fu;
+    V ^= (V << 8) & 0x0FFF000Fu;
+    V ^= (V << 16) & 0x00FFFFFFu;
+    return V;
+}
+uint z_o2m3_y(uint V) { return z_o2m3_x(((V >> 1) & 0x45145145u) ^ (V & 0xB5EB5EB5u) ^ ((V << 1) & 0x8A28A28Au)); }
+uint z_o2m3_z(uint V) { return z_o2m3_x(((V >> 1) & 0x45145145u) ^ (V & 0x7AD7AD7Au) ^ ((V << 1) & 0x8A28A28Au)); }
+float z_float(uint v) { return float(v >> 8) * (1.0f / 16777216.0f); }
+// Morton index of a pixel, x in the even bits.
+uint z_morton(uint2 p) {
+    uint2 v = p & 0xFFFFu;
+    v = (v | (v << 8)) & 0x00FF00FFu; v = (v | (v << 4)) & 0x0F0F0F0Fu;
+    v = (v | (v << 2)) & 0x33333333u; v = (v | (v << 1)) & 0x55555555u;
+    return v.x | (v.y << 1);
+}
+
+// A pixel's random numbers. In PCG mode every draw continues `state`, exactly as the earlier
+// `thread uint &seed` streams did. In Z mode sampling draws come from the Z sampler: each
+// sampling event (sampler_event: a path vertex and a stream such as BSDF or NEE) owns 32
+// consecutive dimensions, and each rand_f / rand_f2 / rand_f3 call takes the event's next
+// one, a 1D, 2D or 3D constituent. sampler_candidate adds `bits` low index bits for one of
+// several candidates of an event (the index's block of 2^bits then covers them). Resampling
+// decisions stay on `state` (rand_decision), which Z mode seeds as PCG mode does.
+struct Sampler {
+    uint state;
+    uint key;
+    uint dimension;
+    uint sub;
+    uint subBits;
+    bool z;
+};
+// Sequence index of `dimension`: a nested binary scramble of the key (Owen scrambling of the key
+// read as a fraction, so each bit flips depending only on the bits above it). Like z_shuffle it
+// maps aligned blocks onto aligned blocks, so per-frame masks and per-pixel nets survive, and
+// independent scrambles decorrelate the dimensions (padding). The key's pixel part is already
+// quadrant-shuffled (z_pixel_key), which randomizes each node's pairing of its four children.
+uint z_index(thread const Sampler &s, uint dimension) {
+    return z_owen((s.key << s.subBits) | s.sub, z_owen_seed(dimension, 3u));
+}
+// A dimension's scrambles also depend on the key's top 8 bits, which a still accumulation keeps
+// (the ReShuffle-like model draws them from a hash of its start): each accumulation is then one of
+// 256 independent Owen randomizations, while all pixels and frames of it share one (masks and nets).
+uint z_dimension(thread Sampler &s) { return s.dimension++ | ((s.key >> 24) << 17); }
+float rand_f(thread Sampler &s) {
+    if (!s.z) return rand_f(s.state);
+    uint d = z_dimension(s);
+    return z_float(z_owen(reverse_bits(z_index(s, d)), z_owen_seed(d, 0u)));
+}
+float2 rand_f2(thread Sampler &s) {
+    if (!s.z) return rand_f2(s.state);
+    uint d = z_dimension(s), i = z_index(s, d);
+    return float2(z_float(z_owen(reverse_bits(i), z_owen_seed(d, 0u))),
+                  z_float(z_owen(z_sobol1(i), z_owen_seed(d, 1u))));
+}
+float3 rand_f3(thread Sampler &s) {
+    if (!s.z) return rand_f3(s.state);
+    uint d = z_dimension(s), V = reverse_bits(z_index(s, d));
+    return float3(z_float(z_owen(z_o2m3_x(V), z_owen_seed(d, 0u))),
+                  z_float(z_owen(z_o2m3_y(V), z_owen_seed(d, 1u))),
+                  z_float(z_owen(z_o2m3_z(V), z_owen_seed(d, 2u))));
+}
+float rand_decision(thread Sampler &s) { return rand_f(s.state); }
+// Whether draws are Z constituents, which callers may join into one rand_f3 where the PCG
+// stream draws them conditionally.
+bool sampler_joint(thread uint &) { return false; }
+bool sampler_joint(thread Sampler &s) { return s.z; }
+// Sampling event streams (32 dimensions each, 16 per path vertex). ReSTIR PT's streams are
+// Z_PT + its pt_seed stream (0 BSDF, 1 NEE, 2 roulette), apart from the shading pass's.
+// Z_PT + 0..2 occupy streams 9-11. Z_WAVELENGTH (vertex 0) is reserved for a per-path hero
+// wavelength: one rand_f of its own event, drawn identically by every pass of a pixel (as the lens
+// is), so ReSTIR PT can re-derive it from the reservoir key. Streams 13-15 are free.
+constant uint Z_BSDF = 0u, Z_NEE = 1u, Z_ROULETTE = 2u, Z_LENS = 3u, Z_DI = 4u,
+    Z_GI_BSDF = 5u, Z_GI_NEE = 6u, Z_CAUSTIC = 7u, Z_FOG = 8u, Z_PT = 9u, Z_WAVELENGTH = 12u;
+void sampler_event(thread Sampler &s, uint pathVertex, uint stream) {
+    s.dimension = (pathVertex * 16u + stream) * 32u; s.sub = 0u; s.subBits = 0u;
+}
+void sampler_candidate(thread Sampler &s, uint pathVertex, uint stream, uint index, uint bits) {
+    sampler_event(s, pathVertex, stream); s.sub = index; s.subBits = bits;
+}
 
 // --- Data Types ---
 struct Ray {
@@ -161,7 +318,7 @@ struct Uniforms {
     uint viewportMode;     // 0 = beauty, 1 = albedo, 2 = normals, 3 = depth, 4 = material
     uint width;
     uint height;
-    uint indirectReuse;    // IndirectReuse and ReSTIR PT options (former padding); see indirect_reuse_mode
+    uint indirectReuse;    // IndirectReuse, ReSTIR PT and sampler options (former padding); see indirect_reuse_mode, sampler_z
     float2 jitter;         // Shared subpixel offset, in pixels, excluding the 0.5 pixel center.
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
     uint reservoirHistoryReset; // 1 = DI/GI history reservoirs were just allocated; skip temporal reuse
@@ -199,6 +356,39 @@ bool splat_frame(constant Uniforms &u) { return (u.indirectReuse & 16u) != 0u; }
 // of the reservoirs' resampled contribution (PathTracerRenderer.controlVariates). The host sets it
 // only with paired spatial reuse, the MIS the method is defined with.
 bool restir_pt_control_variates(constant Uniforms &u) { return restir_pt_active(u) && (u.indirectReuse & 32u) != 0u; }
+// Bit 6: sampling draws come from the Z++ sampler instead of per-pixel PCG streams
+// (PathTracerRenderer.sampler; REFERENCES.md ZPP2026). Bits 7-8 select its temporal model
+// (ZTemporal): 0 per-pixel, 1 temporal interlacing (TZ), 2 spatiotemporal interlacing (STZ),
+// 3 a fresh random block per accumulation (ReShuffle-like).
+bool sampler_z(constant Uniforms &u) { return (u.indirectReuse & 64u) != 0u; }
+uint sampler_z_temporal(constant Uniforms &u) { return (u.indirectReuse >> 7) & 3u; }
+
+// Z++ key of a pixel for this frame: the recursively shuffled Morton index (Ahmed and Wonka's
+// pixel ordering) XOR a temporal index t (ZPP2026 Eq. 3). A progressive accumulation that
+// started at sample s0 is at frame j = frameIndex - 1, and t = T(s0) XOR j: over its first
+// 2^n frames a pixel's keys are then one aligned block of 2^n keys, so every dimension gives
+// it a complete (0, n)-net, and each frame is a Z mask. While the camera moves every frame
+// starts an accumulation, and T sets how successive frames relate: the identity (per-pixel
+// model), the TZ interlacing of Eq. 5, or a hash (a fresh block, as ReShuffle decorrelates).
+// STZ also applies Eq. 6 to the pixel index. Unlike the paper, the XOR precedes the
+// per-dimension shuffle (z_index), so one key serves all dimensions; see REFERENCES.md.
+uint z_pixel_key(uint2 gid, constant Uniforms &u) {
+    uint model = sampler_z_temporal(u);
+    uint j = max(u.frameIndex, 1u) - 1u, s0 = u.sampleIndex - j;
+    uint t = model == 1u || model == 2u ? s0 ^ ((s0 & 0xAAAAAAAAu) << 1) : model == 3u ? z_mix(s0 ^ 0x2c1b3c6du) : s0;
+    uint k = z_shuffle(z_morton(gid), 0xffffffffu);
+    if (model == 2u) k ^= k << 2;
+    return k ^ t ^ j;
+}
+// Pass 1 and pass 2 of a pixel start from this sampler (the PCG state both passes used before).
+Sampler pixel_sampler(uint2 gid, constant Uniforms &u) {
+    Sampler s;
+    s.state = (gid.y * u.width + gid.x) ^ (u.sampleIndex * 1999999973u);
+    s.z = sampler_z(u);
+    s.key = s.z ? z_pixel_key(gid, u) : 0u;
+    s.dimension = 0u; s.sub = 0u; s.subBits = 0u;
+    return s;
+}
 
 // ============================================================================
 // Procedural Physical Sky
@@ -1157,8 +1347,10 @@ float3 eval_environment(float3 d, constant Uniforms &u, constant MaterialResourc
     return result*u.environment.x+independent_sun_radiance(d,u);
 }
 // REFERENCES.md: PBRT2023. Thin-lens focus-plane construction; uniform disk sampling.
-void lens_ray(thread Ray &ray, float3 forward, float3 right, float3 up, constant Uniforms &u, thread uint &seed) {
+template <typename R>
+void lens_ray(thread Ray &ray, float3 forward, float3 right, float3 up, constant Uniforms &u, thread R &seed) {
     if(u.lens.x<=0) return;
+    sampler_event(seed, 0u, Z_LENS);
     float2 random=rand_f2(seed); float radius=sqrt(random.x)*u.lens.x, angle=TWO_PI*random.y;
     float3 focus=ray.origin+ray.direction*(u.lens.y/max(1e-5f,dot(ray.direction,forward)));
     ray.origin+=radius*(cos(angle)*right+sin(angle)*up); ray.direction=normalize(focus-ray.origin);
@@ -1333,8 +1525,7 @@ float power_heuristic(float p_f, float p_g) {
     return f * f / (f * f + g * g);
 }
 
-float3 sample_cosine_hemisphere(float3 n, thread uint &seed) {
-    float2 r = rand_f2(seed);
+float3 sample_cosine_hemisphere(float3 n, float2 r) {
     float phi = TWO_PI * r.x;
     // Center the radial draw in its 24-bit bin: an exact zero creates a
     // tangent ray whose rounded dot-product PDF can be tiny but positive.
@@ -1344,6 +1535,10 @@ float3 sample_cosine_hemisphere(float3 n, thread uint &seed) {
     float3 u, v;
     make_basis(n, u, v);
     return normalize(u * (cos(phi) * sin_th) + v * (sin(phi) * sin_th) + n * cos_th);
+}
+template <typename R>
+float3 sample_cosine_hemisphere(float3 n, thread R &seed) {
+    return sample_cosine_hemisphere(n, rand_f2(seed));
 }
 
 // FRESNEL1994: exact-mirror compatibility path and approximate MetalFX guides.
@@ -1481,14 +1676,17 @@ float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant Mate
     return (1.0f-imported_light_probability(u,images))*environment_mixture_pdf(wi,n,image,u);
 }
 // Both proposals sample the same environment, with their full mixture PDF.
-LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread uint &seed, constant MaterialResources &materialImages) {
+// Emitter choice and the point on the emitter form one 3D constituent (rand_f3) in Z mode;
+// the draws keep the order of the PCG stream.
+template <typename R>
+LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages) {
     LightSample ls = {};
     float importedProbability=imported_light_probability(u,materialImages);
     if(importedProbability>0 && rand_f(seed)<importedProbability) {
-        uint count=materialImages.emitters[0],low=0,high=count-1;float value=rand_f(seed);
+        uint count=materialImages.emitters[0],low=0,high=count-1;float3 q=rand_f3(seed);float value=q.x;
         while(low<high) {uint middle=(low+high)/2;if(as_type<float>(materialImages.emitters[1+count+middle])>=value) high=middle; else low=middle+1;}
         uint index=materialImages.emitters[1+low];
-        MeshTriangle t=scene_triangle(index,materialImages);float2 r=rand_f2(seed);float root=sqrt(r.x);
+        MeshTriangle t=scene_triangle(index,materialImages);float2 r=q.yz;float root=sqrt(r.x);
         ls.position=(1-root)*t.a.xyz+root*(1-r.y)*t.b.xyz+root*r.y*t.c.xyz;
         float3 delta=ls.position-p;ls.dist=length(delta);ls.wi=delta/max(ls.dist,1e-8f);
         float geometry=imported_geometry(p,ls.position,index,materialImages);
@@ -1502,10 +1700,12 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
     if ((u.sceneIndex == 0 || u.sceneIndex == 6)) {
         float sunProbability = environment_sun_probability(u);
         float imagePdf = 0.0f;
-        if (sunProbability > 0.0f && rand_f(seed) < sunProbability) {
+        // With a sun, its choice and the first two draws of either branch share one 3D draw.
+        float3 q = sunProbability > 0.0f ? rand_f3(seed) : float3(1.0f);
+        if (sunProbability > 0.0f && q.x < sunProbability) {
             // Sun cone sampling; sin^2 is formed from 1 - cos for sub-degree suns.
             float3 sun_d = normalize(u.sunParams.xyz);
-            float2 r = rand_f2(seed);
+            float2 r = q.yz;
             float oneMinusCos = r.x * sun_one_minus_cos(u);
             float cos_th = 1.0f - oneMinusCos;
             float sin_th = sqrt(max(0.0f, oneMinusCos * (2.0f - oneMinusCos)));
@@ -1516,8 +1716,9 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
             if (u.environment.z > 0.5f) imagePdf = environment_image_pdf(ls.wi, u, materialImages);
         } else if (u.environment.z > 0.5f) {
             uint width = materialImages.environmentMap.get_width(), height = materialImages.environmentMap.get_height();
-            uint y = environment_cdf_index(materialImages.environmentRows, height, 0, rand_f(seed), true);
-            uint x = environment_cdf_index(materialImages.environmentColumns, width, y, rand_f(seed), false);
+            float2 c = sunProbability > 0.0f ? q.yz : rand_f2(seed);
+            uint y = environment_cdf_index(materialImages.environmentRows, height, 0, c.x, true);
+            uint x = environment_cdf_index(materialImages.environmentColumns, width, y, c.y, false);
             // Keep the in-texel offset inside the chosen cell and use that cell's
             // probability; re-deriving it from the direction can pick a neighbour.
             float2 size = float2(width, height), cell = float2(x, y);
@@ -1528,7 +1729,7 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
             imagePdf = environment_cell_pdf(x, y, sinTheta, materialImages);
         } else {
             // Ambient sky cosine hemisphere sampling -> illuminates shadows & cylinder interior
-            ls.wi = sample_cosine_hemisphere(n, seed);
+            ls.wi = sunProbability > 0.0f ? sample_cosine_hemisphere(n, q.yz) : sample_cosine_hemisphere(n, seed);
         }
         ls.position = p + ls.wi * 1e6f;
         ls.dist = 1e6f;
@@ -1578,7 +1779,10 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
             ls.pdf = (dist * dist) / (0.09f * u.light.w * u.light.w * cos_l);
         }
     } else if (u.sceneIndex == 2) {
-        int pick = clamp(int(rand_f(seed) * 4.0f), 0, 3);
+        // PCG draws the cone sample only outside the sphere; Z mode draws one 3D constituent.
+        bool joint = sampler_joint(seed);
+        float3 q = joint ? rand_f3(seed) : float3(rand_f(seed), 0.0f, 0.0f);
+        int pick = clamp(int(q.x * 4.0f), 0, 3);
         float xs[4] = { -2.4f, -0.8f, 0.8f, 2.4f };
         float radii[4] = { 0.55f, 0.18f, 0.055f, 0.016f };
         float3 emits[4] = { float3(6.0f), float3(45.0f), float3(450.0f), float3(4000.0f) };
@@ -1591,7 +1795,7 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
             float d = sqrt(d2);
             float3 d_c = d_vec / d;
             float oneMinusCosMax = sphere_cone_one_minus_cos(radius * radius / d2);
-            float2 r = rand_f2(seed);
+            float2 r = joint ? q.yz : rand_f2(seed);
             float oneMinusCos = r.x * oneMinusCosMax;
             float cos_th = 1.0f - oneMinusCos;
             float sin_th = sqrt(max(0.0f, oneMinusCos * (2.0f - oneMinusCos)));
@@ -1656,7 +1860,8 @@ float eval_light_pdf(float3 p,float3 hit_pos,Material mat,constant Uniforms &u,c
 // Artistic ring-caustic approximation. This is not an unbiased SMS estimator:
 // it uses a simplified Jacobian and empirical gain, and handles no glass paths.
 // REFERENCES.md: SMS2020 is related work, not this approximation's derivation.
-float3 sample_specular_manifold_caustic(float3 x, float3 n_x, constant Uniforms &u, thread uint &seed, constant MaterialResources &materialImages) {
+template <typename R>
+float3 sample_specular_manifold_caustic(float3 x, float3 n_x, constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages) {
     if (u.sceneIndex != 0 && u.sceneIndex != 5 && u.sceneIndex != 3) return float3(0.0f);
 
     float3 total_caustic = float3(0.0f);
@@ -1839,9 +2044,11 @@ bool is_delta(Material mat) {
     return mat.type == DIELECTRIC || (mat.type == GLOSSY && mat.roughness < 0.02f);
 }
 
-// Returns f * abs(cos(theta)) / PDF, using the same glossy model as NEE.
+// Returns f * abs(cos(theta)) / PDF, using the same glossy model as NEE. The lobe choice and
+// the direction form one 3D constituent (rand_f3) in Z mode.
+template <typename R>
 bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
-                 thread uint &seed, thread float3 &direction,
+                 thread R &seed, thread float3 &direction,
                  thread float3 &weight, thread float &pdf) {
     pdf = 0.0f;
     // A perturbed shading normal can send a delta event across the geometric
@@ -1880,8 +2087,7 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
     }
     if (mat.type == DIFFUSE) {
         // Keep three draws like the generic sampler, including its lobe choice.
-        rand_f(seed);
-        direction = sample_cosine_hemisphere(normal, seed);
+        direction = sample_cosine_hemisphere(normal, rand_f3(seed).yz);
         pdf = max(0.0f, dot(normal, direction)) / PI;
         weight = clamp(mat.albedo, 0.0f, 1.0f);
         return pdf > 0.0f && (dot(mat.geometricNormal, mat.geometricNormal) <= 0.5f || dot(direction, mat.geometricNormal) > 0.0f);
@@ -1890,7 +2096,7 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
     OpenPBR_PreparedBsdf prepared = prepare_openpbr(mat, normal, -incoming);
     OpenPBR_DiffuseSpecular result;
     uint lobe;
-    float3 random = float3(rand_f(seed), rand_f(seed), rand_f(seed));
+    float3 random = rand_f3(seed);
     openpbr_sample(prepared, random, direction, result, pdf, lobe);
     if (pdf <= 0.0f) return false;
     if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(direction, mat.geometricNormal) <= 0.0f) return false;
@@ -1925,8 +2131,9 @@ bool restir_gi_has_complementary_bsdf(float pathDepth) {
 }
 
 // Bounded, single-scatter camera fog. This preview does not model multiple scattering.
+template <typename R>
 float3 apply_camera_fog(float3 color, Ray ray, float surfaceDistance,
-                        constant Uniforms &u, thread uint &seed, constant MaterialResources &materialImages) {
+                        constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages) {
     float3 lo = (u.sceneIndex == 0 || u.sceneIndex == 6) ? float3(-4, -1, -2) : float3(-1);
     float3 hi = (u.sceneIndex == 0 || u.sceneIndex == 6) ? float3(4, 3, 3) : float3(1);
     if (u.sceneIndex == 2 || u.sceneIndex == 5) { lo = float3(-4, -1, -2); hi = float3(4, 3, 3); }
@@ -1946,6 +2153,8 @@ float3 apply_camera_fog(float3 color, Ray ray, float surfaceDistance,
     float step = (exitT - entry) / 8.0f;
     float3 scattered = float3(0.0f);
     for (int i = 0; i < 8; ++i) {
+        // Z mode: one event per step, so the steps of neighbouring pixels complement each other.
+        sampler_event(seed, uint(i), Z_FOG);
         float t = entry + (float(i) + rand_f(seed)) * step;
         float3 point = ray.origin + ray.direction * t;
         LightSample ls = sample_direct_light(point, float3(0, 1, 0), u, seed, materialImages);
@@ -2015,8 +2224,11 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
 struct DIReservoir { LightSample sample; float weightSum; float M; };
 struct GIReservoir { float3 position, normal, radiance; float sourcePdf, weightSum, M; };
 
-// Initial light candidates (RIS M = 4) at a diffuse primary hit.
-DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, thread uint &seed,
+// Initial light candidates (RIS M = 4) at a diffuse primary hit. In Z mode the four candidates
+// are the consecutive block of four indices under the pixel's key (sampler_candidate), so
+// they are stratified; the resampling decisions stay on the PCG stream.
+template <typename R>
+DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, thread R &seed,
                               constant MaterialResources &images) {
     DIReservoir r;
     r.sample = {};
@@ -2028,6 +2240,7 @@ DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, 
     r.weightSum = 0.0f;
     r.M = 0.0f;
     for (int i = 0; i < 4; ++i) {
+        sampler_candidate(seed, 1u, Z_DI, uint(i), 2u);
         LightSample cand = sample_direct_light(rec.position, rec.normal, u, seed, images);
         r.M += 1.0f; // Zero-weight candidates still count in the estimator.
         if (cand.pdf > 0.0f) {
@@ -2035,7 +2248,7 @@ DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, 
             float proposalPDF = cand.pdf * light_geometry(rec.position, cand, u.sceneIndex, u.light.w, images);
             float w_i = proposalPDF > 0.0f ? p_hat / proposalPDF : 0.0f;
             r.weightSum += w_i;
-            if (rand_f(seed) * r.weightSum < w_i) {
+            if (rand_decision(seed) * r.weightSum < w_i) {
                 r.sample = cand;
             }
         }
@@ -2084,8 +2297,9 @@ void restir_di_encode(DIReservoir r, HitRecord rec, float3 view, constant Unifor
 // ReSTIR GI initial path: x0(camera) -> x1(primary diffuse) -> x2(diffuse) -> sampled light. It
 // stores x2 and its one-sample outgoing direct radiance; deeper transport remains in the ordinary
 // path continuation. fovScale is tan(fov / 2), for the texture footprint at x2.
+template <typename R>
 GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, constant Uniforms &u,
-                              constant SurfaceSettings *surfaceSettings, constant MaterialResources &images, thread uint &seed) {
+                              constant SurfaceSettings *surfaceSettings, constant MaterialResources &images, thread R &seed) {
     GIReservoir r;
     r.position = float3(0.0f);
     r.normal = float3(0.0f);
@@ -2095,6 +2309,7 @@ GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, consta
     r.M = 1.0f;
     float3 giDirection, giBSDFWeight;
     float giBSDFPdf;
+    sampler_event(seed, 1u, Z_GI_BSDF);
     if (sample_bsdf(rec.mat, rec.normal, view, rec.front_face, seed,
                     giDirection, giBSDFWeight, giBSDFPdf) && giBSDFPdf > 0.0f) {
         Ray giRay;
@@ -2106,6 +2321,7 @@ GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, consta
                 (rec.t + secondary.t) * 2.0f * fovScale / float(u.height));
             if (secondary.mat.type == DIFFUSE) {
                 float3 secondaryRadiance = float3(0.0f);
+                sampler_event(seed, 2u, Z_GI_NEE);
                 LightSample giLight = sample_direct_light(secondary.position, secondary.normal, u, seed, images);
                 if (giLight.pdf > 0.0f && light_visible(secondary.position,
                     secondary.geometricNormal, giLight, u.sceneIndex, images, u, secondary.error)) {
@@ -2223,7 +2439,7 @@ kernel void restir_temporal_kernel(
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
 
-    uint seed = (gid.y * uniforms.width + gid.x) ^ (uniforms.sampleIndex * 1999999973u);
+    Sampler seed = pixel_sampler(gid, uniforms);
     float aspect = float(uniforms.width) / float(uniforms.height);
     float fov_scale = tan((uniforms.cameraPos.w * 0.5f) * PI / 180.0f);
 
@@ -2313,7 +2529,7 @@ kernel void restir_temporal_kernel(
         bool sameSurface = restir_same_surface(histPosDepth.read(uint2(prevCoord)), histNormalMat.read(uint2(prevCoord)), rec);
         if (sameSurface && histM > 0.0f && histW > 0.0f) {
             restir_di_merge(di, rec, ray.direction, histSamplePosDir.read(uint2(prevCoord)),
-                histSampleEmitPdf.read(uint2(prevCoord)), histM, histW, uniforms, seed, materialImages);
+                histSampleEmitPdf.read(uint2(prevCoord)), histM, histW, uniforms, seed.state, materialImages);
         }
     }
 
@@ -2347,7 +2563,7 @@ kernel void restir_temporal_kernel(
         if (sameSurface && oldGIWeights.y > 0.0f && oldGIWeights.z > 0.0f &&
             oldGIPosPdf.w > 0.0f && oldGINormal.w > 0.0f) {
             restir_gi_merge(gi, rec, ray.direction, oldPos.xyz, oldGIPosPdf, oldGINormal,
-                histGIRadiance.read(uint2(prevCoord)).xyz, oldGIWeights.y, oldGIWeights.z, seed);
+                histGIRadiance.read(uint2(prevCoord)).xyz, oldGIWeights.y, oldGIWeights.z, seed.state);
         }
     }
     float4 giPosPdf, giNormal, giRadiance, giWeights;
@@ -2591,6 +2807,22 @@ float3 pt_decode_direction(uint v) {
 // own stream (0 BSDF, 1 NEE, 2 roulette, 3-5 resampling), so replaying a prefix at another
 // pixel consumes the same numbers whatever the other events consumed.
 uint pt_seed(uint seed, uint pathVertex, uint stream) { return pcg_hash(seed ^ pcg_hash(pathVertex * 8u + stream + 1u)); }
+// The sampler of one such stream. In Z mode the reservoir's seed is the pixel's Z++ key at
+// generation (pt_initial_seed), so a replay anywhere reproduces the base path's numbers; the
+// PCG state (resampling decisions) is derived from it as in PCG mode.
+Sampler pt_sampler(uint seed, uint pathVertex, uint stream, constant Uniforms &u) {
+    Sampler s;
+    s.state = pt_seed(seed, pathVertex, stream);
+    s.z = sampler_z(u);
+    s.key = seed;
+    sampler_event(s, pathVertex, Z_PT + stream);
+    return s;
+}
+// Replay seed of a new path tree of the pixel `gid`; deep splatting domains (layer > 0) XOR the
+// layer into bits 26-28 of the key (a distant block, so never another pixel's key of this frame).
+uint pt_initial_seed(uint2 gid, uint layer, uint pcgSeed, constant Uniforms &u) {
+    return sampler_z(u) ? z_pixel_key(gid, u) ^ (layer << 26) : pcgSeed;
+}
 
 // RESTIRPTE2026 Eq. 5 right-hand side: c/100 times the squared primary footprint radius
 // |x0 - x1|^2 / (<n_x1, x1->x0> / 4 pi) (Mueller et al. 2021).
@@ -2651,12 +2883,13 @@ float3 pt_eval(thread const PTBsdf &b, float3 wi, thread float &pdf) {
     if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(wi, g) <= 0.0f) return float3(0.0f);
     return openpbr_get_sum_of_diffuse_specular(openpbr_eval(b.prepared, wi)) / cosine;
 }
-bool pt_sample(thread const PTBsdf &b, float3 incoming, bool frontFace, thread uint &seed,
+template <typename R>
+bool pt_sample(thread const PTBsdf &b, float3 incoming, bool frontFace, thread R &seed,
                thread float3 &direction, thread float3 &weight, thread float &pdf) {
     if (!b.layered) return sample_bsdf(b.mat, b.normal, incoming, frontFace, seed, direction, weight, pdf);
     OpenPBR_DiffuseSpecular result;
     uint lobe;
-    float3 random = float3(rand_f(seed), rand_f(seed), rand_f(seed));
+    float3 random = rand_f3(seed);
     openpbr_sample(b.prepared, random, direction, result, pdf, lobe);
     if (pdf <= 0.0f) return false;
     float3 g = b.mat.geometricNormal;
@@ -2733,13 +2966,17 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
         PTBsdf bsdf = pt_prepare(current.mat, current.normal, -incoming);
         // Next-event estimation at x_j: a path of j + 1 vertices.
         if (!delta && j + 1u >= minLength) {
-            uint neeSeed = pt_seed(seed, j, 1u);
+            Sampler neeSeed = pt_sampler(seed, j, 1u, u);
             float candidates = pt_nee_candidates(j, u), lightWeight = 1.0f;
+            // Z mode: the RIS light candidates are one stratified block of the event.
+            uint candidateBits = candidates > 1.0f ? 2u : 0u;
+            sampler_candidate(neeSeed, j, Z_PT + 1u, 0u, candidateBits);
             LightSample ls = sample_direct_light(current.position, current.normal, u, neeSeed, images);
             if (candidates > 1.0f) {
                 // RIS over light samples with target luminance(f cos Le); lightWeight = W_RIS p1.
                 float sum = 0.0f, chosenTarget = 0.0f;
                 for (uint i = 0u; i < PT_NEE_CANDIDATES; ++i) {
+                    if (i > 0u) sampler_candidate(neeSeed, j, Z_PT + 1u, i, candidateBits);
                     LightSample candidate = i == 0u ? ls : sample_direct_light(current.position, current.normal, u, neeSeed, images);
                     float target = 0.0f;
                     if (candidate.pdf > 0.0f) {
@@ -2749,7 +2986,7 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
                     }
                     float w = target > 0.0f && isfinite(target) ? target / candidate.pdf : 0.0f;
                     sum += w;
-                    if (w > 0.0f && rand_f(neeSeed) * sum < w) { ls = candidate; chosenTarget = target; }
+                    if (w > 0.0f && rand_decision(neeSeed) * sum < w) { ls = candidate; chosenTarget = target; }
                 }
                 if (!(chosenTarget > 0.0f)) ls.pdf = 0.0f;
                 else lightWeight = sum / candidates / chosenTarget * ls.pdf;
@@ -2798,13 +3035,13 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
         if (j >= 5u) {
             float3 compensated = throughput * inverseSurvival;
             float survival = clamp(max(compensated.x, max(compensated.y, compensated.z)), 0.05f, delta ? 0.99f : 0.95f);
-            uint rouletteSeed = pt_seed(seed, j, 2u);
+            Sampler rouletteSeed = pt_sampler(seed, j, 2u, u);
             if (rand_f(rouletteSeed) >= survival) break;
             inverseSurvival /= survival;
         }
         if (!delta && scatter >= limit) break;
         if (!delta) ++scatter;
-        uint bsdfSeed = pt_seed(seed, j, 0u);
+        Sampler bsdfSeed = pt_sampler(seed, j, 0u, u);
         float3 direction, weight;
         float pdf;
         if (!pt_sample(bsdf, incoming, current.front_face, bsdfSeed, direction, weight, pdf)) break;
@@ -2925,7 +3162,7 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         bool delta = is_delta(current.mat);
         if (!delta && scatter >= limit) return result;
         if (!delta) ++scatter;
-        uint bsdfSeed = pt_seed(r.seed, j, 0u);
+        Sampler bsdfSeed = pt_sampler(r.seed, j, 0u, u);
         float3 direction, weight;
         float pdf;
         if (!sample_bsdf(current.mat, current.normal, incoming, current.front_face, bsdfSeed, direction, weight, pdf)) return result;
@@ -3157,7 +3394,7 @@ kernel void restir_pt_initial_kernel(
     if (position.w > 0.0f && normalMaterial.w != float(EMISSIVE) ) {
         HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
         float3 view = float3(primarySurfaces[index].view);
-        uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2545f491u);
+        uint seed = pt_initial_seed(gid, 0u, pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2545f491u), u);
         result = pt_generate(x1, view, seed, pt_footprint_threshold(position.w, x1.geometricNormal, view),
                              pt_primary_cone(u), u, settings, images, firstHit, estimate);
         reflectance = pt_reflectance(x1.mat, x1.normal, -view);
@@ -4287,7 +4524,8 @@ kernel void restir_pt_deep_initial_kernel(
         HitRecord x1 = load_primary_surface(s, float4(float3(d.position), d.depth));
         float3 view = float3(s.view);
         float firstHit = 0.0f;
-        r = pt_generate(x1, view, splat_seed(d.pixel, d.flags & 255u, 0x2545f491u, u),
+        uint2 pixel = uint2(d.pixel % u.width, d.pixel / u.width);
+        r = pt_generate(x1, view, pt_initial_seed(pixel, d.flags & 255u, splat_seed(d.pixel, d.flags & 255u, 0x2545f491u, u), u),
                         pt_footprint_threshold(d.depth, x1.geometricNormal, view), pt_primary_cone(u), u, settings, images, firstHit,
                         estimate);
         reflectance = pt_reflectance(x1.mat, x1.normal, -view);
@@ -4599,7 +4837,7 @@ kernel void shading_kernel(
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
-    uint seed = (gid.y * uniforms.width + gid.x) ^ (uniforms.sampleIndex * 1999999973u);
+    Sampler seed = pixel_sampler(gid, uniforms);
 
     float4 posDepth = gbufferPosDepth.read(gid);
     float3 radiance = float3(0.0f);
@@ -4636,8 +4874,8 @@ kernel void shading_kernel(
     primaryRay.direction = normalize(forward + u * right + v * up);
     lens_ray(primaryRay,forward,right,up,uniforms,seed);
     // Pass 1 continued this same stream into its candidates; spatial offsets
-    // must not replay them.
-    decorrelate_shading_seed(seed);
+    // must not replay them. (Z-mode sampling events of the two passes are distinct.)
+    decorrelate_shading_seed(seed.state);
 
     if (posDepth.w <= 0.0f) {
         if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
@@ -4688,11 +4926,11 @@ kernel void shading_kernel(
                 neighbors.count = 0;
                 if (compatibilityGuided) {
                     neighbors = select_compatible_neighbors(gid, pos, norm, posDepth.w,
-                        gbufferPosDepth, gbufferNormalMat, uniforms, seed);
+                        gbufferPosDepth, gbufferNormalMat, uniforms, seed.state);
                 }
                 int taps = stochasticPairwise ? 0 : compatibilityGuided ? int(neighbors.count) : UNIFORM_TAPS;
                 for (int i = 0; i < taps; ++i) {
-                    int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed);
+                    int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed.state);
 
                     if (nCoord.x >= 0 && nCoord.x < int(uniforms.width) &&
                         nCoord.y >= 0 && nCoord.y < int(uniforms.height)) {
@@ -4719,7 +4957,7 @@ kernel void shading_kernel(
 
                                 weightSum += w_neighbor;
                                 M += nWeights.y;
-                                if (rand_f(seed) * weightSum < w_neighbor) {
+                                if (rand_decision(seed) * weightSum < w_neighbor) {
                                     selectedSample = nSample;
                                 }
                             }
@@ -4743,7 +4981,7 @@ kernel void shading_kernel(
                 if (stochasticPairwise) {
                     selectedSample = spmis_di_reuse(gid, primaryHit, primaryRay.direction, cPosDir, cEmitPdf, cWeights,
                         gbufferPosDepth, inSamplePosDir, inSampleEmitPdf, inReservoirWeights, primarySurfaces,
-                        spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed, W);
+                        spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed.state, W);
                 }
 
                 // Direct Lighting: ReSTIR DI vs. Standard MIS
@@ -4772,12 +5010,12 @@ kernel void shading_kernel(
                 float giM = currentGIWeights.y;
                 if (compatibilityGuided && giEnabled) {
                     neighbors = select_compatible_neighbors(gid, pos, norm, posDepth.w,
-                        gbufferPosDepth, gbufferNormalMat, uniforms, seed);
+                        gbufferPosDepth, gbufferNormalMat, uniforms, seed.state);
                     taps = int(neighbors.count);
                 }
                 if (stochasticPairwise) taps = 0;
                 for (int i = 0; i < taps && giEnabled; ++i) {
-                    int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed);
+                    int2 nCoord = compatibilityGuided ? neighbors.coord[i] : uniform_neighbor(gid, seed.state);
                     if (nCoord.x < 0 || nCoord.x >= int(uniforms.width) ||
                         nCoord.y < 0 || nCoord.y >= int(uniforms.height)) continue;
                     float4 neighborPrimary = gbufferPosDepth.read(uint2(nCoord));
@@ -4797,7 +5035,7 @@ kernel void shading_kernel(
                     float neighborWeight = neighborTarget * neighborWeights.z * neighborWeights.y;
                     giWeightSum += neighborWeight;
                     giM += neighborWeights.y;
-                    if (rand_f(seed) * giWeightSum < neighborWeight) {
+                    if (rand_decision(seed) * giWeightSum < neighborWeight) {
                         selectedGIPosPdf = neighborPosPdf;
                         selectedGINormal = neighborNormal;
                         selectedGIRadiance = neighborRadiance;
@@ -4820,7 +5058,7 @@ kernel void shading_kernel(
                 if (stochasticPairwise && giEnabled) {
                     spmis_gi_reuse(gid, primaryHit, primaryRay.direction, selectedGIPosPdf, selectedGINormal,
                         selectedGIRadiance, currentGIWeights, gbufferPosDepth, inGIPosPdf, inGINormal, inGIRadiance,
-                        inGIWeights, primarySurfaces, spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed, giW);
+                        inGIWeights, primarySurfaces, spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed.state, giW);
                 }
                 if (giEnabled && giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
                     selectedGIPosPdf.xyz, uniforms, materialImages, primaryHit.error)) {
@@ -4830,6 +5068,7 @@ kernel void shading_kernel(
                     radiance += primaryBSDF * selectedGIRadiance * geometry * giW;
                 }
             } else if (mat.type != DIELECTRIC && !(mat.type == GLOSSY && mat.roughness < 0.02f) && uniforms.samplingMode != 3) {
+                sampler_event(seed, 1u, Z_NEE);
                 LightSample ls = sample_direct_light(pos, norm, uniforms, seed, materialImages);
                 if (ls.pdf > 0.0f) {
                     if (light_visible(pos, primaryHit.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, primaryHit.error)) {
@@ -4846,6 +5085,7 @@ kernel void shading_kernel(
 
             // Optional artistic ring-caustic boost
             if (uniforms.enableSMS == 1 && mat.type == DIFFUSE) {
+                sampler_event(seed, 1u, Z_CAUSTIC);
                 float3 caustic = sample_specular_manifold_caustic(pos, norm, uniforms, seed, materialImages);
                 radiance += caustic * mat.albedo;
             }
@@ -4885,6 +5125,8 @@ kernel void shading_kernel(
                 // Only conventional NEE vertices have complementary power weights.
                 bool previousMIS = uniforms.samplingMode == 1 ||
                     (uniforms.samplingMode == 0 && (bounce > 1 || currentHit.mat.type != DIFFUSE));
+                // Z mode: vertex `bounce` scatters (its BSDF event); rec below is vertex bounce + 1.
+                sampler_event(seed, uint(bounce), Z_BSDF);
                 if (!sample_bsdf(currentHit.mat, currentHit.normal, currentRay.direction,
                                  currentHit.front_face, seed, nextDirection, bsdfWeight, bsdfPDF)) break;
                 throughput *= bsdfWeight;
@@ -4936,6 +5178,7 @@ kernel void shading_kernel(
                 bool restirGISecondary = uniforms.samplingMode == 0 && mat.type == DIFFUSE &&
                     bounce == 1 && rec.mat.type == DIFFUSE;
                 if (!is_delta(rec.mat) && uniforms.samplingMode != 3 && !restirGISecondary) {
+                    sampler_event(seed, uint(bounce) + 1u, Z_NEE);
                     LightSample ls = sample_direct_light(rec.position, rec.normal, uniforms, seed, materialImages);
                     if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, rec.error)) {
                         float cosine = abs(dot(rec.normal, ls.wi));
@@ -4953,6 +5196,7 @@ kernel void shading_kernel(
                     // chains. Division by survival preserves their expected energy.
                     float survival = clamp(max(throughput.x, max(throughput.y, throughput.z)),
                                            0.05f, is_delta(currentHit.mat) ? 0.99f : 0.95f);
+                    sampler_event(seed, uint(bounce) + 1u, Z_ROULETTE);
                     if (rand_f(seed) >= survival) break;
                     throughput /= survival;
                 }
@@ -5098,7 +5342,8 @@ kernel void metalfx_guides_kernel(
         normal = normalize(n.xyz);
         float3 guideCamera=u.cameraPos.xyz;
         if(u.lens.x>0) {
-            uint guideSeed=(gid.y*u.width+gid.x)^(u.sampleIndex*1999999973u);
+            // The lens sample of pass 1 (lens_ray): the same sampler and event.
+            Sampler guideSeed=pixel_sampler(gid,u);sampler_event(guideSeed,0u,Z_LENS);
             float2 q=rand_f2(guideSeed);float radius=sqrt(q.x)*u.lens.x,angle=TWO_PI*q.y;
             float3 f=normalize(u.cameraTarget.xyz-u.cameraPos.xyz),right=normalize(cross(f,u.cameraUp.xyz)),up=cross(right,f);
             guideCamera+=radius*(cos(angle)*right+sin(angle)*up);
@@ -5264,7 +5509,8 @@ struct Uniforms {
     var viewportMode: UInt32
     var width: UInt32
     var height: UInt32
-    // IndirectReuse raw value (bits 0-1) and ReSTIR PT options (bits 2-3); occupies former padding (offset 228).
+    // IndirectReuse raw value (bits 0-1), ReSTIR PT options (bits 2-5) and the sampler (bits 6-8; MSL
+    // sampler_z); occupies former padding (offset 228).
     var indirectReuse: UInt32 = IndirectReuse.restirGI.rawValue
     var jitter: SIMD2<Float> = .zero
     var sampleIndex: UInt32 = 1
@@ -5359,6 +5605,32 @@ enum ControlVariates: UInt32, Sendable {
         guard indirectReuse != .restirGI && indirectReuse != .automatic && spatialNeighbors != .stochasticPairwise else { return .off }
         return self == .automatic ? .restcv : self
     }
+}
+
+// Random numbers of the sampling decisions (Uniforms.indirectReuse bit 6). REFERENCES.md: ZPP2026.
+enum SamplerMode: UInt32, Sendable {
+    // Per-pixel PCG hash streams (HASH2020), seeded per pixel and frame.
+    case pcg = 0
+    // Z++: Owen-scrambled 1D / 2D Sobol' and 3D O2m3 constituents indexed along a recursively
+    // shuffled Morton curve, with Z++ temporal indexing (MSL z_pixel_key, Sampler).
+    case zSampling = 1
+    // Host-side default: Z++ for every strategy and scene. It lowered static equal-sample MSE by
+    // 2-87% (Cornell glass within noise) for 1-4% more frame time, and kept the moving camera's
+    // per-frame and MetalFX error within +1% (mostly lower); see tests/PERFORMANCE.md.
+    case automatic = 2
+    func resolved() -> SamplerMode {
+        self == .automatic ? .zSampling : self
+    }
+}
+
+// How the Z++ sampler's successive frames relate while the camera moves (Uniforms.indirectReuse
+// bits 7-8; MSL z_pixel_key). A static accumulation gives every pixel aligned blocks of its
+// sequences in all four models. REFERENCES.md: ZPP2026 Sec. 4.1.
+enum ZTemporal: UInt32, Sendable {
+    case perPixel = 0          // t = s0 (Eq. 3)
+    case interlaced = 1        // TZ: Eq. 5 interlacing of the frame index
+    case spatiotemporal = 2    // STZ: TZ and Eq. 6 on the pixel index
+    case reshuffled = 3        // a hashed block per frame (independent frames, as ReShuffle)
 }
 
 // RESTIRPTE2026 Sec. 3.1: a tileable, self-inverse pairing of an even side x side torus. Link
@@ -6171,6 +6443,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var controlVariates = PathTracerRenderer.defaultControlVariates {
         didSet { if oldValue != controlVariates { resetAccumulation() } }
     }
+    // Random numbers of sampling decisions: PCG streams or the Z++ sampler (ZPP2026).
+    var sampler = PathTracerRenderer.defaultSampler {
+        didSet { if oldValue != sampler { resetAccumulation() } }
+    }
+    var activeSampler: SamplerMode { resolvedSampler(sampler) }
+    // What a sampler choice runs as with the current strategy and scene (the inspector's
+    // "Automatic (currently: …)").
+    func resolvedSampler(_ mode: SamplerMode) -> SamplerMode { mode.resolved() }
+    // Temporal model of the Z++ sampler.
+    var zTemporal = PathTracerRenderer.defaultZTemporal {
+        didSet { if oldValue != zTemporal { resetAccumulation() } }
+    }
     // RESTIRPTE2026 Sec. 5 duplication-map confidence reduction for ReSTIR PT. It trades
     // correlation for bias, so the progressive renderer leaves it off by default.
     var ptDecorrelation = PathTracerRenderer.defaultPTDecorrelation {
@@ -6214,6 +6498,31 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 #endif
         return .automatic
+    }
+    nonisolated static var defaultSampler: SamplerMode {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with either sampler.
+        switch ProcessInfo.processInfo.environment["VIBE_SAMPLER"] {
+        case "pcg": return .pcg
+        case "z": return .zSampling
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultZTemporal: ZTemporal {
+#if VIBE_TESTING
+        switch ProcessInfo.processInfo.environment["VIBE_Z_TEMPORAL"] {
+        case "perpixel": return .perPixel
+        case "tz": return .interlaced
+        case "stz": return .spatiotemporal
+        case "reshuffle": return .reshuffled
+        default: break
+        }
+#endif
+        // ReShuffle-like frames: the lowest MetalFX error of the four models while the camera
+        // moves (tests/PERFORMANCE.md); still views accumulate aligned nets in every model.
+        return .reshuffled
     }
     nonisolated static var defaultPTDecorrelation: Bool {
 #if VIBE_TESTING
@@ -6920,7 +7229,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             width: UInt32(w),
             height: UInt32(h),
             indirectReuse: indirectReuse.rawValue | (ptDecorrelation ? 4 : 0) | (ptTemporalWhileAccumulating ? 8 : 0)
-                | (splatFrame ? 16 : 0) | (usesPT && activeControlVariates == .restcv ? 32 : 0),
+                | (splatFrame ? 16 : 0) | (usesPT && activeControlVariates == .restcv ? 32 : 0)
+                | (activeSampler == .zSampling ? 64 | (zTemporal.rawValue << 7) : 0),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
             spatialNeighbors: activeSpatialNeighbors.rawValue,
