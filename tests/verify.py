@@ -48,6 +48,7 @@ PARTS = [
     ('Fix_splatting.swift', {'full'}),
     ('Fix_spmis.swift', {'full'}),
     ('Fix_restcv.swift', {'full'}),
+    ('Fix_zsampling.swift', {'full'}),
     ('Fix_ui-modes.swift', {'full', 'studio'}),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
