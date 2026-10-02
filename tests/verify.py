@@ -57,12 +57,15 @@ root = harness.ROOT
 output = harness.output_directory('verify')
 environment = {**os.environ, harness.OUTPUT_VARIABLE: str(output), 'VIBE_TRACER_REPOSITORY': str(root)}
 subprocess.run([sys.executable, str(root / 'scripts/prepare_shaders.py')], check=True)
+subprocess.run([sys.executable, str(root / 'scripts/generate_spectral_tables.py')], check=True)
 subprocess.run(['/usr/bin/python3', str(root / 'scripts/prepare_usd.py')], check=True)
 subprocess.run([sys.executable, str(root / 'scripts/prepare_oidn.py'), '--arch', platform.machine()], check=True)
 # -E ignores PYTHONOPTIMIZE and friends, so assert-based helper checks cannot pass vacuously.
 subprocess.run(['/usr/bin/python3', '-E', str(root / 'tests/USDChecks.py')] + reference, check=True, env=environment)
 subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_build.py')], check=True, env=environment)
 subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_tests.py')], check=True, env=environment)
+# Offline spectral-table checks (round trip, sampling, noise, reproducibility, float32 include).
+subprocess.run([sys.executable, '-E', str(root / 'tests/SpectralTables.py')], check=True, env=environment)
 source = harness.production_source()
 for name, modes in PARTS:
     if mode not in modes:
