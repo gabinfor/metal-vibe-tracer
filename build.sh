@@ -4,6 +4,9 @@ cd -- "$(dirname -- "$0")"
 # One architecture for the executable and the bundled OIDN runtime.
 arch="$(uname -m)"
 python3 scripts/prepare_shaders.py
+# Spectral tables for the pending spectral mode (docs/SPECTRAL_DESIGN.md): generated once into
+# build/SpectralTables (several minutes), then reused; not yet bundled or read by the renderer.
+python3 scripts/generate_spectral_tables.py
 /usr/bin/python3 scripts/prepare_usd.py
 python3 scripts/prepare_oidn.py --arch "$arch"
 app="build/MetalVibeTracer.app"
