@@ -5,10 +5,11 @@ Outputs, written atomically and regenerated only when the script, its pinned inp
 parameters change (see docs/SPECTRAL_DESIGN.md and REFERENCES.md: PETERS2019, FOURIERSRGB2019,
 PETERSBLOG2025, CIEDATA):
 
-  FourierSRGB256.bin   8-bit sRGB -> three bounded trigonometric moments (Fourier coefficients)
-                       of a reflectance spectrum, 256^3 entries of 3 x uint16 (96 MiB + header).
-  FourierSRGB86.bin    The exactly solved coarse grid behind it (codes 0, 3, ..., 255; float32),
-                       for continuous inputs (material constants, 16-bit and float textures).
+  FourierSRGB86.bin    sRGB -> three bounded trigonometric moments (Fourier coefficients) of a
+                       reflectance spectrum, solved exactly on a coarse grid (codes 0, 3, ..., 255;
+                       float32). The renderer interpolates it per colour at render time.
+  FourierSRGB256.bin   Only with --lut256 (a test reference, not bundled): every 8-bit code,
+                       3 x uint16 (96 MiB + header), interpolated from the grid and verified.
   SpectralTables.metal MSL include: CIE 1931 2-degree CMFs, the phase warp, XYZ -> linear sRGB,
                        normalized illuminant spectra, wavelength inverse CDFs, small accessors
                        and the m = 2 bounded-MESE reconstruction.
@@ -727,13 +728,33 @@ LUT_SOURCES = ("verify_inputs", "read_table", "resample", "parse_warp", "inverse
                "decode_moments", "linear_srgb_of_moments", "code_error", "_init_worker", "solve_code",
                "_coarse_line", "interpolation_axis", "interpolate", "_lut_plane", "lut_header", "generate_luts")
 LUT_OUTPUTS = ("FourierSRGB256.bin", "FourierSRGB86.bin")
+# The default outputs: the coarse grid (about 100 s on 10 processes, once) and the cheap ones.
+COARSE_SOURCES = ("verify_inputs", "read_table", "resample", "parse_warp", "inverse3", "apply3", "Data",
+                  "lagrange3", "moments_of_lagrange", "clamp_moments", "srgb_eotf", "srgb_oetf", "code_target",
+                  "rgb_of_lagrange", "rgb_and_jacobian", "solve3", "solve_lagrange", "_init_worker", "solve_code",
+                  "_coarse_line", "lut_header", "generate_coarse")
+DEFAULT_OUTPUTS = ("FourierSRGB86.bin", "SpectralTables.metal")
 
 
-def lut_cache_key():
+def generate_coarse(workers):
+    """The exactly solved 86^3 grid alone (bit-identical to the one generate_luts writes)."""
+    with multiprocessing.get_context("spawn").Pool(workers, _init_worker) as pool:
+        results = pool.map(_coarse_line, [(r, g) for r in COARSE_CODES for g in COARSE_CODES], chunksize=8)
+    coarse = array.array("d")
+    for chunk, _ in results:
+        coarse.frombytes(chunk)
+    coarse32 = array.array("f", coarse)
+    if sys.byteorder != "little":
+        coarse32.byteswap()
+    grid = lut_header(b"VTFSRGBC", COARSE_N, 32) + coarse32.tobytes()
+    return grid, {"coarseNodes": COARSE_N ** 3, "coarseMaxSolverResidual": max(w for _, w in results)}
+
+
+def lut_cache_key(sources=LUT_SOURCES):
     import inspect
     module = sys.modules[__name__]
     digest = hashlib.sha256()
-    for name in LUT_SOURCES:
+    for name in sources:
         digest.update(inspect.getsource(getattr(module, name)).encode())
     lut_parameters = {k: PARAMETERS[k] for k in ("format", "lambda", "epsilon", "lut", "coarseStep",
                                                    "momentNodes", "fixThreshold", "solverTolerance")}
@@ -765,12 +786,17 @@ def main(argv):
     target = pathlib.Path(argv[argv.index("--output") + 1]) if "--output" in argv else build_directory(ROOT) / "SpectralTables"
     workers = int(argv[argv.index("--jobs") + 1]) if "--jobs" in argv else (os.cpu_count() or 1)
     force = "--force" in argv
+    # FourierSRGB256.bin is opt-in: tests/SpectralTables.py checks it when present, the renderer and
+    # the bundle do not use it (docs/SPECTRAL_DESIGN.md, Decisions).
+    lut256 = "--lut256" in argv
     verify_inputs()
-    key, lut_key = cache_key(), lut_cache_key()
+    key, lut_key, coarse_key = cache_key(), lut_cache_key(), lut_cache_key(COARSE_SOURCES)
     target.mkdir(parents=True, exist_ok=True)
     with locked(target.parent / ".spectral-tables.lock"):
         previous = read_manifest(target)
-        if not force and previous.get("key") == key and outputs_match(target, previous, OUTPUTS):
+        have256 = previous.get("lutKey") == lut_key and outputs_match(target, previous, ("FourierSRGB256.bin",))
+        if not force and previous.get("key") == key and outputs_match(target, previous, DEFAULT_OUTPUTS) \
+                and (have256 or not lut256):
             print("Spectral tables up to date (%s)" % target)
             return 0
         started = time.time()
@@ -778,29 +804,49 @@ def main(argv):
         icdfs = [inverse_cdf(sampling_density(data, i)) for i in range(len(ILLUMINANTS))]
         include = msl_include(data, icdfs).encode()
         digests = {"SpectralTables.metal": hashlib.sha256(include).hexdigest()}
-        if not force and previous.get("lutKey") == lut_key and outputs_match(target, previous, LUT_OUTPUTS):
-            stats = previous["statistics"]
-            digests.update({name: previous["outputs"][name] for name in LUT_OUTPUTS})
-            print("Reusing the unchanged Fourier sRGB tables")
-        else:
-            print("Generating the Fourier sRGB tables with %d worker(s); this takes several minutes once" % workers)
+        stats = {}
+        if lut256 and (force or not have256):
+            print("Generating the Fourier sRGB tables (--lut256) with %d worker(s); this takes several minutes" % workers)
             lut, grid, stats = generate_luts(workers)
             stats["seconds"] = round(time.time() - started, 1)
             for name, payload in (("FourierSRGB256.bin", lut), ("FourierSRGB86.bin", grid)):
                 atomic_write(target / name, payload)
                 digests[name] = hashlib.sha256(payload).hexdigest()
+            have256 = True
+        else:
+            if have256:
+                digests["FourierSRGB256.bin"] = previous["outputs"]["FourierSRGB256.bin"]
+                stats.update({k: v for k, v in previous.get("statistics", {}).items() if k.startswith("lut")})
+            if not force and previous.get("coarseKey", previous.get("lutKey") if have256 else None) == coarse_key \
+                    and outputs_match(target, previous, ("FourierSRGB86.bin",)):
+                digests["FourierSRGB86.bin"] = previous["outputs"]["FourierSRGB86.bin"]
+                stats.update({k: v for k, v in previous.get("statistics", {}).items() if k.startswith("coarse")})
+                print("Reusing the unchanged Fourier sRGB grid")
+            else:
+                print("Solving the Fourier sRGB grid with %d worker(s); this takes about two minutes once" % workers)
+                grid, coarse_stats = generate_coarse(workers)
+                stats.update(coarse_stats)
+                stats["coarseSeconds"] = round(time.time() - started, 1)
+                atomic_write(target / "FourierSRGB86.bin", grid)
+                digests["FourierSRGB86.bin"] = hashlib.sha256(grid).hexdigest()
         atomic_write(target / "SpectralTables.metal", include)
+        outputs = DEFAULT_OUTPUTS + (("FourierSRGB256.bin",) if have256 else ())
         manifest = {
-            "key": key, "lutKey": lut_key, "parameters": PARAMETERS, "inputs": INPUTS,
-            "outputs": {name: digests[name] for name in OUTPUTS},
+            "key": key, "coarseKey": coarse_key, "parameters": PARAMETERS, "inputs": INPUTS,
+            "outputs": {name: digests[name] for name in outputs},
             "illuminants": [{"id": i[0], "label": i[1], "source": i[2], "column": i[3]} for i in ILLUMINANTS],
             "whiteXYZ": data.white, "xyzToLinearSRGB": data.xyz_to_rgb, "statistics": stats,
             "licenses": {"CIE data and derived tables": "CC BY-SA 4.0",
                          "Peters2019/XYZWarp.h phase warp": "BSD-3-Clause (Christoph Peters, 2019)"},
         }
+        if have256:
+            manifest["lutKey"] = lut_key
         atomic_write_text(target / "SpectralTables.json", json.dumps(manifest, indent=1) + "\n")
-        print("Spectral tables in %s: max 8-bit error %.3f, mean %.4f, %d exact re-solves" % (
-            target, stats["lutMax8BitError"], stats["lutMean8BitError"], stats["lutEntriesSolvedExactly"]))
+        if "lutMax8BitError" in stats:
+            print("Spectral tables in %s: 256^3 table max 8-bit error %.3f, mean %.4f, %d exact re-solves" % (
+                target, stats["lutMax8BitError"], stats["lutMean8BitError"], stats["lutEntriesSolvedExactly"]))
+        else:
+            print("Spectral tables in %s (coarse grid, max solver residual %.1e)" % (target, stats["coarseMaxSolverResidual"]))
     return 0
 
 

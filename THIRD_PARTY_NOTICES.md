@@ -104,7 +104,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## CIE colorimetric datasets (spectral tables; not yet bundled)
+## CIE colorimetric datasets (spectral tables)
 
 Colour-matching functions of the CIE 1931 standard colorimetric observer (CIE 2019,
 doi:10.25039/CIE.DS.xvudnb9b), CIE standard illuminants D65 (CIE 2019,
@@ -119,16 +119,19 @@ Unmodified copies with their metadata are in `Vendor/Spectral/CIE`. The tables t
 `scripts/generate_spectral_tables.py` writes to `build/SpectralTables` (resampled to 1 nm,
 normalized to luminance Y = 1, zero outside the tabulated range, combined into wavelength
 sampling tables and a sRGB-to-spectrum lookup) are adapted material and are licensed under
-CC BY-SA 4.0. Details, checksums and changes: `Vendor/Spectral/UPSTREAM.md`; see REFERENCES.md
+CC BY-SA 4.0. The application bundles two of them, `SpectralTables.metal` and
+`FourierSRGB86.bin`, under the same licence (CC BY-SA 4.0); the opt-in `FourierSRGB256.bin`
+is not bundled. Details, checksums and changes: `Vendor/Spectral/UPSTREAM.md`; see REFERENCES.md
 (CIEDATA).
 
-## Phase warp from Christoph Peters' bounded-MESE code (spectral tables; not yet bundled)
+## Phase warp from Christoph Peters' bounded-MESE code (spectral tables)
 
 `Vendor/Spectral/Peters2019/XYZWarp.h`, unmodified, from the supplementary code of
 "Spectral Rendering with the Bounded MESE and sRGB Data" (MAM 2019) and "Using Moments to
 Represent Bounded Signals for Spectral Rendering" (SIGGRAPH 2019):
 https://momentsingraphics.de/MAM2019.html. The generator reads its 95-entry `pXYZWarpEven`
-table, which `build/SpectralTables/SpectralTables.metal` reproduces. All other spectral code
+table, which `build/SpectralTables/SpectralTables.metal` (bundled as `SpectralTables.metal`)
+reproduces with the notice below. All other spectral code
 is a local implementation from the papers; see REFERENCES.md (PETERS2019, FOURIERSRGB2019).
 
 ```text

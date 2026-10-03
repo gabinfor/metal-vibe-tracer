@@ -4,8 +4,9 @@ cd -- "$(dirname -- "$0")"
 # One architecture for the executable and the bundled OIDN runtime.
 arch="$(uname -m)"
 python3 scripts/prepare_shaders.py
-# Spectral tables for the pending spectral mode (docs/SPECTRAL_DESIGN.md): generated once into
-# build/SpectralTables (several minutes), then reused; not yet bundled or read by the renderer.
+# Spectral tables for spectral light transport (docs/SPECTRAL_DESIGN.md): the coarse Fourier sRGB
+# grid is solved once into build/SpectralTables (about two minutes), then reused. The 96 MiB
+# FourierSRGB256.bin is an opt-in test reference (--lut256), never bundled.
 python3 scripts/generate_spectral_tables.py
 /usr/bin/python3 scripts/prepare_usd.py
 python3 scripts/prepare_oidn.py --arch "$arch"
@@ -22,6 +23,9 @@ cp build/ShaderResources/OpenPBR.metal "$stage/Contents/Resources/"
 cp Vendor/OpenPBR/LICENSE "$stage/Contents/Resources/OpenPBR-LICENSE"
 cp Vendor/OpenPBR/UPSTREAM.md "$stage/Contents/Resources/OpenPBR-UPSTREAM.md"
 cp THIRD_PARTY_NOTICES.md "$stage/Contents/Resources/THIRD_PARTY_NOTICES.md"
+# CC BY-SA 4.0 (CIE data) and BSD-3-Clause (Peters' phase warp); notices in THIRD_PARTY_NOTICES.md.
+cp build/SpectralTables/SpectralTables.metal build/SpectralTables/FourierSRGB86.bin "$stage/Contents/Resources/"
+cp Vendor/Spectral/UPSTREAM.md "$stage/Contents/Resources/Spectral-UPSTREAM.md"
 cp scripts/usd_bridge.py "$stage/Contents/Resources/"
 cp -RL build/OpenUSD "$stage/Contents/Resources/OpenUSD"
 cp Vendor/OpenUSD/UPSTREAM.md "$stage/Contents/Resources/OpenUSD-UPSTREAM.md"

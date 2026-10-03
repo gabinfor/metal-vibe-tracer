@@ -11,7 +11,7 @@ import platform
 import subprocess
 import sys
 
-from buildsupport import file_table
+from buildsupport import file_table, sha256_file
 
 app = pathlib.Path(sys.argv[1]).resolve()
 arch = sys.argv[2]
@@ -24,9 +24,29 @@ problems = []
 
 for path in [executable, contents / "Info.plist", resources / "OpenPBR.metal", resources / "usd_bridge.py",
              resources / "OpenUSD/VIBE_RUNTIME.json", resources / "OpenPBR-LICENSE",
-             resources / "THIRD_PARTY_NOTICES.md", oidn / "VIBE_RUNTIME.json"]:
+             resources / "THIRD_PARTY_NOTICES.md", oidn / "VIBE_RUNTIME.json",
+             resources / "SpectralTables.metal", resources / "FourierSRGB86.bin", resources / "Spectral-UPSTREAM.md"]:
     if not path.is_file():
         problems.append(f"missing {path.relative_to(app)}")
+
+# Spectral transport's tables: exactly the generator's outputs (their manifest's SHA-256), the
+# licences that cover them, and not the opt-in 96 MiB test table.
+try:
+    manifest = json.loads((app.parents[0] / "SpectralTables/SpectralTables.json").read_text())
+    for name in ("SpectralTables.metal", "FourierSRGB86.bin"):
+        if (resources / name).is_file() and sha256_file(resources / name) != manifest["outputs"][name]:
+            problems.append(f"{name} differs from build/SpectralTables")
+except (OSError, ValueError, KeyError) as error:
+    problems.append(f"spectral table manifest unreadable: {error}")
+if (resources / "FourierSRGB256.bin").exists():
+    problems.append("FourierSRGB256.bin is a test reference and must not be bundled")
+notices = (resources / "THIRD_PARTY_NOTICES.md").read_text() if (resources / "THIRD_PARTY_NOTICES.md").is_file() else ""
+for required in ("CC BY-SA 4.0", "Copyright (c) 2019, Christoph Peters"):
+    if required not in notices:
+        problems.append(f"THIRD_PARTY_NOTICES.md lacks {required!r} for the spectral tables")
+if (resources / "SpectralTables.metal").is_file() and "Copyright (c) 2019, Christoph Peters" not in \
+        (resources / "SpectralTables.metal").read_text():
+    problems.append("SpectralTables.metal lacks the BSD notice of its phase warp")
 
 # The bundle must be self-contained: no symlink may lead outside it.
 for path in contents.rglob("*"):

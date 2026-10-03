@@ -8,7 +8,8 @@ func fixBuildChecks() {
     // A working directory laid out like the repository, holding planted look-alike resources.
     let planted = manager.temporaryDirectory.appendingPathComponent("vibe-planted-" + UUID().uuidString, isDirectory: true)
     let resources = ["scripts/usd_bridge.py", "build/ShaderResources/OpenPBR.metal",
-                     "build/OIDN/lib/libOpenImageDenoise.2.dylib"]
+                     "build/OIDN/lib/libOpenImageDenoise.2.dylib", "build/SpectralTables/SpectralTables.metal",
+                     "build/SpectralTables/FourierSRGB86.bin"]
     for relative in resources {
         let url = planted.appendingPathComponent(relative)
         try? manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -42,6 +43,11 @@ func fixBuildChecks() {
     require(shader.contains("Modified by Metal Vibe Tracer") && shader.contains("Licensed under the Apache License"),
             "the shipped OpenPBR source keeps its modification notice and upstream per-file license comments")
     require(OIDNDenoiser.isAvailable, "Open Image Denoise loads from the repository runtime, not a planted library")
+    // Spectral transport's tables (bundled by build.sh) resolve like the other resources.
+    let tables = try? loadSpectralTablesSource()
+    require(tables.map { !$0.contains("#error planted") && $0.contains("CC BY-SA 4.0") && $0.contains("Copyright (c) 2019, Christoph Peters") } ?? false,
+            "SpectralTables.metal comes from the repository and keeps its licence notices")
+    require(((try? loadSpectralGrid())?.count ?? 0) == 86 * 86 * 86, "FourierSRGB86.bin comes from the repository, not the working directory")
     print("PASS: runtime resources resolve from the bundle or an explicit repository, never the working directory")
 }
 fixBuildChecks()
