@@ -6389,12 +6389,12 @@ enum SamplerMode: UInt32, Sendable {
     // Z++: Owen-scrambled 1D / 2D Sobol' and 3D O2m3 constituents indexed along a recursively
     // shuffled Morton curve, with Z++ temporal indexing (MSL z_pixel_key, Sampler).
     case zSampling = 1
-    // Host-side default: Z++ for every strategy and scene. It lowered static equal-sample MSE by
-    // 2-87% (Cornell glass within noise) for 1-4% more frame time, and kept the moving camera's
-    // per-frame and MetalFX error within +1% (mostly lower); see tests/PERFORMANCE.md.
+    // Host-side default: PCG for now. The current Z++ implementation shows block-shaped correlated
+    // noise at low sample counts (most visible with spectral transport), so Automatic resolves to
+    // PCG until that is fixed; Z++ stays selectable. See tests/PERFORMANCE.md.
     case automatic = 2
     func resolved() -> SamplerMode {
-        self == .automatic ? .zSampling : self
+        self == .automatic ? .pcg : self
     }
 }
 
