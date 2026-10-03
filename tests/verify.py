@@ -49,6 +49,7 @@ PARTS = [
     ('Fix_spmis.swift', {'full'}),
     ('Fix_restcv.swift', {'full'}),
     ('Fix_zsampling.swift', {'full'}),
+    ('Fix_zsampler-blocks.swift', {'full'}),
     ('Fix_ui-modes.swift', {'full', 'studio'}),
     ('Fix_spectral.swift', {'full', 'studio'}),
 ]

@@ -109,6 +109,8 @@ With **Light transport → RGB** (and Automatic in RGB scenes) every procedural 
 
 # Z++ sampler — October 2, 2026
 
+**Update, October 3 (not yet GPU-validated at equal time):** the measurements below predate the key layout fix (`REFERENCES.md` `ZPP2026`, "One key per pixel and frame"). Before the fix, still accumulations shared sample sets across aligned pixel blocks and showed square tiles. Pavilion, ReSTIR GI, spectral, 390 × 370, mean of 2 seed sequences, linear MSE against a 4,096-frame MIS reference at 4 / 16 / 64 frames: PCG 5.45 / 1.46 / 0.368, Z++ before the fix 7.13 / 1.66 / 0.320, after the fix 4.78 / 1.12 / 0.266. Tone-mapped MSE at 64 frames: 1.57e-3 / 1.39e-3 / 1.39e-3. Adjacent-pixel error correlation at 64 frames: 0.08 / 0.38 / 0.10. Frame-time measurements were contended by other GPU work and are not reported. **Sampler → Automatic** resolves to PCG until the tables below are re-measured.
+
 The Z++ sampler (`REFERENCES.md` `ZPP2026`; `SamplerMode.zSampling`, **Sampler → Z++**) against the earlier per-pixel PCG streams (`SamplerMode.pcg`). Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `1124b00` plus this change (uncommitted at measurement; the shaders measured equal the committed ones except that the static and timing runs used the PerPixel temporal model, which renders still views statistically identically to the default ReShuffle-like model; and, before the last change, every accumulation shared one Owen scramble, which leaves error magnitudes unchanged; the bias runs below use the final shaders). Scratch drivers render through the production `renderFrame` path at 320×240 (errors) and 640×480 (times), path depth 16; other GPU work shared the machine. The unedited figures are in [`PERFORMANCE-zsampling-raw.txt`](PERFORMANCE-zsampling-raw.txt).
 
 ## Static accumulation (equal sample count)
@@ -161,7 +163,7 @@ No GPU memory is added: the sampler state lives in registers, and ReSTIR PT keep
 
 ## Default
 
-`SamplerMode.automatic` resolves to Z++ for every strategy and scene: it lowered static equal-sample MSE in 22 of 23 measured scene/strategy pairs (Cornell glass & mirror with ReSTIR GI: +0.3%) at 256 frames, for 0.4–4.9% more frame time, and kept moving-camera errors within about +1% (MetalFX −12% to +1%). `VIBE_SAMPLER=pcg|z` and `VIBE_Z_TEMPORAL=perpixel|tz|stz|reshuffle` select the variants in `-D VIBE_TESTING` builds.
+`SamplerMode.automatic` resolved to Z++ until October 3, 2026 (now PCG; see the update above): it lowered static equal-sample MSE in 22 of 23 measured scene/strategy pairs (Cornell glass & mirror with ReSTIR GI: +0.3%) at 256 frames, for 0.4–4.9% more frame time, and kept moving-camera errors within about +1% (MetalFX −12% to +1%). `VIBE_SAMPLER=pcg|z` and `VIBE_Z_TEMPORAL=perpixel|tz|stz|reshuffle` select the variants in `-D VIBE_TESTING` builds.
 
 # Spatio-temporal control variates (ReSTCV) — September 29, 2026
 
