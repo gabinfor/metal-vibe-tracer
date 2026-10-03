@@ -58,11 +58,15 @@
         three[gid.y * u.width + gid.x] = float4(c, 0.0f);
     }
     // PCG-mode Sampler against the uint streams: lens, lights, BSDFs, DI candidates, fog and
-    // ReSTIR PT streams must draw identical numbers (counts of mismatching trials). RGB library
-    // only (spectral transport draws the same numbers; its helpers need a wavelength context).
-    #if !VIBE_SPECTRAL
+    // ReSTIR PT streams must draw identical numbers (counts of mismatching trials), in the RGB and
+    // the spectral library (the default transport), whose helpers take the scene's spectral context.
+    #if VIBE_SPECTRAL
+    #define Z_WAVELENGTHS SPECTRAL_CONTEXT(u, images)
+    #else
+    #define Z_WAVELENGTHS Wavelengths()
+    #endif
     kernel void z_pcg_equivalence(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(1)]],
-                                  device atomic_uint *mismatches [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+                                  device atomic_uint *mismatches [[buffer(2)]] SPECTRAL_BUFFERS, uint id [[thread_position_in_grid]]) {
         uint2 gid = uint2(id % u.width, id / u.width);
         Sampler s = pixel_sampler(gid, u);
         uint seed = (gid.y * u.width + gid.x) ^ (u.sampleIndex * 1999999973u);
@@ -82,15 +86,15 @@
         float3 view = normalize(float3(0.3f, -1, 0.2f));
         for (int k = 0; k < 3; ++k) {
             Material q = k == 0 ? m : k == 1 ? d : g;
-            float3 d1, w1, d2, w2; float p1, p2;
-            bool r1 = sample_bsdf(q, n, view, true, seed, d1, w1, p1, Wavelengths()), r2 = sample_bsdf(q, n, view, true, s, d2, w2, p2, Wavelengths());
+            float3 d1, d2; Spectrum w1, w2; float p1, p2;
+            bool r1 = sample_bsdf(q, n, view, true, seed, d1, w1, p1, Z_WAVELENGTHS), r2 = sample_bsdf(q, n, view, true, s, d2, w2, p2, Z_WAVELENGTHS);
             same = same && r1 == r2 && (!r1 || (all(d1 == d2) && p1 == p2));
         }
         HitRecord rec = {}; rec.position = p; rec.normal = n; rec.geometricNormal = n; rec.mat = d; rec.front_face = true;
-        DIReservoir c1 = restir_di_initial(rec, view, u, seed, images, Wavelengths()), c2 = restir_di_initial(rec, view, u, s, images, Wavelengths());
+        DIReservoir c1 = restir_di_initial(rec, view, u, seed, images, Z_WAVELENGTHS), c2 = restir_di_initial(rec, view, u, s, images, Z_WAVELENGTHS);
         same = same && c1.weightSum == c2.weightSum && all(c1.sample.position == c2.sample.position);
         Ray fogRay = { float3(0, 0, 3), normalize(float3(0.05f, 0.1f, -1)) };
-        same = same && all(apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, seed, images, Wavelengths()) == apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, s, images, Wavelengths()));
+        same = same && all(apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, seed, images, Z_WAVELENGTHS) == apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, s, images, Z_WAVELENGTHS));
         same = same && seed == s.state;
         uint key = pcg_hash(id * 7919u + 3u);
         uint streamA = pt_seed(key, 2u, 0u);
@@ -98,7 +102,6 @@
         same = same && all(rand_f3(streamA) == rand_f3(streamB)) && rand_f(streamA) == rand_f(streamB);
         if (!same) atomic_fetch_add_explicit(mismatches, 1u, memory_order_relaxed);
     }
-    #endif
     // Z mode: replaying a ReSTIR PT stream from its key reproduces its numbers; the two passes'
     // events and every PT stream draw different numbers from the same key; the lens event is
     // shared by both passes (it defines the pixel's primary ray).
@@ -301,6 +304,30 @@
     }
   }
   require(mismatches.contents().load(as: UInt32.self) == 0, "the PCG-mode Sampler draws the previous uint streams exactly")
+  // The same in a spectral library (the default light transport), bound to the renderer's spectral state.
+  if renderer.spectralShaders.grid == nil || renderer.spectralSampling == nil {
+    let transport = renderer.lightTransport
+    renderer.lightTransport = .spectral
+    _ = render(makeUniforms(scene: 1, mode: 0, width: 8, height: 8), samples: 1)
+    renderer.lightTransport = transport
+  }
+  let spectralZ = try gpu.makeComputePipelineState(function: rendererShaderLibrary(kernels, spectral: true).makeFunction(name: "z_pcg_equivalence")!)
+  for scene: UInt32 in [0, 1, 2] {
+    var u = makeUniforms(scene: scene, mode: 1, width: 64, height: 64, fog: 1)
+    u.lens.x = 0.05; u.sampleIndex = 17
+    var words = renderer.spectralSceneWords()
+    let command = renderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(spectralZ)
+    encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0); renderer.materials.bind(encoder)
+    encoder.setBuffer(mismatches, offset: 0, index: 2)
+    encoder.setBytes(&words, length: words.count * 4, index: 27)
+    encoder.setBuffer(renderer.spectralShaders.grid!, offset: 0, index: 28)
+    encoder.setBuffer(renderer.spectralSampling!, offset: 0, index: 29)
+    encoder.dispatchThreads(MTLSize(width: 64 * 64, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    require(command.status == .completed, "spectral z_pcg_equivalence completes: \(String(describing: command.error))")
+  }
+  require(mismatches.contents().load(as: UInt32.self) == 0, "the PCG-mode Sampler draws the previous uint streams exactly in spectral libraries")
   let counts = gpu.makeBuffer(length: 12, options: .storageModeShared)!
   memset(counts.contents(), 0, 12)
   var zu = makeUniforms(scene: 1, mode: 0, width: 128, height: 96)

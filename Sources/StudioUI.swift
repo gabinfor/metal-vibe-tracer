@@ -243,9 +243,9 @@ final class StudioController: NSViewController {
   static let lightTransportChoices: [(mode: LightTransport, title: String)] = [
     (.automatic, "Automatic"), (.spectral, "Spectral"), (.rgb, "RGB"),
   ]
-  // Placeholder figures are replaced from tests/PERFORMANCE.md (Spectral light transport).
+  // Figures from tests/PERFORMANCE.md (Spectral transport cost).
   static let lightTransportHelp =
-    "Spectral traces four wavelengths per path: illuminant presets (sodium, fluorescent, LED, incandescent), dispersion and thin film render physically, and saturated colours interreflect without RGB's errors, for more frame time and some colour noise per frame. RGB scenes look the same either way. Automatic uses Spectral only where the scene needs it. The spectral shaders compile in the background the first time."
+    "Spectral traces four wavelengths per path: illuminant presets (sodium, fluorescent, LED, incandescent), dispersion and thin film render physically, and saturated colours interreflect without RGB's errors, for about a third more frame time and some colour noise per frame. Automatic uses Spectral. RGB is faster and renders RGB-lit scenes almost the same; it ignores presets, dispersion and thin film. The spectral shaders compile in the background the first time."
   // Emitter spectra (StudioOptions.lightSpectrum / sunSpectrum): nil is the RGB colour.
   static let illuminantTitles = [
     "RGB colour", "E (equal energy)", "D65 (daylight)", "A (incandescent, 2856 K)", "FL11 (narrow-band fluorescent)",

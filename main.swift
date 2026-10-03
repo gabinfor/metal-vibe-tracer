@@ -6404,13 +6404,11 @@ enum SamplerMode: UInt32, Sendable {
 enum LightTransport: UInt32, Sendable {
     case rgb = 0
     case spectral = 1
-    // Host-side default: spectral only where the scene needs wavelengths (an illuminant preset other
-    // than D65, dispersion or thin film), RGB elsewhere: spectral transport cost 6-71% more frame
-    // time (1.15-1.71x the time to equal error) for RGB scenes (tests/PERFORMANCE.md).
+    // Host-side default: spectral for every scene (since 2026-10-03). It renders presets, dispersion
+    // and thin film, and interreflections of saturated colours without RGB's error, and looks like RGB
+    // elsewhere, for 25-35% more frame time on the M4 (tests/PERFORMANCE.md, "Spectral transport cost").
     case automatic = 2
-    func resolved(sceneNeedsSpectral: Bool) -> LightTransport {
-        self == .automatic ? (sceneNeedsSpectral ? .spectral : .rgb) : self
-    }
+    func resolved() -> LightTransport { self == .automatic ? .spectral : self }
 }
 
 // Emitter spectra of spectral transport (MSL VibeIlluminant, normalized to luminance one). An
@@ -7473,13 +7471,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         didSet { if oldValue != lightTransport { resetAccumulation() } }
     }
     var activeLightTransport: LightTransport { resolvedLightTransport(lightTransport) }
-    func resolvedLightTransport(_ mode: LightTransport) -> LightTransport { mode.resolved(sceneNeedsSpectral: sceneNeedsSpectral) }
-    // Lights with an illuminant preset, and materials with dispersion or thin film, need wavelengths.
-    var sceneNeedsSpectral: Bool {
-        let weights = spectralIlluminantWeights()
-        return weights.enumerated().contains { $0.offset != Int(Illuminant.d65.rawValue) && $0.element > 0 }
-            || materials.spectralMaterials.contains { $0.x > 0 || $0.y > 0 }
-    }
+    func resolvedLightTransport(_ mode: LightTransport) -> LightTransport { mode.resolved() }
     // Whether the scene has area or sphere lights or imported emitters (StudioOptions.lightSpectrum),
     // and a sun (StudioOptions.sunSpectrum).
     var sceneHasLights: Bool { (1...5).contains(sceneIndex) || (sceneIndex == 6 && materials.hasEmitters) }

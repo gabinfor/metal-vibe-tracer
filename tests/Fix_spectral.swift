@@ -1,5 +1,5 @@
 // Spectral light transport (REFERENCES.md PETERSBLOG2025, PETERS2019, FOURIERSRGB2019, HERO2014, CIEDATA;
-// docs/SPECTRAL_DESIGN.md, Sec. 9): the transport seam, Automatic and the RGB kernels; the runtime colour
+// docs/SPECTRAL_DESIGN.md, Sec. 9): the transport seam, Automatic (spectral) and the RGB kernels; the runtime colour
 // conversion's round trip over every 8-bit code (the coarse grid replacing FourierSRGB256); the
 // four-wavelength estimator under a monochromatic spectrum; grey-world parity with RGB; colour round
 // trips in renders; illuminant presets; Cauchy dispersion and the hero wavelength's unbiasedness;
@@ -22,31 +22,24 @@
   let seam: LightTransport = ["rgb": .rgb, "spectral": .spectral][ProcessInfo.processInfo.environment["VIBE_LIGHT_TRANSPORT"] ?? ""]
     ?? .automatic
   require(PathTracerRenderer.defaultLightTransport == seam, "the default light transport follows the VIBE_LIGHT_TRANSPORT seam")
-  require(LightTransport.automatic.resolved(sceneNeedsSpectral: false) == .rgb
-    && LightTransport.automatic.resolved(sceneNeedsSpectral: true) == .spectral
-    && LightTransport.rgb.resolved(sceneNeedsSpectral: true) == .rgb && LightTransport.spectral.resolved(sceneNeedsSpectral: false) == .spectral,
-    "Automatic is spectral only where the scene needs wavelengths; explicit choices are kept")
+  require(LightTransport.automatic.resolved() == .spectral && LightTransport.rgb.resolved() == .rgb
+    && LightTransport.spectral.resolved() == .spectral, "Automatic is spectral; explicit choices are kept")
   r.materials.settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
   r.materials.spectralOverrides = [:]
   r.lightTransport = .automatic
   r.sceneIndex = 1
   var o = StudioOptions()
   r.options = o
-  require(!r.sceneNeedsSpectral && r.activeLightTransport == .rgb, "an RGB Cornell box resolves Automatic to RGB")
+  require(r.activeLightTransport == .spectral && r.spectralIlluminantWeights() == [0, 1, 0, 0, 0, 0],
+    "an RGB Cornell box traces spectrally under Automatic, sampling D65")
   o.lightSpectrum = Illuminant.hp1.rawValue; r.options = o
-  require(r.sceneNeedsSpectral && r.activeLightTransport == .spectral, "a sodium light makes Automatic spectral")
-  o.lightSpectrum = Illuminant.d65.rawValue; r.options = o
-  require(!r.sceneNeedsSpectral, "a D65 preset is the RGB colour's own spectrum")
+  require(r.activeLightTransport == .spectral && r.spectralIlluminantWeights() == [0, 0, 0, 0, 1, 0], "a sodium light is sampled alone")
   r.sceneIndex = 0
   o.lightSpectrum = Illuminant.fl11.rawValue; r.options = o
-  require(!r.sceneNeedsSpectral, "the Pavilion has no area light, so the light spectrum does not matter there")
+  require(r.spectralIlluminantWeights() == [0, 1, 0, 0, 0, 0], "the Pavilion has no area light, so the light spectrum does not matter there")
   o.sunSpectrum = Illuminant.a.rawValue; r.options = o
-  require(r.sceneNeedsSpectral && r.spectralIlluminantWeights() == [0, 1, 1, 0, 0, 0],
-    "an incandescent sun makes the Pavilion spectral, sampling D65 (sky) and A (sun) equally")
+  require(r.spectralIlluminantWeights() == [0, 1, 1, 0, 0, 0], "an incandescent sun samples D65 (sky) and A (sun) equally")
   r.options = StudioOptions()
-  r.materials.spectralOverrides = [5: SIMD4(1, 0, 0.5, 1.4)]
-  require(r.sceneNeedsSpectral, "a dispersive material needs wavelengths")
-  r.materials.spectralOverrides = [:]
   require(Illuminant.resolved(nil) == .d65 && Illuminant.resolved(9) == .d65 && Illuminant.resolved(4) == .hp1,
     "a missing or unknown preset is the RGB colour (D65)")
   require(PathTracerRenderer.spectralGridNodes.count == 86 && PathTracerRenderer.spectralGridNodes[0] == 0
@@ -76,6 +69,8 @@
   require(old.lightTransport == nil && old.restirModes.lightTransport == ReSTIRModes.defaults.lightTransport
     && old.options.lightSpectrum == nil && old.options.sunSpectrum == nil,
     "projects written before the fields open with the default transport and RGB-coloured lights")
+  require(seam != .automatic || old.restirModes.lightTransport.resolved() == .spectral,
+    "projects written before the field (or with Automatic) now render spectrally")
   for (key, value, inOptions) in [("lightTransport", 3, false), ("lightSpectrum", 6, true), ("sunSpectrum", 99, true)] {
     var bad = object
     if inOptions { var opts = bad["options"] as! [String: Any]; opts[key] = value; bad["options"] = opts } else { bad[key] = value }
@@ -123,19 +118,19 @@
   let rgbImage = render(cornell, samples: 4)
   require(!r.spectralFrame && r.sceneKernels.shading === r.proceduralKernels.shading,
     "RGB frames use the RGB pipelines")
-  r.lightTransport = .automatic
-  let automaticImage = render(cornell, samples: 4)
-  require(!r.spectralFrame && zip(rgbImage, automaticImage).allSatisfy { $0 == $1 },
-    "Automatic renders an RGB scene bit for bit like RGB")
   r.lightTransport = .spectral
-  _ = render(cornell, samples: 1)
+  let spectralImage = render(cornell, samples: 4)
   require(r.spectralFrame && r.spectralShaders.kernels != nil && r.sceneKernels.shading !== r.proceduralKernels.shading,
     "Spectral frames use the spectral pipelines")
+  r.lightTransport = .automatic
+  let automaticImage = render(cornell, samples: 4)
+  require(r.spectralFrame && zip(spectralImage, automaticImage).allSatisfy { $0 == $1 } && !zip(rgbImage, automaticImage).allSatisfy { $0 == $1 },
+    "Automatic renders spectrally, bit for bit like Spectral")
   require(r.spectralShaders.grid?.length == Int(PathTracerRenderer.spectralGridBytes) && r.spectralShaders.refined
     && r.spectralShaders.refinedCells > 0 && r.spectralShaders.refinedCells < PathTracerRenderer.spectralRefinedCapacity,
     "the moment grid (86^3 float4 and refined blocks) is loaded and refined (\(r.spectralShaders.refinedCells) cells)")
   print("Spectral grid: \(r.spectralShaders.refinedCells) of 614,125 cells refined (0.35-step threshold)")
-  print("PASS: fix-spectral RGB and Automatic share the RGB kernels; Spectral compiles its own")
+  print("PASS: fix-spectral RGB keeps the RGB kernels; Spectral and Automatic share the spectral ones")
 
   // --- Kernel checks in a spectral library ----------------------------------------------------
   let tables = try loadSpectralTablesSource()
@@ -613,7 +608,8 @@
   history.removeAllActions()
   controller.page = 0
   controller.rebuild()
-  let automatic = testRenderer.resolvedLightTransport(.automatic) == .spectral ? "Spectral" : "RGB"
+  require(testRenderer.resolvedLightTransport(.automatic) == .spectral, "Automatic resolves to Spectral")
+  let automatic = "Spectral"
   require(popup("Light transport").itemTitles == ["Automatic (currently: \(automatic))", "Spectral", "RGB"]
     && popup("Light transport").isEnabled && !(popup("Light transport").toolTip ?? "").isEmpty,
     "the Render page offers Automatic, Spectral and RGB light transport")
@@ -636,7 +632,7 @@
   testRenderer.lightTransport = .automatic
   pick("Light spectrum", 5)
   require(testRenderer.options.lightSpectrum == Illuminant.hp1.rawValue && testRenderer.activeLightTransport == .spectral
-    && history.undoActionName == "Light spectrum", "a sodium light spectrum switches Automatic to spectral, with one undo step")
+    && history.undoActionName == "Light spectrum", "a sodium light spectrum keeps Automatic spectral, with one undo step")
   history.undo()
   require(testRenderer.options.lightSpectrum == nil, "undo restores the RGB colour")
   pick("Sun spectrum", 3)
