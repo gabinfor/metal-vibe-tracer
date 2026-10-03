@@ -1,3 +1,58 @@
+# Spectral light transport — October 3, 2026
+
+Spectral transport (`REFERENCES.md` `PETERSBLOG2025`, `PETERS2019`, `FOURIERSRGB2019`, `HERO2014`, `CIEDATA`; `LightTransport.spectral`, **Light transport → Spectral**; [docs/SPECTRAL_DESIGN.md](../docs/SPECTRAL_DESIGN.md)) against RGB transport. Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `6ed36c2` plus this change (uncommitted at measurement; the shaders measured equal the committed ones up to the near-grey shortcut of `spectral_lagrange`, which changed the grey-world means by less than 0.01%). Scratch drivers render through the production `renderFrame` path, path depth 16, the default Z++ sampler. The unedited figures are in [`PERFORMANCE-spectral-raw.txt`](PERFORMANCE-spectral-raw.txt).
+
+## Frame time
+
+Median GPU frame time at 640×480 (frames 5–12):
+
+| Scene, strategy | RGB | Spectral | Change |
+| --- | ---: | ---: | ---: |
+| Cornell, ReSTIR GI | 12.56 ms | 17.96 ms | +43% |
+| Cornell glass & mirror, ReSTIR GI | 13.41 ms | 18.95 ms | +41% |
+| Pavilion, MIS | 23.27 ms | 31.21 ms | +34% |
+| Pavilion, ReSTIR GI | 27.68 ms | 41.49 ms | +50% |
+| Pavilion, coated floor, ReSTIR GI | 35.06 ms | 53.20 ms | +52% |
+| Imported UV sphere, unified ReSTIR PT | 13.70 ms | 23.47 ms | +71% |
+
+A second run (the equal-time table below) measured +6% to +48% for the same scenes, and `tests/Fix_spectral.swift` +13% to +44% at 320×240: the overhead is large everywhere, against Peters' 2–36% (≤ 0.3 ms) on an RTX 5070 Ti. Disabling parts in turn attributed it roughly to colour conversions at every vertex (≈ 30 points: the grid's eight loads and the bounded MESE per base colour, specular colour and emitter) and register pressure from float4 throughput and the second OpenPBR preparation (≈ 10 points). Caching the conversions per vertex or per kernel made frames 5–30% slower (more registers in the path loops) and was reverted; the host solves the area light's multipliers once per frame instead.
+
+## Error at equal sample count and equal time
+
+Linear MSE of 64 accumulated frames at 160×120 (default strategy: ReSTIR, the scene's default indirect reuse) against a 2,048-frame MIS reference of the same transport, mean of 3 independent sequences; equal-time ratio = spectral MSE × time / (RGB MSE × time):
+
+| Scene | MSE RGB | MSE spectral | Equal samples | Frame time | Equal time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cornell | 2.461e-4 | 2.675e-4 | ×1.09 | +6% | ×1.15 |
+| Cornell glass & mirror | 4.975e-3 | 5.358e-3 | ×1.08 | +32% | ×1.42 |
+| Pavilion | 0.2289 | 0.2529 | ×1.10 | +48% | ×1.64 |
+| Pavilion, coated floor | 0.3299 | 0.3346 | ×1.01 | +43% | ×1.45 |
+| Imported UV sphere | 5.298e-4 | 6.550e-4 | ×1.24 | +38% | ×1.71 |
+
+Four stratified, importance-sampled wavelengths add 1–24% colour noise per sample; with the frame time, spectral transport needs 1.15–1.71 times RGB's time for the same error in these RGB-defined scenes.
+
+## Converged RGB against spectral
+
+The two transports' 2,048-frame MIS references differ by what RGB gets wrong in interreflections of coloured surfaces (relative mean, RGB / spectral − 1, R, G, B): Cornell +1.2%, +0.3%, +1.0%; Cornell glass & mirror +1.8%, +0.2%, +0.7%; Pavilion +3.0%, −0.4%, +1.5% (coated floor the same); imported UV sphere (grey) −0.1%, +0.1%, 0.0%. In a grey world (grey OpenPBR room, white light) the transports agree within 0.3% of the mean, 2–4 tile-clustered standard errors (`tests/Fix_spectral.swift`), and six test colours rendered on a wall round-trip within 0.05 8-bit steps beyond three standard errors. The light and sun presets render their 1 nm reference colours within 1.3 standard errors per channel.
+
+Spectral ReSTIR keeps RGB ReSTIR's bias against MIS of the same transport (relative, R, G, B, coloured Cornell box, ± standard error ≈ 0.15%): ReSTIR GI +1.43, +1.78, +1.18% (RGB +1.38, +1.71, +1.28%); ReSTIR PT +0.51, +0.10, +0.12% (RGB +0.60, +0.07, +0.24%); unified ReSTIR PT +0.71, +0.03, +0.27% (RGB +0.70, +0.05, +0.37%); with ReSTCV +0.57, +0.12, +0.05% (RGB +0.67, +0.08, +0.18%); with stochastic pairwise MIS +0.76, −0.05, +0.19% (RGB +0.73, −0.03, +0.30%); ReSTIR GI with stochastic pairwise MIS +0.41, +0.68, +0.41% (RGB +0.39, +0.59, +0.46%). Paths shifted back into their own pixel reproduce F in 99.6–100% of cases, as in RGB.
+
+## Colour conversion
+
+Round trip of every 8-bit sRGB code (16,777,216) through the renderer's float32 conversion with relaxed math (`tests/Fix_spectral.swift`): max 0.459 8-bit steps, mean 0.012; 22 codes above 0.4, none above 0.5. Without the refinement the coarse grid's trilinear interpolation reached 0.787 steps at the gamut boundary (also in double precision); the 5,189 cells (of 614,125) worse than 0.35 steps are solved exactly at load in 369 ms. Monochromatic 500 nm light reproduces its CMF colour within 2e-5.
+
+## Memory and build
+
+Spectral transport allocates 18.6 MB per device (the 86³ float4 moment grid, 10.2 MB, plus room for 8,192 refined 4×4×4 blocks, 8.4 MB) and a 15 KB sampling buffer per renderer, all on first use; `renderMemoryError` counts them. No reservoir grows. The app bundles `FourierSRGB86.bin` (7.6 MB) and `SpectralTables.metal` (154 KB); the 256³ table (101 MB) is no longer generated by `build.sh` or bundled. The first build solves the grid in about 100 s (10 processes) instead of about 470 s for the grid and the 256³ table. The two spectral libraries compile concurrently in 2.9 s cold (in the background in the application).
+
+## Equivalence against `main`
+
+With **Light transport → RGB** (and Automatic in RGB scenes) every procedural `tests/benchmark.py` scenario renders mean radiance identical to `6ed36c2` at zero tolerance (Pavilion default, MIS, coated floor and orbiting, Cornell; MetalFX on and off). The scene-6 scenarios differ by up to 0.09% because the benchmark forces the baseline onto the flat BVH, as in the Z++ section above. RGB frame times are within −2% to +0% of `6ed36c2` on the procedural scenarios (for example Pavilion 28.04 → 27.81 ms, Cornell 12.60 → 12.53 ms); the scene-6 baseline times use the flat BVH and are not comparable.
+
+## Default
+
+`LightTransport.automatic` resolves to spectral only where the scene needs wavelengths: a light or sun preset other than D65, or dispersion or thin film on a material. Everywhere else it traces RGB, because spectral transport costs 6–71% more frame time and 1.15–1.71 times the time to equal error, for differences that are RGB's interreflection error (up to 3% in one channel in the Pavilion) rather than visible effects. `VIBE_LIGHT_TRANSPORT=rgb|spectral` selects the transport in `-D VIBE_TESTING` builds.
+
 # Z++ sampler — October 2, 2026
 
 The Z++ sampler (`REFERENCES.md` `ZPP2026`; `SamplerMode.zSampling`, **Sampler → Z++**) against the earlier per-pixel PCG streams (`SamplerMode.pcg`). Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `1124b00` plus this change (uncommitted at measurement; the shaders measured equal the committed ones except that the static and timing runs used the PerPixel temporal model, which renders still views statistically identically to the default ReShuffle-like model; and, before the last change, every accumulation shared one Owen scramble, which leaves error magnitudes unchanged; the bias runs below use the final shaders). Scratch drivers render through the production `renderFrame` path at 320×240 (errors) and 640×480 (times), path depth 16; other GPU work shared the machine. The unedited figures are in [`PERFORMANCE-zsampling-raw.txt`](PERFORMANCE-zsampling-raw.txt).

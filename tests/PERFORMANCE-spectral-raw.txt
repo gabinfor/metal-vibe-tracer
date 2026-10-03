@@ -1,0 +1,137 @@
+# Spectral light transport raw output, October 3, 2026 (Apple M4, macOS 27.0)
+
+## Equal-sample / equal-time error and converged comparison (scratch driver equaltime: 160x120, 64 frames x 3 independent sequences against 2048-frame MIS references per transport; frame time 640x480 median)
+Spectral pipelines, cold concurrent compile of both libraries: 2.9 s
+Grid refinement: 369 ms, 5189 cells
+Cornell: 64 frames, MSE RGB 0.0002461, spectral 0.0002675 (x1.09); frame 640x480 RGB 17.68 ms, spectral 18.72 ms (+6%); equal-time MSE ratio x1.15
+Cornell: converged RGB vs spectral MIS: mean (0.2098, 0.1344, 0.0823) vs (0.2073, 0.1340, 0.0815) = +1.22%, +0.30%, +0.97%; RMS difference 0.003733 (spectral reference noise MSE ~ 8.36e-06)
+Cornell glass & mirror: 64 frames, MSE RGB 0.004975, spectral 0.005358 (x1.08); frame 640x480 RGB 14.76 ms, spectral 19.50 ms (+32%); equal-time MSE ratio x1.42
+Cornell glass & mirror: converged RGB vs spectral MIS: mean (0.1935, 0.1155, 0.0797) vs (0.1901, 0.1152, 0.0792) = +1.79%, +0.21%, +0.67%; RMS difference 0.005949 (spectral reference noise MSE ~ 0.000167)
+Pavilion: 64 frames, MSE RGB 0.2289, spectral 0.2529 (x1.10); frame 640x480 RGB 27.48 ms, spectral 40.77 ms (+48%); equal-time MSE ratio x1.64
+Pavilion: converged RGB vs spectral MIS: mean (1.6814, 1.0377, 0.6408) vs (1.6319, 1.0418, 0.6314) = +3.03%, -0.40%, +1.49%; RMS difference 0.05272 (spectral reference noise MSE ~ 0.0079)
+Pavilion, coated floor: 64 frames, MSE RGB 0.3299, spectral 0.3346 (x1.01); frame 640x480 RGB 34.60 ms, spectral 49.39 ms (+43%); equal-time MSE ratio x1.45
+Pavilion, coated floor: converged RGB vs spectral MIS: mean (1.9554, 1.1997, 0.7513) vs (1.8985, 1.2044, 0.7405) = +3.00%, -0.39%, +1.46%; RMS difference 0.05776 (spectral reference noise MSE ~ 0.0105)
+Imported UV sphere: 64 frames, MSE RGB 0.0005298, spectral 0.000655 (x1.24); frame 640x480 RGB 16.56 ms, spectral 22.85 ms (+38%); equal-time MSE ratio x1.71
+Imported UV sphere: converged RGB vs spectral MIS: mean (0.7895, 0.5786, 0.4610) vs (0.7902, 0.5781, 0.4610) = -0.09%, +0.09%, -0.01%; RMS difference 0.002214 (spectral reference noise MSE ~ 2.05e-05)
+
+## Frame time, 640x480, per strategy (scratch driver timing)
+Pavilion GI: RGB 27.68 ms, spectral 41.49 ms (+49.9%)
+Pavilion coated floor: RGB 35.06 ms, spectral 53.20 ms (+51.7%)
+Cornell GI: RGB 12.56 ms, spectral 17.96 ms (+43.0%)
+Cornell glass: RGB 13.41 ms, spectral 18.95 ms (+41.3%)
+Pavilion MIS: RGB 23.27 ms, spectral 31.21 ms (+34.2%)
+UV sphere unified PT: RGB 13.70 ms, spectral 23.47 ms (+71.3%)
+
+## tests/Fix_spectral.swift
+PASS: runtime shader compilation on Apple M4
+PASS: fix-spectral seam, Automatic resolution and illuminant weights
+PASS: fix-spectral project round trips, legacy files and validation
+PASS: fix-spectral MaterialX dispersion and thin-film inputs
+PASS: fix-spectral Render and Lighting controls, undo and exports
+Spectral grid: 5189 of 614,125 cells refined (0.35-step threshold)
+PASS: fix-spectral RGB and Automatic share the RGB kernels; Spectral compiles its own
+Spectral runtime colour round trip, all 16,777,216 codes (float32, relaxed math, 0.3 s): max 0.459 8-bit steps at (1, 0, 38), mean 0.0119; 196992 codes above 0.25, 22 above 0.4, 0 above 0.5
+Monochromatic 500 nm (1 nm box): estimate SIMD3<Double>(-0.6162281315773726, 0.6125180304516107, 0.22194190393202007), CMF colour SIMD3<Double>(-0.6162165797884056, 0.6125057290849472, 0.22193782914689844)
+Dispersion: n(F, d, C) = 1.5174803733825684, 1.5, 1.4924803972244263; V_d = 20.000019073504518; sin(theta_t) n = [0.5646424, 0.5646425, 0.5646425], sin(theta_i) = 0.5646425
+Interreflection, Cornell red: spectral rho^2 = SIMD3<Float>(0.3974077, -0.012621485, -0.0022197298), RGB rho^2 = SIMD3<Float>(0.42249835, 0.0024999285, 0.0024998179)
+Interreflection, Cornell green: spectral rho^2 = SIMD3<Float>(-0.0086691445, 0.20055757, 0.01814388), RGB rho^2 = SIMD3<Float>(0.014400492, 0.2024994, 0.02250061)
+Interreflection, copper: spectral rho^2 = SIMD3<Float>(0.8582048, 0.4173959, 0.28768322), RGB rho^2 = SIMD3<Float>(0.9024983, 0.40959945, 0.2915968)
+PASS: fix-spectral conversion round trip, monochromatic estimator, Cauchy dispersion and interreflections
+Grey world, MIS: spectral - RGB = SIMD3<Double>(-0.0006345300485448139, 0.0003588288609029316, -0.00031064127299298603) ± SIMD3<Double>(0.00018478536798115333, 9.07412800289722e-05, 9.901667682009636e-05) of SIMD3<Double>(0.2012674315573602, 0.2012674315573602, 0.2012674315573602)
+Grey world, ReSTIR GI: spectral - RGB = SIMD3<Double>(-0.0006370008082651511, 0.00035153030849448063, -0.00031812122341517995) ± SIMD3<Double>(0.00017867908345537816, 8.759334747428383e-05, 9.849368113153115e-05) of SIMD3<Double>(0.20135169514159604, 0.20135169514159604, 0.20135169514159604)
+Grey world, unified ReSTIR PT: spectral - RGB = SIMD3<Double>(-0.0008765135641868522, 7.157497017121897e-05, 0.00020889670928803887) ± SIMD3<Double>(0.00017242406170157306, 6.035626508653908e-05, 0.00014033461567238017) of SIMD3<Double>(0.20192964046920944, 0.20192964046920944, 0.20192964046920944)
+Render round trip [18, 239, 253]: spectral / RGB - 1 = SIMD3<Double>(0.006290431526021964, -2.6290434553525577e-05, -0.0014396781480268575), error SIMD3<Double>(0.07348769595019, 0.0024311092646200905, 0.14055288028623636) 8-bit steps (3 SE: SIMD3<Double>(2.0707367637604897, 0.14320691629387738, 0.08713261089499724))
+Render round trip [224, 172, 105]: spectral / RGB - 1 = SIMD3<Double>(0.00013844741384737085, 3.696966657524249e-05, -0.00189965054439707), error SIMD3<Double>(0.012042865484033882, 0.002513345040540571, 0.08267851328908193) 8-bit steps (3 SE: SIMD3<Double>(0.18425931229992898, 0.08673745353195272, 0.04173623091412537))
+Render round trip [200, 30, 30]: spectral / RGB - 1 = SIMD3<Double>(0.00037668293209821294, 0.00024665385241862093, -0.0032504958589612055), error SIMD3<Double>(0.029459996490061258, 0.003968222151531364, 0.0523481311313958) 8-bit steps (3 SE: SIMD3<Double>(0.3076220902377429, 0.30315891931558525, 0.022803586522286423))
+Render round trip [30, 60, 200]: spectral / RGB - 1 = SIMD3<Double>(-0.009720917336738884, 0.002526540650569487, -0.001650103289007021), error SIMD3<Double>(0.15684927035673724, 0.06830066461358797, 0.1291292815853069) 8-bit steps (3 SE: SIMD3<Double>(0.2841803284570439, 0.11637800012780275, 0.11581833561896815))
+Render round trip [250, 220, 20]: spectral / RGB - 1 = SIMD3<Double>(0.000291887689331183, -0.00024450884877243813, -0.0151114887646048), error SIMD3<Double>(0.028162020532022325, 0.0209135500198272, 0.18874290717547382) 8-bit steps (3 SE: SIMD3<Double>(0.19768114942408488, 0.1487274786969408, 0.20375797841738574))
+Render round trip [128, 128, 128]: spectral / RGB - 1 = SIMD3<Double>(0.00012013515855880157, 8.798430816916207e-05, -0.001568313889927931), error SIMD3<Double>(0.006235333072794447, 0.0045666615612134365, 0.08143976522477203) 8-bit steps (3 SE: SIMD3<Double>(0.14464323195313966, 0.06944976939792014, 0.05023494425682884))
+PASS: fix-spectral grey-world parity and colour round trips in renders (worst beyond noise 0.05 steps)
+Preset e: mean SIMD3<Double>(0.17149286248444653, 0.13497339073883455, 0.12938831622925195), expected SIMD3<Double>(0.17092229262688577, 0.13451588260135075, 0.1289777585333064) (difference SIMD3<Double>(0.0005705729094624135, 0.0004575112262060489, 0.0004105591598544846) ± SIMD3<Double>(0.0005395621693407963, 0.00042560681978431707, 0.00040929800625793)); luminance 0.14233418805235978 vs 0.14185884244904062
+Preset a: mean SIMD3<Double>(0.26263656124702217, 0.11768466181801839, 0.033039245897487114), expected SIMD3<Double>(0.2617443325457229, 0.11718352613088101, 0.03309732887916362) (difference SIMD3<Double>(0.0008922304431487287, 0.0005011363560430199, -5.8083720090642604e-05) ± SIMD3<Double>(0.0008246034871651133, 0.0003692637034787638, 0.00011746195782860229)); luminance 0.14239003660716223 vs 0.14185884244904062
+Preset fl11: mean SIMD3<Double>(0.20130523025705635, 0.13165946440184073, 0.07562414466306148), expected SIMD3<Double>(0.200538086410391, 0.13110200358049365, 0.07553749705208018) (difference SIMD3<Double>(0.0007671493494765517, 0.000557462369705228, 8.664897647702031e-05) ± SIMD3<Double>(0.0006333887116673002, 0.00041448050445274287, 0.000244158843570801)); luminance 0.14242040413751972 vs 0.14185884244904062
+Preset hp1: mean SIMD3<Double>(0.3643665596338734, 0.09083764984537047, -0.0001514321118376217), expected SIMD3<Double>(0.36298317546538306, 0.09041826846818124, -1.0930830678248116e-05) (difference SIMD3<Double>(0.0013833982630407468, 0.00041938096381727963, -0.00014050128147161762) ± SIMD3<Double>(0.0011429387869051053, 0.00028429524034867694, 2.6445589963134736e-05)); luminance 0.14242048434909577 vs 0.14185884244904062
+Preset ledB3: mean SIMD3<Double>(0.19845920046632454, 0.13188693897371792, 0.08091366472093506), expected SIMD3<Double>(0.19783396403375525, 0.13139706801374873, 0.08058189271131833) (difference SIMD3<Double>(0.0006252387570291612, 0.000489867089241208, 0.0003317686086525087) ± SIMD3<Double>(0.0006242952869331879, 0.0004141399976240769, 0.00025507818568648447)); luminance 0.14235993136599517 vs 0.14185884244904062
+PASS: fix-spectral illuminant presets render their exact colours
+Hero termination (dispersion 1e-6): image SIMD3<Double>(-0.002364175575507943, -0.0009573590477505908, 0.00019571906492880467) ± SIMD3<Double>(0.0010047061304280618, 0.0007577456688103654, 0.00039319233568114873) of SIMD3<Double>(0.170086487555326, 0.10280491425669898, 0.07067519919534249); glass pixels SIMD3<Double>(0.002270369717244352, 0.0011305372345815883, 0.0007457717928742425) ± SIMD3<Double>(0.004133750114371452, 0.0025215068372502723, 0.00382778873188498) (89)
+PASS: fix-spectral hero-wavelength termination is unbiased
+Coloured Cornell, MIS: RGB SIMD3<Double>(0.22869993447291495, 0.1368989381364956, 0.08192027597405643), spectral SIMD3<Double>(0.2251056950514746, 0.13634924938862505, 0.0808316932689088) (RGB / spectral - 1 = SIMD3<Double>(0.015966896886453474, 0.004031476156526548, 0.013467275781619215))
+Spectral ReSTIR GI - spectral MIS: SIMD3<Double>(0.014261232718737098, 0.017789399951639855, 0.011823869882601219) ± SIMD3<Double>(0.0013143138333814983, 0.002530958858140308, 0.0017587732536903553) (relative); RGB: SIMD3<Double>(0.013820467565032338, 0.017058050607292687, 0.012817877469524905) ± SIMD3<Double>(0.0011043513566842897, 0.002515316309198621, 0.0017838143988459687)
+Spectral ReSTIR PT - spectral MIS: SIMD3<Double>(0.005123561634509946, 0.0009904246194295597, 0.0011654917109019396) ± SIMD3<Double>(0.0015018758519808537, 0.0013564412533132258, 0.0015565866926040301) (relative); RGB: SIMD3<Double>(0.005992511444443605, 0.0006804558993451189, 0.0024174189054612977) ± SIMD3<Double>(0.001503193584205916, 0.0013652685150855833, 0.0014221562311354495)
+Spectral unified ReSTIR PT - spectral MIS: SIMD3<Double>(0.007106046985240863, 0.00034397305067937635, 0.0026964600800602257) ± SIMD3<Double>(0.0017751660599151572, 0.0014666210281322303, 0.0018587237026260449) (relative); RGB: SIMD3<Double>(0.0070040849736196995, 0.0004784698040492449, 0.0036956488907801703) ± SIMD3<Double>(0.0018345707947797448, 0.0014124992538290043, 0.0016860286354897138)
+Spectral unified ReSTIR PT + ReSTCV - spectral MIS: SIMD3<Double>(0.005652677845073203, 0.0012108888556885934, 0.000504317116027356) ± SIMD3<Double>(0.0015065846081238387, 0.0013836181591073836, 0.0016152847903155188) (relative); RGB: SIMD3<Double>(0.006702481366489906, 0.0007747952144241028, 0.001764548389725076) ± SIMD3<Double>(0.0015104117861055152, 0.0013790478243156166, 0.0014989528278280173)
+Spectral unified ReSTIR PT, stochastic pairwise MIS - spectral MIS: SIMD3<Double>(0.007624953562153717, -0.0005078839426574845, 0.0019379928911102636) ± SIMD3<Double>(0.0016407393697320139, 0.0013652466934853979, 0.0017608710936672333) (relative); RGB: SIMD3<Double>(0.007330468429603603, -0.0002515356063039412, 0.0030135444434149514) ± SIMD3<Double>(0.0016858109845910951, 0.0013364627020523488, 0.0015766584820955747)
+Spectral ReSTIR GI, stochastic pairwise MIS - spectral MIS: SIMD3<Double>(0.00411804666399471, 0.006769400441087122, 0.004108117601934221) ± SIMD3<Double>(0.0007839307039917291, 0.0008790659292719963, 0.0007107876520488597) (relative); RGB: SIMD3<Double>(0.003922604409852695, 0.00587246597584089, 0.004604765355339971) ± SIMD3<Double>(0.0005626339834693765, 0.0008206099258096794, 0.0006516049758914234)
+Spectral Cornell restirPT: 2761 of 2765 paths shifted into their pixel keep F (wavelengths from the seed)
+Spectral Cornell restirPTUnified: 3775 of 3775 paths shifted into their pixel keep F (wavelengths from the seed)
+Spectral Pavilion restirPT: 3681 of 3692 paths shifted into their pixel keep F (wavelengths from the seed)
+Spectral Pavilion restirPTUnified: 6082 of 6087 paths shifted into their pixel keep F (wavelengths from the seed)
+PASS: fix-spectral ReSTIR DI, GI, PT, ReSTCV and stochastic pairwise MIS agree with spectral MIS; shifts keep wavelengths
+PASS: fix-spectral MetalFX input
+Frame time, Cornell, ReSTIR GI (320 x 240): RGB 6.61 ms, spectral 7.48 ms (+13%)
+Frame time, Pavilion, ReSTIR GI (320 x 240): RGB 7.29 ms, spectral 10.52 ms (+44%)
+Frame time, Pavilion, MIS (320 x 240): RGB 6.74 ms, spectral 8.21 ms (+22%)
+PASS: fix-spectral frame times
+
+## tests/benchmark.py --baseline main_6ed36c2.swift (zero tolerance: equivalence; 0.01: timings)
+RUN round=0 Default Pavilion | MetalFX off variant=baseline meanRadiance=1.1639652
+RUN round=0 Default Pavilion | MetalFX off variant=current meanRadiance=1.1639652
+RUN round=0 Default Pavilion | MetalFX on variant=baseline meanRadiance=1.1639652
+RUN round=0 Default Pavilion | MetalFX on variant=current meanRadiance=1.1639652
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=baseline meanRadiance=1.3324641
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX off variant=current meanRadiance=1.3324641
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=baseline meanRadiance=1.3324641
+RUN round=0 Pavilion with coated OpenPBR floor | MetalFX on variant=current meanRadiance=1.3324641
+RUN round=0 Cornell box | MetalFX off variant=baseline meanRadiance=0.14723401
+RUN round=0 Cornell box | MetalFX off variant=current meanRadiance=0.14723401
+RUN round=0 Cornell box | MetalFX on variant=baseline meanRadiance=0.14723401
+RUN round=0 Cornell box | MetalFX on variant=current meanRadiance=0.14723401
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=baseline meanRadiance=0.6100708
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX off variant=current meanRadiance=0.6101388
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=baseline meanRadiance=0.6100708
+RUN round=0 Imported mesh (scene 6, 8130 triangles) | MetalFX on variant=current meanRadiance=0.6101388
+RUN round=0 Default Pavilion, MIS | MetalFX off variant=baseline meanRadiance=1.1207528
+RUN round=0 Default Pavilion, MIS | MetalFX off variant=current meanRadiance=1.1207528
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=baseline meanRadiance=0.6504156
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off variant=current meanRadiance=0.65041536
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=baseline meanRadiance=0.6504156
+RUN round=0 Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on variant=current meanRadiance=0.65041536
+RUN round=0 Default Pavilion, orbiting | MetalFX off variant=baseline meanRadiance=1.1415136
+RUN round=0 Default Pavilion, orbiting | MetalFX off variant=current meanRadiance=1.1415136
+RUN round=0 Default Pavilion, orbiting | MetalFX on variant=baseline meanRadiance=1.1415136
+RUN round=0 Default Pavilion, orbiting | MetalFX on variant=current meanRadiance=1.1415136
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX off variant=baseline meanRadiance=0.61118716
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX off variant=current meanRadiance=0.6106638
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX on variant=baseline meanRadiance=0.61118716
+RUN round=0 Imported mesh (scene 6), orbiting | MetalFX on variant=current meanRadiance=0.6106638
+OUTPUT MISMATCH: Imported mesh (scene 6), orbiting | MetalFX off: baseline 0.61118716, current 0.6106638 (tolerance 0.0); timings withheld
+RESULT Cornell box | MetalFX off | baseline | medianMS=12.60 min=12.31 max=13.31 n=16
+RESULT Cornell box | MetalFX off | current | medianMS=12.53 min=12.15 max=12.96 n=16
+RESULT Cornell box | MetalFX on | baseline | medianMS=16.39 min=15.77 max=16.81 n=16
+RESULT Cornell box | MetalFX on | current | medianMS=16.33 min=15.87 max=17.10 n=16
+RESULT Default Pavilion | MetalFX off | baseline | medianMS=28.04 min=27.37 max=28.53 n=16
+RESULT Default Pavilion | MetalFX off | current | medianMS=27.81 min=26.65 max=28.97 n=16
+RESULT Default Pavilion | MetalFX on | baseline | medianMS=32.23 min=31.37 max=32.50 n=16
+RESULT Default Pavilion | MetalFX on | current | medianMS=32.03 min=31.24 max=33.89 n=16
+RESULT Default Pavilion, MIS | MetalFX off | baseline | medianMS=23.66 min=23.22 max=24.33 n=16
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=23.42 min=23.17 max=24.28 n=16
+RESULT Default Pavilion, orbiting | MetalFX off | baseline | medianMS=28.12 min=27.64 max=28.66 n=16
+RESULT Default Pavilion, orbiting | MetalFX off | current | medianMS=27.82 min=27.17 max=28.38 n=16
+RESULT Default Pavilion, orbiting | MetalFX on | baseline | medianMS=32.59 min=31.13 max=34.27 n=16
+RESULT Default Pavilion, orbiting | MetalFX on | current | medianMS=32.36 min=31.42 max=33.68 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | baseline | medianMS=30.34 min=29.84 max=31.08 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | current | medianMS=17.85 min=17.53 max=18.76 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | baseline | medianMS=34.23 min=33.17 max=34.82 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | current | medianMS=21.62 min=20.83 max=22.34 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | baseline | medianMS=23.72 min=22.94 max=24.61 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=13.66 min=13.42 max=14.31 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | baseline | medianMS=27.59 min=26.65 max=28.31 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=17.42 min=16.89 max=18.30 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | baseline | medianMS=58.86 min=57.87 max=60.21 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=22.84 min=21.75 max=23.26 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | baseline | medianMS=62.48 min=61.37 max=64.12 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=26.39 min=25.75 max=27.18 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | baseline | medianMS=35.43 min=34.61 max=36.70 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=34.64 min=33.67 max=35.80 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | baseline | medianMS=39.92 min=38.98 max=41.30 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=39.95 min=39.08 max=40.85 n=16
