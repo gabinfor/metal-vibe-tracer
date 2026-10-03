@@ -1,0 +1,151 @@
+# Spectral transport cost raw output, October 3, 2026 (Apple M4, macOS 27.0)
+
+Scratch drivers render through the production renderFrame path, 640x480, path depth 16, Z++ sampler,
+12 frames per run, medians of frames 5-12 over 4 interleaved rounds (3 where marked). "A/B" runs
+compile two shader versions into one process under the same host code (as tests/benchmark.py does
+for baselines) and interleave A spectral, B spectral and B RGB. Other GPU work shared the machine
+during some runs (RGB times of the same scene vary up to 30% between runs); the B/A ratio of one
+run is the robust figure.
+
+## Baseline (e4c9108, in-process RGB vs spectral, 4 rounds)
+Cornell GI: RGB 12.79 ms, spectral 18.20 ms (+42.3%)
+Cornell glass: RGB 13.42 ms, spectral 19.32 ms (+43.9%)
+Pavilion MIS: RGB 23.42 ms, spectral 32.69 ms (+39.6%)
+Pavilion GI: RGB 28.00 ms, spectral 43.49 ms (+55.3%)
+Pavilion coated floor: RGB 35.08 ms, spectral 56.62 ms (+61.4%)
+UV sphere unified PT: RGB 13.88 ms, spectral 23.43 ms (+68.8%)
+
+## Per-pass GPU time at e4c9108 (stage-boundary timestamps, 16 frames)
+Cornell GI: pass 1 RGB 2.49 / spectral 3.16 ms; pass 2 10.52 / 14.81 ms
+Pavilion GI: pass 1 4.30 / 6.19 ms; pass 2 23.32 / 34.16 ms
+Pavilion coated floor: pass 1 2.98 / 4.39 ms; pass 2 32.02 / 45.15 ms
+UV sphere unified PT: pass 1 0.78 / 0.93; pass 2 0.86 / 1.11; PT initial 5.45 / 8.75; PT paired shifts 4.15 / 9.78; PT spatial 1.79 / 1.77 ms
+
+## Step 1a: CMF weights read back per conversion instead of kept per path (toR/toG/toB), in-process ratios
+Cornell GI +34.6%, Cornell glass +38.0%, Pavilion MIS +36.2%, Pavilion GI +49.7%, coated +50.2%, UV sphere +48.7%
+
+## Step 1 (committed 2710ba1: lambda, weights, phases, hero read back from u; per-bin phase), A/B against e4c9108
+lazy lambda/weights (intermediate), A = e4c9108, B = intermediate, 4 rounds:
+Cornell GI: RGB 12.88, A 19.32 (+50.0%), B 18.59 (+44.3%); B/A -3.8%
+Cornell glass: RGB 14.09, A 20.67 (+46.8%), B 20.32 (+44.3%); B/A -1.7%
+Pavilion MIS: RGB 25.57, A 37.58 (+47.0%), B 36.13 (+41.3%); B/A -3.8%
+Pavilion GI: RGB 33.29, A 51.10 (+53.5%), B 48.47 (+45.6%); B/A -5.2%
+Pavilion coated floor: RGB 41.58, A 59.46 (+43.0%), B 59.47 (+43.0%); B/A +0.0%
+UV sphere unified PT: RGB 14.34, A 23.43 (+63.1%), B 20.22 (+41.0%); B/A -13.7%
+per-bin cos phase table and no per-path phases (A = intermediate, B = step 1), 4 rounds:
+Cornell GI: RGB 12.57, A 17.46 (+39.0%), B 16.74 (+33.2%); B/A -4.2%
+Cornell glass: RGB 13.53, A 18.43 (+36.2%), B 17.76 (+31.3%); B/A -3.6%
+Pavilion MIS: RGB 23.16, A 30.72 (+32.6%), B 30.77 (+32.9%); B/A +0.2%
+Pavilion GI: RGB 27.88, A 40.18 (+44.1%), B 40.31 (+44.6%); B/A +0.3%
+Pavilion coated floor: RGB 35.17, A 50.25 (+42.9%), B 49.66 (+41.2%); B/A -1.2%
+UV sphere unified PT: RGB 13.81, A 19.55 (+41.6%), B 18.56 (+34.4%); B/A -5.1%
+(phases recomputed by interpolation per use instead, rejected: B/A +1.1, +0.8, +2.6, +2.2, +0.2, -5.9%)
+
+## Step 2 (committed 3d30956: linear emission basis), A/B, A = step 1 + palette experiment host, B = step 2, 3 rounds
+Cornell GI: RGB 12.71, A 17.19 (+35.3%), B 17.50 (+37.8%); B/A +1.8%
+Cornell glass: RGB 14.02, A 18.86 (+34.5%), B 18.63 (+32.8%); B/A -1.2%
+Pavilion MIS: RGB 24.87, A 33.62 (+35.2%), B 32.07 (+29.0%); B/A -4.6%
+Pavilion GI: RGB 29.40, A 44.75 (+52.2%), B 40.11 (+36.4%); B/A -10.4%
+Pavilion coated floor: RGB 36.05, A 53.15 (+47.4%), B 49.06 (+36.1%); B/A -7.7%
+UV sphere unified PT: RGB 14.24, A 19.41 (+36.3%), B 18.37 (+29.0%); B/A -5.4%
+
+## Cumulative, A = e4c9108, B = steps 1 + 2 (busy machine), 4 rounds
+Cornell GI: RGB 14.13, A 20.87 (+47.7%), B 19.27 (+36.4%); B/A -7.7%
+Cornell glass: RGB 16.23, A 25.78 (+58.9%), B 22.75 (+40.2%); B/A -11.7%
+Pavilion MIS: RGB 31.87, A 44.08 (+38.3%), B 42.97 (+34.8%); B/A -2.5%
+Pavilion GI: RGB 35.91, A 56.81 (+58.2%), B 47.98 (+33.6%); B/A -15.5%
+Pavilion coated floor: RGB 46.78, A 70.05 (+49.7%), B 64.90 (+38.7%); B/A -7.3%
+UV sphere unified PT: RGB 15.72, A 25.64 (+63.1%), B 19.95 (+26.9%); B/A -22.2%
+
+## Rejected experiments (A/B, B/A per scenario: Cornell GI, Cornell glass, Pavilion MIS, Pavilion GI, coated, UV sphere)
+albedo converted once per vertex into Material (A = step 1 without the per-bin phase): +1.1, +2.6, +3.4, -0.8, +9.4, +6.0%
+host palette of constant colours scanned before the grid (A = no palette): +3.0, +9.4, +4.1, -5.0, +0.2, +1.4%
+palette without the grid fallback compiled (upper bound): +0.5, -0.5, +2.5, -5.7, -1.4, -3.7%
+single trilinear code path in spectral_moments: +0.5, +1.9, +0.7, -2.5, +1.7, +0.3%
+out-of-line conversion (noinline, scalar arguments): +1.3, -1.2, -2.8, -2.3, +0.6, -2.2%
+out-of-line OpenPBR preparation and conversion (noinline): +3.2, -3.4, +182, +120, +309, +27%
+cheaper atan substitute (wrong output, cost probe): -0.2, +1.3, +0.7, -3.3, +1.9, -1.7%
+constant phases (wrong output, cost probe): -0.3, +13.2, +3.4, +0.1, +4.8, -0.5% (busy machine)
+fixed CMF conversion (wrong output, cost probe): -7.1, -5.2, -0.3, +1.2, -4.2, -3.9% (busy machine)
+no emitter conversion at all (wrong output, before step 2, 3 rounds, Pavilion only): MIS -16.2, GI -25.0, coated -10.0% (busy machine)
+skip the lane-3 OpenPBR preparation (wrong output; upper bound of a single evaluation), A = steps 1 + 2:
+Cornell GI: RGB 12.86, A 16.51 (+28.4%), B 16.60 (+29.1%); B/A +0.6%
+Cornell glass: RGB 13.71, A 17.65 (+28.7%), B 17.75 (+29.4%); B/A +0.6%
+Pavilion MIS: RGB 23.49, A 29.73 (+26.6%), B 27.32 (+16.3%); B/A -8.1%
+Pavilion GI: RGB 28.38, A 38.15 (+34.4%), B 35.39 (+24.7%); B/A -7.2%
+Pavilion coated floor: RGB 35.53, A 48.05 (+35.2%), B 43.22 (+21.7%); B/A -10.0%
+UV sphere unified PT: RGB 14.01, A 17.61 (+25.6%), B 16.99 (+21.2%); B/A -3.5%
+
+## Equal-sample and equal-time error, steps 1 + 2 (160x120, 64 frames x 3 sequences against 2048-frame MIS references per transport; frame time 640x480, 4 rounds)
+Cornell: MSE RGB 0.000363, spectral 0.0003894 (x1.07); frame 640x480 RGB 13.01 ms, spectral 16.36 ms (+26%); equal-time ratio x1.35
+Cornell glass & mirror: MSE RGB 0.004876, spectral 0.005132 (x1.05); frame 640x480 RGB 13.67 ms, spectral 17.45 ms (+28%); equal-time ratio x1.34
+Pavilion: MSE RGB 0.2436, spectral 0.2764 (x1.13); frame 640x480 RGB 27.73 ms, spectral 37.51 ms (+35%); equal-time ratio x1.53
+Pavilion, coated floor: MSE RGB 0.3225, spectral 0.3436 (x1.07); frame 640x480 RGB 34.95 ms, spectral 46.22 ms (+32%); equal-time ratio x1.41
+Imported UV sphere: MSE RGB 0.0005275, spectral 0.0006485 (x1.23); frame 640x480 RGB 14.14 ms, spectral 17.69 ms (+25%); equal-time ratio x1.54
+
+## Grey-world offset (grey OpenPBR room, white light, 48x32 MIS, spectral / RGB - 1, R, G, B)
+pcg 512 spp depth 16: -0.0265%, +0.0289%, -0.0086%
+pcg 2048 spp depth 16: +0.0081%, +0.0085%, -0.0097%
+zSampling 512 spp depth 16: -0.3153%, +0.1783%, -0.1543%
+zSampling 2048 spp depth 16: +0.0067%, +0.0329%, -0.0418%
+pcg 512 spp depth 1: -0.0289%, +0.0213%, -0.0266%
+pcg 2048 spp depth 1: +0.0128%, +0.0079%, -0.0221%
+zSampling 512 spp depth 1: -0.1095%, +0.0208%, -0.1202%
+zSampling 2048 spp depth 1: +0.1233%, -0.0246%, -0.0505%
+Per-frame image-wide chroma shift of single spectral frames against RGB (160x120, 24 frames): pcg RMS 0.314%, max 0.759%; zSampling RMS 0.117%, max 0.224%
+
+## Final in-process RGB vs spectral (469dbe1, 6 rounds)
+Cornell GI: RGB 13.14 ms, spectral 16.89 ms (+28.5%)
+Cornell glass: RGB 13.83 ms, spectral 17.67 ms (+27.8%)
+Pavilion MIS: RGB 23.75 ms, spectral 30.08 ms (+26.6%)
+Pavilion GI: RGB 28.36 ms, spectral 38.38 ms (+35.3%)
+Pavilion coated floor: RGB 35.78 ms, spectral 48.15 ms (+34.6%)
+UV sphere unified PT: RGB 14.16 ms, spectral 17.81 ms (+25.8%)
+
+## Final per-pass GPU time (469dbe1, 16 frames)
+== Cornell GI
+  Pass 1: G-Buffer & ReSTIR Temporal RGB   2.58  spectral   3.01  (+0.44 ms)
+  Pass 2: Spatial Resampling & Shading RGB  10.72  spectral  13.49  (+2.77 ms)
+  total RGB  13.29  spectral  16.50  (+3.21 ms)
+== Pavilion GI
+  Pass 1: G-Buffer & ReSTIR Temporal RGB   4.25  spectral   5.69  (+1.43 ms)
+  Pass 2: Spatial Resampling & Shading RGB  23.71  spectral  31.91  (+8.20 ms)
+  total RGB  27.97  spectral  37.60  (+9.63 ms)
+== Pavilion coated floor
+  Pass 1: G-Buffer & ReSTIR Temporal RGB   3.07  spectral   3.85  (+0.77 ms)
+  Pass 2: Spatial Resampling & Shading RGB  32.13  spectral  42.61  (+10.47 ms)
+  total RGB  35.21  spectral  46.46  (+11.25 ms)
+== UV sphere unified PT
+  Pass 1: G-Buffer & ReSTIR Temporal RGB   0.87  spectral   0.90  (+0.03 ms)
+  Pass 2: Spatial Resampling & Shading RGB   0.89  spectral   1.03  (+0.14 ms)
+  ReSTIR PT: initial paths RGB   6.12  spectral   8.14  (+2.02 ms)
+  ReSTIR PT: paired shifts RGB   4.51  spectral   5.99  (+1.48 ms)
+  ReSTIR PT: spatial reuse RGB   1.86  spectral   1.98  (+0.12 ms)
+  ReSTIR PT: temporal reuse RGB   0.01  spectral   0.03  (+0.01 ms)
+  total RGB  14.26  spectral  18.05  (+3.79 ms)
+
+## Visual comparisons (build/checks/spectral-default, scratch driver; 240x180, 1024 frames unless noted)
+scene-0-pavilion: RGB mean (1.6811, 1.0370, 0.6409), spectral (1.6443, 1.0350, 0.6322), spectral/RGB - 1 = -2.19%, -0.19%, -1.37%; display diff > 2/255 in 25.7% of pixels, > 8/255 in 5.60%, max 60/255; non-finite 0, negative 192
+scene-1-cornell: RGB mean (0.2102, 0.1348, 0.0825), spectral (0.2102, 0.1340, 0.0818), spectral/RGB - 1 = +0.01%, -0.54%, -0.92%; display diff > 2/255 in 6.2% of pixels, > 8/255 in 0.00%, max 5/255; non-finite 0, negative 0
+scene-2-veach-mis: RGB mean (0.5899, 0.5892, 0.5882), spectral (0.5901, 0.5891, 0.5881), spectral/RGB - 1 = +0.03%, -0.01%, -0.01%; display diff > 2/255 in 0.7% of pixels, > 8/255 in 0.27%, max 16/255; non-finite 0, negative 0
+scene-3-cornell-glass-mirror: RGB mean (0.1941, 0.1156, 0.0800), spectral (0.1942, 0.1148, 0.0794), spectral/RGB - 1 = +0.06%, -0.62%, -0.79%; display diff > 2/255 in 24.8% of pixels, > 8/255 in 2.74%, max 49/255; non-finite 0, negative 2
+scene-4-cornell-fog: RGB mean (0.3338, 0.2321, 0.1702), spectral (0.3340, 0.2313, 0.1695), spectral/RGB - 1 = +0.06%, -0.35%, -0.45%; display diff > 2/255 in 5.8% of pixels, > 8/255 in 0.00%, max 7/255; non-finite 0, negative 0
+scene-5-ring: RGB mean (0.0808, 0.0739, 0.0639), spectral (0.0806, 0.0739, 0.0638), spectral/RGB - 1 = -0.22%, +0.01%, -0.15%; display diff > 2/255 in 6.5% of pixels, > 8/255 in 0.48%, max 51/255; non-finite 0, negative 0
+scene-6-imported-uv-sphere: RGB mean (0.7885, 0.5777, 0.4611), spectral (0.7884, 0.5780, 0.4609), spectral/RGB - 1 = -0.01%, +0.04%, -0.03%; display diff > 2/255 in 0.0% of pixels, > 8/255 in 0.00%, max 3/255; non-finite 0, negative 0
+metalfx-0-pavilion (320x240, 8 frames, MetalFX output, 64-frame driver run): spectral/RGB - 1 = -1.99%, -0.47%, -1.55%; display diff > 2/255 in 30.4% of pixels, > 8/255 in 6.85%, max 34/255; non-finite 0, negative 0
+metalfx-1-cornell: spectral/RGB - 1 = -0.13%, -0.59%, -1.16%; display diff > 2/255 in 12.5%, > 8/255 in 0.03%, max 17/255; non-finite 0, negative 0
+metalfx-3-cornell-glass-mirror: spectral/RGB - 1 = -0.18%, -0.89%, -1.50%; display diff > 2/255 in 14.1%, > 8/255 in 0.23%, max 17/255; non-finite 0, negative 0
+interactive-1spp-0-pavilion: spectral/RGB - 1 = -1.99%, -0.27%, -1.66%; non-finite 0 (per-pixel noise differs, as expected)
+interactive-1spp-1-cornell: spectral/RGB - 1 = +0.14%, -0.63%, -0.92%; non-finite 0
+preset-cornell-sodium-hp1: RGB light (0.2102, 0.1348, 0.0825), HP1 (0.4451, 0.0891, -0.0081)
+preset-cornell-incandescent-a: A (0.3741, 0.1067, 0.0137)
+preset-cornell-fluorescent-fl11: FL11 (0.2896, 0.1255, 0.0387)
+preset-cornell-led-b3: LED-B3 (0.2735, 0.1250, 0.0424)
+preset-cornell-equal-energy-e: E (0.2485, 0.1267, 0.0734)
+preset-pavilion-sun-a: RGB sun (1.6811, 1.0370, 0.6409), A sun (2.1249, 0.9572, 0.4563)
+effect-dispersion-abbe20 (spectral, against no dispersion): -0.59%, +0.09%, +0.19%; non-finite 0
+effect-thin-film-ring (450 nm, n 1.33, on the gold ring): +0.14%, +0.21%, +0.73%; non-finite 0
+texture-saturated-stripes-direct: spectral/RGB - 1 = +0.04%, -0.01%, +0.00%; display diff > 2/255 in 0.7%, max 6/255; non-finite 0
+texture-saturated-stripes-full: spectral/RGB - 1 = +0.27%, +0.16%, +0.03%; display diff > 2/255 in 3.1%, max 26/255; non-finite 0
+aswf-shader-ball (512 frames): spectral/RGB - 1 = -0.26%, +0.08%, -0.30%; display diff > 2/255 in 14.7%, > 8/255 in 2.76%, max 24/255; non-finite 0
+metalfx-aswf-shader-ball (8 frames): spectral/RGB - 1 = -0.56%, -0.04%, -0.18%; max 54/255; non-finite 0, negative 0

@@ -1,8 +1,9 @@
 # Spectral light transport: design for the renderer integration
 
-Status, 2026-10-03: **implemented.** Spectral light transport is integrated as designed below, with
-the changes recorded in §11 ("Decisions taken in the integration"), which supersedes the plan where
-they differ. §1–§10 are kept as the design that was implemented. Citation keys refer to
+Status, 2026-10-03: **implemented, and the default.** Spectral light transport is integrated as designed
+below, with the changes recorded in §11 ("Decisions taken in the integration") and §12 ("Cost
+reductions and the spectral default"), which supersede the plan where they differ. §1–§10 are kept
+as the design that was implemented. Citation keys refer to
 [REFERENCES.md](../REFERENCES.md) (`PETERS2019`, `FOURIERSRGB2019`, `PETERSBLOG2025`, `HERO2014`,
 `CIEDATA`, `OPENPBR`, `ZPP2026`).
 
@@ -11,7 +12,7 @@ from sRGB through three Fourier coefficients reconstructed with the bounded MESE
 `FOURIERSRGB2019`), four wavelengths per path sample from one random number, importance sampled
 in proportion to illuminant × L1 norm of the colour-matching functions, and XYZ → linear sRGB
 before anything downstream. It extends the existing renderer (AGENTS.md); RGB transport keeps its
-behaviour bit for bit, and Automatic chooses RGB unless a scene needs wavelengths (§11).
+behaviour bit for bit, and Automatic, the default, chooses spectral transport (§12).
 
 ## 1. What exists now
 
@@ -463,7 +464,7 @@ light's Lagrange multipliers are solved on the host per frame (`SpectralColour`,
 `SpectralScene.lightLagrange`), the CMFs and the phase are read from a per-nanometre float4 table,
 and a D65 sun lets the environment convert in one piece.
 
-**Default: Automatic, which is RGB unless the scene needs wavelengths.** Spectral transport costs
+**Default: Automatic, which was RGB unless the scene needs wavelengths (superseded by §12).** Spectral transport costs
 6–71% more frame time at 640 × 480 (Cornell with ReSTIR GI 12.6 → 18.0 ms, Pavilion 27.7 → 41.5 ms), well above Peters' ≤ 0.3 ms / 2–36%,
 and RGB scenes render statistically identical images (grey-world parity, colour round trips within
 half an 8-bit step), so at equal time it loses wherever the scene is RGB (1.15–1.71 times RGB's time to equal error).
@@ -473,3 +474,65 @@ or thin film, where RGB cannot render the effect: narrow-line spectra (FL11, HP1
 Not done: spectral sky models, Planckian `colorTemperature`, measured conductor spectra, per-light
 spectra for imported UsdLux lights (they follow the Light spectrum preset), and phase 2 of §4 (a
 generated float4 variant of the upstream BSDF).
+
+## 12. Cost reductions and the spectral default (2026-10-03)
+
+The integration's overhead (6–71% frame time) was cut, then Automatic was switched to spectral.
+Measurements: `tests/PERFORMANCE.md` ("Spectral transport cost — October 3, 2026"), visual checks in
+`build/checks/spectral-default/` (scratch renders, not committed).
+
+**Per-path state, not caching, was the cost.** Per-pass GPU timestamps showed the overhead in the path
+loops (pass 2, ReSTIR PT initial paths and paired shifts, +60% and +135% on the imported sphere),
+and ablations that only removed work (cheaper atan, constant phases, no grid lookups) changed frame
+time within noise, while every attempt to keep more per path (a converted albedo per vertex in
+`Material`, as §11 had also found) made frames slower. So the path now keeps only its numbers u and
+heroU and the hero flag; λk, 1/(4 p(λk)), the CMFs and the phase cosine are read back from the
+sampling buffer where they are used (`spectral_lambda`, `spectral_bin`, `spectral_cos_phase`,
+`spectrum_rgb`). This removed 22 floats per path: −2% to −22% spectral frame time. The phase is
+taken at the wavelength's 1 nm bin like the CMFs, so a reflectance's expected colour is exactly its
+1 nm sum.
+
+**Emission is upsampled linearly.** Emitters (lights, sky, sun, HDRI, MaterialX emission) are
+lo · 1 + (mid − lo) · secondary + (hi − mid) · primary (Smits' decomposition, `SMITS1999`), with the
+bounded-MESE spectra of the six saturated sRGB corners as the basis, tabulated per nanometre with
+the CMFs, times the emitter's illuminant (`spectral_emission`). No emitter colour is converted at run
+time (the sky was converted at every NEE sample and miss): −5% to −10% in sky-lit scenes. White
+remains exactly the illuminant and pure corners keep their former spectra; other emitter colours
+are different metamers than s ρ_{e/s}, within 0.33 8-bit steps of their colour, never negative.
+Reflectances keep the bounded MESE (§2).
+
+**Tried and not kept** (A/B, same process, interleaved):
+
+- A per-scene palette of constant colours solved on the host (material literals read from the shader
+  source, inspector colours), scanned before the grid lookup: +0–9% (no gain even without the grid
+  fallback compiled). Converting per texel at texture load (§2's moment textures) was therefore not
+  pursued: conversion work is not where the time goes.
+- Converting a vertex's albedo once into `Material` (again): +6–9%. Calling the conversion out of line
+  (`noinline`): within noise; making the OpenPBR preparation out of line: 2–5× slower.
+- A single OpenPBR evaluation with per-lobe spectral scaling (§4 phase 2). The upstream BSDF is not
+  linear in `base_color`: the coat darkening Δ = (1 − K) / (1 − K E_b) is rational in it, the metal
+  multiple-scattering scale is the square of the F82 average Fresnel, and lobe probabilities depend on
+  luminance. Splitting it exactly needs per-lobe access the adapter does not have, and an
+  approximation would not match the current output. Its upper bound, measured by skipping the
+  lane-3 preparation (incorrect output): −7% to −10% in the Pavilion scenes (metals, coated floor),
+  none elsewhere.
+- Spectral kernel variants (item 4 of the plan) already existed: `VIBE_SPECTRAL` libraries (§11).
+  Half-precision storage of the GI reservoir radiance would need transport-dependent texture formats
+  for a bandwidth saving the per-pass timings do not show; not done.
+
+**Result:** spectral transport costs +25% to +35% frame time against RGB at 640 × 480 (before:
++40% to +69% in the same run conditions), within Peters' 2–36%, and 1.34–1.54× RGB's time to equal
+error in RGB-defined scenes.
+
+**Default: Automatic is spectral.** Side-by-side converged renders of every built-in scene, the
+imported mesh, the ASWF Standard Shader Ball, MetalFX and 1-spp interactive frames, saturated
+texture stripes, the light presets, dispersion and thin film show no hue casts, banding, NaN or
+negative specks after presentation, greys and whites unchanged (Veach and the grey sphere within
+0.04%), saturated textures within 6/255 on direct light, and differences only where RGB's
+interreflection error is (the Pavilion's terracotta wall and gold cylinder: −2.2% red, −1.4% blue
+on the image mean). Under Automatic every scene traces spectrally; RGB stays selectable and bit
+identical to `main`. Projects without the field, or saved with Automatic, now open spectrally: a
+visible change. The grey-world offset of §11 (up to 0.3% per channel at 512 frames) is the Z++
+sampler's correlated wavelength numbers, not bias: with PCG it is within 0.03%, and with Z++ it falls
+to 0.04% at 2,048 frames; single frames show an image-wide chroma shift of 0.12% RMS (no flicker).
+

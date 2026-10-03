@@ -1,3 +1,57 @@
+# Spectral transport cost — October 3, 2026
+
+Cost reductions of spectral light transport and the switch of **Light transport → Automatic** to spectral (`REFERENCES.md` "October 3 spectral transport cost", `SMITS1999`; [docs/SPECTRAL_DESIGN.md](../docs/SPECTRAL_DESIGN.md) §12). Setup as in the section below: Apple M4 (10-core GPU, 16 GB), macOS 27.0, scratch drivers through the production `renderFrame` path, 640×480, depth 16, Z++ sampler, medians of frames 5–12 over interleaved rounds. Each step was measured A/B: both shader versions compiled into one process under the same host code and interleaved with RGB, so that the ratio of one run is robust to other GPU work on the machine. The unedited figures are in [`PERFORMANCE-spectral-cost-raw.txt`](PERFORMANCE-spectral-cost-raw.txt).
+
+## Where the time went
+
+Per-pass GPU timestamps at `e4c9108` put the overhead in the path loops: pass 2 (+4.3 ms of +5.0 ms in the Cornell box, +10.8 of +12.7 ms in the Pavilion) and, on the imported sphere with unified ReSTIR PT, the initial paths (+60%) and paired shifts (+135%) in a grey scene that converts no colour. Ablations that only remove work (a cheaper atan, constant phases, no conversion) changed frame time within noise, while keeping anything more per path made frames slower. The cost was live per-path state, not arithmetic.
+
+## Steps (change in spectral frame time, B against A)
+
+| Step | Cornell GI | Cornell glass | Pavilion MIS | Pavilion GI | Coated floor | UV sphere, unified PT |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1. Wavelength data read back from u (λ, 1/(4p), CMFs) | −3.8% | −1.7% | −3.8% | −5.2% | 0.0% | −13.7% |
+| … and the phase per 1 nm bin, hero derived (commit 1) | −4.2% | −3.6% | +0.2% | +0.3% | −1.2% | −5.1% |
+| 2. Linear emission basis (commit 2) | +1.8% | −1.2% | −4.6% | −10.4% | −7.7% | −5.4% |
+| Steps 1 + 2 against `e4c9108` | −7.7% | −11.7% | −2.5% | −15.5% | −7.3% | −22.2% |
+
+Tried and not kept (B/A in the same order): the albedo converted once per vertex into `Material`, +1 to +9%; a host-solved palette of the scene's constant colours, +0 to +9% (with the grid fallback not even compiled, −6 to +3%); one out-of-line conversion, within noise; an out-of-line OpenPBR preparation, 1.3–4× slower. Per-texel moment textures were not built, since conversion work is not where the time goes. A single OpenPBR evaluation for all four lanes cannot be exact with the unmodified upstream BSDF (§12 of the design); its upper bound, skipping the lane-3 preparation with incorrect output, is −7% to −10% in the three Pavilion scenarios and none elsewhere. Separate spectral kernels already existed (`VIBE_SPECTRAL` libraries).
+
+## Result
+
+| Scene, strategy | RGB | Spectral | Change | At `e4c9108` |
+| --- | ---: | ---: | ---: | ---: |
+| Cornell, ReSTIR GI | 13.14 ms | 16.89 ms | +28.5% | +42.3% |
+| Cornell glass & mirror, ReSTIR GI | 13.83 ms | 17.67 ms | +27.8% | +43.9% |
+| Pavilion, MIS | 23.75 ms | 30.08 ms | +26.6% | +39.6% |
+| Pavilion, ReSTIR GI | 28.36 ms | 38.38 ms | +35.3% | +55.3% |
+| Pavilion, coated floor, ReSTIR GI | 35.78 ms | 48.15 ms | +34.6% | +61.4% |
+| Imported UV sphere, unified ReSTIR PT | 14.16 ms | 17.81 ms | +25.8% | +68.8% |
+
+The last column is the same driver run on `e4c9108` earlier the same day (the October 3 integration table below measured +34% to +71% in another run). Per pass: Cornell +0.4 ms (pass 1) and +2.8 ms (pass 2); Pavilion +1.4 and +8.2 ms; the imported sphere's ReSTIR PT initial paths +2.0 ms and paired shifts +1.5 ms (were +3.3 and +5.6 ms).
+
+Linear MSE of 64 frames at 160×120 against a 2,048-frame MIS reference of the same transport, mean of 3 sequences; equal-time ratio = spectral MSE × time / (RGB MSE × time):
+
+| Scene | MSE RGB | MSE spectral | Equal samples | Frame time | Equal time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cornell | 3.630e-4 | 3.894e-4 | ×1.07 | +26% | ×1.35 |
+| Cornell glass & mirror | 4.876e-3 | 5.132e-3 | ×1.05 | +28% | ×1.34 |
+| Pavilion | 0.2436 | 0.2764 | ×1.13 | +35% | ×1.53 |
+| Pavilion, coated floor | 0.3225 | 0.3436 | ×1.07 | +32% | ×1.41 |
+| Imported UV sphere | 5.275e-4 | 6.485e-4 | ×1.23 | +25% | ×1.54 |
+
+Spectral transport now costs 25–35% more frame time, within Peters' 2–36% on an RTX 5070 Ti, and 1.34–1.54 times RGB's time to equal error in these RGB-defined scenes (1.15–1.71 before). `tests/Fix_spectral.swift` prints its own 320×240 frame times.
+
+## Default and visual checks
+
+Automatic now resolves to spectral for every scene: at this cost it renders presets, dispersion and thin film, and saturated interreflections without RGB's error, and RGB-lit scenes look the same. Converged side-by-side renders (240×180, 1,024 frames, default strategy; the shader ball 512) of the six built-in scenes, the imported sphere, the ASWF Standard Shader Ball, saturated sRGB texture stripes (direct light and full paths), MetalFX output (8 frames) and single 1-spp frames, the five light presets in the Cornell box, an A sun in the Pavilion, dispersion (Abbe 20) and a 450 nm thin film were inspected; the PNGs are scratch output in `build/checks/spectral-default/` (RGB, spectral, |difference| × 8). Mean spectral / RGB − 1 (R, G, B): Pavilion −2.2%, −0.2%, −1.4% (the terracotta wall and gold cylinder's interreflections, as the October 3 references found); Cornell 0.0%, −0.5%, −0.9%; Cornell glass & mirror +0.1%, −0.6%, −0.8%; fog study +0.1%, −0.4%, −0.5%; ring −0.2%, 0.0%, −0.2%; Veach MIS (grey) and the grey sphere within 0.04%; the shader ball −0.3%, +0.1%, −0.3%; saturated stripes on direct light within 0.04% (at most 6/255 per pixel). No pixel is non-finite; presentation clamps the expected out-of-gamut (negative) single samples. Sodium light renders near-monochrome orange, A warm, FL11 and LED-B3 tinted, E slightly warm; MetalFX output differs from RGB only by the same interreflection shift. Every check found nothing that needed RGB as the default.
+
+The integration's grey-world offset (up to 0.3% per channel at 512 frames, 2–4 tile-clustered standard errors) is the Z++ sampler's correlated wavelength numbers, not bias: with PCG the transports agree within 0.03% at 512 and 2,048 frames, and with Z++ the offset falls to 0.04% at 2,048 frames. A single frame's image-wide chroma shift against RGB is 0.12% RMS with Z++ (0.31% with PCG), so the view does not flicker in colour.
+
+## Equivalence against `main`
+
+With `VIBE_LIGHT_TRANSPORT=rgb`, `tests/benchmark.py --baseline` (main at `6ed36c2`) `--output-tolerance 0` renders every procedural scenario with mean radiance identical to `main`; the scene-6 scenarios differ by the same amounts as at `e4c9108`, because the benchmark forces the baseline onto the flat BVH (see the Z++ section).
+
 # Spectral light transport — October 3, 2026
 
 Spectral transport (`REFERENCES.md` `PETERSBLOG2025`, `PETERS2019`, `FOURIERSRGB2019`, `HERO2014`, `CIEDATA`; `LightTransport.spectral`, **Light transport → Spectral**; [docs/SPECTRAL_DESIGN.md](../docs/SPECTRAL_DESIGN.md)) against RGB transport. Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `6ed36c2` plus this change (uncommitted at measurement; the shaders measured equal the committed ones up to the near-grey shortcut of `spectral_lagrange`, which changed the grey-world means by less than 0.01%). Scratch drivers render through the production `renderFrame` path, path depth 16, the default Z++ sampler. The unedited figures are in [`PERFORMANCE-spectral-raw.txt`](PERFORMANCE-spectral-raw.txt).
@@ -51,7 +105,7 @@ With **Light transport → RGB** (and Automatic in RGB scenes) every procedural 
 
 ## Default
 
-`LightTransport.automatic` resolves to spectral only where the scene needs wavelengths: a light or sun preset other than D65, or dispersion or thin film on a material. Everywhere else it traces RGB, because spectral transport costs 6–71% more frame time and 1.15–1.71 times the time to equal error, for differences that are RGB's interreflection error (up to 3% in one channel in the Pavilion) rather than visible effects. `VIBE_LIGHT_TRANSPORT=rgb|spectral` selects the transport in `-D VIBE_TESTING` builds.
+(Superseded by "Spectral transport cost — October 3, 2026" above: Automatic is now spectral everywhere.) `LightTransport.automatic` resolved to spectral only where the scene needs wavelengths: a light or sun preset other than D65, or dispersion or thin film on a material. Everywhere else it traces RGB, because spectral transport costs 6–71% more frame time and 1.15–1.71 times the time to equal error, for differences that are RGB's interreflection error (up to 3% in one channel in the Pavilion) rather than visible effects. `VIBE_LIGHT_TRANSPORT=rgb|spectral` selects the transport in `-D VIBE_TESTING` builds.
 
 # Z++ sampler — October 2, 2026
 
