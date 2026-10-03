@@ -50,12 +50,14 @@ PARTS = [
     ('Fix_restcv.swift', {'full'}),
     ('Fix_zsampling.swift', {'full'}),
     ('Fix_ui-modes.swift', {'full', 'studio'}),
+    ('Fix_spectral.swift', {'full', 'studio'}),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()
 root = harness.ROOT
 output = harness.output_directory('verify')
-environment = {**os.environ, harness.OUTPUT_VARIABLE: str(output), 'VIBE_TRACER_REPOSITORY': str(root)}
+# VIBE_SUITE_MODE lets files shared by several suites skip their full-suite-only GPU checks.
+environment = {**os.environ, harness.OUTPUT_VARIABLE: str(output), 'VIBE_TRACER_REPOSITORY': str(root), 'VIBE_SUITE_MODE': mode}
 subprocess.run([sys.executable, str(root / 'scripts/prepare_shaders.py')], check=True)
 subprocess.run([sys.executable, str(root / 'scripts/generate_spectral_tables.py')], check=True)
 subprocess.run(['/usr/bin/python3', str(root / 'scripts/prepare_usd.py')], check=True)
