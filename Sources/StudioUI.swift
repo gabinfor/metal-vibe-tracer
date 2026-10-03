@@ -240,6 +240,17 @@ final class StudioController: NSViewController {
   ]
   static let samplerHelp =
     "Z++ draws low-discrepancy samples ordered along a shuffled Z curve, so neighbouring pixels complement each other and every pixel's samples over a still render are stratified: 2–87% less noise at the same sample count (least through glass) for 0.4–5% more frame time, and finer-grained noise in each frame. Independent draws per-pixel random numbers, as before."
+  static let lightTransportChoices: [(mode: LightTransport, title: String)] = [
+    (.automatic, "Automatic"), (.spectral, "Spectral"), (.rgb, "RGB"),
+  ]
+  // Placeholder figures are replaced from tests/PERFORMANCE.md (Spectral light transport).
+  static let lightTransportHelp =
+    "Spectral traces four wavelengths per path: illuminant presets (sodium, fluorescent, LED, incandescent), dispersion and thin film render physically, and saturated colours interreflect without RGB's errors, for more frame time and some colour noise per frame. RGB scenes look the same either way. Automatic uses Spectral only where the scene needs it. The spectral shaders compile in the background the first time."
+  // Emitter spectra (StudioOptions.lightSpectrum / sunSpectrum): nil is the RGB colour.
+  static let illuminantTitles = [
+    "RGB colour", "E (equal energy)", "D65 (daylight)", "A (incandescent, 2856 K)", "FL11 (narrow-band fluorescent)",
+    "HP1 (high-pressure sodium)", "LED-B3 (white LED)",
+  ]
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 
@@ -267,6 +278,7 @@ final class StudioController: NSViewController {
     renderer.onFrameUpdate = { [weak self] _ in self?.updateStatus() }
     renderer.onError = { [weak self] text in self?.showError(text) }
     renderer.onPausedChange = { [weak self] in self?.busyStateChanged() }
+    renderer.onSpectralShadersReady = { [weak self] in self?.rebuild() }
     installMenus()
     updateWindowTitle()
     rebuild()
@@ -550,6 +562,19 @@ final class StudioController: NSViewController {
       automatic: name(r.resolvedSampler(.automatic), Self.samplerChoices),
       help: Self.samplerHelp, enabled: true
     ) { $0.sampler = $1 }
+    // The light transport applies to every strategy.
+    choice(
+      "Light transport", Self.lightTransportChoices, current: r.lightTransport,
+      automatic: name(r.resolvedLightTransport(.automatic), Self.lightTransportChoices),
+      help: Self.lightTransportHelp, enabled: true
+    ) { $0.lightTransport = $1 }
+    if r.activeLightTransport == .spectral && !r.spectralShaders.compiling && r.spectralShaders.kernels == nil,
+      let failure = r.spectralShaders.failure
+    {
+      text(failure)
+    } else if r.activeLightTransport == .spectral && r.spectralShaders.compiling {
+      text("Compiling the spectral shaders; the view renders in RGB until they are ready.")
+    }
     choice(
       "Indirect reuse", Self.indirectReuseChoices, current: r.indirectReuse,
       automatic: name(r.resolvedIndirectReuse(.automatic), Self.indirectReuseChoices),
@@ -787,6 +812,24 @@ final class StudioController: NSViewController {
       })
     text(
       "Applies to the finite lights in Cornell, Veach, and Ring scenes. Veach lights share these controls."
+    )
+    heading("Light spectra")
+    func spectrum(_ title: String, _ path: WritableKeyPath<StudioOptions, UInt32?>) {
+      let current = renderer.options[keyPath: path].map { Int($0) + 1 } ?? 0
+      popup(Self.illuminantTitles, min(current, Self.illuminantTitles.count - 1), label: title) { [weak self] i in
+        guard let self else { return }
+        self.checkpoint(title)
+        self.renderer.options[keyPath: path] = i == 0 ? nil : UInt32(i - 1)
+        self.changed()
+        self.rebuild()
+      }
+    }
+    text("Light spectrum")
+    spectrum("Light spectrum", \.lightSpectrum)
+    text("Sun spectrum")
+    spectrum("Sun spectrum", \.sunSpectrum)
+    text(
+      "Spectral light transport only: a preset replaces the RGB colour's daylight-like spectrum, and the light colour tints it like a filter. Light spectrum covers area and sphere lights and imported emitters; the sky and environment images stay RGB."
     )
     popup(["Atmosphere: Clear", "Atmosphere: Fog preview"], Int(renderer.enableFog), label: "Atmosphere") {
       [weak self] i in
