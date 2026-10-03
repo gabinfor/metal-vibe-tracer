@@ -51,6 +51,7 @@ PARTS = [
     ('Fix_zsampling.swift', {'full'}),
     ('Fix_ui-modes.swift', {'full', 'studio'}),
     ('Fix_spectral.swift', {'full', 'studio'}),
+    ('Fix_spectral-mis.swift', {'full'}),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()

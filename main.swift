@@ -259,6 +259,13 @@ void sampler_event(thread Sampler &s, uint pathVertex, uint stream) {
 void sampler_candidate(thread Sampler &s, uint pathVertex, uint stream, uint index, uint bits) {
     sampler_event(s, pathVertex, stream); s.sub = index; s.subBits = bits;
 }
+// Lane `lane` of a path split into its wavelengths (spectral_split) draws after the split from its
+// own numbers: key bits 29-30 (Z mode; aligned blocks stay aligned, and z_dimension mixes the key's
+// top bits into every scramble) or a rehashed PCG state. Lane 0 keeps the unsplit path's numbers.
+void sampler_split(thread Sampler &s, uint lane) {
+    if (lane == 0u) return;
+    if (s.z) s.key ^= lane << 29; else s.state = pcg_hash(s.state ^ (lane * 0x9e3779b9u));
+}
 
 // --- Data Types ---
 struct Ray {
@@ -551,7 +558,8 @@ struct SpectralMaterial {
 struct SpectralScene {
     uint lightIlluminant;    // VibeIlluminant of area and sphere lights and imported emitters (D65 = their RGB colour)
     uint sunIlluminant;      // VibeIlluminant of the sun (procedural disc, imported DistantLight)
-    uint padding0, padding1;
+    uint dispersionSampling; // DispersionSampling bits: 1 spectral MIS at rough dispersive lobes, 2 lane splitting at delta ones
+    float misOverlap;        // spectral MIS needs roughness^2 >= misOverlap x (n_F - n_C) (spectral_mis)
     float nodes[88];          // linear sRGB of the coarse grid's nodes, codes 0, 3, ..., 255 (86 used)
     SpectralMaterial materials[64];
 };
@@ -785,15 +793,58 @@ bool spectral_dispersive(Material m, thread const Wavelengths &wl) {
     return (m.type == DIELECTRIC || (m.type == OPENPBR && m.transmission > 0.0f && m.metalness < 1.0f))
         && spectral_material(m, wl).dispersion > 0.0f;
 }
-// HERO2014 at the first dispersive vertex: the four lanes would need four directions, so the path
-// keeps lane `hero` (chosen uniformly by heroU), times four, and drops the others. Applied before
-// the vertex scatters (NEE and BSDF sampling), never to its emission, in every pass that builds or
-// shifts paths, so the integrand of a path and its wavelength numbers is one function.
+// Spectral MIS at rough dispersive lobes (DispersionSampling bit 0) in the shading pass: HERO2014's
+// hero-wavelength estimator (Secs. 3.2-3.3, Eqs. 10-12), equivalently CMIS2020's stochastic MIS over
+// the path's four stratified wavelengths (Sec. 5, Eq. 21). The OpenPBR transmission lobe is never
+// delta (roughness >= 0.03), so all four lanes can follow a direction the hero lane sampled. A rough
+// dispersive vertex then samples the hero lane's lobe and evaluates every lane's value and PDF; the
+// path keeps R_k = prod p_k / p_hero over its dispersive vertices, and its throughput carries the
+// balance weight 4 / sum_k R_k of its hero technique (spectral_mis_sample, spectral_mis_eval). Delta
+// dispersive vertices (the legacy dielectric) keep one lane (spectral_arrive_lanes) or split.
+bool spectral_mis(Material m, thread const Wavelengths &wl) {
+    if (wl.heroOnly || (wl.scene->dispersionSampling & 1u) == 0u || m.type == DIELECTRIC || !spectral_dispersive(m, wl)) return false;
+    float alpha = max(0.03f, m.roughness);
+    alpha *= alpha;
+    float spread = (max(1.01f, m.ior) - 1.0f) * spectral_material(m, wl).dispersion / 20.0f;
+    return alpha >= wl.scene->misOverlap * spread;
+}
+// HERO2014 at the first dispersive vertex the lanes cannot share: the four lanes would need four
+// directions, so the path keeps lane `hero` (chosen uniformly by heroU), times four, and drops the
+// others. Applied before the vertex scatters (NEE and BSDF sampling), never to its emission, in every
+// pass that builds or shifts paths, so the integrand of a path and its wavelength numbers is one
+// function.
 void spectral_arrive(Material m, thread Spectrum &throughput, thread Wavelengths &wl) {
     if (wl.heroOnly || !spectral_dispersive(m, wl)) return;
     wl.heroOnly = true;
     throughput *= select(Spectrum(0.0f), Spectrum(4.0f), uint4(0u, 1u, 2u, 3u) == spectral_hero(wl));
 }
+// The shading pass's form: with spectral MIS only delta dispersive vertices keep one lane. The hero
+// lane's factor is then sum_k R_k instead of four: its throughput already carries the weight
+// 4 / sum_k R_k of the rough dispersive vertices before, and once the other lanes' path PDFs are zero
+// the hero technique's balance weight is one.
+void spectral_arrive_lanes(Material m, thread Spectrum &throughput, thread Wavelengths &wl, Spectrum laneRatio) {
+    if (wl.heroOnly || !spectral_dispersive(m, wl) || spectral_mis(m, wl)) return;
+    wl.heroOnly = true;
+    float factor = laneRatio.x + laneRatio.y + laneRatio.z + laneRatio.w;
+    throughput *= select(Spectrum(0.0f), Spectrum(factor), uint4(0u, 1u, 2u, 3u) == spectral_hero(wl));
+}
+// Lane splitting at the first delta dispersive vertex (DispersionSampling bit 1; Evans and McCool's
+// splitting as HERO2014 Sec. 2 describes it, bounded to one split into the four lanes): the shading
+// pass continues the path once per lane, lane `lane` with weight one instead of a uniformly chosen
+// lane with weight four, so the vertex adds no lane-selection noise. Returns whether it split.
+bool spectral_split(Material m, thread Spectrum &throughput, thread Wavelengths &wl, uint lane) {
+    if (wl.heroOnly || (wl.scene->dispersionSampling & 2u) == 0u || m.type != DIELECTRIC || !spectral_dispersive(m, wl))
+        return false;
+    wl.heroOnly = true;
+    wl.heroU = (float(lane) + 0.5f) * 0.25f;
+    throughput *= select(Spectrum(0.0f), Spectrum(1.0f), uint4(0u, 1u, 2u, 3u) == lane);
+    return true;
+}
+float spectral_hero_u(thread const Wavelengths &wl) { return wl.heroU; }
+uint spectral_hero_of(float heroU) { return min(uint(heroU * 4.0f), 3u); }
+bool spectral_split_merges(thread const Wavelengths &wl) { return (wl.scene->dispersionSampling & 8u) != 0u; }
+// Undoes spectral_split for the next lane's pass.
+void spectral_unsplit(thread Wavelengths &wl, float heroU) { wl.heroOnly = false; wl.heroU = heroU; }
 Spectrum spectral_hero_lane(float value, thread const Wavelengths &wl) {
     return select(Spectrum(0.0f), Spectrum(value), uint4(0u, 1u, 2u, 3u) == spectral_hero(wl));
 }
@@ -810,6 +861,12 @@ Spectrum spectral_reflectance(float3 rgb, thread const Wavelengths &) { return r
 Spectrum emitter_spectrum(float3 e, thread const Wavelengths &) { return e; }
 float3 emitter_rgb(float3 e, thread const Wavelengths &) { return e; }
 void spectral_arrive(Material, thread Spectrum &, thread Wavelengths &) {}
+void spectral_arrive_lanes(Material, thread Spectrum &, thread Wavelengths &, Spectrum) {}
+bool spectral_split(Material, thread Spectrum &, thread Wavelengths &, uint) { return false; }
+float spectral_hero_u(thread const Wavelengths &) { return 0.0f; }
+uint spectral_hero_of(float) { return 0u; }
+bool spectral_split_merges(thread const Wavelengths &) { return false; }
+void spectral_unsplit(thread Wavelengths &, float) {}
 Spectrum spectral_albedo(Material, float3 rgb, thread const Wavelengths &) { return rgb; }
 #endif
 float3 rotate_object(float3 p, float3 a) {
@@ -1962,7 +2019,8 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
 // `a` holds lanes 0-2 (base colour rho(lambda_0..2) at lambda_0..2) and `b` lane 3. Sampling
 // directions, lobe probabilities and PDFs are those of `a`; `b` only evaluates, and is skipped
 // when every lane would equal lane 0 (a grey base colour without thin film or dispersion). At a
-// dispersive material on a hero path, `a` is prepared at the hero wavelength alone.
+// dispersive material on a hero path, `a` is prepared at the hero wavelength alone (rough dispersive
+// vertices of the shading pass's spectral MIS use spectral_mis_sample / spectral_mis_eval instead).
 #if VIBE_SPECTRAL
 struct PreparedBsdf { OpenPBR_PreparedBsdf a, b; uint hero; bool flat; };
 OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, float3 baseColor, float3 lambda,
@@ -2520,6 +2578,25 @@ bool light_visible(float3 p, float3 n, LightSample ls, uint sceneIndex, constant
     return !scene_occluded(shadow, sceneIndex, d - endpointTolerance, materialImages, u);
 }
 
+#if VIBE_SPECTRAL
+// OPENPBR "Thin film" on an ideal mirror (the delta conductor of sample_bsdf, which the upstream BSDF
+// does not cover): the upstream Airy reflectance of film over metal (openpbr_thin_film_and_base_
+// reflectance, with the metal's F0 and a white F82 tint, as prepare_openpbr_lanes passes them) at each
+// lane's wavelength, blended with the film-free Fresnel by thin_film_weight and the upstream presence
+// ramp, as openpbr_reflection_coefficient blends them for rough lobes.
+Spectrum spectral_thin_film_mirror(Material mat, Spectrum standard, Spectrum f0, float cosI, thread const Wavelengths &wl) {
+    SpectralMaterial sm = spectral_material(mat, wl);
+    float thickness = sm.thinFilmThickness * 1000.0f;
+    float presence = sm.thinFilmWeight * openpbr_thin_film_presence_multiplier(thickness);
+    if (!(presence > 0.0f)) return standard;
+    float4 lambda = spectral_lambdas(wl);
+    OpenPBR_ThinFilmResults a = openpbr_thin_film_and_base_reflectance(cosI, 1.0f, sm.thinFilmIOR, float3(1.5f), false,
+        f0.xyz, float3(1.0f), false, true, thickness, lambda.xyz);
+    OpenPBR_ThinFilmResults b = openpbr_thin_film_and_base_reflectance(cosI, 1.0f, sm.thinFilmIOR, float3(1.5f), false,
+        float3(f0.w), float3(1.0f), false, true, thickness, float3(lambda.w));
+    return mix(standard, Spectrum(a.reflectance_metal, b.reflectance_metal.x), presence);
+}
+#endif
 bool is_delta(Material mat) {
     return mat.type == DIELECTRIC || (mat.type == GLOSSY && mat.roughness < 0.02f);
 }
@@ -2572,6 +2649,9 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
         // Conductor Fresnel (Schlick) per wavelength, with F0 the reflectance spectrum.
         Spectrum f0 = spectral_albedo(mat, mat.albedo, wl);
         weight = f0 + (1.0f - f0) * pow(1.0f - cosI, 5.0f);
+#if VIBE_SPECTRAL
+        weight = spectral_thin_film_mirror(mat, weight, f0, cosI, wl);
+#endif
         return dot(direction, geometric) > 0.0f;
     }
     if (mat.type == DIFFUSE) {
@@ -2589,6 +2669,95 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
     if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(direction, mat.geometricNormal) <= 0.0f) return false;
     return all(isfinite(weight)) && all(weight >= 0.0f);
 }
+
+// Spectral MIS at a rough dispersive vertex of the shading pass (spectral_mis; HERO2014 Eqs. 10-12,
+// CMIS2020 Eq. 21). Each lane's lobe is the upstream BSDF prepared at that lane's wavelength alone.
+// With laneRatio R_k = prod p_k / p_hero over the earlier dispersive vertices and throughput weighted
+// by 4 / sum R, a lane's value here is scaled by sum_k R_k / sum_k R_k p_k(wi) instead of divided by
+// the hero's PDF: the path's balance weight over its four hero techniques with this vertex included
+// (zero where the hero lane cannot sample wi). The returned PDF is the hero lane's, which the NEE /
+// BSDF power heuristic of the hero technique uses (the per-hero partition of HERO2014 Sec. 3.3).
+#if VIBE_SPECTRAL
+OpenPBR_PreparedBsdf spectral_mis_lane(Material mat, float3 n, float3 wo, float rho, uint k, thread const Wavelengths &wl) {
+    return prepare_openpbr_lanes(mat, n, wo, float3(rho), float3(spectral_lambda(wl, k)), spectral_material(mat, wl));
+}
+// f (without cosine) of every lane at wi, scaled as above; pdf = the hero lane's.
+Spectrum spectral_mis_eval(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf, thread const Wavelengths &wl,
+                           Spectrum laneRatio) {
+    pdf = 0.0f;
+    float cosine = abs(dot(n, wi));
+    if (cosine < 1e-7f || dot(n, wo) <= 0.0f) return Spectrum(0.0f);
+    Spectrum rho = spectral_albedo(mat, clamp(mat.albedo, 0.0f, 1.0f), wl);
+    uint hero = spectral_hero(wl);
+    Spectrum f = Spectrum(0.0f);
+    float mixture = 0.0f;
+    for (uint k = 0u; k < 4u; ++k) {
+        OpenPBR_PreparedBsdf lane = spectral_mis_lane(mat, n, wo, rho[k], k, wl);
+        float pk = openpbr_pdf(lane, wi);
+        f[k] = openpbr_get_sum_of_diffuse_specular(openpbr_eval(lane, wi)).x;
+        mixture += laneRatio[k] * pk;
+        if (k == hero) pdf = pk;
+    }
+    if (!(mixture > 0.0f)) return Spectrum(0.0f);
+    float scale = (laneRatio.x + laneRatio.y + laneRatio.z + laneRatio.w) / mixture;
+    return f * (scale * pdf / cosine);
+}
+template <typename R>
+bool spectral_mis_sample(Material mat, float3 normal, float3 incoming, bool frontFace, thread R &seed,
+                         thread float3 &direction, thread Spectrum &weight, thread float &pdf,
+                         thread const Wavelengths &wl, thread Spectrum &laneRatio) {
+    pdf = 0.0f;
+    mat.inside = !frontFace;
+    float3 wo = -incoming;
+    Spectrum rho = spectral_albedo(mat, clamp(mat.albedo, 0.0f, 1.0f), wl);
+    uint hero = spectral_hero(wl);
+    float3 random = rand_f3(seed);
+    OpenPBR_DiffuseSpecular result;
+    uint lobe;
+    float own;
+    openpbr_sample(spectral_mis_lane(mat, normal, wo, rho[hero], hero, wl), random, direction, result, own, lobe);
+    if (!(own > 0.0f)) return false;
+    Spectrum f = Spectrum(0.0f), p = Spectrum(0.0f);
+    for (uint k = 0u; k < 4u; ++k) {
+        if (k == hero) { f[k] = openpbr_get_sum_of_diffuse_specular(result).x * own; p[k] = own; continue; }
+        OpenPBR_PreparedBsdf lane = spectral_mis_lane(mat, normal, wo, rho[k], k, wl);
+        p[k] = openpbr_pdf(lane, direction);
+        f[k] = openpbr_get_sum_of_diffuse_specular(openpbr_eval(lane, direction)).x;
+    }
+    float before = laneRatio.x + laneRatio.y + laneRatio.z + laneRatio.w;
+    float mixture = dot(laneRatio, p);
+    if (!(mixture > 0.0f)) return false;
+    weight = f * (before / mixture);
+    laneRatio *= p / own;
+    pdf = own;
+    return all(isfinite(weight)) && all(weight >= 0.0f) && all(isfinite(laneRatio));
+}
+// The shading pass's BSDF sampling and evaluation: spectral MIS at rough dispersive vertices.
+template <typename R>
+bool lanes_sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace, thread R &seed,
+                       thread float3 &direction, thread Spectrum &weight, thread float &pdf,
+                       thread const Wavelengths &wl, thread Spectrum &laneRatio) {
+    if (spectral_mis(mat, wl))
+        return spectral_mis_sample(mat, normal, incoming, frontFace, seed, direction, weight, pdf, wl, laneRatio);
+    return sample_bsdf(mat, normal, incoming, frontFace, seed, direction, weight, pdf, wl);
+}
+Spectrum lanes_eval_bsdf_with_pdf(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf,
+                                  thread const Wavelengths &wl, Spectrum laneRatio) {
+    if (spectral_mis(mat, wl)) return spectral_mis_eval(mat, n, wo, wi, pdf, wl, laneRatio);
+    return eval_bsdf_with_pdf(mat, n, wo, wi, pdf, wl);
+}
+#else
+template <typename R>
+bool lanes_sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace, thread R &seed,
+                       thread float3 &direction, thread Spectrum &weight, thread float &pdf,
+                       thread const Wavelengths &wl, thread Spectrum &) {
+    return sample_bsdf(mat, normal, incoming, frontFace, seed, direction, weight, pdf, wl);
+}
+Spectrum lanes_eval_bsdf_with_pdf(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf,
+                                  thread const Wavelengths &wl, Spectrum) {
+    return eval_bsdf_with_pdf(mat, n, wo, wi, pdf, wl);
+}
+#endif
 
 // Complementary MIS weight for an emitter reached by a BSDF continuation.
 // References: MIS1995, PBRT2023 in REFERENCES.md.
@@ -5499,7 +5668,12 @@ kernel void shading_kernel(
         } else {
             // Camera rays see MaterialX emission directly; no light strategy samples them.
             radiance = emitter_rgb(openpbr_emission(mat, norm, -primaryRay.direction), wl);
-            spectral_arrive(mat, throughput, wl);
+            // A delta dispersive primary vertex splits the continuation into its lanes (below).
+            // laneRatio: the path's R_k of spectral MIS (spectral_mis_sample).
+            Spectrum laneRatio = Spectrum(1.0f);
+            float pathHeroU = spectral_hero_u(wl);
+            bool splitPass = spectral_split(mat, throughput, wl, 0u);
+            spectral_arrive_lanes(mat, throughput, wl, laneRatio);
             // ReSTIR PT (restir_pt_spatial_kernel) estimates paths of three or more vertices,
             // or, unified, every path of two or more (RESTIRPTE2026 Sec. 6.1).
             bool restirPT = uniforms.samplingMode == 0 && restir_pt_active(uniforms);
@@ -5686,7 +5860,7 @@ kernel void shading_kernel(
                     if (light_visible(pos, primaryHit.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, primaryHit.error)) {
                         float cos_th = abs(dot(norm, ls.wi));
                         float bsdf_pdf;
-                        Spectrum bsdf = eval_bsdf_with_pdf(mat, norm, -primaryRay.direction, ls.wi, bsdf_pdf, wl);
+                        Spectrum bsdf = lanes_eval_bsdf_with_pdf(mat, norm, -primaryRay.direction, ls.wi, bsdf_pdf, wl, laneRatio);
                         // Depth 1 has no BSDF continuation to share the direct integral.
                         bool useMIS = uniforms.samplingMode <= 1 && scattering_limit(uniforms.cameraTarget.w) > 0;
                         float weight = useMIS ? power_heuristic(ls.pdf, bsdf_pdf) : 1.0f;
@@ -5720,6 +5894,15 @@ kernel void shading_kernel(
             } else if (restirPT) {
                 radiance += ptIndirect.read(gid).rgb;
             }
+            // Lane splitting (spectral_split): when the continuation split at its first delta
+            // dispersive vertex, it is traced once more for each further lane. Such a pass replays the
+            // first pass's draws up to that vertex (the same Sampler), adds nothing up to it, and
+            // continues lane `lane` alone beyond it.
+            Sampler pathSeed = seed;
+            bool pathSplit = splitPass;
+            for (uint lane = 0u; ; ) {
+            bool merged = false;
+            sampler_split(seed, splitPass ? lane : 0u);
             for (int bounce = 1; !unifiedPT; ++bounce) {
                 float3 nextDirection;
                 Spectrum bsdfWeight;
@@ -5739,8 +5922,8 @@ kernel void shading_kernel(
                     (uniforms.samplingMode == 0 && (bounce > 1 || currentHit.mat.type != DIFFUSE));
                 // Z mode: vertex `bounce` scatters (its BSDF event); rec below is vertex bounce + 1.
                 sampler_event(seed, uint(bounce), Z_BSDF);
-                if (!sample_bsdf(currentHit.mat, currentHit.normal, currentRay.direction,
-                                 currentHit.front_face, seed, nextDirection, bsdfWeight, bsdfPDF, wl)) break;
+                if (!lanes_sample_bsdf(currentHit.mat, currentHit.normal, currentRay.direction,
+                                       currentHit.front_face, seed, nextDirection, bsdfWeight, bsdfPDF, wl, laneRatio)) break;
                 throughput *= bsdfWeight;
                 if (!all(isfinite(throughput)) || spectrum_max(throughput) <= 0.0f) break;
                 float3 previousPosition = currentHit.position;
@@ -5756,21 +5939,23 @@ kernel void shading_kernel(
                     if (!previousDelta) coneSpread = max(coneSpread, currentHit.mat.type == DIFFUSE ? 0.25f : currentHit.mat.roughness * 0.15f);
                     resolve_material(rec, currentRay, uniforms, surfaceSettings, materialImages, pathDistance * coneSpread);
                 }
-                if (bounce == 1 && (mat.type == GLOSSY || mat.type == DIELECTRIC || mat.type == OPENPBR)) {
+                if (bounce == 1 && lane == 0u && (mat.type == GLOSSY || mat.type == DIELECTRIC || mat.type == OPENPBR)) {
                     specularHitDistance = hit ? rec.t : 10000.0f;
                 }
                 if (!hit) {
                     if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
                         float lightPDF = eval_environment_pdf(nextDirection, previousNormal, uniforms,materialImages);
                         float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                        radiance += spectrum_rgb(throughput * weight * environment_spectrum(nextDirection, uniforms, materialImages, wl), wl);
+                        if (lane == 0u || splitPass)
+                            radiance += spectrum_rgb(throughput * weight * environment_spectrum(nextDirection, uniforms, materialImages, wl), wl);
                     }
                     break;
                 }
                 if (rec.mat.type == EMISSIVE) {
                     float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms,materialImages,rec.triangle);
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                    radiance += spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, wl), wl);
+                    if (lane == 0u || splitPass)
+                        radiance += spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, wl), wl);
                     break;
                 }
                 // A MaterialX emitter also scatters: add its emission with the same MIS
@@ -5781,12 +5966,19 @@ kernel void shading_kernel(
                     float lightPDF = uniforms.sceneIndex == 6
                         ? eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms, materialImages, rec.triangle) : 0.0f;
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                    radiance += spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, wl), wl);
+                    if (lane == 0u || splitPass)
+                        radiance += spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, wl), wl);
                 }
                 if (emissionOnly) break;
                 // The x2 emission above is a two-vertex path; ReSTIR PT holds the longer ones.
                 if (restirPT) break;
-                spectral_arrive(rec.mat, throughput, wl);
+                // Only the camera's specular chain splits: the passes then replay delta vertices only,
+                // and the lanes' colour fringes are what the camera sees.
+                if (scatteringDepth == 0 && spectral_split(rec.mat, throughput, wl, lane)) {
+                    splitPass = true; pathSplit = true;
+                    sampler_split(seed, lane);
+                }
+                spectral_arrive_lanes(rec.mat, throughput, wl, laneRatio);
 
                 bool restirGISecondary = uniforms.samplingMode == 0 && mat.type == DIFFUSE &&
                     bounce == 1 && rec.mat.type == DIFFUSE;
@@ -5796,12 +5988,20 @@ kernel void shading_kernel(
                     if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, rec.error)) {
                         float cosine = abs(dot(rec.normal, ls.wi));
                         float pdf;
-                        Spectrum bsdf = eval_bsdf_with_pdf(rec.mat, rec.normal, -currentRay.direction, ls.wi, pdf, wl);
+                        Spectrum bsdf = lanes_eval_bsdf_with_pdf(rec.mat, rec.normal, -currentRay.direction, ls.wi, pdf, wl, laneRatio);
                         // At the last vertex there will be no BSDF light sample.
                         bool useMIS = uniforms.samplingMode <= 1 && scatteringDepth < scatteringLimit;
                         float weight = useMIS ? power_heuristic(ls.pdf, pdf) : 1.0f;
-                        radiance += spectrum_rgb(throughput * bsdf * cosine * light_spectrum(ls, wl) * weight / ls.pdf, wl);
+                        if (lane == 0u || splitPass)
+                            radiance += spectrum_rgb(throughput * bsdf * cosine * light_spectrum(ls, wl) * weight / ls.pdf, wl);
                     }
+                }
+                // Bounded splitting: past the first scattering vertex after the split, one lane, the
+                // path's own hero (chosen before the split), continues with weight four.
+                if (splitPass && !merged && !is_delta(rec.mat) && spectral_split_merges(wl)) {
+                    merged = true;
+                    if (lane != spectral_hero_of(pathHeroU)) break;
+                    throughput *= 4.0f;
                 }
                 currentHit = rec;
                 if (bounce > 3) {
@@ -5813,6 +6013,19 @@ kernel void shading_kernel(
                     if (rand_f(seed) >= survival) break;
                     throughput /= survival;
                 }
+            }
+            if (!pathSplit || ++lane >= 4u) break;
+            seed = pathSeed;
+            currentRay = primaryRay;
+            currentHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth);
+            throughput = Spectrum(1.0f);
+            scatteringDepth = 0;
+            emissionOnly = false;
+            pathDistance = currentHit.t;
+            coneSpread = 2.0f * fov_scale / float(uniforms.height);
+            spectral_unsplit(wl, pathHeroU);
+            laneRatio = Spectrum(1.0f);
+            splitPass = spectral_split(mat, throughput, wl, lane);
             }
         }
     }
@@ -6409,6 +6622,21 @@ enum LightTransport: UInt32, Sendable {
     // elsewhere, for 25-35% more frame time on the M4 (tests/PERFORMANCE.md, "Spectral transport cost").
     case automatic = 2
     func resolved() -> LightTransport { self == .automatic ? .spectral : self }
+}
+
+// How spectral transport samples dispersive interfaces (MSL SpectralScene.dispersionSampling bits;
+// REFERENCES.md HERO2014, CMIS2020). `hero` is the earlier behaviour: the first dispersive vertex keeps
+// one uniformly chosen lane, times four. `spectralMIS` keeps all four lanes through rough dispersive
+// lobes with the balance heuristic over the lanes (spectral_mis); `split` traces the continuation of
+// the first delta dispersive vertex once per lane in the shading pass (spectral_split).
+enum DispersionSampling: UInt32, Sendable {
+    case hero = 0
+    case spectralMIS = 1
+    case split = 2
+    case spectralMISSplit = 3
+    // Host-side default, from equal-time measurements (tests/PERFORMANCE.md, "Dispersion sampling").
+    case automatic = 4
+    func resolved() -> DispersionSampling { self == .automatic ? .spectralMISSplit : self }
 }
 
 // Emitter spectra of spectral transport (MSL VibeIlluminant, normalized to luminance one). An
@@ -7471,6 +7699,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         didSet { if oldValue != lightTransport { resetAccumulation() } }
     }
     var activeLightTransport: LightTransport { resolvedLightTransport(lightTransport) }
+    var dispersionSampling = PathTracerRenderer.defaultDispersionSampling {
+        didSet { if oldValue != dispersionSampling { resetAccumulation() } }
+    }
     func resolvedLightTransport(_ mode: LightTransport) -> LightTransport { mode.resolved() }
     // Whether the scene has area or sphere lights or imported emitters (StudioOptions.lightSpectrum),
     // and a sun (StudioOptions.sunSpectrum).
@@ -7556,6 +7787,19 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         switch ProcessInfo.processInfo.environment["VIBE_LIGHT_TRANSPORT"] {
         case "rgb": return .rgb
         case "spectral": return .spectral
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultDispersionSampling: DispersionSampling {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with the earlier hero-wavelength termination.
+        switch ProcessInfo.processInfo.environment["VIBE_DISPERSION"] {
+        case "hero": return .hero
+        case "mis": return .spectralMIS
+        case "split": return .split
+        case "mis-split": return .spectralMISSplit
         default: break
         }
 #endif
@@ -7952,6 +8196,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var words = [UInt32](repeating: 0, count: 348)
         words[0] = Illuminant.resolved(options.lightSpectrum).rawValue
         words[1] = Illuminant.resolved(options.sunSpectrum).rawValue
+        words[2] = dispersionSampling.resolved().rawValue
+            | (ProcessInfo.processInfo.environment["VIBE_SPLIT_MERGE"] == "1" ? 8 : 0)
+        words[3] = Float(ProcessInfo.processInfo.environment["VIBE_MIS_OVERLAP"] ?? "0")!.bitPattern
         for (i, v) in Self.spectralGridNodes.enumerated() { words[4 + i] = v.bitPattern }
         for (slot, m) in materials.spectralMaterials.enumerated() {
             for c in 0..<4 { words[92 + slot * 4 + c] = m[c].bitPattern }
