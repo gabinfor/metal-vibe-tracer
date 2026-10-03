@@ -533,9 +533,10 @@ float3 procedural_light_emission(uint sceneIndex) {
 // ============================================================================
 // Scene data stays RGB everywhere (materials, textures, MaterialX graphs, lights, reservoirs'
 // emission). A path converts it to its four wavelengths where it is used: bounded colours through
-// the bounded MESE of their trigonometric moments (PETERS2019, FOURIERSRGB2019), emitters as
-// s rho_{e/s}(lambda) S(lambda) with s = max(e) and S the emitter's illuminant (D65 for RGB
-// colours, so that an RGB emitter keeps its colour). Contributions become linear sRGB where they
+// the bounded MESE of their trigonometric moments (PETERS2019, FOURIERSRGB2019), emitters through a
+// linear decomposition into white and the MESE spectra of the saturated sRGB corners (SMITS1999),
+// times the emitter's illuminant S (D65 for RGB colours, so that an RGB emitter keeps its colour;
+// spectral_emission). Contributions become linear sRGB where they
 // are added, at the wavelengths of the estimator that produced them. In RGB libraries every helper
 // below is the identity and Wavelengths is empty.
 #if VIBE_SPECTRAL
@@ -551,20 +552,19 @@ struct SpectralScene {
     uint lightIlluminant;    // VibeIlluminant of area and sphere lights and imported emitters (D65 = their RGB colour)
     uint sunIlluminant;      // VibeIlluminant of the sun (procedural disc, imported DistantLight)
     uint padding0, padding1;
-    float4 lightChroma;      // the area light's e / max(e) (scenes 1, 3, 4, 5), or -1
-    float4 lightLagrange;    // and its spectral_lagrange, solved on the host
     float nodes[88];          // linear sRGB of the coarse grid's nodes, codes 0, 3, ..., 255 (86 used)
     SpectralMaterial materials[64];
 };
-static_assert(sizeof(SpectralScene) == 1424, "Swift writes a 1424-byte SpectralScene");
+static_assert(sizeof(SpectralScene) == 1392, "Swift writes a 1392-byte SpectralScene");
 // Buffer 28 (SpectralShaderCache.grid): the exactly solved 86^3 grid of FourierSRGB86.bin as float4
 // (c0, c1, c2, 0), indexed (r * 86 + g) * 86 + b. Buffer 29 (PathTracerRenderer.spectralSampling),
 // written by spectral_icdf_kernel: the scene's 1025-node wavelength inverse CDF, then at float4 257
-// the linear-sRGB CMFs and the cosine of Peters' phase per nanometre (rgb, cos phase), then the
-// kernel's scratch.
+// per nanometre the linear-sRGB CMFs and the cosine of Peters' phase (rgb, cos phase), then the
+// emission basis (two float4 per nanometre: R, G, B and C, M, Y), then the kernel's scratch.
 constant uint SPECTRAL_GRID = 86u;
 constant uint SPECTRAL_CMF_TABLE = 257u;   // float4 offset of the per-nanometre (rgb CMF, cos phase) table
-constant uint SPECTRAL_SCRATCH = 4u * (257u + 471u);   // float offset of the kernel's scratch
+constant uint SPECTRAL_BASIS = 257u + 471u;   // float4 offset of the per-nanometre emission basis (2 per nm)
+constant uint SPECTRAL_SCRATCH = 4u * (257u + 3u * 471u);   // float offset of the kernel's scratch
 
 // Four wavelengths of one path sample from one number u: lambda_k = F^-1((u + k) / 4) for the scene's
 // piecewise-linear inverse CDF (illuminant x |rgb CMF| with a 10% defensive term). A path keeps only
@@ -621,8 +621,8 @@ float4 spectral_lambdas(thread const Wavelengths &wl) {
     return float4(spectral_lambda(wl, 0u), spectral_lambda(wl, 1u), spectral_lambda(wl, 2u), spectral_lambda(wl, 3u));
 }
 // The 1 nm bin of lambda. Colours are defined by 1 nm sums (the generator's colour model, the
-// XYZ -> sRGB matrix and the presets' luminance), so CMFs, illuminants and the reflectance phase are
-// all evaluated at the nearest node: the estimator's expectation is then
+// XYZ -> sRGB matrix and the presets' luminance), so CMFs, illuminants, the emission basis and the
+// reflectance phase are all evaluated at the nearest node: the estimator's expectation is then
 // exactly those sums (a grey under D65 renders as RGB does, a reflectance's colour is its 1 nm sum).
 uint spectral_bin(float lambda) {
     return min(uint(clamp(lambda - VIBE_LAMBDA_MIN + 0.5f, 0.0f, float(VIBE_SPECTRAL_SAMPLES - 1u))), VIBE_SPECTRAL_SAMPLES - 1u);
@@ -705,7 +705,7 @@ float3 spectral_moments(float3 c, thread const Wavelengths &wl) {
 float4 spectral_lagrange(float3 rgb, thread const Wavelengths &wl) {
     float3 c = saturate(rgb);
     // Greys are exactly flat. Near-greys too (within 1e-4, far below an 8-bit step): near white the
-    // bounded multipliers diverge, and an emitter's e / max(e) is grey only up to rounding.
+    // bounded multipliers diverge.
     float lo = min(c.x, min(c.y, c.z)), hi = max(c.x, max(c.y, c.z));
     if (hi - lo <= 1e-4f) return float4((c.x + c.y + c.z) / 3.0f, 0.0f, 0.0f, 2.0f);
     return float4(vibe_fourier_lagrange(spectral_moments(c, wl)), 1.0f);
@@ -724,38 +724,54 @@ Spectrum spectral_reflectance(float3 rgb, thread const Wavelengths &wl) {
 float spectral_illuminant(uint illuminant, float lambda) {
     return vibe_illuminant_spd[min(illuminant, VIBE_ILLUMINANT_COUNT - 1u)][spectral_bin(lambda)];
 }
+// Emission is upsampled linearly (Smits' decomposition, SMITS1999, with the bounded-MESE spectra of
+// the six saturated sRGB corners as its basis): e = lo (1, 1, 1) + (mid - lo) secondary + (hi - mid)
+// primary, where hi >= mid >= lo are e's sorted channels, the primary is the corner of e's largest
+// channel and the secondary the corner of its two largest. The spectrum reproduces e's colour (the
+// basis spectra's own colours to the table's precision), white is exactly the illuminant, and no
+// colour is solved at run time: the basis is tabulated per nanometre in the sampling buffer.
+struct SpectralEmissionWeights { float lo, secondary, primary; uint secondaryIndex, primaryIndex; };
+SpectralEmissionWeights spectral_emission_weights(float3 e) {
+    e = max(e, 0.0f);
+    float hi = max(e.x, max(e.y, e.z)), lo = min(e.x, min(e.y, e.z)), mid = e.x + e.y + e.z - hi - lo;
+    SpectralEmissionWeights w;
+    w.primaryIndex = e.x == hi ? 0u : e.y == hi ? 1u : 2u;
+    // The secondary (C, M, Y) is indexed by the channel it lacks: the smallest other than the primary.
+    w.secondaryIndex = w.primaryIndex != 2u && e.z == lo ? 2u : w.primaryIndex != 1u && e.y == lo ? 1u : 0u;
+    w.lo = lo; w.secondary = max(mid - lo, 0.0f); w.primary = max(hi - mid, 0.0f);
+    return w;
+}
+float spectral_emission_basis(SpectralEmissionWeights w, const device float4 *basis, uint bin) {
+    return w.lo + w.secondary * basis[2u * bin + 1u][w.secondaryIndex] + w.primary * basis[2u * bin][w.primaryIndex];
+}
 // Unbounded RGB radiance e of an emitter with illuminant S (normalized to luminance one).
 Spectrum spectral_emission(float3 e, uint illuminant, thread const Wavelengths &wl) {
-    float s = max(e.x, max(e.y, e.z));
-    if (!(s > 0.0f)) return Spectrum(0.0f);
-    float4 lambda = spectral_lambdas(wl);
-    Spectrum S = Spectrum(spectral_illuminant(illuminant, lambda.x), spectral_illuminant(illuminant, lambda.y),
-                          spectral_illuminant(illuminant, lambda.z), spectral_illuminant(illuminant, lambda.w));
-    // The area light's colour is converted once per frame on the host (SpectralScene.lightLagrange).
-    float3 c = e / s;
-    float4 L;
-    if (all(abs(c - wl.scene->lightChroma.xyz) < 1e-5f)) L = wl.scene->lightLagrange;
-    else L = spectral_lagrange(c, wl);
-    return s * spectral_from_lagrange(L, wl) * S;
+    if (!(max(e.x, max(e.y, e.z)) > 0.0f)) return Spectrum(0.0f);
+    SpectralEmissionWeights w = spectral_emission_weights(e);
+    const device float4 *basis = (const device float4 *)wl.icdf + SPECTRAL_BASIS;
+    constant float *spd = vibe_illuminant_spd[min(illuminant, VIBE_ILLUMINANT_COUNT - 1u)];
+    Spectrum result;
+    for (uint k = 0u; k < 4u; ++k) {
+        uint bin = spectral_bin(spectral_lambda(wl, k));
+        result[k] = spectral_emission_basis(w, basis, bin) * spd[bin];
+    }
+    return result;
 }
 // The exact linear sRGB of that emission (1 nm sums), for paths without a scattering vertex
 // (camera rays that see an emitter or the sky): their wavelength integral needs no sampling.
-// With D65 the upsampled spectrum reproduces e within the table's precision.
+// With D65 the upsampled spectrum reproduces e within the basis' precision, so e is returned.
 float3 spectral_emission_rgb(float3 e, uint illuminant, thread const Wavelengths &wl) {
-    float s = max(e.x, max(e.y, e.z));
-    if (illuminant == VIBE_ILLUMINANT_D65 || !(s > 0.0f)) return e;
-    float3 c = saturate(e / s);
-    bool grey = c.x == c.y && c.y == c.z;
-    float3 L = grey ? float3(0.0f) : vibe_fourier_lagrange(spectral_moments(c, wl));
+    if (illuminant == VIBE_ILLUMINANT_D65 || !(max(e.x, max(e.y, e.z)) > 0.0f)) return e;
+    SpectralEmissionWeights w = spectral_emission_weights(e);
+    const device float4 *basis = (const device float4 *)wl.icdf + SPECTRAL_BASIS;
     constant float *spd = vibe_illuminant_spd[min(illuminant, VIBE_ILLUMINANT_COUNT - 1u)];
     float3 xyz = float3(0.0f);
     for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i) {
         float S = spd[i];
         if (S == 0.0f) continue;
-        float rho = grey ? c.x : vibe_fourier_reflectance(L, vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i)));
-        xyz += rho * S * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]);
+        xyz += spectral_emission_basis(w, basis, i) * S * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]);
     }
-    return s * (VIBE_XYZ_TO_LINEAR_SRGB * xyz);
+    return VIBE_XYZ_TO_LINEAR_SRGB * xyz;
 }
 Spectrum emitter_spectrum(float3 e, thread const Wavelengths &wl) { return spectral_emission(e, wl.scene->lightIlluminant, wl); }
 float3 emitter_rgb(float3 e, thread const Wavelengths &wl) { return spectral_emission_rgb(e, wl.scene->lightIlluminant, wl); }
@@ -6056,9 +6072,17 @@ kernel void spectral_icdf_kernel(device float *table [[buffer(29)]], constant fl
                                  uint tid [[thread_position_in_grid]]) {
     if (tid != 0u) return;
     device float4 *cmf = (device float4 *)table + SPECTRAL_CMF_TABLE;
-    for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i)
-        cmf[i] = float4(VIBE_XYZ_TO_LINEAR_SRGB * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]),
-                        cos(vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i))));
+    device float4 *basis = (device float4 *)table + SPECTRAL_BASIS;
+    for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i) {
+        float phase = vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i));
+        cmf[i] = float4(VIBE_XYZ_TO_LINEAR_SRGB * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]), cos(phase));
+        // The emission basis (spectral_emission): the six saturated corners R, G, B and C, M, Y, whose
+        // Lagrange multipliers the host solved (weights[2 ..]).
+        float corner[6];
+        for (uint k = 0u; k < 6u; ++k) corner[k] = vibe_fourier_reflectance(weights[2u + k].xyz, phase);
+        basis[2u * i] = float4(corner[0], corner[1], corner[2], 0.0f);
+        basis[2u * i + 1u] = float4(corner[3], corner[4], corner[5], 0.0f);
+    }
     device float *density = table + SPECTRAL_SCRATCH;
     device float *cdf = density + VIBE_SPECTRAL_SAMPLES;
     float w[6] = { weights[0].x, weights[0].y, weights[0].z, weights[0].w, weights[1].x, weights[1].y };
@@ -6435,8 +6459,8 @@ func loadSpectralGrid() throws -> [SIMD4<Float>] {
 
 // Host copy of the shader's colour conversion (MSL spectral_lagrange), in double precision: moments
 // interpolated trilinearly in linear light from the grid, then the bounded MESE's Lagrange multipliers
-// (MSL vibe_fourier_lagrange; PETERS2019 Eqs. 6, 7, 10, FOURIERSRGB2019 Alg. 1 and 2). It converts
-// constant colours once per frame (SpectralScene.lightLagrange) instead of once per light sample.
+// (MSL vibe_fourier_lagrange; PETERS2019 Eqs. 6, 7, 10, FOURIERSRGB2019 Alg. 1 and 2). It solves the
+// six saturated corners of the emission basis (MSL spectral_emission) once per device.
 enum SpectralColour {
     static func lagrange(_ rgb: SIMD3<Double>, grid: MTLBuffer, nodes: [Float]) -> SIMD4<Float> {
         let c = simd_clamp(rgb, SIMD3(repeating: 0), SIMD3(repeating: 1))
@@ -7897,7 +7921,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
               let command = commandQueue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { return }
         cache.refined = true
         memset(flags.contents(), 0, flags.length)
-        var words = spectralSceneWords(lightLagrange: false)
+        var words = spectralSceneWords()
         encoder.setComputePipelineState(kernels.refineFlags)
         encoder.setBytes(&words, length: words.count * 4, index: 27)
         encoder.setBuffer(grid, offset: 0, index: 28)
@@ -7926,30 +7950,19 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         solver.endEncoding(); solve.commit(); solve.waitUntilCompleted()
         if solve.status != .completed { onError?("The spectral grid refinement failed: \(String(describing: solve.error))") }
     }
-    // SpectralScene (MSL, 1424 bytes): light and sun illuminants, the coarse grid's node values and
+    // SpectralScene (MSL, 1392 bytes): light and sun illuminants, the coarse grid's node values and
     // the slots' spectral material parameters.
     static let spectralGridNodes: [Float] = (0..<86).map { i in
         let v = Double(3 * i) / 255
         return Float(v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4))
     }
-    func spectralSceneWords(lightLagrange solveLight: Bool = true) -> [UInt32] {
-        var words = [UInt32](repeating: 0, count: 356)
+    func spectralSceneWords() -> [UInt32] {
+        var words = [UInt32](repeating: 0, count: 348)
         words[0] = Illuminant.resolved(options.lightSpectrum).rawValue
         words[1] = Illuminant.resolved(options.sunSpectrum).rawValue
-        // The area light's colour (MSL procedural_light_emission x Uniforms.light), solved once here.
-        var chroma = SIMD4<Float>(-1, -1, -1, 0), lagrange = SIMD4<Float>(0, 0, 0, 0)
-        if solveLight, let emission = Self.proceduralLightEmission[sceneIndex], let grid = spectralShaders.grid {
-            let e = emission * options.lightColor * options.lightIntensity
-            if e.max() > 0 {
-                let c = e / e.max()
-                chroma = SIMD4(c, 0)
-                lagrange = SpectralColour.lagrange(SIMD3<Double>(c), grid: grid, nodes: Self.spectralGridNodes)
-            }
-        }
-        for c in 0..<4 { words[4 + c] = chroma[c].bitPattern; words[8 + c] = lagrange[c].bitPattern }
-        for (i, v) in Self.spectralGridNodes.enumerated() { words[12 + i] = v.bitPattern }
+        for (i, v) in Self.spectralGridNodes.enumerated() { words[4 + i] = v.bitPattern }
         for (slot, m) in materials.spectralMaterials.enumerated() {
-            for c in 0..<4 { words[100 + slot * 4 + c] = m[c].bitPattern }
+            for c in 0..<4 { words[92 + slot * 4 + c] = m[c].bitPattern }
         }
         return words
     }
@@ -7957,16 +7970,14 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // and the sampling buffer.
     nonisolated static let spectralRefinedCapacity = 8192
     nonisolated static let spectralGridBytes: UInt64 = (86 * 86 * 86 + 8192 * 64) * 16
-    nonisolated static let spectralBytes: UInt64 = spectralGridBytes + 4 * (4 * (257 + 471) + 2 * 471)
-    // MSL procedural_light_emission: the area light of scenes 1, 3, 4 and 5 before its tint.
-    static let proceduralLightEmission: [UInt32: SIMD3<Float>] = [
-        1: SIMD3(18, 15, 10), 3: SIMD3(24, 20, 15), 4: SIMD3(32, 28, 22), 5: SIMD3(45, 42, 38)]
+    nonisolated static let spectralSamplingFloats = 4 * (257 + 3 * 471) + 2 * 471
+    nonisolated static let spectralBytes: UInt64 = spectralGridBytes + 4 * UInt64(spectralSamplingFloats)
     // Encodes spectral_icdf_kernel when the scene's illuminant weights changed; returns the weights the
     // buffer will hold once the command buffer completes.
     func encodeSpectralSampling(_ command: MTLCommandBuffer) -> [Float]? {
         let weights = spectralIlluminantWeights()
         if spectralSampling == nil {
-            spectralSampling = device.makeBuffer(length: (4 * (257 + 471) + 2 * 471) * 4, options: .storageModePrivate)
+            spectralSampling = device.makeBuffer(length: Self.spectralSamplingFloats * 4, options: .storageModePrivate)
             spectralSampling?.label = "Spectral: wavelength inverse CDF"
             spectralSamplingWeights = nil
         }
@@ -7976,6 +7987,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         encoder.label = "Spectral: wavelength sampling"
         encoder.setComputePipelineState(kernels.icdf)
         var packed = weights + [Float](repeating: 0, count: 8 - weights.count)
+        // The Lagrange multipliers of the emission basis: the saturated corners R, G, B, C, M, Y.
+        guard let grid = spectralShaders.grid else { return nil }
+        for corner in [SIMD3<Double>(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1), SIMD3(0, 1, 1), SIMD3(1, 0, 1), SIMD3(1, 1, 0)] {
+            let L = SpectralColour.lagrange(corner, grid: grid, nodes: Self.spectralGridNodes)
+            packed += [L.x, L.y, L.z, 0]
+        }
         encoder.setBytes(&packed, length: packed.count * 4, index: 0)
         encoder.setBuffer(buffer, offset: 0, index: 29)
         encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))

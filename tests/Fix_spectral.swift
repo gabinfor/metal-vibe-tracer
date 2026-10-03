@@ -215,6 +215,21 @@
         float n = openpbr_dispersion_adjusted_ior(1.5f, 1.0f, spectral_lambda(wl, spectral_hero(wl)));
         out[tid] = float4(length(d.xy), n, openpbr_dispersion_adjusted_ior(1.5f, 1.0f, lines[tid]), d.z);
     }
+    // The emission basis (spectral_emission): the 1 nm colour of an upsampled RGB emitter under D65,
+    // and the smallest value of its spectrum.
+    kernel void spectral_emission_colour(constant float4 *colours [[buffer(0)]], device float4 *out [[buffer(3)]]
+                                         SPECTRAL_BUFFERS, uint tid [[thread_position_in_grid]]) {
+        SpectralEmissionWeights w = spectral_emission_weights(colours[tid].xyz);
+        const device float4 *basis = (const device float4 *)spectralSampling + SPECTRAL_BASIS;
+        float3 xyz = float3(0.0f);
+        float lowest = INFINITY;
+        for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i) {
+            float v = spectral_emission_basis(w, basis, i);
+            lowest = min(lowest, v);
+            xyz += v * vibe_illuminant_spd[VIBE_ILLUMINANT_D65][i] * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]);
+        }
+        out[tid] = float4(VIBE_XYZ_TO_LINEAR_SRGB * xyz, lowest);
+    }
     // One interreflection between two Cornell red walls under D65: sum rho^2 S xyz at 1 nm.
     kernel void spectral_interreflection(constant Uniforms &u [[buffer(1)]], constant MaterialResources &images [[buffer(2)]],
                                          device float4 *out [[buffer(0)]] SPECTRAL_BUFFERS, uint tid [[thread_position_in_grid]]) {
@@ -317,6 +332,32 @@
   require(rays.allSatisfy { abs($0.x * $0.y - sin(0.6)) < 2e-5 && $0.w < 0 } && Set(rays.map { $0.y }).count == 3,
     "each hero wavelength refracts by Snell's law with n(lambda)")
   r.materials.spectralOverrides = [:]
+
+  // Emission basis: white is the illuminant itself, and every upsampled RGB emitter (corners, mixtures,
+  // greys, unbounded values) has a nonnegative spectrum whose colour is the RGB value within half an
+  // 8-bit step at its brightest channel's scale.
+  var emitters: [SIMD4<Float>] = [SIMD4(1, 1, 1, 0), SIMD4(1, 0, 0, 0), SIMD4(0, 1, 0, 0), SIMD4(0, 0, 1, 0), SIMD4(0, 1, 1, 0),
+    SIMD4(1, 0, 1, 0), SIMD4(1, 1, 0, 0), SIMD4(18, 15, 10, 0), SIMD4(24, 20, 15, 0), SIMD4(0.3, 0.5, 0.9, 0), SIMD4(2, 0.2, 0.6, 0)]
+  var generator = SystemRandomNumberGenerator()
+  for _ in 0..<500 { emitters.append(SIMD4(Float.random(in: 0...1, using: &generator), Float.random(in: 0...1, using: &generator),
+                                           Float.random(in: 0...1, using: &generator), 0) * Float.random(in: 0.1...50, using: &generator)) }
+  let emitterBuffer = gpu.makeBuffer(bytes: emitters, length: emitters.count * 16, options: .storageModeShared)!
+  let emitterColours = gpu.makeBuffer(length: emitters.count * 16, options: .storageModeShared)!
+  try run("spectral_emission_colour", width: emitters.count) { encoder in
+    bindUnits(encoder); encoder.setBuffer(emitterBuffer, offset: 0, index: 0); encoder.setBuffer(emitterColours, offset: 0, index: 3)
+  }
+  var emissionWorst = 0.0, emissionLowest = Float.infinity
+  func code(_ v: Double) -> Double { (v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055) * 255 }
+  for (i, e) in emitters.enumerated() {
+    let v = emitterColours.contents().load(fromByteOffset: i * 16, as: SIMD4<Float>.self)
+    let s = Double(max(e.x, e.y, e.z))
+    for c in 0..<3 { emissionWorst = max(emissionWorst, abs(code(Double(v[c]) / s) - code(Double(e[c]) / s))) }
+    emissionLowest = min(emissionLowest, v.w / Float(s))
+    if i == 0 { require(abs(v.x - 1) < 1e-4 && abs(v.y - 1) < 1e-4 && abs(v.z - 1) < 1e-4 && v.w == 1, "white emission is D65 exactly: \(v)") }
+  }
+  print(String(format: "Emission basis: %d emitters, colour error max %.3f 8-bit steps (relative to the brightest channel), smallest spectral value %.4f",
+               emitters.count, emissionWorst, emissionLowest))
+  require(emissionWorst <= 0.5 && emissionLowest >= 0, "upsampled emitters keep their colour and a nonnegative spectrum")
 
   // Saturated interreflection: one bounce between two walls of the same colour under D65.
   let bounce = gpu.makeBuffer(length: 6 * 16, options: .storageModeShared)!
