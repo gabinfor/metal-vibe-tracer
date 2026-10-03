@@ -99,7 +99,7 @@
         constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],
         constant MaterialResources &images [[buffer(2)]], const device PrimarySurface *surfaces [[buffer(3)]],
         const device PTReservoir *reservoirs [[buffer(5)]], constant int2 &offset [[buffer(6)]],
-        device float4 *identity [[buffer(7)]], device float4 *trip [[buffer(8)]], uint2 gid [[thread_position_in_grid]]) {
+        device float4 *identity [[buffer(7)]], device float4 *trip [[buffer(8)]] SPECTRAL_BUFFERS, uint2 gid [[thread_position_in_grid]]) {
         if (gid.x >= u.width || gid.y >= u.height) return;
         uint i = gid.y * u.width + gid.x;
         identity[i] = float4(-1); trip[i] = float4(-1);
@@ -110,7 +110,7 @@
         HitRecord y = load_primary_surface(surfaces[i], p);
         float3 view = float3(surfaces[i].view);
         float threshold = pt_footprint_threshold(p.w, y.geometricNormal, view);
-        PTShift s = pt_shift(r, y, view, threshold, cone, u, settings, images);
+        PTShift s = pt_shift(r, y, view, threshold, cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
         float J = pt_rc_index(r) > 0u ? s.jacobian / r.rcJacobian : 1.0f;
         identity[i] = float4(pt_luminance(s.FJ), pt_luminance(r.F), J, float(pt_rc_index(r)));
         int2 q = int2(gid) + offset;
@@ -120,20 +120,22 @@
         uint qi = uint(q.y) * u.width + uint(q.x);
         HitRecord z = load_primary_surface(surfaces[qi], qp);
         float3 zView = float3(surfaces[qi].view);
-        PTShift forward = pt_shift(r, z, zView, pt_footprint_threshold(qp.w, z.geometricNormal, zView), cone, u, settings, images);
+        PTShift forward = pt_shift(r, z, zView, pt_footprint_threshold(qp.w, z.geometricNormal, zView), cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
         if (!(pt_luminance(forward.FJ) > 0.0f)) { trip[i] = float4(0, 0, 0, float(pt_rc_index(r))); return; }
         PTReservoir shifted = r;
         float J1 = pt_rc_index(r) > 0u ? forward.jacobian / r.rcJacobian : 1.0f;
         shifted.F = forward.FJ / J1;
         if (pt_rc_index(r) > 0u) shifted.rcJacobian = forward.jacobian;
-        PTShift back = pt_shift(shifted, y, view, threshold, cone, u, settings, images);
+        PTShift back = pt_shift(shifted, y, view, threshold, cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
         float J2 = pt_rc_index(r) > 0u ? back.jacobian / shifted.rcJacobian : 1.0f;
         trip[i] = float4(pt_luminance(back.FJ / J2), pt_luminance(r.F), J1 * J2, float(pt_rc_index(r)) + 1000.0f);
     }
     """
   let library = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  // Kernels that read rendered reservoirs need their transport's layouts (rendererShaderLibrary).
+  let reservoirLibrary = try rendererShaderLibrary(kernels)
   func run(_ name: String, width: Int, height: Int = 1, _ bind: (MTLComputeCommandEncoder) -> Void) throws {
-    let state = try gpu.makeComputePipelineState(function: library.makeFunction(name: name)!)
+    let state = try gpu.makeComputePipelineState(function: (name == "pt_round_trip" ? reservoirLibrary : library).makeFunction(name: name)!)
     let command = renderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
     encoder.setComputePipelineState(state)
     bind(encoder)
@@ -218,6 +220,7 @@
           $0.setBuffer(renderer.ptReservoirs!, offset: 0, index: 5)
           $0.setBytes(&offset, length: 8, index: 6)
           $0.setBuffer(identity, offset: 0, index: 7); $0.setBuffer(trip, offset: 0, index: 8)
+          bindRendererSpectral($0)
         }
         for i in 0..<(rw * rh) {
           let a = identity.contents().load(fromByteOffset: i * 16, as: SIMD4<Float>.self)

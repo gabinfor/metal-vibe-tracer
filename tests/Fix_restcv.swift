@@ -59,8 +59,8 @@
     kernel void restcv_same_domain(texture2d<float, access::read> positions [[texture(0)]],
         constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],
         constant MaterialResources &images [[buffer(2)]], const device PrimarySurface *surfaces [[buffer(3)]],
-        const device PTReservoir *reservoirs [[buffer(5)]], device float2 *out [[buffer(7)]],
-        uint2 gid [[thread_position_in_grid]]) {
+        const device PTReservoir *reservoirs [[buffer(5)]], device float2 *out [[buffer(7)]]
+        SPECTRAL_BUFFERS, uint2 gid [[thread_position_in_grid]]) {
         if (gid.x >= u.width || gid.y >= u.height) return;
         uint i = gid.y * u.width + gid.x;
         out[i] = float2(-1.0f);
@@ -73,13 +73,15 @@
         t.M = 7.0f;
         float3 difference;
         PTReservoir merged = pt_temporal_merge(c, x1, view, p.w, t, x1, view, p.w, PT_CONFIDENCE_CAP, 5u, u, settings, images,
-                                               difference);
+                                               difference, SPECTRAL_CONTEXT(u, images));
         out[i] = float2(length(difference), length(float3(c.F) * c.W) + 0.0f * merged.W);
     }
     """
   let library = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  // Kernels that read rendered reservoirs need their transport's layouts (rendererShaderLibrary).
+  let reservoirLibrary = try rendererShaderLibrary(kernels)
   func run(_ name: String, width: Int, height: Int = 1, _ bind: (MTLComputeCommandEncoder) -> Void) throws {
-    let state = try gpu.makeComputePipelineState(function: library.makeFunction(name: name)!)
+    let state = try gpu.makeComputePipelineState(function: (name == "restcv_same_domain" ? reservoirLibrary : library).makeFunction(name: name)!)
     let command = renderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
     encoder.setComputePipelineState(state)
     bind(encoder)
@@ -155,6 +157,7 @@
     encoder.setBuffer(renderer.primarySurfaces!, offset: 0, index: 3)
     encoder.setBuffer(renderer.ptReservoirs!, offset: 0, index: 5)
     encoder.setBuffer(same, offset: 0, index: 7)
+    bindRendererSpectral(encoder)
   }
   let pairs = (0..<pixels).map { same.contents().load(fromByteOffset: $0 * 8, as: SIMD2<Float>.self) }.filter { $0.x >= 0 }
   let cancelled = pairs.filter { $0.x <= 1e-3 * $0.y }.count

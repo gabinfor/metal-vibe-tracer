@@ -16,11 +16,11 @@ kernel void openpbr_adapter_checks(device float4 *out [[buffer(0)]], uint index 
     float maximumError = 0, pdfError = 0; uint valid = 0, below = 0;
     for (int i = 0; i < 4096; ++i) {
         float3 direction, weight; float pdf;
-        if (!sample_bsdf(m, n, -wo, !m.inside, seed, direction, weight, pdf)) continue;
+        if (!sample_bsdf(m, n, -wo, !m.inside, seed, direction, weight, pdf, Wavelengths())) continue;
         ++valid; if (direction.z < 0) ++below;
-        float3 expected = eval_bsdf(m, n, wo, direction) * abs(direction.z) / pdf;
+        float3 expected = eval_bsdf(m, n, wo, direction, Wavelengths()) * abs(direction.z) / pdf;
         float combinedPdf;
-        float3 combined = eval_bsdf_with_pdf(m,n,wo,direction,combinedPdf) * abs(direction.z) / pdf;
+        float3 combined = eval_bsdf_with_pdf(m,n,wo,direction,combinedPdf,Wavelengths()) * abs(direction.z) / pdf;
         maximumError = max(maximumError, length(combined - expected) / max(1.0f,length(expected)));
         pdfError = max(pdfError, abs(combinedPdf-pdf)/max(1e-5f,pdf));
         if (index == 6) {
@@ -30,7 +30,7 @@ kernel void openpbr_adapter_checks(device float4 *out [[buffer(0)]], uint index 
             pdfError = max(pdfError,abs(openpbr_pdf(full,direction)-pdf)/max(1e-5f,pdf));
         }
         maximumError = max(maximumError, length(expected - weight) / max(1.0f, length(weight)));
-        pdfError = max(pdfError, abs(pdf - eval_bsdf_pdf(m,n,wo,direction)) / max(1e-5f,pdf));
+        pdfError = max(pdfError, abs(pdf - eval_bsdf_pdf(m,n,wo,direction,Wavelengths())) / max(1e-5f,pdf));
     }
     out[index] = float4(maximumError, pdfError, float(valid), float(below));
 }

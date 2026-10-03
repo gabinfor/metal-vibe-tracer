@@ -63,6 +63,22 @@ using namespace metal;
 constant bool MESHES = VIBE_MESHES;
 constant bool HARDWARE_MESHES = VIBE_MESHES;
 
+// Light transport (PathTracerRenderer.lightTransport; docs/SPECTRAL_DESIGN.md). Spectral
+// libraries compile with VIBE_SPECTRAL=1 after the generated SpectralTables.metal include
+// (REFERENCES.md: PETERSBLOG2025, PETERS2019, FOURIERSRGB2019, HERO2014, CIEDATA): each path
+// carries four wavelengths and its throughput is a Spectrum of their values. RGB libraries compile
+// the `#else` branches, whose code is the RGB renderer's, with Spectrum = float3.
+#ifndef VIBE_SPECTRAL
+#define VIBE_SPECTRAL 0
+#endif
+#if VIBE_SPECTRAL
+typedef float4 Spectrum;
+#define SPECTRAL_KEEPS_NEGATIVE true
+#else
+typedef float3 Spectrum;
+#define SPECTRAL_KEEPS_NEGATIVE false
+#endif
+
 // --- PRNG (PCG Hash) ---
 // References: HASH2020, PCG2014; float conversion and seed feedback are local.
 uint pcg_hash(uint input) {
@@ -232,9 +248,9 @@ bool sampler_joint(thread uint &) { return false; }
 bool sampler_joint(thread Sampler &s) { return s.z; }
 // Sampling event streams (32 dimensions each, 16 per path vertex). ReSTIR PT's streams are
 // Z_PT + its pt_seed stream (0 BSDF, 1 NEE, 2 roulette), apart from the shading pass's.
-// Z_PT + 0..2 occupy streams 9-11. Z_WAVELENGTH (vertex 0) is reserved for a per-path hero
-// wavelength: one rand_f of its own event, drawn identically by every pass of a pixel (as the lens
-// is), so ReSTIR PT can re-derive it from the reservoir key. Streams 13-15 are free.
+// Z_PT + 0..2 occupy streams 9-11. Z_WAVELENGTH (vertex 0) holds spectral transport's wavelength
+// numbers (wavelength_numbers): u, then the hero choice, drawn identically by every pass of a pixel
+// (as the lens is), so ReSTIR PT re-derives them from the reservoir key. Streams 13-15 are free.
 constant uint Z_BSDF = 0u, Z_NEE = 1u, Z_ROULETTE = 2u, Z_LENS = 3u, Z_DI = 4u,
     Z_GI_BSDF = 5u, Z_GI_NEE = 6u, Z_CAUSTIC = 7u, Z_FOG = 8u, Z_PT = 9u, Z_WAVELENGTH = 12u;
 void sampler_event(thread Sampler &s, uint pathVertex, uint stream) {
@@ -300,6 +316,10 @@ struct LightSample {
     float dist;
     float pdf;
     uint isDirectional;
+    // Spectral transport: the wavelength number of the path that drew the sample (Wavelengths.u).
+    // Reused samples are evaluated at their own wavelengths, so emission stays the RGB value it
+    // was drawn with. Zero in RGB libraries.
+    float u;
 };
 
 struct Uniforms {
@@ -500,6 +520,268 @@ struct MaterialResources {
     texture2d<float> environmentRows [[id(392)]];
     texture2d<float> environmentColumns [[id(393)]];
 };
+
+// Radiance of the area light of scenes 1, 3, 4 and 5 before the light tint (Uniforms.light).
+float3 procedural_light_emission(uint sceneIndex) {
+    if (sceneIndex == 5u) return float3(45.0f, 42.0f, 38.0f);
+    return (sceneIndex == 4) ? float3(32.0f, 28.0f, 22.0f) :
+           (sceneIndex == 3) ? float3(24.0f, 20.0f, 15.0f) : float3(18.0f, 15.0f, 10.0f);
+}
+
+// ============================================================================
+// Spectral light transport (docs/SPECTRAL_DESIGN.md; REFERENCES.md PETERSBLOG2025)
+// ============================================================================
+// Scene data stays RGB everywhere (materials, textures, MaterialX graphs, lights, reservoirs'
+// emission). A path converts it to its four wavelengths where it is used: bounded colours through
+// the bounded MESE of their trigonometric moments (PETERS2019, FOURIERSRGB2019), emitters as
+// s rho_{e/s}(lambda) S(lambda) with s = max(e) and S the emitter's illuminant (D65 for RGB
+// colours, so that an RGB emitter keeps its colour). Contributions become linear sRGB where they
+// are added, at the wavelengths of the estimator that produced them. In RGB libraries every helper
+// below is the identity and Wavelengths is empty.
+#if VIBE_SPECTRAL
+// Per-slot wavelength-dependent OpenPBR parameters (MaterialLibrary.spectralMaterials).
+struct SpectralMaterial {
+    float dispersion;        // OpenPBR "dispersion" parameter 20 / V_d (V_d = Abbe number / dispersion scale); 0 = none
+    float thinFilmWeight;    // thin_film_weight
+    float thinFilmThickness; // thin_film_thickness, micrometres
+    float thinFilmIOR;       // thin_film_ior
+};
+// Scene spectral state (PathTracerRenderer.spectralScene, buffer 27).
+struct SpectralScene {
+    uint lightIlluminant;    // VibeIlluminant of area and sphere lights and imported emitters (D65 = their RGB colour)
+    uint sunIlluminant;      // VibeIlluminant of the sun (procedural disc, imported DistantLight)
+    uint padding0, padding1;
+    float4 lightChroma;      // the area light's e / max(e) (scenes 1, 3, 4, 5), or -1
+    float4 lightLagrange;    // and its spectral_lagrange, solved on the host
+    float nodes[88];          // linear sRGB of the coarse grid's nodes, codes 0, 3, ..., 255 (86 used)
+    SpectralMaterial materials[64];
+};
+static_assert(sizeof(SpectralScene) == 1424, "Swift writes a 1424-byte SpectralScene");
+// Buffer 28 (SpectralShaderCache.grid): the exactly solved 86^3 grid of FourierSRGB86.bin as float4
+// (c0, c1, c2, 0), indexed (r * 86 + g) * 86 + b. Buffer 29 (PathTracerRenderer.spectralSampling),
+// written by spectral_icdf_kernel: the scene's 1025-node wavelength inverse CDF, then at float4 257
+// the linear-sRGB CMFs and Peters' phase per nanometre (rgb, phase), then the kernel's scratch.
+constant uint SPECTRAL_GRID = 86u;
+constant uint SPECTRAL_CMF_TABLE = 257u;   // float4 offset of the per-nanometre (rgb CMF, phase) table
+constant uint SPECTRAL_SCRATCH = 4u * (257u + 471u);   // float offset of the kernel's scratch
+
+// Four wavelengths of one path sample from one number u: lambda_k = F^-1((u + k) / 4) for the scene's
+// piecewise-linear inverse CDF (illuminant x |rgb CMF| with a 10% defensive term), and per lane the
+// linear sRGB weights of a unit value, M xyz(lambda_k) / (4 p(lambda_k)), so that a Spectrum
+// converts with three dot products. The scene pointers ride along so that emitters and the
+// environment can be evaluated wherever a Spectrum is formed.
+struct Wavelengths {
+    float4 lambda;          // nm
+    float4 cosPhase;        // cos of Peters' warped phase of lambda_k (PETERS2019 Sec. 4.1)
+    float4 toR, toG, toB;   // linear sRGB weights per lane
+    float u, heroU;         // the path's wavelength numbers (Z_WAVELENGTH dimensions 0 and 1)
+    uint hero;              // the lane kept at the path's first dispersive vertex (HERO2014)
+    bool heroOnly;          // set at that vertex; the other lanes then carry zero throughput
+    constant SpectralScene *scene;
+    const device float4 *grid;
+    const device float *icdf;
+    constant Uniforms *uniforms;
+    constant MaterialResources *images;
+};
+
+// The per-wavelength part: lambda_k, the phases and the conversion weights for numbers (u, heroU).
+void spectral_fill(thread Wavelengths &wl, float u, float heroU) {
+    const device float *table = wl.icdf;
+    // Colours are defined by 1 nm sums (the generator's colour model, the XYZ -> sRGB matrix and the
+    // presets' luminance), so the CMFs and illuminants are evaluated per 1 nm bin, at the nearest
+    // node: the estimator's expectation is then exactly those sums (a grey under D65 renders as RGB
+    // does). The reflectance phase is piecewise linear (Peters' 5 nm warp), read from the same table.
+    const device float4 *cmf = (const device float4 *)wl.icdf + SPECTRAL_CMF_TABLE;
+    for (uint k = 0u; k < 4u; ++k) {
+        float x = (u + float(k)) * 0.25f * float(VIBE_ICDF_SEGMENTS);
+        uint i = min(uint(x), VIBE_ICDF_SEGMENTS - 1u);
+        float low = table[i], width = table[i + 1u] - low;
+        float lambda = low + (x - float(i)) * width;
+        float n = clamp(lambda - VIBE_LAMBDA_MIN, 0.0f, float(VIBE_SPECTRAL_SAMPLES - 1u));
+        uint j = min(uint(n), VIBE_SPECTRAL_SAMPLES - 2u);
+        float4 c0 = cmf[j], c1 = cmf[j + 1u];
+        float f = n - float(j);
+        // The density actually sampled: 1 / (segments x node spacing), so f / p stays unbiased.
+        float3 rgb = (f < 0.5f ? c0.xyz : c1.xyz) * (0.25f * float(VIBE_ICDF_SEGMENTS) * width);
+        wl.lambda[k] = lambda;
+        wl.cosPhase[k] = cos(mix(c0.w, c1.w, f));
+        wl.toR[k] = rgb.x; wl.toG[k] = rgb.y; wl.toB[k] = rgb.z;
+    }
+    wl.u = u; wl.heroU = heroU;
+    wl.hero = min(uint(heroU * 4.0f), 3u);
+    wl.heroOnly = false;
+}
+Wavelengths spectral_wavelengths(float u, float heroU, constant SpectralScene *scene, const device float4 *grid,
+                                 const device float *icdf, constant Uniforms *uniforms, constant MaterialResources *images) {
+    Wavelengths wl;
+    wl.scene = scene; wl.grid = grid; wl.icdf = icdf; wl.uniforms = uniforms; wl.images = images;
+    spectral_fill(wl, u, heroU);
+    return wl;
+}
+// The same scene with other wavelength numbers (reused samples, ReSTIR PT paths).
+Wavelengths spectral_wavelengths(float u, float heroU, thread const Wavelengths &context) {
+    Wavelengths wl = context;
+    spectral_fill(wl, u, heroU);
+    return wl;
+}
+Wavelengths spectral_wavelengths(float u, thread const Wavelengths &context) {
+    return spectral_wavelengths(u, context.heroU, context);
+}
+
+float3 spectrum_rgb(Spectrum s, thread const Wavelengths &wl) {
+    return float3(dot(s, wl.toR), dot(s, wl.toG), dot(s, wl.toB));
+}
+float spectrum_max(Spectrum s) { return max(max(s.x, s.y), max(s.z, s.w)); }
+float wavelength_u(thread const Wavelengths &wl) { return wl.u; }
+// The wavelengths of a reused sample (DI, GI) that carries its own number u.
+Wavelengths sample_wavelengths(float u, thread const Wavelengths &wl) {
+    if (u == wl.u) return wl;
+    return spectral_wavelengths(u, wl);
+}
+
+// Trigonometric moments of a bounded linear sRGB colour: the coarse grid's exact solutions
+// interpolated trilinearly in linear light (the generator's `interpolate`, so 8-bit codes match
+// the cells FourierSRGB256 was built from). Cells in which that reproduces an 8-bit code worse than
+// 0.35 steps (5,278 of 614,125, saturated colours at the gamut boundary; spectral_refine_flags_kernel)
+// are refined: their lower-corner node holds slot + 1 in w, and a block of the grid buffer holds the
+// exact moments of the cell's 4 x 4 x 4 codes (spectral_refine_solve_kernel), interpolated in the same
+// way at one-code spacing. tests/Fix_spectral.swift measures the round trip over every code.
+constant uint SPECTRAL_REFINED = 86u * 86u * 86u;     // float4 offset of the refined blocks
+constant uint SPECTRAL_REFINED_CAPACITY = 8192u;      // blocks (PathTracerRenderer.spectralGridBytes)
+float3 spectral_eotf(float3 v) { return select(pow((v + 0.055f) / 1.055f, float3(2.4f)), v / 12.92f, v <= 0.04045f); }
+// Position in coarse-node units (code / 3) of a linear colour in [0, 1].
+float3 spectral_code85(float3 c) {
+    return select(1.055f * pow(c, float3(1.0f / 2.4f)) - 0.055f, 12.92f * c, c <= 0.0031308f) * 85.0f;
+}
+uint3 spectral_cell(float3 code85) { return min(uint3(max(code85, 0.0f)), uint3(SPECTRAL_GRID - 2u)); }
+float3 spectral_moments_coarse(float3 c, float3 code85, uint3 i, thread const Wavelengths &wl) {
+    constant float *nodes = wl.scene->nodes;
+    float3 low = float3(nodes[i.x], nodes[i.y], nodes[i.z]);
+    float3 high = float3(nodes[i.x + 1u], nodes[i.y + 1u], nodes[i.z + 1u]);
+    float3 t = saturate((c - low) / (high - low));
+    const device float4 *grid = wl.grid;
+    float3 m = float3(0.0f);
+    for (uint a = 0u; a < 2u; ++a) for (uint b = 0u; b < 2u; ++b) {
+        uint row = ((i.x + a) * SPECTRAL_GRID + (i.y + b)) * SPECTRAL_GRID + i.z;
+        float w = (a == 0u ? 1.0f - t.x : t.x) * (b == 0u ? 1.0f - t.y : t.y);
+        m += w * ((1.0f - t.z) * grid[row].xyz + t.z * grid[row + 1u].xyz);
+    }
+    return m;
+}
+float3 spectral_moments(float3 c, thread const Wavelengths &wl) {
+    float3 code85 = spectral_code85(c);
+    uint3 i = spectral_cell(code85);
+    float slot = wl.grid[(i.x * SPECTRAL_GRID + i.y) * SPECTRAL_GRID + i.z].w;
+    if (!(slot > 0.0f)) return spectral_moments_coarse(c, code85, i, wl);
+    uint3 s = min(uint3(max(code85 * 3.0f - float3(3u * i), 0.0f)), uint3(2u));
+    float3 n0 = float3(3u * i + s);
+    float3 low = spectral_eotf(n0 / 255.0f), high = spectral_eotf((n0 + 1.0f) / 255.0f);
+    float3 t = saturate((c - low) / (high - low));
+    const device float4 *block = wl.grid + SPECTRAL_REFINED + 64u * (uint(slot) - 1u);
+    float3 m = float3(0.0f);
+    for (uint a = 0u; a < 2u; ++a) for (uint b = 0u; b < 2u; ++b) {
+        uint row = ((s.x + a) * 4u + (s.y + b)) * 4u + s.z;
+        float w = (a == 0u ? 1.0f - t.x : t.x) * (b == 0u ? 1.0f - t.y : t.y);
+        m += w * ((1.0f - t.z) * block[row].xyz + t.z * block[row + 1u].xyz);
+    }
+    return m;
+}
+// A bounded linear sRGB colour as the Lagrange multipliers of its bounded MESE (w = 1), or, for a
+// grey, its value (x, w = 2): greys are exactly flat (their moments c1 = c2 = 0), so white reflects one.
+float4 spectral_lagrange(float3 rgb, thread const Wavelengths &wl) {
+    float3 c = saturate(rgb);
+    // Greys are exactly flat. Near-greys too (within 1e-4, far below an 8-bit step): near white the
+    // bounded multipliers diverge, and an emitter's e / max(e) is grey only up to rounding.
+    float lo = min(c.x, min(c.y, c.z)), hi = max(c.x, max(c.y, c.z));
+    if (hi - lo <= 1e-4f) return float4((c.x + c.y + c.z) / 3.0f, 0.0f, 0.0f, 2.0f);
+    return float4(vibe_fourier_lagrange(spectral_moments(c, wl)), 1.0f);
+}
+// Bounded reflectance rho(lambda_k) from those multipliers (PETERS2019 Eq. 11).
+Spectrum spectral_from_lagrange(float4 L, thread const Wavelengths &wl) {
+    if (L.w == 2.0f) return Spectrum(L.x);
+    float4 x = wl.cosPhase;
+    float4 series = L.x + 2.0f * L.y * x + 2.0f * L.z * (2.0f * x * x - 1.0f);
+    return atan(series) * 0.318309886f + 0.5f;
+}
+Spectrum spectral_reflectance(float3 rgb, thread const Wavelengths &wl) {
+    return spectral_from_lagrange(spectral_lagrange(rgb, wl), wl);
+}
+// An illuminant's 1 nm bin at lambda (see spectral_fill).
+float spectral_illuminant(uint illuminant, float lambda) {
+    uint j = min(uint(clamp(lambda - VIBE_LAMBDA_MIN + 0.5f, 0.0f, float(VIBE_SPECTRAL_SAMPLES - 1u))), VIBE_SPECTRAL_SAMPLES - 1u);
+    return vibe_illuminant_spd[min(illuminant, VIBE_ILLUMINANT_COUNT - 1u)][j];
+}
+// Unbounded RGB radiance e of an emitter with illuminant S (normalized to luminance one).
+Spectrum spectral_emission(float3 e, uint illuminant, thread const Wavelengths &wl) {
+    float s = max(e.x, max(e.y, e.z));
+    if (!(s > 0.0f)) return Spectrum(0.0f);
+    Spectrum S = Spectrum(spectral_illuminant(illuminant, wl.lambda.x), spectral_illuminant(illuminant, wl.lambda.y),
+                          spectral_illuminant(illuminant, wl.lambda.z), spectral_illuminant(illuminant, wl.lambda.w));
+    // The area light's colour is converted once per frame on the host (SpectralScene.lightLagrange).
+    float3 c = e / s;
+    float4 L;
+    if (all(abs(c - wl.scene->lightChroma.xyz) < 1e-5f)) L = wl.scene->lightLagrange;
+    else L = spectral_lagrange(c, wl);
+    return s * spectral_from_lagrange(L, wl) * S;
+}
+// The exact linear sRGB of that emission (1 nm sums), for paths without a scattering vertex
+// (camera rays that see an emitter or the sky): their wavelength integral needs no sampling.
+// With D65 the upsampled spectrum reproduces e within the table's precision.
+float3 spectral_emission_rgb(float3 e, uint illuminant, thread const Wavelengths &wl) {
+    float s = max(e.x, max(e.y, e.z));
+    if (illuminant == VIBE_ILLUMINANT_D65 || !(s > 0.0f)) return e;
+    float3 c = saturate(e / s);
+    bool grey = c.x == c.y && c.y == c.z;
+    float3 L = grey ? float3(0.0f) : vibe_fourier_lagrange(spectral_moments(c, wl));
+    constant float *spd = vibe_illuminant_spd[min(illuminant, VIBE_ILLUMINANT_COUNT - 1u)];
+    float3 xyz = float3(0.0f);
+    for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i) {
+        float S = spd[i];
+        if (S == 0.0f) continue;
+        float rho = grey ? c.x : vibe_fourier_reflectance(L, vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i)));
+        xyz += rho * S * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]);
+    }
+    return s * (VIBE_XYZ_TO_LINEAR_SRGB * xyz);
+}
+Spectrum emitter_spectrum(float3 e, thread const Wavelengths &wl) { return spectral_emission(e, wl.scene->lightIlluminant, wl); }
+float3 emitter_rgb(float3 e, thread const Wavelengths &wl) { return spectral_emission_rgb(e, wl.scene->lightIlluminant, wl); }
+
+SpectralMaterial spectral_material(Material m, thread const Wavelengths &wl) {
+    SpectralMaterial none = { 0.0f, 0.0f, 0.0f, 1.4f };
+    return m.slot < 64u ? wl.scene->materials[m.slot] : none;
+}
+// Whether the material's index of refraction depends on wavelength (OpenPBR "Dispersion").
+bool spectral_dispersive(Material m, thread const Wavelengths &wl) {
+    return (m.type == DIELECTRIC || (m.type == OPENPBR && m.transmission > 0.0f && m.metalness < 1.0f))
+        && spectral_material(m, wl).dispersion > 0.0f;
+}
+// HERO2014 at the first dispersive vertex: the four lanes would need four directions, so the path
+// keeps lane `hero` (chosen uniformly by heroU), times four, and drops the others. Applied before
+// the vertex scatters (NEE and BSDF sampling), never to its emission, in every pass that builds or
+// shifts paths, so the integrand of a path and its wavelength numbers is one function.
+void spectral_arrive(Material m, thread Spectrum &throughput, thread Wavelengths &wl) {
+    if (wl.heroOnly || !spectral_dispersive(m, wl)) return;
+    wl.heroOnly = true;
+    throughput *= select(Spectrum(0.0f), Spectrum(4.0f), uint4(0u, 1u, 2u, 3u) == wl.hero);
+}
+Spectrum spectral_hero_lane(float value, thread const Wavelengths &wl) {
+    return select(Spectrum(0.0f), Spectrum(value), uint4(0u, 1u, 2u, 3u) == wl.hero);
+}
+// The reflectance of a material's albedo; `rgb` is the value RGB transport uses (the saturated or raw
+// albedo, which convert alike).
+Spectrum spectral_albedo(Material, float3 rgb, thread const Wavelengths &wl) { return spectral_reflectance(rgb, wl); }
+#else
+struct Wavelengths {};
+float3 spectrum_rgb(Spectrum s, thread const Wavelengths &) { return s; }
+float spectrum_max(Spectrum s) { return max(s.x, max(s.y, s.z)); }
+float wavelength_u(thread const Wavelengths &) { return 0.0f; }
+Wavelengths sample_wavelengths(float, thread const Wavelengths &wl) { return wl; }
+Spectrum spectral_reflectance(float3 rgb, thread const Wavelengths &) { return rgb; }
+Spectrum emitter_spectrum(float3 e, thread const Wavelengths &) { return e; }
+float3 emitter_rgb(float3 e, thread const Wavelengths &) { return e; }
+void spectral_arrive(Material, thread Spectrum &, thread Wavelengths &) {}
+Spectrum spectral_albedo(Material, float3 rgb, thread const Wavelengths &) { return rgb; }
+#endif
 float3 rotate_object(float3 p, float3 a) {
     p.yz = float2(cos(a.x)*p.y-sin(a.x)*p.z, sin(a.x)*p.y+cos(a.x)*p.z);
     p.xz = float2(cos(a.y)*p.x+sin(a.y)*p.z, -sin(a.y)*p.x+cos(a.y)*p.z);
@@ -1346,6 +1628,55 @@ float3 eval_environment(float3 d, constant Uniforms &u, constant MaterialResourc
     // An imported sun is its own directional emitter, independent of environment brightness.
     return result*u.environment.x+independent_sun_radiance(d,u);
 }
+#if VIBE_SPECTRAL
+// eval_environment split into the sun (procedural disc or imported DistantLight), which carries the
+// sun illuminant, and everything else (image or procedural sky), upsampled as RGB (D65) radiance.
+void environment_parts(float3 d, constant Uniforms &u, constant MaterialResources &images,
+                       thread float3 &sky, thread float3 &sun) {
+    sun = independent_sun_radiance(d, u);
+    if (u.environment.z > 0.5f) {
+        constexpr sampler env(coord::normalized,address::repeat,filter::linear);
+        float2 uv=float2(atan2(d.z,d.x)/TWO_PI+0.5f+u.environment.y/TWO_PI,acos(clamp(d.y,-1.0f,1.0f))/PI);
+        uv.y=clamp(uv.y,0.5f/images.environmentMap.get_height(),1.0f-0.5f/images.environmentMap.get_height());
+        sky = images.environmentMap.sample(env,uv).rgb * u.environment.x;
+        return;
+    }
+    float4 sunParams = u.lens.w > 0 ? float4(u.sunParams.xyz, 0) : u.sunParams;
+    float3 full = eval_procedural_sky(d, sunParams, u.skyMode);
+    // The disc is the only term that depends on the sun's intensity.
+    float3 clear = sunParams.w > 0.0f && in_sun_cone(d, normalize(sunParams.xyz), procedural_sun_one_minus_cos(u.skyMode))
+        ? eval_procedural_sky(d, float4(sunParams.xyz, 0.0f), u.skyMode) : full;
+    sky = clear * u.environment.x;
+    sun += (full - clear) * u.environment.x;
+}
+Spectrum environment_spectrum(float3 d, constant Uniforms &u, constant MaterialResources &images, thread const Wavelengths &wl) {
+    if (wl.scene->sunIlluminant == VIBE_ILLUMINANT_D65) return spectral_emission(eval_environment(d, u, images), VIBE_ILLUMINANT_D65, wl);
+    float3 sky, sun;
+    environment_parts(d, u, images, sky, sun);
+    return spectral_emission(sky, VIBE_ILLUMINANT_D65, wl) + spectral_emission(sun, wl.scene->sunIlluminant, wl);
+}
+// The environment seen without scattering (camera misses): its exact colour.
+float3 environment_rgb(float3 d, constant Uniforms &u, constant MaterialResources &images, thread const Wavelengths &wl) {
+    if (wl.scene->sunIlluminant == VIBE_ILLUMINANT_D65) return eval_environment(d, u, images);
+    float3 sky, sun;
+    environment_parts(d, u, images, sky, sun);
+    return sky + spectral_emission_rgb(sun, wl.scene->sunIlluminant, wl);
+}
+// A light sample's emission at the wavelengths `wl`: the environment re-evaluated in its parts,
+// any other emitter (area, sphere, imported triangle) with the light illuminant.
+Spectrum light_spectrum(LightSample ls, thread const Wavelengths &wl) {
+    if (ls.isDirectional == 1u) return environment_spectrum(ls.wi, *wl.uniforms, *wl.images, wl);
+    return emitter_spectrum(ls.emission, wl);
+}
+#else
+Spectrum environment_spectrum(float3 d, constant Uniforms &u, constant MaterialResources &images, thread const Wavelengths &) {
+    return eval_environment(d, u, images);
+}
+float3 environment_rgb(float3 d, constant Uniforms &u, constant MaterialResources &images, thread const Wavelengths &) {
+    return eval_environment(d, u, images);
+}
+Spectrum light_spectrum(LightSample ls, thread const Wavelengths &) { return ls.emission; }
+#endif
 // REFERENCES.md: PBRT2023. Thin-lens focus-plane construction; uniform disk sampling.
 template <typename R>
 void lens_ray(thread Ray &ray, float3 forward, float3 right, float3 up, constant Uniforms &u, thread R &seed) {
@@ -1355,6 +1686,33 @@ void lens_ray(thread Ray &ray, float3 forward, float3 right, float3 up, constant
     float3 focus=ray.origin+ray.direction*(u.lens.y/max(1e-5f,dot(ray.direction,forward)));
     ray.origin+=radius*(cos(angle)*right+sin(angle)*up); ray.direction=normalize(focus-ray.origin);
 }
+#if VIBE_SPECTRAL
+// The wavelength numbers (u, heroU) of a sampler, drawn from a copy so that its streams continue
+// unchanged: in Z mode dimensions 0 and 1 of the vertex-0 Z_WAVELENGTH event under the sampler's key
+// (pass 1, pass 2 and ReSTIR PT, whose replay seed is that key, see the same numbers), else a hash
+// of the PCG state.
+float2 wavelength_numbers(Sampler s) {
+    if (s.z) {
+        sampler_event(s, 0u, Z_WAVELENGTH);
+        float u = rand_f(s);
+        return float2(u, rand_f(s));
+    }
+    uint h = pcg_hash(s.state ^ 0x5bd1e995u);
+    return float2(float(h >> 8u), float(pcg_hash(h) >> 8u)) * (1.0f / 16777216.0f);
+}
+// Kernels of spectral libraries bind the scene's spectral state at buffers 27-29.
+#define SPECTRAL_BUFFERS , constant SpectralScene &spectralScene [[buffer(27)]], \
+    const device float4 *spectralGrid [[buffer(28)]], const device float *spectralSampling [[buffer(29)]]
+#define SPECTRAL_WAVELENGTHS(numbers, u, images) \
+    spectral_wavelengths((numbers).x, (numbers).y, &spectralScene, spectralGrid, spectralSampling, &(u), &(images))
+// The scene's spectral state without wavelengths, for passes whose samples bring their own.
+#define SPECTRAL_CONTEXT(u, images) \
+    spectral_wavelengths(0.0f, 0.0f, &spectralScene, spectralGrid, spectralSampling, &(u), &(images))
+#else
+#define SPECTRAL_BUFFERS
+#define SPECTRAL_WAVELENGTHS(numbers, u, images) Wavelengths()
+#define SPECTRAL_CONTEXT(u, images) Wavelengths()
+#endif
 // Four independent images per editable material, preserving each image's size.
 // Swift and Metal SurfaceSettings layouts are 64 bytes. Buffers 1/2 are shared
 // by primary shading, every secondary hit, and MetalFX material-guide tracing.
@@ -1568,6 +1926,91 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
     return openpbr_prepare(inputs, float3(1), OpenPBR_BaseRgbWavelengths_nm, 1.0f, wo);
 }
 
+// The layered BSDF prepared for one vertex, as evaluation, sampling and PDFs consume it. RGB: the
+// upstream prepared state. Spectral: the upstream BSDF evaluates three colour channels at the
+// wavelengths it is given (its stochastic-RGB-wavelength mode, used for dispersion and thin film), so
+// `a` holds lanes 0-2 (base colour rho(lambda_0..2) at lambda_0..2) and `b` lane 3. Sampling
+// directions, lobe probabilities and PDFs are those of `a`; `b` only evaluates, and is skipped
+// when every lane would equal lane 0 (a grey base colour without thin film or dispersion). At a
+// dispersive material on a hero path, `a` is prepared at the hero wavelength alone.
+#if VIBE_SPECTRAL
+struct PreparedBsdf { OpenPBR_PreparedBsdf a, b; uint hero; bool flat; };
+OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, float3 baseColor, float3 lambda,
+                                           SpectralMaterial sm) {
+    OpenPBR_ResolvedInputs inputs = openpbr_make_default_resolved_inputs();
+    inputs.base_color = baseColor;
+    inputs.specular_roughness = max(0.03f, mat.roughness);
+    inputs.base_metalness = mat.type == GLOSSY ? 1.0f : mat.metalness;
+    inputs.specular_weight = mat.usesMaterialX ? mat.specularWeight : (mat.type == DIFFUSE ? 0.0f : 1.0f);
+    if(mat.usesMaterialX) { inputs.base_weight=mat.baseWeight; inputs.base_diffuse_roughness=mat.diffuseRoughness; }
+    inputs.specular_ior = max(1.01f, mat.ior);
+    inputs.coat_weight = mat.coat;
+    inputs.coat_roughness = mat.usesMaterialX ? mat.coatRoughness : 0.12f;
+    inputs.specular_roughness_anisotropy = mat.anisotropy;
+    inputs.fuzz_weight = mat.fuzz;
+    inputs.transmission_weight = mat.transmission;
+    // OpenPBR dispersion: the upstream Abbe-number parameterization with V_d = 20 / dispersion.
+    inputs.transmission_dispersion_scale = sm.dispersion;
+    inputs.transmission_dispersion_abbe_number = 20.0f;
+    inputs.thin_film_weight = sm.thinFilmWeight;
+    inputs.thin_film_thickness = sm.thinFilmThickness;
+    inputs.thin_film_ior = sm.thinFilmIOR;
+    float3 outward = mat.transmission > 0.0f && mat.inside ? -n : n;
+    inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
+        ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
+    inputs.geometry_coat_basis = inputs.geometry_basis;
+    return openpbr_prepare(inputs, float3(1), lambda, 1.0f, wo);
+}
+PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavelengths &wl) {
+    SpectralMaterial sm = spectral_material(mat, wl);
+    float3 albedo = clamp(mat.albedo, 0.0f, 1.0f);
+    Spectrum rho = spectral_albedo(mat, albedo, wl);
+    PreparedBsdf p;
+    p.hero = 4u;
+    if (wl.heroOnly && spectral_dispersive(mat, wl)) {
+        p.hero = wl.hero; p.flat = true;
+        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[wl.hero]), float3(wl.lambda[wl.hero]), sm);
+        return p;
+    }
+    p.flat = albedo.x == albedo.y && albedo.y == albedo.z && !(sm.thinFilmWeight > 0.0f) && !spectral_dispersive(mat, wl);
+    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, wl.lambda.xyz, sm);
+    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(wl.lambda.w), sm);
+    return p;
+}
+Spectrum prepared_lanes(thread const PreparedBsdf &p, float3 a, float b) {
+    return p.hero < 4u ? select(Spectrum(0.0f), Spectrum(a.x), uint4(0u, 1u, 2u, 3u) == p.hero) : Spectrum(a, b);
+}
+// f |cos| at wi.
+Spectrum prepared_eval(thread const PreparedBsdf &p, float3 wi) {
+    float3 a = openpbr_get_sum_of_diffuse_specular(openpbr_eval(p.a, wi));
+    return prepared_lanes(p, a, p.flat || p.hero < 4u ? a.x : openpbr_get_sum_of_diffuse_specular(openpbr_eval(p.b, wi)).x);
+}
+float prepared_pdf(thread const PreparedBsdf &p, float3 wi) { return openpbr_pdf(p.a, wi); }
+// Direction and PDF of `a`; weight = f |cos| / pdf for every lane.
+void prepared_sample(thread const PreparedBsdf &p, float3 random, thread float3 &direction, thread Spectrum &weight,
+                     thread float &pdf) {
+    OpenPBR_DiffuseSpecular result;
+    uint lobe;
+    openpbr_sample(p.a, random, direction, result, pdf, lobe);
+    float3 a = openpbr_get_sum_of_diffuse_specular(result);
+    float b = a.x;
+    if (!p.flat && p.hero >= 4u) b = pdf > 0.0f ? openpbr_get_sum_of_diffuse_specular(openpbr_eval(p.b, direction)).x / pdf : 0.0f;
+    weight = prepared_lanes(p, a, b);
+}
+#else
+typedef OpenPBR_PreparedBsdf PreparedBsdf;
+PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavelengths &) { return prepare_openpbr(mat, n, wo); }
+Spectrum prepared_eval(thread const PreparedBsdf &p, float3 wi) { return openpbr_get_sum_of_diffuse_specular(openpbr_eval(p, wi)); }
+float prepared_pdf(thread const PreparedBsdf &p, float3 wi) { return openpbr_pdf(p, wi); }
+void prepared_sample(thread const PreparedBsdf &p, float3 random, thread float3 &direction, thread Spectrum &weight,
+                     thread float &pdf) {
+    OpenPBR_DiffuseSpecular result;
+    uint lobe;
+    openpbr_sample(p, random, direction, result, pdf, lobe);
+    weight = openpbr_get_sum_of_diffuse_specular(result);
+}
+#endif
+
 // REFERENCES.md: MATERIALX, OPENPBR. Radiance a MaterialX surface emits toward wo, as in
 // the pinned MaterialX v1.39.5 open_pbr_surface graph: emission_color x emission_luminance
 // (uniform_edf), mixed by coat_weight with its generalized_schlick_edf coated form, whose
@@ -1580,39 +2023,38 @@ float3 openpbr_emission(Material mat, float3 n, float3 wo) {
     return mat.emission * mix(1.0f, coated, clamp(mat.coat, 0.0f, 1.0f));
 }
 
-float3 eval_bsdf(Material mat, float3 n, float3 wo, float3 wi) {
-    if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return float3(0);
+Spectrum eval_bsdf(Material mat, float3 n, float3 wo, float3 wi, thread const Wavelengths &wl) {
+    if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return Spectrum(0);
     float cosine = abs(dot(n, wi));
-    if (cosine < 1e-7f || dot(n, wo) <= 0.0f) return float3(0);
+    if (cosine < 1e-7f || dot(n, wo) <= 0.0f) return Spectrum(0);
     // Uncoated legacy diffuse is the Lambert limit of the OpenPBR inputs.
     // Avoid preparing all layered lobes for every ReSTIR candidate.
-    if (mat.type == DIFFUSE) return dot(n, wi) > 0.0f ? clamp(mat.albedo, 0.0f, 1.0f) / PI : float3(0);
-    OpenPBR_PreparedBsdf prepared = prepare_openpbr(mat, n, wo);
-    OpenPBR_DiffuseSpecular value = openpbr_eval(prepared, wi);
+    if (mat.type == DIFFUSE) return dot(n, wi) > 0.0f ? spectral_albedo(mat, clamp(mat.albedo, 0.0f, 1.0f), wl) / PI : Spectrum(0);
+    PreparedBsdf prepared = prepare_bsdf(mat, n, wo, wl);
     // Upstream already includes cosine; this adapter returns f for existing callers.
-    return openpbr_get_sum_of_diffuse_specular(value) / cosine;
+    return prepared_eval(prepared, wi) / cosine;
 }
 
-float eval_bsdf_pdf(Material mat, float3 n, float3 wo, float3 wi) {
+float eval_bsdf_pdf(Material mat, float3 n, float3 wo, float3 wi, thread const Wavelengths &wl) {
     if (dot(n, wo) <= 0.0f) return 0.0f;
     if (mat.type == DIFFUSE) return max(0.0f, dot(n, wi)) / PI;
-    OpenPBR_PreparedBsdf prepared = prepare_openpbr(mat, n, wo);
-    return openpbr_pdf(prepared, wi);
+    PreparedBsdf prepared = prepare_bsdf(mat, n, wo, wl);
+    return prepared_pdf(prepared, wi);
 }
 
 // Direct lighting needs both values; prepare the layered BSDF only once.
-float3 eval_bsdf_with_pdf(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf) {
+Spectrum eval_bsdf_with_pdf(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf, thread const Wavelengths &wl) {
     if (mat.type == DIFFUSE) {
-        pdf = eval_bsdf_pdf(mat, n, wo, wi);
-        return eval_bsdf(mat, n, wo, wi);
+        pdf = eval_bsdf_pdf(mat, n, wo, wi, wl);
+        return eval_bsdf(mat, n, wo, wi, wl);
     }
     pdf = 0.0f;
     float cosine = abs(dot(n, wi));
-    if (cosine < 1e-7f || dot(n, wo) <= 0.0f) return float3(0);
-    OpenPBR_PreparedBsdf prepared = prepare_openpbr(mat, n, wo);
-    pdf = openpbr_pdf(prepared, wi);
-    if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return float3(0);
-    return openpbr_get_sum_of_diffuse_specular(openpbr_eval(prepared, wi)) / cosine;
+    if (cosine < 1e-7f || dot(n, wo) <= 0.0f) return Spectrum(0);
+    PreparedBsdf prepared = prepare_bsdf(mat, n, wo, wl);
+    pdf = prepared_pdf(prepared, wi);
+    if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return Spectrum(0);
+    return prepared_eval(prepared, wi) / cosine;
 }
 
 // 1 - cos(theta_max) of a sphere's cone for x = r^2/d^2, without the
@@ -1740,8 +2182,7 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
         float3 corner = (u.sceneIndex == 3) ? float3(-0.2f, 0.999f, -0.2f) : float3(-0.25f, 0.999f, -0.25f);
         float3 su = (u.sceneIndex == 3) ? float3(0.4f, 0, 0) : float3(0.5f, 0, 0);
         float3 sv = (u.sceneIndex == 3) ? float3(0, 0, 0.4f) : float3(0, 0, 0.5f);
-        float3 emit = (u.sceneIndex == 4) ? float3(32.0f, 28.0f, 22.0f) :
-                      (u.sceneIndex == 3) ? float3(24.0f, 20.0f, 15.0f) : float3(18.0f, 15.0f, 10.0f);
+        float3 emit = procedural_light_emission(u.sceneIndex);
 
         float3 center=corner+0.5f*(su+sv); su*=u.light.w; sv*=u.light.w; corner=center-0.5f*(su+sv);
         float2 uv = rand_f2(seed);
@@ -1775,7 +2216,7 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
             ls.position = light_pos;
             ls.wi = dir;
             ls.dist = dist;
-            ls.emission = float3(45.0f, 42.0f, 38.0f);
+            ls.emission = procedural_light_emission(5u);
             ls.pdf = (dist * dist) / (0.09f * u.light.w * u.light.w * cos_l);
         }
     } else if (u.sceneIndex == 2) {
@@ -1965,13 +2406,17 @@ float light_geometry(float3 p, LightSample ls, uint sceneIndex, float lightSize,
     return max(0.0f, dot(normal, -delta * rsqrt(d2))) / d2;
 }
 
-float eval_restir_target_pdf(float3 p, float3 n, float3 rayDir, Material mat, LightSample candidate, uint sceneIndex, float lightSize,constant MaterialResources &images) {
+// Spectral transport: the candidate is evaluated at its own wavelengths (LightSample.u), and the
+// target is the length of the resulting linear sRGB contribution, as in RGB.
+float eval_restir_target_pdf(float3 p, float3 n, float3 rayDir, Material mat, LightSample candidate, uint sceneIndex, float lightSize,constant MaterialResources &images,
+                             thread const Wavelengths &context) {
     if (candidate.pdf <= 0.0f) return 0.0f;
     float3 dir = (candidate.isDirectional == 1) ? candidate.wi : normalize(candidate.position - p);
     float cos_th = max(0.0f, dot(n, dir));
     if (cos_th <= 0.0f) return 0.0f;
-    float3 bsdf = eval_bsdf(mat, n, -rayDir, dir);
-    return length(bsdf * candidate.emission * cos_th) * light_geometry(p, candidate, sceneIndex, lightSize,images);
+    Wavelengths wl = sample_wavelengths(candidate.u, context);
+    Spectrum bsdf = eval_bsdf(mat, n, -rayDir, dir, wl);
+    return length(spectrum_rgb(bsdf * light_spectrum(candidate, wl) * cos_th, wl)) * light_geometry(p, candidate, sceneIndex, lightSize,images);
 }
 
 // First-indirect diffuse reconnection in area measure. The stored secondary
@@ -2004,12 +2449,14 @@ bool restir_gi_accepts_shift(float3 x1r, float3 x1q, float3 x2, float3 n2) {
     return jacobian >= 0.1f && jacobian <= 10.0f;
 }
 
+// `wl` are the sample's wavelengths (sample_wavelengths of its stored number), at which its
+// secondary radiance was traced.
 float eval_restir_gi_target(float3 x1, float3 n1, float3 rayDir, Material mat,
-                            float3 x2, float3 n2, float3 secondaryRadiance) {
+                            float3 x2, float3 n2, Spectrum secondaryRadiance, thread const Wavelengths &wl) {
     float geometry = gi_geometry(x1, n1, x2, n2);
     if (geometry <= 0.0f || !all(isfinite(secondaryRadiance))) return 0.0f;
     float3 direction = normalize(x2 - x1);
-    return length(eval_bsdf(mat, n1, -rayDir, direction) * secondaryRadiance * geometry);
+    return length(spectrum_rgb(eval_bsdf(mat, n1, -rayDir, direction, wl) * secondaryRadiance * geometry, wl));
 }
 
 bool gi_connection_visible(float3 x1, float3 n1, float3 x2,
@@ -2045,18 +2492,25 @@ bool is_delta(Material mat) {
 }
 
 // Returns f * abs(cos(theta)) / PDF, using the same glossy model as NEE. The lobe choice and
-// the direction form one 3D constituent (rand_f3) in Z mode.
+// the direction form one 3D constituent (rand_f3) in Z mode. Spectral: per-wavelength values; a
+// dispersive dielectric on a hero path (spectral_arrive) refracts the hero wavelength.
 template <typename R>
 bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
                  thread R &seed, thread float3 &direction,
-                 thread float3 &weight, thread float &pdf) {
+                 thread Spectrum &weight, thread float &pdf, thread const Wavelengths &wl) {
     pdf = 0.0f;
     // A perturbed shading normal can send a delta event across the geometric
     // surface; repeat such an event about the geometric normal instead.
     float3 geometric = dot(mat.geometricNormal, mat.geometricNormal) > 0.5f ? mat.geometricNormal : normal;
     if (mat.type == DIELECTRIC) {
-        float eta = frontFace ? 1.0f / mat.ior : mat.ior;
-        float r0 = (1.0f - mat.ior) / (1.0f + mat.ior);
+        float ior = mat.ior;
+#if VIBE_SPECTRAL
+        if (wl.heroOnly && spectral_dispersive(mat, wl))
+            ior = openpbr_dispersion_adjusted_ior(mat.ior, spectral_material(mat, wl).dispersion, wl.lambda[wl.hero]);
+#endif
+        Spectrum tint = spectral_albedo(mat, mat.albedo, wl);
+        float eta = frontFace ? 1.0f / ior : ior;
+        float r0 = (1.0f - ior) / (1.0f + ior);
         for (int attempt = 0; attempt < 2; ++attempt) {
             float3 m = attempt == 0 ? normal : geometric;
             float cosI = clamp(dot(-incoming, m), 0.0f, 1.0f);
@@ -2069,10 +2523,10 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
                 // Renormalized: rounding in long mirror chains otherwise compounds into
                 // non-unit rays that the sphere test (unit-direction form) hits off-surface.
                 direction = normalize(reflect(incoming, m));
-                weight = mat.albedo;
+                weight = tint;
             } else {
                 direction = normalize(eta * incoming + (eta * cosI - sqrt(1.0f - sin2T)) * m);
-                weight = mat.albedo * (eta * eta);
+                weight = tint * (eta * eta);
             }
             if ((dot(direction, geometric) > 0.0f) == reflected) return true;
         }
@@ -2082,25 +2536,24 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
         float3 m = dot(reflect(incoming, normal), geometric) > 0.0f ? normal : geometric;
         direction = normalize(reflect(incoming, m));
         float cosI = clamp(dot(-incoming, m), 0.0f, 1.0f);
-        weight = mat.albedo + (1.0f - mat.albedo) * pow(1.0f - cosI, 5.0f);
+        // Conductor Fresnel (Schlick) per wavelength, with F0 the reflectance spectrum.
+        Spectrum f0 = spectral_albedo(mat, mat.albedo, wl);
+        weight = f0 + (1.0f - f0) * pow(1.0f - cosI, 5.0f);
         return dot(direction, geometric) > 0.0f;
     }
     if (mat.type == DIFFUSE) {
         // Keep three draws like the generic sampler, including its lobe choice.
         direction = sample_cosine_hemisphere(normal, rand_f3(seed).yz);
         pdf = max(0.0f, dot(normal, direction)) / PI;
-        weight = clamp(mat.albedo, 0.0f, 1.0f);
+        weight = spectral_albedo(mat, clamp(mat.albedo, 0.0f, 1.0f), wl);
         return pdf > 0.0f && (dot(mat.geometricNormal, mat.geometricNormal) <= 0.5f || dot(direction, mat.geometricNormal) > 0.0f);
     }
     mat.inside = !frontFace;
-    OpenPBR_PreparedBsdf prepared = prepare_openpbr(mat, normal, -incoming);
-    OpenPBR_DiffuseSpecular result;
-    uint lobe;
+    PreparedBsdf prepared = prepare_bsdf(mat, normal, -incoming, wl);
     float3 random = rand_f3(seed);
-    openpbr_sample(prepared, random, direction, result, pdf, lobe);
+    prepared_sample(prepared, random, direction, weight, pdf);
     if (pdf <= 0.0f) return false;
     if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(direction, mat.geometricNormal) <= 0.0f) return false;
-    weight = openpbr_get_sum_of_diffuse_specular(result);
     return all(isfinite(weight)) && all(weight >= 0.0f);
 }
 
@@ -2131,9 +2584,11 @@ bool restir_gi_has_complementary_bsdf(float pathDepth) {
 }
 
 // Bounded, single-scatter camera fog. This preview does not model multiple scattering.
+// Spectral: the medium is grey, so the scattered light is converted at the pixel's wavelengths.
 template <typename R>
 float3 apply_camera_fog(float3 color, Ray ray, float surfaceDistance,
-                        constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages) {
+                        constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages,
+                        thread const Wavelengths &wl) {
     float3 lo = (u.sceneIndex == 0 || u.sceneIndex == 6) ? float3(-4, -1, -2) : float3(-1);
     float3 hi = (u.sceneIndex == 0 || u.sceneIndex == 6) ? float3(4, 3, 3) : float3(1);
     if (u.sceneIndex == 2 || u.sceneIndex == 5) { lo = float3(-4, -1, -2); hi = float3(4, 3, 3); }
@@ -2161,7 +2616,7 @@ float3 apply_camera_fog(float3 color, Ray ray, float surfaceDistance,
         if (light_visible(point, float3(0), ls, u.sceneIndex, materialImages, u)) {
             float lightDistance = ls.isDirectional == 1 ? 3.0f : ls.dist;
             float transmittance = exp(-sigmaT * (t - entry + lightDistance));
-            scattered += transmittance * (0.85f * sigmaT) * ls.emission * step / (4.0f * PI * ls.pdf);
+            scattered += spectrum_rgb(transmittance * (0.85f * sigmaT) * light_spectrum(ls, wl) * step / (4.0f * PI * ls.pdf), wl);
         }
     }
     return color * exp(-sigmaT * (exitT - entry)) + scattered;
@@ -2221,15 +2676,25 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
 // ReSTIR DI and GI reservoirs of one reuse domain (a primary hit and its view direction): the
 // selected sample, the running resampling-weight sum and the confidence M. restir_temporal_kernel
 // builds them for the front layer; the reservoir-splatting kernels also for deep layers (HONG2026).
+// Spectral transport: a sample is a pair (sample, wavelength number u) and every domain evaluates
+// it at its u, so the shifts and their Jacobians are those of RGB mode. The stored layouts carry u
+// in weights.w (zero in RGB) and GI's secondary radiance per wavelength in radiance.xyzw.
 struct DIReservoir { LightSample sample; float weightSum; float M; };
-struct GIReservoir { float3 position, normal, radiance; float sourcePdf, weightSum, M; };
+struct GIReservoir { float3 position, normal; Spectrum radiance; float sourcePdf, weightSum, M, u; };
+#if VIBE_SPECTRAL
+float4 gi_radiance_texel(Spectrum r) { return r; }
+Spectrum gi_radiance(float4 t) { return t; }
+#else
+float4 gi_radiance_texel(Spectrum r) { return float4(r, 0.0f); }
+Spectrum gi_radiance(float4 t) { return t.xyz; }
+#endif
 
 // Initial light candidates (RIS M = 4) at a diffuse primary hit. In Z mode the four candidates
 // are the consecutive block of four indices under the pixel's key (sampler_candidate), so
 // they are stratified; the resampling decisions stay on the PCG stream.
 template <typename R>
 DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, thread R &seed,
-                              constant MaterialResources &images) {
+                              constant MaterialResources &images, thread const Wavelengths &wl) {
     DIReservoir r;
     r.sample = {};
     r.sample.pdf = 0.0f;
@@ -2242,9 +2707,10 @@ DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, 
     for (int i = 0; i < 4; ++i) {
         sampler_candidate(seed, 1u, Z_DI, uint(i), 2u);
         LightSample cand = sample_direct_light(rec.position, rec.normal, u, seed, images);
+        cand.u = wavelength_u(wl);
         r.M += 1.0f; // Zero-weight candidates still count in the estimator.
         if (cand.pdf > 0.0f) {
-            float p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, cand, u.sceneIndex, u.light.w, images);
+            float p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, cand, u.sceneIndex, u.light.w, images, wl);
             float proposalPDF = cand.pdf * light_geometry(rec.position, cand, u.sceneIndex, u.light.w, images);
             float w_i = proposalPDF > 0.0f ? p_hat / proposalPDF : 0.0f;
             r.weightSum += w_i;
@@ -2256,23 +2722,26 @@ DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, 
     return r;
 }
 
-// A stored DI sample (the reservoir texture layout) seen from the shading point p.
-LightSample restir_di_stored_sample(float4 posDir, float4 emitPdf, float3 p) {
+// A stored DI sample (the reservoir texture layout) seen from the shading point p; u is the
+// reservoir's weights.w.
+LightSample restir_di_stored_sample(float4 posDir, float4 emitPdf, float3 p, float u) {
     LightSample s = {};
     s.position = posDir.xyz;
     s.isDirectional = uint(posDir.w);
     s.wi = (s.isDirectional == 1) ? s.position : normalize(s.position - p);
     s.emission = emitPdf.xyz;
     s.pdf = emitPdf.w;
+    s.u = u;
     return s;
 }
 
-// Temporal DI merge of a history reservoir (confidence M, contribution weight W) with the
-// history confidence capped at 20. The caller has checked M > 0 and W > 0.
+// Temporal DI merge of a history reservoir (confidence M, contribution weight W, wavelength
+// number histU) with the history confidence capped at 20. The caller has checked M > 0 and W > 0.
 void restir_di_merge(thread DIReservoir &r, HitRecord rec, float3 view, float4 histPosDir, float4 histEmitPdf,
-                     float histM, float histW, constant Uniforms &u, thread uint &seed, constant MaterialResources &images) {
-    LightSample histSample = restir_di_stored_sample(histPosDir, histEmitPdf, rec.position);
-    float prev_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, histSample, u.sceneIndex, u.light.w, images);
+                     float histM, float histW, float histU, constant Uniforms &u, thread uint &seed, constant MaterialResources &images,
+                     thread const Wavelengths &wl) {
+    LightSample histSample = restir_di_stored_sample(histPosDir, histEmitPdf, rec.position, histU);
+    float prev_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, histSample, u.sceneIndex, u.light.w, images, wl);
     float clampedM = min(histM, 20.0f);
     float w_temporal = prev_p_hat * histW * clampedM;
     r.M += clampedM;
@@ -2283,15 +2752,15 @@ void restir_di_merge(thread DIReservoir &r, HitRecord rec, float3 view, float4 h
 }
 
 // The reservoir's stored form: sample position (or direction) and type, emission and PDF, and
-// (weight sum, M, W, 0).
+// (weight sum, M, W, wavelength number).
 void restir_di_encode(DIReservoir r, HitRecord rec, float3 view, constant Uniforms &u, constant MaterialResources &images,
-                      thread float4 &posDir, thread float4 &emitPdf, thread float4 &weights) {
-    float current_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, r.sample, u.sceneIndex, u.light.w, images);
+                      thread float4 &posDir, thread float4 &emitPdf, thread float4 &weights, thread const Wavelengths &wl) {
+    float current_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, r.sample, u.sceneIndex, u.light.w, images, wl);
     float W = (r.M > 0.0f && current_p_hat > 0.0f) ? (r.weightSum / (r.M * current_p_hat)) : 0.0f;
     float3 storeDirPos = (r.sample.isDirectional == 1) ? r.sample.wi : r.sample.position;
     posDir = float4(storeDirPos, float(r.sample.isDirectional));
     emitPdf = float4(r.sample.emission, r.sample.pdf);
-    weights = float4(r.weightSum, r.M, W, 0.0f);
+    weights = float4(r.weightSum, r.M, W, r.sample.u);
 }
 
 // ReSTIR GI initial path: x0(camera) -> x1(primary diffuse) -> x2(diffuse) -> sampled light. It
@@ -2299,19 +2768,22 @@ void restir_di_encode(DIReservoir r, HitRecord rec, float3 view, constant Unifor
 // path continuation. fovScale is tan(fov / 2), for the texture footprint at x2.
 template <typename R>
 GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, constant Uniforms &u,
-                              constant SurfaceSettings *surfaceSettings, constant MaterialResources &images, thread R &seed) {
+                              constant SurfaceSettings *surfaceSettings, constant MaterialResources &images, thread R &seed,
+                              thread const Wavelengths &wl) {
     GIReservoir r;
     r.position = float3(0.0f);
     r.normal = float3(0.0f);
-    r.radiance = float3(0.0f);
+    r.radiance = Spectrum(0.0f);
     r.sourcePdf = 0.0f;
     r.weightSum = 0.0f;
     r.M = 1.0f;
-    float3 giDirection, giBSDFWeight;
+    r.u = wavelength_u(wl);
+    float3 giDirection;
+    Spectrum giBSDFWeight;
     float giBSDFPdf;
     sampler_event(seed, 1u, Z_GI_BSDF);
     if (sample_bsdf(rec.mat, rec.normal, view, rec.front_face, seed,
-                    giDirection, giBSDFWeight, giBSDFPdf) && giBSDFPdf > 0.0f) {
+                    giDirection, giBSDFWeight, giBSDFPdf, wl) && giBSDFPdf > 0.0f) {
         Ray giRay;
         giRay.origin = ray_origin(rec.position, rec.geometricNormal, giDirection, u, rec.error);
         giRay.direction = giDirection;
@@ -2320,18 +2792,18 @@ GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, consta
             resolve_material(secondary, giRay, u, surfaceSettings, images,
                 (rec.t + secondary.t) * 2.0f * fovScale / float(u.height));
             if (secondary.mat.type == DIFFUSE) {
-                float3 secondaryRadiance = float3(0.0f);
+                Spectrum secondaryRadiance = Spectrum(0.0f);
                 sampler_event(seed, 2u, Z_GI_NEE);
                 LightSample giLight = sample_direct_light(secondary.position, secondary.normal, u, seed, images);
                 if (giLight.pdf > 0.0f && light_visible(secondary.position,
                     secondary.geometricNormal, giLight, u.sceneIndex, images, u, secondary.error)) {
                     float secondaryCosine = max(0.0f, dot(secondary.normal, giLight.wi));
                     float secondaryBSDFPdf;
-                    float3 secondaryBSDF = eval_bsdf_with_pdf(secondary.mat, secondary.normal,
-                        -giRay.direction, giLight.wi, secondaryBSDFPdf);
+                    Spectrum secondaryBSDF = eval_bsdf_with_pdf(secondary.mat, secondary.normal,
+                        -giRay.direction, giLight.wi, secondaryBSDFPdf, wl);
                     float mis = restir_gi_has_complementary_bsdf(u.cameraTarget.w)
                         ? power_heuristic(giLight.pdf, secondaryBSDFPdf) : 1.0f;
-                    secondaryRadiance = secondaryBSDF * secondaryCosine * giLight.emission *
+                    secondaryRadiance = secondaryBSDF * secondaryCosine * light_spectrum(giLight, wl) *
                         (mis / giLight.pdf);
                 }
                 float3 giDelta = secondary.position - rec.position;
@@ -2339,7 +2811,7 @@ GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, consta
                 float cosSecondary = max(0.0f, dot(secondary.normal, -giDirection));
                 float sourcePdfArea = d2 > 1e-10f ? giBSDFPdf * cosSecondary / d2 : 0.0f;
                 float pHat = eval_restir_gi_target(rec.position, rec.normal, view,
-                    rec.mat, secondary.position, secondary.normal, secondaryRadiance);
+                    rec.mat, secondary.position, secondary.normal, secondaryRadiance, wl);
                 if (sourcePdfArea > 0.0f && pHat > 0.0f) {
                     r.position = secondary.position;
                     r.normal = secondary.normal;
@@ -2357,10 +2829,11 @@ GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, consta
 // sourceX1 is reconnected and reweighted at rec. The caller has checked the reservoir's M, W,
 // source PDF and normal flag.
 void restir_gi_merge(thread GIReservoir &r, HitRecord rec, float3 view, float3 sourceX1, float4 oldGIPosPdf,
-                     float4 oldGINormal, float3 oldGIRadiance, float oldM, float oldW, thread uint &seed) {
+                     float4 oldGINormal, Spectrum oldGIRadiance, float oldU, float oldM, float oldW, thread uint &seed,
+                     thread const Wavelengths &wl) {
     if (!restir_gi_accepts_shift(rec.position, sourceX1, oldGIPosPdf.xyz, oldGINormal.xyz)) return;
     float pHat = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat,
-        oldGIPosPdf.xyz, oldGINormal.xyz, oldGIRadiance);
+        oldGIPosPdf.xyz, oldGINormal.xyz, oldGIRadiance, sample_wavelengths(oldU, wl));
     float clampedM = min(oldM, 20.0f);
     float temporalWeight = pHat * oldW * clampedM;
     r.M += clampedM;
@@ -2370,17 +2843,19 @@ void restir_gi_merge(thread GIReservoir &r, HitRecord rec, float3 view, float3 s
         r.normal = oldGINormal.xyz;
         r.radiance = oldGIRadiance;
         r.sourcePdf = oldGIPosPdf.w;
+        r.u = oldU;
     }
 }
 
 void restir_gi_encode(GIReservoir r, HitRecord rec, float3 view, thread float4 &posPdf, thread float4 &normal,
-                      thread float4 &radiance, thread float4 &weights) {
-    float target = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, r.position, r.normal, r.radiance);
+                      thread float4 &radiance, thread float4 &weights, thread const Wavelengths &wl) {
+    float target = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, r.position, r.normal, r.radiance,
+                                         sample_wavelengths(r.u, wl));
     float W = r.M > 0.0f && target > 0.0f ? r.weightSum / (r.M * target) : 0.0f;
     posPdf = float4(r.position, r.sourcePdf);
     normal = float4(r.normal, r.sourcePdf > 0.0f ? 1.0f : 0.0f);
-    radiance = float4(r.radiance, 0.0f);
-    weights = float4(r.weightSum, r.M, W, 0.0f);
+    radiance = gi_radiance_texel(r.radiance);
+    weights = float4(r.weightSum, r.M, W, r.u);
 }
 
 // The ReSTIR DI same-surface test of temporal reprojection. position / oldPosition hold
@@ -2434,12 +2909,15 @@ kernel void restir_temporal_kernel(
     constant Uniforms &uniforms [[buffer(0)]],
     constant SurfaceSettings *surfaceSettings [[buffer(1)]],
     constant MaterialResources &materialImages [[buffer(2)]],
-    device PrimarySurface *primarySurfaces [[buffer(3)]],
+    device PrimarySurface *primarySurfaces [[buffer(3)]]
+    SPECTRAL_BUFFERS,
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
 
     Sampler seed = pixel_sampler(gid, uniforms);
+    // The pixel's wavelengths: pass 2 derives the same ones from the same sampler.
+    Wavelengths wl = SPECTRAL_WAVELENGTHS(wavelength_numbers(seed), uniforms, materialImages);
     float aspect = float(uniforms.width) / float(uniforms.height);
     float fov_scale = tan((uniforms.cameraPos.w * 0.5f) * PI / 180.0f);
 
@@ -2515,7 +2993,7 @@ kernel void restir_temporal_kernel(
     }
 
     // Initial Candidate Generation (RIS M = 4)
-    DIReservoir di = restir_di_initial(rec, ray.direction, uniforms, seed, materialImages);
+    DIReservoir di = restir_di_initial(rec, ray.direction, uniforms, seed, materialImages, wl);
 
     // Temporal Reprojection. Reservoir history survives camera motion; the
     // reprojected surface test below rejects disocclusions. With reservoir splatting
@@ -2529,12 +3007,12 @@ kernel void restir_temporal_kernel(
         bool sameSurface = restir_same_surface(histPosDepth.read(uint2(prevCoord)), histNormalMat.read(uint2(prevCoord)), rec);
         if (sameSurface && histM > 0.0f && histW > 0.0f) {
             restir_di_merge(di, rec, ray.direction, histSamplePosDir.read(uint2(prevCoord)),
-                histSampleEmitPdf.read(uint2(prevCoord)), histM, histW, uniforms, seed.state, materialImages);
+                histSampleEmitPdf.read(uint2(prevCoord)), histM, histW, histWeights.w, uniforms, seed.state, materialImages, wl);
         }
     }
 
     float4 diPosDir, diEmitPdf, diWeights;
-    restir_di_encode(di, rec, ray.direction, uniforms, materialImages, diPosDir, diEmitPdf, diWeights);
+    restir_di_encode(di, rec, ray.direction, uniforms, materialImages, diPosDir, diEmitPdf, diWeights, wl);
     outSamplePosDir.write(diPosDir, gid);
     outSampleEmitPdf.write(diEmitPdf, gid);
     outReservoirWeights.write(diWeights, gid);
@@ -2550,7 +3028,7 @@ kernel void restir_temporal_kernel(
         return;
     }
 
-    GIReservoir gi = restir_gi_initial(rec, ray.direction, fov_scale, uniforms, surfaceSettings, materialImages, seed);
+    GIReservoir gi = restir_gi_initial(rec, ray.direction, fov_scale, uniforms, surfaceSettings, materialImages, seed, wl);
 
     // Temporal GI reservoir merge. Primary-surface reprojection defines the
     // reuse domain; the secondary point is reconnected and reweighted at x1.
@@ -2563,11 +3041,11 @@ kernel void restir_temporal_kernel(
         if (sameSurface && oldGIWeights.y > 0.0f && oldGIWeights.z > 0.0f &&
             oldGIPosPdf.w > 0.0f && oldGINormal.w > 0.0f) {
             restir_gi_merge(gi, rec, ray.direction, oldPos.xyz, oldGIPosPdf, oldGINormal,
-                histGIRadiance.read(uint2(prevCoord)).xyz, oldGIWeights.y, oldGIWeights.z, seed.state);
+                gi_radiance(histGIRadiance.read(uint2(prevCoord))), oldGIWeights.w, oldGIWeights.y, oldGIWeights.z, seed.state, wl);
         }
     }
     float4 giPosPdf, giNormal, giRadiance, giWeights;
-    restir_gi_encode(gi, rec, ray.direction, giPosPdf, giNormal, giRadiance, giWeights);
+    restir_gi_encode(gi, rec, ray.direction, giPosPdf, giNormal, giRadiance, giWeights, wl);
     outGIPosPdf.write(giPosPdf, gid);
     outGINormal.write(giNormal, gid);
     outGIRadiance.write(giRadiance, gid);
@@ -2721,16 +3199,55 @@ constant float PT_DUPLICATION_EXPONENT = 0.1f;
 //               x_k (17), non-delta continuations among x_1..x_{k-1} (18-23)
 //   rcDirection w_k, octahedral 2 x 16 bit;  lightPdf  NEE solid-angle PDF of the light
 //               vertex from x_{d-1}, kept for the final MIS weight when k = d - 1.
+// Spectral transport: F stays linear sRGB (the integrand at the path's wavelengths, converted), and
+// L_k, which receivers multiply by their own prefix, is stored per wavelength as its maximum and four
+// 16-bit fractions of it (the 12 bytes of rcRadiance). The wavelength numbers are not stored: every
+// pass re-derives them from the replay seed (pt_wavelengths), as random replay re-derives its draws.
 struct PTReservoir {
     packed_float3 F; float W;
     packed_float3 rcPosition; float M;
-    packed_float3 rcRadiance; float rcJacobian;
+#if VIBE_SPECTRAL
+    float rcScale; uint rcLanes[2];
+#else
+    packed_float3 rcRadiance;
+#endif
+    float rcJacobian;
     uint seed; uint flags; uint rcDirection; float lightPdf;
 };
 static_assert(sizeof(PTReservoir) == 64, "Swift allocates 64-byte ReSTIR PT reservoirs");
 
 constant uint PT_NEE = 1u << 16;
 constant uint PT_ENVIRONMENT = 1u << 17;
+// Spectral transport: L_k passed a dispersive vertex, so it holds only the hero lane (unscaled); a
+// receiver whose prefix kept all four lanes applies the hero's factor of four (spectral_arrive).
+constant uint PT_RC_DISPERSIVE = 1u << 24;
+#if VIBE_SPECTRAL
+Spectrum pt_rc_radiance(PTReservoir r) {
+    return r.rcScale * float4(float(r.rcLanes[0] & 65535u), float(r.rcLanes[0] >> 16), float(r.rcLanes[1] & 65535u),
+                              float(r.rcLanes[1] >> 16)) * (1.0f / 65535.0f);
+}
+void pt_set_rc_radiance(thread PTReservoir &r, Spectrum L) {
+    L = max(L, 0.0f);
+    float m = spectrum_max(L);
+    if (!(m > 0.0f) || !isfinite(m)) { r.rcScale = 0.0f; r.rcLanes[0] = 0u; r.rcLanes[1] = 0u; return; }
+    uint4 q = uint4(round(saturate(L / m) * 65535.0f));
+    r.rcScale = m; r.rcLanes[0] = q.x | (q.y << 16); r.rcLanes[1] = q.z | (q.w << 16);
+}
+// A ReSTIR PT path's wavelengths from its replay seed: in Z mode the seed is the pixel's key, so a
+// path generated at a pixel has that pixel's wavelengths (wavelength_numbers).
+Wavelengths pt_wavelengths(uint seed, thread const Wavelengths &context) {
+    Sampler s;
+    s.state = pcg_hash(seed ^ pcg_hash(6u));
+    s.z = sampler_z(*context.uniforms);
+    s.key = seed; s.dimension = 0u; s.sub = 0u; s.subBits = 0u;
+    float2 numbers = wavelength_numbers(s);
+    return spectral_wavelengths(numbers.x, numbers.y, context);
+}
+#else
+Spectrum pt_rc_radiance(PTReservoir r) { return float3(r.rcRadiance); }
+void pt_set_rc_radiance(thread PTReservoir &r, Spectrum L) { r.rcRadiance = L; }
+Wavelengths pt_wavelengths(uint, thread const Wavelengths &context) { return context; }
+#endif
 uint pt_length(PTReservoir r) { return r.flags & 255u; }
 uint pt_rc_index(PTReservoir r) { return (r.flags >> 8) & 255u; }
 uint pt_rc_scatter(PTReservoir r) { return (r.flags >> 18) & 63u; }
@@ -2741,7 +3258,7 @@ uint pt_flags(uint length, uint k, bool nee, bool environment, int scatter) {
 PTReservoir pt_empty() {
     PTReservoir r;
     r.F = float3(0.0f); r.W = 0.0f; r.rcPosition = float3(0.0f); r.M = 0.0f;
-    r.rcRadiance = float3(0.0f); r.rcJacobian = 0.0f;
+    pt_set_rc_radiance(r, Spectrum(0.0f)); r.rcJacobian = 0.0f;
     r.seed = 0u; r.flags = 0u; r.rcDirection = 0u; r.lightPdf = 0.0f;
     return r;
 }
@@ -2865,36 +3382,33 @@ float pt_nee_candidates(uint pathVertex, constant Uniforms &u) {
 // One vertex's BSDF, prepared once for its NEE evaluations and its continuation sample
 // (sample_bsdf and eval_bsdf_with_pdf prepare the layered OpenPBR BSDF on every call). The
 // results equal those functions': both prepare with the resolved Material's inside flag.
-struct PTBsdf { Material mat; float3 normal; float3 wo; bool layered; OpenPBR_PreparedBsdf prepared; };
-PTBsdf pt_prepare(Material m, float3 n, float3 wo) {
+struct PTBsdf { Material mat; float3 normal; float3 wo; bool layered; PreparedBsdf prepared; };
+PTBsdf pt_prepare(Material m, float3 n, float3 wo, thread const Wavelengths &wl) {
     PTBsdf b;
     b.mat = m; b.normal = n; b.wo = wo;
     b.layered = m.type != DIFFUSE && m.type != EMISSIVE && !is_delta(m);
-    if (b.layered) b.prepared = prepare_openpbr(m, n, wo);
+    if (b.layered) b.prepared = prepare_bsdf(m, n, wo, wl);
     return b;
 }
-float3 pt_eval(thread const PTBsdf &b, float3 wi, thread float &pdf) {
-    if (!b.layered) return eval_bsdf_with_pdf(b.mat, b.normal, b.wo, wi, pdf);
+Spectrum pt_eval(thread const PTBsdf &b, float3 wi, thread float &pdf, thread const Wavelengths &wl) {
+    if (!b.layered) return eval_bsdf_with_pdf(b.mat, b.normal, b.wo, wi, pdf, wl);
     pdf = 0.0f;
     float cosine = abs(dot(b.normal, wi));
-    if (cosine < 1e-7f || dot(b.normal, b.wo) <= 0.0f) return float3(0.0f);
-    pdf = openpbr_pdf(b.prepared, wi);
+    if (cosine < 1e-7f || dot(b.normal, b.wo) <= 0.0f) return Spectrum(0.0f);
+    pdf = prepared_pdf(b.prepared, wi);
     float3 g = b.mat.geometricNormal;
-    if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(wi, g) <= 0.0f) return float3(0.0f);
-    return openpbr_get_sum_of_diffuse_specular(openpbr_eval(b.prepared, wi)) / cosine;
+    if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(wi, g) <= 0.0f) return Spectrum(0.0f);
+    return prepared_eval(b.prepared, wi) / cosine;
 }
 template <typename R>
 bool pt_sample(thread const PTBsdf &b, float3 incoming, bool frontFace, thread R &seed,
-               thread float3 &direction, thread float3 &weight, thread float &pdf) {
-    if (!b.layered) return sample_bsdf(b.mat, b.normal, incoming, frontFace, seed, direction, weight, pdf);
-    OpenPBR_DiffuseSpecular result;
-    uint lobe;
+               thread float3 &direction, thread Spectrum &weight, thread float &pdf, thread const Wavelengths &wl) {
+    if (!b.layered) return sample_bsdf(b.mat, b.normal, incoming, frontFace, seed, direction, weight, pdf, wl);
     float3 random = rand_f3(seed);
-    openpbr_sample(b.prepared, random, direction, result, pdf, lobe);
+    prepared_sample(b.prepared, random, direction, weight, pdf);
     if (pdf <= 0.0f) return false;
     float3 g = b.mat.geometricNormal;
     if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(direction, g) <= 0.0f) return false;
-    weight = openpbr_get_sum_of_diffuse_specular(result);
     return all(isfinite(weight)) && all(weight >= 0.0f);
 }
 
@@ -2936,7 +3450,10 @@ bool pt_accept(thread float &weightSum, thread uint &risSeed, float3 F, float so
 // pt_connectable, a forced NEE light vertex (RESTIRPTE2026 Sec. 6.2.3), or none (replay only).
 PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, float coneSpread,
                         constant Uniforms &u, constant SurfaceSettings *settings,
-                        constant MaterialResources &images, thread float &firstHitDistance, thread float3 &estimate) {
+                        constant MaterialResources &images, thread float &firstHitDistance, thread float3 &estimate,
+                        thread const Wavelengths &context) {
+    // Spectral: the path's wavelengths follow from its seed, so every shift re-derives them.
+    Wavelengths wl = pt_wavelengths(seed, context);
     PTReservoir selected = pt_empty();
     float weightSum = 0.0f;
     estimate = float3(0.0f);
@@ -2945,7 +3462,7 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
     const uint minLength = restir_pt_unified(u) ? 2u : 3u;
     HitRecord current = x1;
     float3 incoming = view;
-    float3 throughput = float3(1.0f);   // roulette excluded (Sec. 6.2.4)
+    Spectrum throughput = Spectrum(1.0f);   // roulette excluded (Sec. 6.2.4)
     float inverseSurvival = 1.0f;
     int scatter = 0;
     float pathDistance = x1.t;
@@ -2958,12 +3475,21 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
     float previousDistance2 = 0.0f;
     // Reconnection vertex of the shared prefix (pairs whose x_k continuation is BSDF sampled).
     uint rcIndex = 0u; int rcScatter = 0;
-    float3 rcPosition = float3(0.0f), suffix = float3(1.0f);
+    float3 rcPosition = float3(0.0f);
+    Spectrum suffix = Spectrum(1.0f);
     float rcJacobian = 0.0f; uint rcDirection = 0u;
+    uint rcDispersive = 0u;   // PT_RC_DISPERSIVE when the suffix passed a dispersive vertex
     firstHitDistance = 0.0f;
     for (uint j = 1u; j < PT_MAX_VERTICES; ++j) {
         bool delta = is_delta(current.mat);
-        PTBsdf bsdf = pt_prepare(current.mat, current.normal, -incoming);
+#if VIBE_SPECTRAL
+        // Hero wavelength at a dispersive x_j (before it scatters); a suffix keeps only that lane.
+        if (spectral_dispersive(current.mat, wl)) {
+            spectral_arrive(current.mat, throughput, wl);
+            if (rcIndex != 0u) { suffix *= spectral_hero_lane(1.0f, wl); rcDispersive = PT_RC_DISPERSIVE; }
+        }
+#endif
+        PTBsdf bsdf = pt_prepare(current.mat, current.normal, -incoming, wl);
         // Next-event estimation at x_j: a path of j + 1 vertices.
         if (!delta && j + 1u >= minLength) {
             Sampler neeSeed = pt_sampler(seed, j, 1u, u);
@@ -2981,8 +3507,8 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
                     float target = 0.0f;
                     if (candidate.pdf > 0.0f) {
                         float ignored;
-                        float3 f = pt_eval(bsdf, candidate.wi, ignored);
-                        target = pt_luminance(f * abs(dot(current.normal, candidate.wi)) * candidate.emission);
+                        Spectrum f = pt_eval(bsdf, candidate.wi, ignored, wl);
+                        target = pt_luminance(spectrum_rgb(f * abs(dot(current.normal, candidate.wi)) * light_spectrum(candidate, wl), wl));
                     }
                     float w = target > 0.0f && isfinite(target) ? target / candidate.pdf : 0.0f;
                     sum += w;
@@ -2993,8 +3519,9 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
             }
             if (light_visible(current.position, current.geometricNormal, ls, u.sceneIndex, images, u, current.error)) {
                 float bsdfPdf;
-                float3 f = pt_eval(bsdf, ls.wi, bsdfPdf);
-                float3 contribution = f * abs(dot(current.normal, ls.wi)) * ls.emission / ls.pdf;
+                Spectrum f = pt_eval(bsdf, ls.wi, bsdfPdf, wl);
+                Spectrum emission = light_spectrum(ls, wl);
+                Spectrum contribution = f * abs(dot(current.normal, ls.wi)) * emission / ls.pdf;
                 float w = scatter < limit ? power_heuristic(candidates * ls.pdf, bsdfPdf) : 1.0f;
                 // Reconnection: the prefix's vertex, x_j itself (its NEE direction and light stay
                 // fixed), or else the NEE light vertex (forced; the shift then reuses the light
@@ -3003,28 +3530,28 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
                     abs(dot(current.geometricNormal, incoming)), abs(dot(previousGeometric, incoming)), false, 0.0f, threshold);
                 float forcedJacobian = ls.pdf * light_geometry(current.position, ls, u.sceneIndex, u.light.w, images);
                 bool valid = rcIndex != 0u || atVertex || forcedJacobian > 0.0f;
-                float3 F = throughput * contribution * w;
+                float3 F = spectrum_rgb(throughput * contribution * w, wl);
                 if (valid && any(contribution > 0.0f) && all(isfinite(contribution)) &&
                     pt_accept(weightSum, risSeed, F, inverseSurvival * lightWeight, estimate)) {
                     selected = pt_empty();
                     selected.F = F; selected.seed = seed;
                     if (rcIndex != 0u) {
-                        selected.flags = pt_flags(j + 1u, rcIndex, true, false, rcScatter);
+                        selected.flags = pt_flags(j + 1u, rcIndex, true, false, rcScatter) | rcDispersive;
                         selected.rcPosition = rcPosition; selected.rcJacobian = rcJacobian; selected.rcDirection = rcDirection;
-                        selected.rcRadiance = suffix * contribution * w;
+                        pt_set_rc_radiance(selected, suffix * contribution * w);
                     } else if (atVertex) {
                         selected.flags = pt_flags(j + 1u, j, true, false, scatter);
                         selected.rcPosition = current.position;
                         selected.rcJacobian = previousPdf * abs(dot(current.geometricNormal, incoming)) / previousDistance2;
                         selected.rcDirection = pt_encode_direction(ls.wi);
-                        selected.rcRadiance = ls.emission / ls.pdf;
+                        pt_set_rc_radiance(selected, emission / ls.pdf);
                         selected.lightPdf = ls.pdf;
                     } else {
                         bool directional = ls.isDirectional == 1u;
                         selected.flags = pt_flags(j + 1u, j + 1u, true, directional, scatter);
                         selected.rcPosition = directional ? ls.wi : ls.position;
                         selected.rcJacobian = forcedJacobian;
-                        selected.rcRadiance = ls.emission;
+                        pt_set_rc_radiance(selected, emission);
                         selected.lightPdf = as_type<float>(ls.isDirectional);
                     }
                 }
@@ -3033,8 +3560,8 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
         // Roulette for the continuation (shading_kernel's policy), applied at initial
         // sampling only: replay never terminates a path by roulette.
         if (j >= 5u) {
-            float3 compensated = throughput * inverseSurvival;
-            float survival = clamp(max(compensated.x, max(compensated.y, compensated.z)), 0.05f, delta ? 0.99f : 0.95f);
+            Spectrum compensated = throughput * inverseSurvival;
+            float survival = clamp(spectrum_max(compensated), 0.05f, delta ? 0.99f : 0.95f);
             Sampler rouletteSeed = pt_sampler(seed, j, 2u, u);
             if (rand_f(rouletteSeed) >= survival) break;
             inverseSurvival /= survival;
@@ -3042,9 +3569,10 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
         if (!delta && scatter >= limit) break;
         if (!delta) ++scatter;
         Sampler bsdfSeed = pt_sampler(seed, j, 0u, u);
-        float3 direction, weight;
+        float3 direction;
+        Spectrum weight;
         float pdf;
-        if (!pt_sample(bsdf, incoming, current.front_face, bsdfSeed, direction, weight, pdf)) break;
+        if (!pt_sample(bsdf, incoming, current.front_face, bsdfSeed, direction, weight, pdf, wl)) break;
         if (rcIndex == 0u && j >= 2u && !delta &&
             pt_connectable(previous, previousPdf, previousDistance2, abs(dot(current.geometricNormal, incoming)),
                            abs(dot(previousGeometric, incoming)), current.mat.type != DIFFUSE, pdf, threshold)) {
@@ -3052,12 +3580,12 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
             rcPosition = current.position;
             rcJacobian = previousPdf * abs(dot(current.geometricNormal, incoming)) / previousDistance2 * pdf;
             rcDirection = pt_encode_direction(direction);
-            suffix = float3(1.0f);
+            suffix = Spectrum(1.0f);
         } else if (rcIndex != 0u) {
             suffix *= weight;
         }
         throughput *= weight;
-        if (!all(isfinite(throughput)) || max(throughput.x, max(throughput.y, throughput.z)) <= 0.0f) break;
+        if (!all(isfinite(throughput)) || spectrum_max(throughput) <= 0.0f) break;
         Ray next;
         next.origin = ray_origin(current.position, current.geometricNormal, direction, u, current.error);
         next.direction = direction;
@@ -3071,24 +3599,24 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
         }
         // Emitter reached by the BSDF sample: a path of j + 1 vertices.
         if (j + 1u >= minLength) {
-            float3 emitted = float3(0.0f);
+            Spectrum emitted = Spectrum(0.0f);
             float lightPdf = 0.0f;
             bool environment = !found;
             if (!found) {
                 if (u.sceneIndex == 0 || u.sceneIndex == 6) {
-                    emitted = eval_environment(direction, u, images);
+                    emitted = environment_spectrum(direction, u, images, wl);
                     lightPdf = eval_environment_pdf(direction, current.normal, u, images);
                 }
             } else if (hit.mat.type == EMISSIVE) {
-                emitted = hit.mat.emission;
+                emitted = emitter_spectrum(hit.mat.emission, wl);
                 lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
             } else {
-                emitted = openpbr_emission(hit.mat, hit.normal, -direction);
+                emitted = emitter_spectrum(openpbr_emission(hit.mat, hit.normal, -direction), wl);
                 if (u.sceneIndex == 6 && any(emitted > 0.0f))
                     lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
             }
             float w = emission_weight(delta, !delta, true, pdf, lightPdf * pt_nee_candidates(j, u));
-            float3 F = throughput * emitted * w;
+            float3 F = spectrum_rgb(throughput * emitted * w, wl);
             float distance2 = found ? hit.t * hit.t : -1.0f;
             float endCosine = found ? abs(dot(hit.geometricNormal, direction)) : 1.0f;
             // Reconnection: the prefix's vertex, this emitter (endpoint rule), or none (replay only).
@@ -3100,10 +3628,10 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
                 selected = pt_empty();
                 selected.F = F; selected.seed = seed;
                 if (rcIndex != 0u) {
-                    selected.flags = pt_flags(j + 1u, rcIndex, false, false, rcScatter);
+                    selected.flags = pt_flags(j + 1u, rcIndex, false, false, rcScatter) | rcDispersive;
                     selected.rcPosition = rcPosition; selected.rcJacobian = rcJacobian; selected.rcDirection = rcDirection;
                     // k = d - 1 keeps L_k MIS-free: the weight depends on the direction into x_k.
-                    selected.rcRadiance = rcIndex == j ? emitted : suffix * emitted * w;
+                    pt_set_rc_radiance(selected, rcIndex == j ? emitted : suffix * emitted * w);
                     selected.lightPdf = lightPdf;
                 } else if (atEnd) {
                     selected.flags = pt_flags(j + 1u, j + 1u, false, environment, scatter);
@@ -3140,8 +3668,11 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
 struct PTShift { float3 FJ; float jacobian; };
 
 PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, float coneSpread,
-                 constant Uniforms &u, constant SurfaceSettings *settings, constant MaterialResources &images) {
+                 constant Uniforms &u, constant SurfaceSettings *settings, constant MaterialResources &images,
+                 thread const Wavelengths &context) {
     PTShift result = { float3(0.0f), 0.0f };
+    // The base path's wavelengths (from its seed), so the shift and its Jacobian are those of RGB.
+    Wavelengths wl = pt_wavelengths(r.seed, context);
     uint d = pt_length(r), k = pt_rc_index(r);
     if (d < 2u || y1.mat.type == EMISSIVE) return result;
     bool nee = (r.flags & PT_NEE) != 0u, environment = (r.flags & PT_ENVIRONMENT) != 0u;
@@ -3149,7 +3680,7 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
     const int limit = scattering_limit(u.cameraTarget.w);
     HitRecord current = y1;
     float3 incoming = view;
-    float3 throughput = float3(1.0f);
+    Spectrum throughput = Spectrum(1.0f);
     int scatter = 0;
     float pathDistance = y1.t;
     Material previous = y1.mat;
@@ -3162,15 +3693,17 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         bool delta = is_delta(current.mat);
         if (!delta && scatter >= limit) return result;
         if (!delta) ++scatter;
+        spectral_arrive(current.mat, throughput, wl);
         Sampler bsdfSeed = pt_sampler(r.seed, j, 0u, u);
-        float3 direction, weight;
+        float3 direction;
+        Spectrum weight;
         float pdf;
-        if (!sample_bsdf(current.mat, current.normal, incoming, current.front_face, bsdfSeed, direction, weight, pdf)) return result;
+        if (!sample_bsdf(current.mat, current.normal, incoming, current.front_face, bsdfSeed, direction, weight, pdf, wl)) return result;
         if (j >= 2u && !delta &&
             pt_connectable(previous, previousPdf, previousDistance2, abs(dot(current.geometricNormal, incoming)),
                            abs(dot(previousGeometric, incoming)), current.mat.type != DIFFUSE, pdf, threshold)) return result;
         throughput *= weight;
-        if (!all(isfinite(throughput)) || max(throughput.x, max(throughput.y, throughput.z)) <= 0.0f) return result;
+        if (!all(isfinite(throughput)) || spectrum_max(throughput) <= 0.0f) return result;
         Ray next;
         next.origin = ray_origin(current.position, current.geometricNormal, direction, u, current.error);
         next.direction = direction;
@@ -3183,18 +3716,18 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         }
         if (k == 0u && j == d - 1u) {
             // Replay-only path: the offset must reach an emitter itself.
-            float3 emitted = float3(0.0f);
+            Spectrum emitted = Spectrum(0.0f);
             float lightPdf = 0.0f;
             if (!found) {
                 if (u.sceneIndex == 0 || u.sceneIndex == 6) {
-                    emitted = eval_environment(direction, u, images);
+                    emitted = environment_spectrum(direction, u, images, wl);
                     lightPdf = eval_environment_pdf(direction, current.normal, u, images);
                 }
             } else if (hit.mat.type == EMISSIVE) {
-                emitted = hit.mat.emission;
+                emitted = emitter_spectrum(hit.mat.emission, wl);
                 lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
             } else {
-                emitted = openpbr_emission(hit.mat, hit.normal, -direction);
+                emitted = emitter_spectrum(openpbr_emission(hit.mat, hit.normal, -direction), wl);
                 if (u.sceneIndex == 6 && any(emitted > 0.0f))
                     lightPdf = eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle);
             }
@@ -3202,7 +3735,7 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
             if (!delta && pt_connectable(current.mat, pdf, found ? hit.t * hit.t : -1.0f,
                     found ? abs(dot(hit.geometricNormal, direction)) : 1.0f,
                     abs(dot(current.geometricNormal, direction)), false, 0.0f, threshold)) return result;
-            result.FJ = throughput * emitted * emission_weight(delta, !delta, true, pdf, lightPdf * pt_nee_candidates(j, u));
+            result.FJ = spectrum_rgb(throughput * emitted * emission_weight(delta, !delta, true, pdf, lightPdf * pt_nee_candidates(j, u)), wl);
             result.jacobian = r.rcJacobian;
             return result;
         }
@@ -3214,6 +3747,7 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
     if (k == 0u || !(r.rcJacobian > 0.0f)) return result;
     // Reconnection y_{k-1} -> x_k.
     if (is_delta(current.mat)) return result;
+    spectral_arrive(current.mat, throughput, wl);
     bool bsdfSegment = !(nee && k == d);
     if (bsdfSegment) {
         if (scatter >= limit) return result;
@@ -3237,8 +3771,8 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         direction = e * rsqrt(distance2);
     }
     float startPdf;
-    float3 startBSDF = eval_bsdf_with_pdf(current.mat, current.normal, -incoming, direction, startPdf);
-    float3 start = startBSDF * abs(dot(current.normal, direction));
+    Spectrum startBSDF = eval_bsdf_with_pdf(current.mat, current.normal, -incoming, direction, startPdf, wl);
+    Spectrum start = startBSDF * abs(dot(current.normal, direction));
     if (!any(start > 0.0f) || !(startPdf > 0.0f)) return result;
     // The pair ending at y_{k-1} must fail the criteria with the reconnection direction.
     if (k >= 3u) {
@@ -3253,14 +3787,15 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         ls.position = environment ? current.position + direction * 1e6f : float3(r.rcPosition);
         ls.wi = direction;
         ls.dist = environment ? 1e6f : sqrt(distance2);
-        ls.emission = float3(r.rcRadiance);
+        // L_k of a light vertex is its emission (at the path's wavelengths).
+        Spectrum emission = pt_rc_radiance(r);
         ls.pdf = environment ? eval_environment_pdf(direction, current.normal, u, images)
             : eval_light_pdf(current.position, ls.position, current.mat, u, images, ls.isDirectional >= 2u ? ls.isDirectional - 2u : 0xffffffffu);
         float geometry = light_geometry(current.position, ls, u.sceneIndex, u.light.w, images);
-        if (!(ls.pdf > 0.0f) || !(geometry > 0.0f) || !any(ls.emission > 0.0f)) return result;
+        if (!(ls.pdf > 0.0f) || !(geometry > 0.0f) || !any(emission > 0.0f)) return result;
         if (!light_visible(current.position, current.geometricNormal, ls, u.sceneIndex, images, u, current.error)) return result;
         float w = scatter < limit ? power_heuristic(pt_nee_candidates(d - 1u, u) * ls.pdf, startPdf) : 1.0f;
-        result.FJ = throughput * start * ls.emission * (w * geometry) / r.rcJacobian;
+        result.FJ = spectrum_rgb(throughput * start * emission * (w * geometry) / r.rcJacobian, wl);
         if (!all(isfinite(result.FJ))) { result.FJ = float3(0.0f); return result; }
         result.jacobian = ls.pdf * geometry;
         return result;
@@ -3282,17 +3817,17 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         resolve_material(hit, link, u, settings, images,
             (pathDistance + hit.t) * max(coneSpread, current.mat.type == DIFFUSE ? 0.25f : current.mat.roughness * 0.15f));
     }
-    float3 value;
+    Spectrum value;
     float jacobian;
     if (k == d) {
         // x_k is an emitter the BSDF sample at y_{d-1} reaches.
-        float3 emitted;
+        Spectrum emitted;
         float lightPdf;
         if (environment) {
-            emitted = eval_environment(direction, u, images);
+            emitted = environment_spectrum(direction, u, images, wl);
             lightPdf = eval_environment_pdf(direction, current.normal, u, images);
         } else {
-            emitted = hit.mat.type == EMISSIVE ? hit.mat.emission : openpbr_emission(hit.mat, hit.normal, -direction);
+            emitted = emitter_spectrum(hit.mat.type == EMISSIVE ? hit.mat.emission : openpbr_emission(hit.mat, hit.normal, -direction), wl);
             lightPdf = hit.mat.type == EMISSIVE || u.sceneIndex == 6
                 ? eval_light_pdf(current.position, hit.position, hit.mat, u, images, hit.triangle) : 0.0f;
         }
@@ -3306,9 +3841,18 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         if (hit.mat.type == EMISSIVE || is_delta(hit.mat)) return result;
         bool neeEnd = nee && k == d - 1u;
         float3 wk = pt_decode_direction(r.rcDirection);
+        spectral_arrive(hit.mat, throughput, wl);
+#if VIBE_SPECTRAL
+        // L_k passed a dispersive vertex: it holds the hero lane only, and the path's factor of four
+        // belongs to its first dispersive vertex, which this prefix has not reached.
+        if ((r.flags & PT_RC_DISPERSIVE) != 0u && !wl.heroOnly) {
+            wl.heroOnly = true;
+            throughput *= spectral_hero_lane(4.0f, wl);
+        }
+#endif
         float endPdf;
-        float3 endBSDF = eval_bsdf_with_pdf(hit.mat, hit.normal, -direction, wk, endPdf);
-        float3 end = endBSDF * abs(dot(hit.normal, wk));
+        Spectrum endBSDF = eval_bsdf_with_pdf(hit.mat, hit.normal, -direction, wk, endPdf, wl);
+        Spectrum end = endBSDF * abs(dot(hit.normal, wk));
         if (!any(end > 0.0f)) return result;
         if (!pt_connectable(current.mat, startPdf, distance2, abs(dot(hit.geometricNormal, direction)),
                             abs(dot(current.geometricNormal, direction)), !neeEnd && hit.mat.type != DIFFUSE, endPdf,
@@ -3324,9 +3868,9 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
             else if (scatter != int(pt_rc_scatter(r)) + 1) return result;
             jacobian = startPdf * geometry * endPdf;
         }
-        value = end * float3(r.rcRadiance) * w;
+        value = end * pt_rc_radiance(r) * w;
     }
-    result.FJ = throughput * start * geometry * value / r.rcJacobian;
+    result.FJ = spectrum_rgb(throughput * start * geometry * value / r.rcJacobian, wl);
     if (!all(isfinite(result.FJ))) { result.FJ = float3(0.0f); return result; }
     result.jacobian = jacobian;
     return result;
@@ -3381,7 +3925,8 @@ kernel void restir_pt_initial_kernel(
     constant MaterialResources &images [[buffer(2)]],
     const device PrimarySurface *primarySurfaces [[buffer(3)]],
     device PTReservoir *reservoirs [[buffer(5)]],
-    device PTControl *controls [[buffer(24)]],
+    device PTControl *controls [[buffer(24)]]
+    SPECTRAL_BUFFERS,
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -3396,7 +3941,7 @@ kernel void restir_pt_initial_kernel(
         float3 view = float3(primarySurfaces[index].view);
         uint seed = pt_initial_seed(gid, 0u, pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2545f491u), u);
         result = pt_generate(x1, view, seed, pt_footprint_threshold(position.w, x1.geometricNormal, view),
-                             pt_primary_cone(u), u, settings, images, firstHit, estimate);
+                             pt_primary_cone(u), u, settings, images, firstHit, estimate, SPECTRAL_CONTEXT(u, images));
         reflectance = pt_reflectance(x1.mat, x1.normal, -view);
     }
     reservoirs[index] = result;
@@ -3431,15 +3976,15 @@ bool pt_same_surface(float4 position, float4 normalMaterial, float3 view, float4
 PTReservoir pt_temporal_merge(PTReservoir c, HitRecord x1, float3 view, float depth, PTReservoir t, HitRecord y1,
                               float3 oldView, float oldDepth, float cap, uint selectSeed, constant Uniforms &u,
                               constant SurfaceSettings *settings, constant MaterialResources &images,
-                              thread float3 &difference) {
+                              thread float3 &difference, thread const Wavelengths &context) {
     float cone = pt_primary_cone(u);
     float cc = c.M, ct = min(t.M, cap);
     float pc = pt_luminance(c.F), pt = pt_luminance(t.F);
     PTShift toPrevious = { float3(0.0f), 0.0f }, toCurrent = { float3(0.0f), 0.0f };
     if (pc > 0.0f) toPrevious = pt_shift(c, y1, oldView, pt_footprint_threshold(oldDepth, y1.geometricNormal, oldView),
-                                         cone, u, settings, images);
+                                         cone, u, settings, images, context);
     if (pt > 0.0f && t.W > 0.0f) toCurrent = pt_shift(t, x1, view, pt_footprint_threshold(depth, x1.geometricNormal, view),
-                                                      cone, u, settings, images);
+                                                      cone, u, settings, images, context);
     float pcPrevious = pt_luminance(toPrevious.FJ), ptCurrent = pt_luminance(toCurrent.FJ);
     float mc = pt_talbot(pc, cc, pcPrevious, ct), mt = pt_talbot(pt, ct, ptCurrent, cc);
     float wc = c.W > 0.0f ? mc * pc * c.W : 0.0f;
@@ -3496,7 +4041,8 @@ kernel void restir_pt_temporal_kernel(
     const device PrimarySurface *historySurfaces [[buffer(4)]],
     device PTReservoir *reservoirs [[buffer(5)]],
     const device PTReservoir *history [[buffer(6)]],
-    device PTControl *controls [[buffer(24)]],
+    device PTControl *controls [[buffer(24)]]
+    SPECTRAL_BUFFERS,
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -3529,7 +4075,7 @@ kernel void restir_pt_temporal_kernel(
     uint selectSeed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
     float3 difference;
     reservoirs[index] = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldPosition.w, cap, selectSeed,
-                                          u, settings, images, difference);
+                                          u, settings, images, difference, SPECTRAL_CONTEXT(u, images));
     if (restir_pt_control_variates(u))
         pt_cv_temporal(controls[index], c.M, min(t.M, cap), ptIndirect.read(uint2(prevCoord)).xyz, difference);
 }
@@ -3546,7 +4092,8 @@ kernel void restir_pt_shift_kernel(
     const device PrimarySurface *primarySurfaces [[buffer(3)]],
     const device PTReservoir *reservoirs [[buffer(5)]],
     device float4 *shifts [[buffer(7)]],
-    const device char2 *pairing [[buffer(8)]],
+    const device char2 *pairing [[buffer(8)]]
+    SPECTRAL_BUFFERS,
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -3567,7 +4114,7 @@ kernel void restir_pt_shift_kernel(
                 HitRecord y1 = load_primary_surface(primarySurfaces[qIndex], qPosition);
                 float3 view = float3(primarySurfaces[qIndex].view);
                 PTShift s = pt_shift(r, y1, view, pt_footprint_threshold(qPosition.w, y1.geometricNormal, view),
-                                     cone, u, settings, images);
+                                     cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
                 value = float4(s.FJ, s.jacobian);
             }
         }
@@ -3697,7 +4244,9 @@ kernel void restir_pt_spatial_kernel(
         return;
     }
     if (!all(isfinite(color))) color = float3(0.0f);
-    ptIndirect.write(float4(max(color, 0.0f), firstHit), gid);
+    // Spectral transport keeps out-of-gamut (negative) colour: clamping it per frame would bias the
+    // accumulation (shading_kernel accumulates it unclamped and clamps only the MetalFX input).
+    ptIndirect.write(float4(SPECTRAL_KEEPS_NEGATIVE ? color : max(color, 0.0f), firstHit), gid);
 }
 
 // ============================================================================
@@ -3963,7 +4512,8 @@ kernel void restir_pt_spmis_shift_kernel(
     device SPMISShift *shifts [[buffer(7)]],
     const device SPMISPixel *cells [[buffer(9)]],
     const device SPMISSlot *slots [[buffer(10)]],
-    const device SPMISChoice *choices [[buffer(11)]],
+    const device SPMISChoice *choices [[buffer(11)]]
+    SPECTRAL_BUFFERS,
     uint3 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height || gid.z > SPMIS_PT_CANDIDATES) return;
@@ -4000,7 +4550,7 @@ kernel void restir_pt_spmis_shift_kernel(
         if (z != SPMIS_NO_PIXEL) {
             PTShift s = { float3(path.F), path.rcJacobian };
             if (z != index) s = pt_shift(path, y1, view, pt_footprint_threshold(depth, y1.geometricNormal, view),
-                                         pt_primary_cone(u), u, settings, images);
+                                         pt_primary_cone(u), u, settings, images, SPECTRAL_CONTEXT(u, images));
             record.FJ = all(isfinite(s.FJ)) ? s.FJ : float3(0.0f);
             record.jacobian = s.jacobian;
             record.pixel = z;
@@ -4083,7 +4633,9 @@ kernel void restir_pt_spmis_kernel(
     chosen.M = cc + cS;
     output[index] = chosen;
     if (!all(isfinite(color))) color = float3(0.0f);
-    ptIndirect.write(float4(max(color, 0.0f), firstHit), gid);
+    // Spectral transport keeps out-of-gamut (negative) colour: clamping it per frame would bias the
+    // accumulation (shading_kernel accumulates it unclamped and clamps only the MetalFX input).
+    ptIndirect.write(float4(SPECTRAL_KEEPS_NEGATIVE ? color : max(color, 0.0f), firstHit), gid);
 }
 
 // ReSTIR DI spatial reuse by stochastic pairwise MIS (Algorithm 2) at the diffuse primary hit
@@ -4097,10 +4649,11 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
                            texture2d<float, access::read> reservoirWeights, const device PrimarySurface *primarySurfaces,
                            const device SPMISPixel *cells, const device SPMISSlot *slots,
                            const device SPMISChoice *choices, constant Uniforms &u,
-                           constant MaterialResources &images, thread uint &seed, thread float &W) {
+                           constant MaterialResources &images, thread uint &seed, thread float &W,
+                           thread const Wavelengths &wl) {
     uint index = gid.y * u.width + gid.x;
-    LightSample selected = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, rec.position);
-    float pc = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, selected, u.sceneIndex, u.light.w, images);
+    LightSample selected = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, rec.position, canonicalWeights.w);
+    float pc = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, selected, u.sceneIndex, u.light.w, images, wl);
     W = 0.0f;
     SPMISPixel own = cells[index];
     if (spmis_count(own) == 0u) {
@@ -4118,9 +4671,9 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
         float from = pc;
         if (z != index) {
             HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
-            LightSample y = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, y1.position);
+            LightSample y = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, y1.position, canonicalWeights.w);
             from = eval_restir_target_pdf(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat, y,
-                                          u.sceneIndex, u.light.w, images);
+                                          u.sceneIndex, u.light.w, images, wl);
         }
         float m = spmis_canonical_share(cS, cc) + M * spmis_canonical_beta(reservoirWeights.read(zc).y * scale, cS, cc, from, pc);
         weightSum = m * pc * canonicalWeights.z;
@@ -4132,8 +4685,8 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
         uint2 zc = uint2(z % u.width, z / u.width);
         float4 w = reservoirWeights.read(zc);
         if (!(w.y > 0.0f) || !(w.z > 0.0f) || !(w.x > 0.0f)) continue;
-        LightSample y = restir_di_stored_sample(samplePosDir.read(zc), sampleEmitPdf.read(zc), rec.position);
-        float here = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, y, u.sceneIndex, u.light.w, images);
+        LightSample y = restir_di_stored_sample(samplePosDir.read(zc), sampleEmitPdf.read(zc), rec.position, w.w);
+        float here = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, y, u.sceneIndex, u.light.w, images, wl);
         if (!(here > 0.0f)) continue;
         float source = w.x / (w.y * w.z);
         float m = spmis_neighbor_weight(w.y * scale, cS, cc, source, here) / (float(SPMIS_CANDIDATES) * probability);
@@ -4142,7 +4695,7 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
         weightSum += wi;
         if (rand_f(seed) * weightSum < wi) selected = y;
     }
-    float target = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, selected, u.sceneIndex, u.light.w, images);
+    float target = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, selected, u.sceneIndex, u.light.w, images, wl);
     W = target > 0.0f && weightSum > 0.0f && isfinite(weightSum) ? weightSum / target : 0.0f;
     return selected;
 }
@@ -4157,15 +4710,17 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
 // normal: y's target from domain i also needs both (one ray per pixel). Without that test the canonical weight
 // counts domains that cannot produce y, which darkened Cornell by 0.08%. Shifts into this pixel
 // need no test: shading applies visibility, and an occluded y contributes nothing.
+// `radiance` and `sampleU` are the selected sample's secondary radiance and wavelength number.
 void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf, thread float4 &normal,
-                    thread float3 &radiance, float4 canonicalWeights, texture2d<float, access::read> gbufferPosDepth,
+                    thread Spectrum &radiance, thread float &sampleU, float4 canonicalWeights, texture2d<float, access::read> gbufferPosDepth,
                     texture2d<float, access::read> giPosPdf, texture2d<float, access::read> giNormal,
                     texture2d<float, access::read> giRadiance, texture2d<float, access::read> giWeights,
                     const device PrimarySurface *primarySurfaces, const device SPMISPixel *cells,
                     const device SPMISSlot *slots, const device SPMISChoice *choices, constant Uniforms &u,
-                    constant MaterialResources &images, thread uint &seed, thread float &W) {
+                    constant MaterialResources &images, thread uint &seed, thread float &W, thread const Wavelengths &wl) {
     uint index = gid.y * u.width + gid.x;
-    float pc = normal.w > 0.0f ? eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, posPdf.xyz, normal.xyz, radiance) : 0.0f;
+    float pc = normal.w > 0.0f ? eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, posPdf.xyz, normal.xyz, radiance,
+                                                       sample_wavelengths(sampleU, wl)) : 0.0f;
     W = 0.0f;
     SPMISPixel own = cells[index];
     if (spmis_count(own) == 0u) {
@@ -4185,7 +4740,7 @@ void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf
             HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
             from = restir_gi_accepts_shift(rec.position, y1.position, posPdf.xyz, normal.xyz)
                 ? eval_restir_gi_target(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat,
-                                        posPdf.xyz, normal.xyz, radiance) : 0.0f;
+                                        posPdf.xyz, normal.xyz, radiance, sample_wavelengths(sampleU, wl)) : 0.0f;
             // restir_gi_initial samples x2 by sample_bsdf, which rejects directions below the
             // geometric normal, and by tracing, so x2 must also be visible from x1_i.
             float3 g = y1.geometricNormal;
@@ -4205,8 +4760,9 @@ void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf
         float4 zPosPdf = giPosPdf.read(zc), zNormal = giNormal.read(zc);
         if (!(w.y > 0.0f) || !(w.z > 0.0f) || !(w.x > 0.0f) || zPosPdf.w <= 0.0f || zNormal.w <= 0.0f) continue;
         if (z != index && !restir_gi_accepts_shift(rec.position, gbufferPosDepth.read(zc).xyz, zPosPdf.xyz, zNormal.xyz)) continue;
-        float3 zRadiance = giRadiance.read(zc).xyz;
-        float here = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, zPosPdf.xyz, zNormal.xyz, zRadiance);
+        Spectrum zRadiance = gi_radiance(giRadiance.read(zc));
+        float here = eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, zPosPdf.xyz, zNormal.xyz, zRadiance,
+                                           sample_wavelengths(w.w, wl));
         if (!(here > 0.0f)) continue;
         float source = w.x / (w.y * w.z);
         float m = spmis_neighbor_weight(w.y * scale, cS, cc, source, here) / (float(SPMIS_CANDIDATES) * probability);
@@ -4214,10 +4770,11 @@ void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf
         if (!(wi > 0.0f) || !isfinite(wi)) continue;
         weightSum += wi;
         if (rand_f(seed) * weightSum < wi) {
-            posPdf = zPosPdf; normal = zNormal; radiance = zRadiance;
+            posPdf = zPosPdf; normal = zNormal; radiance = zRadiance; sampleU = w.w;
         }
     }
-    float target = normal.w > 0.0f ? eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, posPdf.xyz, normal.xyz, radiance) : 0.0f;
+    float target = normal.w > 0.0f ? eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, posPdf.xyz, normal.xyz, radiance,
+                                                           sample_wavelengths(sampleU, wl)) : 0.0f;
     W = target > 0.0f && weightSum > 0.0f && isfinite(weightSum) ? weightSum / target : 0.0f;
 }
 
@@ -4474,7 +5031,8 @@ kernel void splat_deep_restir_kernel(
     const device PrimarySurface *surfaces [[buffer(13)]],
     const device uint *counters [[buffer(14)]],
     device SplatDI *di [[buffer(19)]],
-    device SplatGI *gi [[buffer(21)]],
+    device SplatGI *gi [[buffer(21)]]
+    SPECTRAL_BUFFERS,
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= splat_count(counters)) return;
@@ -4484,19 +5042,22 @@ kernel void splat_deep_restir_kernel(
     HitRecord rec = load_primary_surface(s, float4(float3(d.position), d.depth));
     float3 view = float3(s.view);
     uint seed = splat_seed(d.pixel, d.flags & 255u, 0x7f4a7c15u, u);
+    // The deep domain's own wavelengths, from its seed.
+    Wavelengths wl = SPECTRAL_WAVELENGTHS(float2(float(pcg_hash(seed ^ 0x5bd1e995u) >> 8u), float(pcg_hash(seed) >> 8u)) * (1.0f / 16777216.0f),
+                                          u, images);
     if (restir_di_active(u)) {
         SplatDI r = { float4(0.0f), float4(0.0f), float4(0.0f) };
         if (diffuse) {
-            DIReservoir c = restir_di_initial(rec, view, u, seed, images);
-            restir_di_encode(c, rec, view, u, images, r.posDir, r.emitPdf, r.weights);
+            DIReservoir c = restir_di_initial(rec, view, u, seed, images, wl);
+            restir_di_encode(c, rec, view, u, images, r.posDir, r.emitPdf, r.weights, wl);
         }
         di[tid] = r;
     }
     if (restir_gi_active(u)) {
         SplatGI r = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
         if (diffuse && restir_gi_enabled(u.cameraTarget.w)) {
-            GIReservoir c = restir_gi_initial(rec, view, tan((u.cameraPos.w * 0.5f) * PI / 180.0f), u, settings, images, seed);
-            restir_gi_encode(c, rec, view, r.posPdf, r.normal, r.radiance, r.weights);
+            GIReservoir c = restir_gi_initial(rec, view, tan((u.cameraPos.w * 0.5f) * PI / 180.0f), u, settings, images, seed, wl);
+            restir_gi_encode(c, rec, view, r.posPdf, r.normal, r.radiance, r.weights, wl);
         }
         gi[tid] = r;
     }
@@ -4512,7 +5073,8 @@ kernel void restir_pt_deep_initial_kernel(
     const device PrimarySurface *surfaces [[buffer(13)]],
     const device uint *counters [[buffer(14)]],
     device PTReservoir *pt [[buffer(23)]],
-    device PTControl *controls [[buffer(25)]],
+    device PTControl *controls [[buffer(25)]]
+    SPECTRAL_BUFFERS,
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= splat_count(counters)) return;
@@ -4527,7 +5089,7 @@ kernel void restir_pt_deep_initial_kernel(
         uint2 pixel = uint2(d.pixel % u.width, d.pixel / u.width);
         r = pt_generate(x1, view, pt_initial_seed(pixel, d.flags & 255u, splat_seed(d.pixel, d.flags & 255u, 0x2545f491u, u), u),
                         pt_footprint_threshold(d.depth, x1.geometricNormal, view), pt_primary_cone(u), u, settings, images, firstHit,
-                        estimate);
+                        estimate, SPECTRAL_CONTEXT(u, images));
         reflectance = pt_reflectance(x1.mat, x1.normal, -view);
     }
     pt[tid] = r;
@@ -4646,9 +5208,11 @@ kernel void splat_temporal_kernel(
     const device SplatDI *previousDI [[buffer(18)]],
     device SplatDI *di [[buffer(19)]],
     const device SplatGI *previousGI [[buffer(20)]],
-    device SplatGI *gi [[buffer(21)]],
+    device SplatGI *gi [[buffer(21)]]
+    SPECTRAL_BUFFERS,
     uint tid [[thread_position_in_grid]])
 {
+    Wavelengths context = SPECTRAL_CONTEXT(u, images);
     uint pixels = u.width * u.height;
     bool deep = tid >= pixels;
     uint j = tid - pixels;
@@ -4692,21 +5256,22 @@ kernel void splat_temporal_kernel(
     uint seed = pcg_hash(tid ^ (u.sampleIndex * 1999999973u) ^ 0x3c6ef372u);
     SplatDI c = deep ? di[j] : SplatDI{ samplePosDir.read(p), sampleEmitPdf.read(p), reservoirWeights.read(p) };
     DIReservoir r;
-    r.sample = restir_di_stored_sample(c.posDir, c.emitPdf, rec.position);
+    r.sample = restir_di_stored_sample(c.posDir, c.emitPdf, rec.position, c.weights.w);
     r.weightSum = c.weights.x; r.M = c.weights.y;
     if (h.weights.y > 0.0f && h.weights.z > 0.0f)
-        restir_di_merge(r, rec, view, h.posDir, h.emitPdf, h.weights.y, h.weights.z, u, seed, images);
-    restir_di_encode(r, rec, view, u, images, c.posDir, c.emitPdf, c.weights);
+        restir_di_merge(r, rec, view, h.posDir, h.emitPdf, h.weights.y, h.weights.z, h.weights.w, u, seed, images, context);
+    restir_di_encode(r, rec, view, u, images, c.posDir, c.emitPdf, c.weights, context);
     if (deep) di[j] = c;
     else { samplePosDir.write(c.posDir, p); sampleEmitPdf.write(c.emitPdf, p); reservoirWeights.write(c.weights, p); }
     if (!restir_gi_active(u) || !restir_gi_enabled(u.cameraTarget.w)) return;
     SplatGI g = deep ? gi[j] : SplatGI{ giPosPdf.read(p), giNormal.read(p), giRadiance.read(p), giWeights.read(p) };
     GIReservoir e;
-    e.position = g.posPdf.xyz; e.sourcePdf = g.posPdf.w; e.normal = g.normal.xyz; e.radiance = g.radiance.xyz;
-    e.weightSum = g.weights.x; e.M = g.weights.y;
+    e.position = g.posPdf.xyz; e.sourcePdf = g.posPdf.w; e.normal = g.normal.xyz; e.radiance = gi_radiance(g.radiance);
+    e.weightSum = g.weights.x; e.M = g.weights.y; e.u = g.weights.w;
     if (hg.weights.y > 0.0f && hg.weights.z > 0.0f && hg.posPdf.w > 0.0f && hg.normal.w > 0.0f)
-        restir_gi_merge(e, rec, view, sourceX1, hg.posPdf, hg.normal, hg.radiance.xyz, hg.weights.y, hg.weights.z, seed);
-    restir_gi_encode(e, rec, view, g.posPdf, g.normal, g.radiance, g.weights);
+        restir_gi_merge(e, rec, view, sourceX1, hg.posPdf, hg.normal, gi_radiance(hg.radiance), hg.weights.w, hg.weights.y, hg.weights.z,
+                        seed, context);
+    restir_gi_encode(e, rec, view, g.posPdf, g.normal, g.radiance, g.weights, context);
     if (deep) gi[j] = g;
     else { giPosPdf.write(g.posPdf, p); giNormal.write(g.normal, p); giRadiance.write(g.radiance, p); giWeights.write(g.weights, p); }
 }
@@ -4741,7 +5306,8 @@ kernel void restir_pt_splat_temporal_kernel(
     device PTReservoir *pt [[buffer(23)]],
     device PTControl *controls [[buffer(24)]],
     device PTControl *deepControls [[buffer(25)]],
-    const device PTControl *previousControls [[buffer(26)]],
+    const device PTControl *previousControls [[buffer(26)]]
+    SPECTRAL_BUFFERS,
     uint tid [[thread_position_in_grid]])
 {
     uint pixels = u.width * u.height;
@@ -4797,7 +5363,7 @@ kernel void restir_pt_splat_temporal_kernel(
     uint selectSeed = pcg_hash(tid ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
     float3 difference;
     PTReservoir chosen = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldDepth, cap, selectSeed, u, settings, images,
-                                           difference);
+                                           difference, SPECTRAL_CONTEXT(u, images));
     if (deep) pt[j] = chosen;
     else reservoirs[tid] = chosen;
     if (restir_pt_control_variates(u)) {
@@ -4833,11 +5399,14 @@ kernel void shading_kernel(
     const device PrimarySurface *primarySurfaces [[buffer(3)]],
     const device SPMISPixel *spmisCells [[buffer(4)]],
     const device SPMISSlot *spmisSlots [[buffer(5)]],
-    const device SPMISChoice *spmisChoices [[buffer(6)]],
+    const device SPMISChoice *spmisChoices [[buffer(6)]]
+    SPECTRAL_BUFFERS,
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
     Sampler seed = pixel_sampler(gid, uniforms);
+    // The pixel's wavelengths (pass 1 derived the same ones). Reused DI and GI samples bring theirs.
+    Wavelengths wl = SPECTRAL_WAVELENGTHS(wavelength_numbers(seed), uniforms, materialImages);
 
     float4 posDepth = gbufferPosDepth.read(gid);
     float3 radiance = float3(0.0f);
@@ -4879,7 +5448,7 @@ kernel void shading_kernel(
 
     if (posDepth.w <= 0.0f) {
         if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
-            radiance = eval_environment(primaryRay.direction, uniforms, materialImages);
+            radiance = environment_rgb(primaryRay.direction, uniforms, materialImages, wl);
         }
     } else {
         // Pass 1 traced and resolved this exact ray; reuse its hit.
@@ -4889,11 +5458,15 @@ kernel void shading_kernel(
         float3 pos = primaryHit.position;
         float3 norm = primaryHit.normal;
         Material mat = primaryHit.mat;
+        // The path's throughput after the primary hit (spectral: four lanes, then the hero lane alone
+        // past a dispersive vertex).
+        Spectrum throughput = Spectrum(1.0f);
         if (mat.type == EMISSIVE) {
-            radiance = mat.emission;
+            radiance = emitter_rgb(mat.emission, wl);
         } else {
             // Camera rays see MaterialX emission directly; no light strategy samples them.
-            radiance = openpbr_emission(mat, norm, -primaryRay.direction);
+            radiance = emitter_rgb(openpbr_emission(mat, norm, -primaryRay.direction), wl);
+            spectral_arrive(mat, throughput, wl);
             // ReSTIR PT (restir_pt_spatial_kernel) estimates paths of three or more vertices,
             // or, unified, every path of two or more (RESTIRPTE2026 Sec. 6.1).
             bool restirPT = uniforms.samplingMode == 0 && restir_pt_active(uniforms);
@@ -4912,8 +5485,9 @@ kernel void shading_kernel(
                 selectedSample.wi = (selectedSample.isDirectional == 1) ? selectedSample.position : normalize(selectedSample.position - pos);
                 selectedSample.emission = cEmitPdf.xyz;
                 selectedSample.pdf = cEmitPdf.w;
+                selectedSample.u = cWeights.w;
 
-                float p_hat_c = eval_restir_target_pdf(pos, norm, primaryRay.direction, mat, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
+                float p_hat_c = eval_restir_target_pdf(pos, norm, primaryRay.direction, mat, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages, wl);
                 float weightSum = p_hat_c * cWeights.z * cWeights.y;
                 float M = cWeights.y;
 
@@ -4951,8 +5525,9 @@ kernel void shading_kernel(
                                 nSample.wi = (nSample.isDirectional == 1) ? nSample.position : normalize(nSample.position - pos);
                                 nSample.emission = nEmitPdf.xyz;
                                 nSample.pdf = nEmitPdf.w;
+                                nSample.u = nWeights.w;
 
-                                float p_hat_n = eval_restir_target_pdf(pos, norm, primaryRay.direction, mat, nSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
+                                float p_hat_n = eval_restir_target_pdf(pos, norm, primaryRay.direction, mat, nSample, uniforms.sceneIndex, uniforms.light.w,materialImages, wl);
                                 float w_neighbor = p_hat_n * nWeights.z * nWeights.y;
 
                                 weightSum += w_neighbor;
@@ -4965,7 +5540,7 @@ kernel void shading_kernel(
                     }
                 }
 
-                float final_p_hat = eval_restir_target_pdf(pos, norm, primaryRay.direction, mat, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
+                float final_p_hat = eval_restir_target_pdf(pos, norm, primaryRay.direction, mat, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages, wl);
                 if (compatibilityGuided && final_p_hat > 0.0f) {
                     // RESTIR2020 Alg. 6: Z counts every reused reservoir, empty ones
                     // included, whose pixel could have produced the selected sample.
@@ -4981,7 +5556,7 @@ kernel void shading_kernel(
                 if (stochasticPairwise) {
                     selectedSample = spmis_di_reuse(gid, primaryHit, primaryRay.direction, cPosDir, cEmitPdf, cWeights,
                         gbufferPosDepth, inSamplePosDir, inSampleEmitPdf, inReservoirWeights, primarySurfaces,
-                        spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed.state, W);
+                        spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed.state, W, wl);
                 }
 
                 // Direct Lighting: ReSTIR DI vs. Standard MIS
@@ -4990,8 +5565,9 @@ kernel void shading_kernel(
 
                     if (light_visible(pos, primaryHit.geometricNormal, selectedSample, uniforms.sceneIndex, materialImages, uniforms, primaryHit.error)) {
                         float cos_th = max(0.0f, dot(norm, dir));
-                        float3 bsdf = eval_bsdf(mat, norm, -primaryRay.direction, dir);
-                        radiance += bsdf * cos_th * selectedSample.emission * W * light_geometry(pos, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages);
+                        Wavelengths sampleWavelengths = sample_wavelengths(selectedSample.u, wl);
+                        Spectrum bsdf = eval_bsdf(mat, norm, -primaryRay.direction, dir, sampleWavelengths);
+                        radiance += spectrum_rgb(bsdf * cos_th * light_spectrum(selectedSample, sampleWavelengths) * W * light_geometry(pos, selectedSample, uniforms.sceneIndex, uniforms.light.w,materialImages), sampleWavelengths);
                     }
                 }
 
@@ -5001,11 +5577,12 @@ kernel void shading_kernel(
                 bool giEnabled = restir_gi_enabled(uniforms.cameraTarget.w) && !restirPT;
                 float4 selectedGIPosPdf = giEnabled ? inGIPosPdf.read(gid) : float4(0.0f);
                 float4 selectedGINormal = giEnabled ? inGINormal.read(gid) : float4(0.0f);
-                float3 selectedGIRadiance = giEnabled ? inGIRadiance.read(gid).xyz : float3(0.0f);
+                Spectrum selectedGIRadiance = giEnabled ? gi_radiance(inGIRadiance.read(gid)) : Spectrum(0.0f);
                 float4 currentGIWeights = giEnabled ? inGIWeights.read(gid) : float4(0.0f);
+                float selectedGIU = currentGIWeights.w;
                 float giTarget = selectedGINormal.w > 0.0f
                     ? eval_restir_gi_target(pos, norm, primaryRay.direction, mat,
-                        selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
+                        selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance, sample_wavelengths(selectedGIU, wl)) : 0.0f;
                 float giWeightSum = giTarget * currentGIWeights.z * currentGIWeights.y;
                 float giM = currentGIWeights.y;
                 if (compatibilityGuided && giEnabled) {
@@ -5029,9 +5606,9 @@ kernel void shading_kernel(
                         neighborPosPdf.w <= 0.0f || neighborNormal.w <= 0.0f) continue;
                     if (!restir_gi_accepts_shift(pos, neighborPrimary.xyz,
                         neighborPosPdf.xyz, neighborNormal.xyz)) continue;
-                    float3 neighborRadiance = inGIRadiance.read(uint2(nCoord)).xyz;
+                    Spectrum neighborRadiance = gi_radiance(inGIRadiance.read(uint2(nCoord)));
                     float neighborTarget = eval_restir_gi_target(pos, norm, primaryRay.direction,
-                        mat, neighborPosPdf.xyz, neighborNormal.xyz, neighborRadiance);
+                        mat, neighborPosPdf.xyz, neighborNormal.xyz, neighborRadiance, sample_wavelengths(neighborWeights.w, wl));
                     float neighborWeight = neighborTarget * neighborWeights.z * neighborWeights.y;
                     giWeightSum += neighborWeight;
                     giM += neighborWeights.y;
@@ -5039,11 +5616,12 @@ kernel void shading_kernel(
                         selectedGIPosPdf = neighborPosPdf;
                         selectedGINormal = neighborNormal;
                         selectedGIRadiance = neighborRadiance;
+                        selectedGIU = neighborWeights.w;
                     }
                 }
                 float finalGITarget = selectedGINormal.w > 0.0f
                     ? eval_restir_gi_target(pos, norm, primaryRay.direction, mat,
-                        selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance) : 0.0f;
+                        selectedGIPosPdf.xyz, selectedGINormal.xyz, selectedGIRadiance, sample_wavelengths(selectedGIU, wl)) : 0.0f;
                 if (compatibilityGuided && giEnabled && finalGITarget > 0.0f) {
                     giM = currentGIWeights.y;
                     for (int i = 0; i < taps; ++i) {
@@ -5057,15 +5635,16 @@ kernel void shading_kernel(
                     ? giWeightSum / (giM * finalGITarget) : 0.0f;
                 if (stochasticPairwise && giEnabled) {
                     spmis_gi_reuse(gid, primaryHit, primaryRay.direction, selectedGIPosPdf, selectedGINormal,
-                        selectedGIRadiance, currentGIWeights, gbufferPosDepth, inGIPosPdf, inGINormal, inGIRadiance,
-                        inGIWeights, primarySurfaces, spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed.state, giW);
+                        selectedGIRadiance, selectedGIU, currentGIWeights, gbufferPosDepth, inGIPosPdf, inGINormal, inGIRadiance,
+                        inGIWeights, primarySurfaces, spmisCells, spmisSlots, spmisChoices, uniforms, materialImages, seed.state, giW, wl);
                 }
                 if (giEnabled && giW > 0.0f && gi_connection_visible(pos, primaryHit.geometricNormal,
                     selectedGIPosPdf.xyz, uniforms, materialImages, primaryHit.error)) {
                     float3 direction = normalize(selectedGIPosPdf.xyz - pos);
-                    float3 primaryBSDF = eval_bsdf(mat, norm, -primaryRay.direction, direction);
+                    Wavelengths sampleWavelengths = sample_wavelengths(selectedGIU, wl);
+                    Spectrum primaryBSDF = eval_bsdf(mat, norm, -primaryRay.direction, direction, sampleWavelengths);
                     float geometry = gi_geometry(pos, norm, selectedGIPosPdf.xyz, selectedGINormal.xyz);
-                    radiance += primaryBSDF * selectedGIRadiance * geometry * giW;
+                    radiance += spectrum_rgb(primaryBSDF * selectedGIRadiance * geometry * giW, sampleWavelengths);
                 }
             } else if (mat.type != DIELECTRIC && !(mat.type == GLOSSY && mat.roughness < 0.02f) && uniforms.samplingMode != 3) {
                 sampler_event(seed, 1u, Z_NEE);
@@ -5074,11 +5653,11 @@ kernel void shading_kernel(
                     if (light_visible(pos, primaryHit.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, primaryHit.error)) {
                         float cos_th = abs(dot(norm, ls.wi));
                         float bsdf_pdf;
-                        float3 bsdf = eval_bsdf_with_pdf(mat, norm, -primaryRay.direction, ls.wi, bsdf_pdf);
+                        Spectrum bsdf = eval_bsdf_with_pdf(mat, norm, -primaryRay.direction, ls.wi, bsdf_pdf, wl);
                         // Depth 1 has no BSDF continuation to share the direct integral.
                         bool useMIS = uniforms.samplingMode <= 1 && scattering_limit(uniforms.cameraTarget.w) > 0;
                         float weight = useMIS ? power_heuristic(ls.pdf, bsdf_pdf) : 1.0f;
-                        radiance += bsdf * cos_th * ls.emission * (weight / ls.pdf);
+                        radiance += spectrum_rgb(throughput * bsdf * cos_th * light_spectrum(ls, wl) * (weight / ls.pdf), wl);
                     }
                 }
             }
@@ -5092,7 +5671,6 @@ kernel void shading_kernel(
 
             Ray currentRay = primaryRay;
             HitRecord currentHit = primaryHit;
-            float3 throughput = float3(1.0f);
 
             // Budget scattering events, not ideal reflections/refractions. Near
             // horizontal rays can cross the open ring dozens of times before
@@ -5110,7 +5688,8 @@ kernel void shading_kernel(
                 radiance += ptIndirect.read(gid).rgb;
             }
             for (int bounce = 1; !unifiedPT; ++bounce) {
-                float3 nextDirection, bsdfWeight;
+                float3 nextDirection;
+                Spectrum bsdfWeight;
                 float bsdfPDF;
                 bool previousDelta = is_delta(currentHit.mat);
                 if (!previousDelta && scatteringDepth >= scatteringLimit) {
@@ -5128,9 +5707,9 @@ kernel void shading_kernel(
                 // Z mode: vertex `bounce` scatters (its BSDF event); rec below is vertex bounce + 1.
                 sampler_event(seed, uint(bounce), Z_BSDF);
                 if (!sample_bsdf(currentHit.mat, currentHit.normal, currentRay.direction,
-                                 currentHit.front_face, seed, nextDirection, bsdfWeight, bsdfPDF)) break;
+                                 currentHit.front_face, seed, nextDirection, bsdfWeight, bsdfPDF, wl)) break;
                 throughput *= bsdfWeight;
-                if (!all(isfinite(throughput)) || max(throughput.x, max(throughput.y, throughput.z)) <= 0.0f) break;
+                if (!all(isfinite(throughput)) || spectrum_max(throughput) <= 0.0f) break;
                 float3 previousPosition = currentHit.position;
                 float3 previousNormal = currentHit.normal;
                 float3 offsetNormal = currentHit.geometricNormal;
@@ -5151,14 +5730,14 @@ kernel void shading_kernel(
                     if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
                         float lightPDF = eval_environment_pdf(nextDirection, previousNormal, uniforms,materialImages);
                         float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                        radiance += throughput * weight * eval_environment(nextDirection, uniforms, materialImages);
+                        radiance += spectrum_rgb(throughput * weight * environment_spectrum(nextDirection, uniforms, materialImages, wl), wl);
                     }
                     break;
                 }
                 if (rec.mat.type == EMISSIVE) {
                     float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms,materialImages,rec.triangle);
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                    radiance += throughput * weight * rec.mat.emission;
+                    radiance += spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, wl), wl);
                     break;
                 }
                 // A MaterialX emitter also scatters: add its emission with the same MIS
@@ -5169,11 +5748,12 @@ kernel void shading_kernel(
                     float lightPDF = uniforms.sceneIndex == 6
                         ? eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms, materialImages, rec.triangle) : 0.0f;
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                    radiance += throughput * weight * surfaceEmission;
+                    radiance += spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, wl), wl);
                 }
                 if (emissionOnly) break;
                 // The x2 emission above is a two-vertex path; ReSTIR PT holds the longer ones.
                 if (restirPT) break;
+                spectral_arrive(rec.mat, throughput, wl);
 
                 bool restirGISecondary = uniforms.samplingMode == 0 && mat.type == DIFFUSE &&
                     bounce == 1 && rec.mat.type == DIFFUSE;
@@ -5183,18 +5763,18 @@ kernel void shading_kernel(
                     if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, rec.error)) {
                         float cosine = abs(dot(rec.normal, ls.wi));
                         float pdf;
-                        float3 bsdf = eval_bsdf_with_pdf(rec.mat, rec.normal, -currentRay.direction, ls.wi, pdf);
+                        Spectrum bsdf = eval_bsdf_with_pdf(rec.mat, rec.normal, -currentRay.direction, ls.wi, pdf, wl);
                         // At the last vertex there will be no BSDF light sample.
                         bool useMIS = uniforms.samplingMode <= 1 && scatteringDepth < scatteringLimit;
                         float weight = useMIS ? power_heuristic(ls.pdf, pdf) : 1.0f;
-                        radiance += throughput * bsdf * cosine * ls.emission * weight / ls.pdf;
+                        radiance += spectrum_rgb(throughput * bsdf * cosine * light_spectrum(ls, wl) * weight / ls.pdf, wl);
                     }
                 }
                 currentHit = rec;
                 if (bounce > 3) {
                     // A higher survival ceiling reduces variance in long mirror
                     // chains. Division by survival preserves their expected energy.
-                    float survival = clamp(max(throughput.x, max(throughput.y, throughput.z)),
+                    float survival = clamp(spectrum_max(throughput),
                                            0.05f, is_delta(currentHit.mat) ? 0.99f : 0.95f);
                     sampler_event(seed, uint(bounce) + 1u, Z_ROULETTE);
                     if (rand_f(seed) >= survival) break;
@@ -5205,7 +5785,7 @@ kernel void shading_kernel(
     }
 
     if (uniforms.enableFog == 1) {
-        radiance = apply_camera_fog(radiance, primaryRay, posDepth.w > 0.0f ? posDepth.w : 100.0f, uniforms, seed, materialImages);
+        radiance = apply_camera_fog(radiance, primaryRay, posDepth.w > 0.0f ? posDepth.w : 100.0f, uniforms, seed, materialImages, wl);
     }
 
     if (isnan(radiance.r) || isnan(radiance.g) || isnan(radiance.b) ||
@@ -5214,7 +5794,14 @@ kernel void shading_kernel(
     }
     // ReSTCV estimates can be negative in single frames; the progressive average keeps them so
     // that it converges without the clamp's upward bias. MetalFX receives the clamped frame.
+#if VIBE_SPECTRAL
+    // Spectral samples are often outside the sRGB gamut (colour noise of four wavelengths, narrow-band
+    // light): negative channels stay in the progressive average, which then converges to the
+    // integral's colour. Presentation, exports and OIDN clamp, and MetalFX receives the clamped frame.
+    float3 accumulated = radiance;
+#else
     float3 accumulated = restir_pt_control_variates(uniforms) && uniforms.samplingMode == 0 ? radiance : max(radiance, float3(0.0f));
+#endif
     radiance = max(radiance, float3(0.0f));
 
     // OIDN auxiliary inputs must use the same jitter/reconstruction filter as
@@ -5441,6 +6028,153 @@ kernel void pick_kernel(constant Uniforms &u [[buffer(0)]],
     result[0]=trace_scene(ray,u.sceneIndex,hit,images,u) && (hit.mat.type!=EMISSIVE || hit.objectID>=64) ? hit.objectID : 0xffffffffu;
 }
 
+#if VIBE_SPECTRAL
+// The scene's wavelength-sampling inverse CDF (buffer 29), one thread, run when
+// the scene's illuminants change: a preset's generated table when one weight is set, else the
+// weighted mixture of the presets' sampling densities, (1 - 0.1) S s / int(S s) + 0.1 s / int(s) with
+// s = |r| + |g| + |b| of the linear-sRGB CMFs, inverted exactly for its 1 nm piecewise-linear form
+// (scripts/generate_spectral_tables.py: sampling_density, mixture_density, inverse_cdf). Scratch
+// space for the density and its CDF follows the table.
+kernel void spectral_icdf_kernel(device float *table [[buffer(29)]], constant float4 *weights [[buffer(0)]],
+                                 uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) return;
+    device float4 *cmf = (device float4 *)table + SPECTRAL_CMF_TABLE;
+    for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i)
+        cmf[i] = float4(VIBE_XYZ_TO_LINEAR_SRGB * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]),
+                        vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i)));
+    device float *density = table + SPECTRAL_SCRATCH;
+    device float *cdf = density + VIBE_SPECTRAL_SAMPLES;
+    float w[6] = { weights[0].x, weights[0].y, weights[0].z, weights[0].w, weights[1].x, weights[1].y };
+    uint used = 0u, last = 1u;
+    float total = 0.0f;
+    for (uint k = 0u; k < VIBE_ILLUMINANT_COUNT; ++k) if (w[k] > 0.0f) { ++used; last = k; total += w[k]; }
+    if (used <= 1u) {
+        for (uint i = 0u; i <= VIBE_ICDF_SEGMENTS; ++i) table[i] = vibe_wavelength_icdf[last][i];
+        return;
+    }
+    float plain = 0.0f, weighted[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i) {
+        float3 c = VIBE_XYZ_TO_LINEAR_SRGB * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]);
+        float s = abs(c.x) + abs(c.y) + abs(c.z);
+        density[i] = s;
+        float edge = i == 0u || i + 1u == VIBE_SPECTRAL_SAMPLES ? 0.5f : 1.0f;   // trapezoid weights
+        plain += edge * s;
+        for (uint k = 0u; k < VIBE_ILLUMINANT_COUNT; ++k) weighted[k] += edge * s * vibe_illuminant_spd[k][i];
+    }
+    for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i) {
+        float s = density[i], p = 0.0f;
+        for (uint k = 0u; k < VIBE_ILLUMINANT_COUNT; ++k)
+            if (w[k] > 0.0f) p += w[k] / total * (0.9f * vibe_illuminant_spd[k][i] * s / weighted[k] + 0.1f * s / plain);
+        density[i] = p;
+    }
+    cdf[0] = 0.0f;
+    for (uint i = 1u; i < VIBE_SPECTRAL_SAMPLES; ++i) cdf[i] = cdf[i - 1u] + 0.5f * (density[i - 1u] + density[i]);
+    float sum = cdf[VIBE_SPECTRAL_SAMPLES - 1u];
+    table[0] = VIBE_LAMBDA_MIN;
+    uint j = 0u;
+    for (uint n = 1u; n < VIBE_ICDF_SEGMENTS; ++n) {
+        float y = sum * float(n) / float(VIBE_ICDF_SEGMENTS);
+        while (j + 2u < VIBE_SPECTRAL_SAMPLES && cdf[j + 1u] < y) ++j;
+        float p0 = density[j], dp = density[j + 1u] - p0, rest = y - cdf[j];
+        float t = abs(dp) < 1e-6f * max(p0, 1e-30f) ? rest / max(p0, 1e-30f)
+                                                    : (-p0 + sqrt(max(p0 * p0 + 2.0f * dp * rest, 0.0f))) / dp;
+        table[n] = max(VIBE_LAMBDA_MIN + float(j) + clamp(t, 0.0f, 1.0f), nextafter(table[n - 1u], INFINITY));
+    }
+    table[VIBE_ICDF_SEGMENTS] = max(VIBE_LAMBDA_MAX, nextafter(table[VIBE_ICDF_SEGMENTS - 1u], INFINITY));
+}
+
+// Grid refinement, run once when the grid is loaded (PathTracerRenderer.refineSpectralGrid).
+// The linear sRGB of a reflectance under D65 at 1 nm (the generator's rgb_of_lagrange), and with
+// Jacobian rows (r, g, b) x (L0, L1, L2) for Levenberg-Marquardt (solve_lagrange).
+float3 spectral_rgb_of_lagrange(float3 L, thread float3x3 *jacobian) {
+    float3 rgb = float3(0.0f);
+    float3 j0 = float3(0.0f), j1 = float3(0.0f), j2 = float3(0.0f);
+    for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i) {
+        float3 w = VIBE_XYZ_TO_LINEAR_SRGB * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i])
+            * vibe_illuminant_spd[VIBE_ILLUMINANT_D65][i];
+        float x = cos(vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i)));
+        float c1 = 2.0f * x, c2 = 2.0f * (2.0f * x * x - 1.0f);
+        float s = L.x + L.y * c1 + L.z * c2;
+        rgb += w * (atan(s) * 0.318309886f + 0.5f);
+        if (jacobian) {
+            float3 d = w * (0.318309886f / (1.0f + s * s));
+            j0 += d; j1 += d * c1; j2 += d * c2;
+        }
+    }
+    if (jacobian) *jacobian = float3x3(j0, j1, j2);   // columns: d rgb / d L0, L1, L2
+    return rgb;
+}
+float3x3 spectral_inverse3(float3x3 m) {
+    float3 a = m[0], b = m[1], c = m[2];
+    float3 r0 = cross(b, c), r1 = cross(c, a), r2 = cross(a, b);
+    return transpose(float3x3(r0, r1, r2)) / dot(a, r0);
+}
+// The round trip of one 8-bit code through the unrefined conversion, in 8-bit steps.
+float spectral_code_error(uint3 code, thread const Wavelengths &wl) {
+    float3 c = spectral_eotf(float3(code) / 255.0f);
+    if (c.x == c.y && c.y == c.z) return 0.0f;
+    float3 code85 = spectral_code85(c);
+    float3 L = vibe_fourier_lagrange(spectral_moments_coarse(c, code85, spectral_cell(code85), wl));
+    float3 rgb = saturate(spectral_rgb_of_lagrange(L, nullptr));
+    float3 back = select(1.055f * pow(rgb, float3(1.0f / 2.4f)) - 0.055f, 12.92f * rgb, rgb <= 0.0031308f) * 255.0f;
+    float3 d = abs(back - float3(code));
+    return max(d.x, max(d.y, d.z));
+}
+kernel void spectral_refine_flags_kernel(constant SpectralScene &scene [[buffer(27)]], const device float4 *grid [[buffer(28)]],
+                                         device atomic_uint *flags [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    if (tid >= 16777216u) return;
+    uint3 code = uint3(tid >> 16, (tid >> 8) & 255u, tid & 255u);
+    Wavelengths wl;
+    wl.scene = &scene; wl.grid = grid;
+    if (spectral_code_error(code, wl) <= 0.35f) return;
+    uint3 i = spectral_cell(spectral_code85(spectral_eotf(float3(code) / 255.0f)));
+    atomic_store_explicit(&flags[(i.x * 85u + i.y) * 85u + i.z], 1u, memory_order_relaxed);
+}
+// Exact moments of a refined cell's 64 codes: Levenberg-Marquardt in Lagrange space from the
+// interpolated start (the generator's solve_lagrange, in float32), then the moments by the
+// generator's 1024-node midpoint rule (moments_of_lagrange).
+kernel void spectral_refine_solve_kernel(constant SpectralScene &scene [[buffer(27)]], device float4 *grid [[buffer(28)]],
+                                         const device uint *cells [[buffer(0)]], constant uint &count [[buffer(1)]],
+                                         uint tid [[thread_position_in_grid]]) {
+    if (tid >= 64u * count) return;
+    uint slot = tid / 64u, entry = tid % 64u, cell = cells[slot];
+    uint3 i = uint3(cell / (85u * 85u), (cell / 85u) % 85u, cell % 85u);
+    uint3 code = min(3u * i + uint3(entry / 16u, (entry / 4u) % 4u, entry % 4u), uint3(255u));
+    float3 c = spectral_eotf(float3(code) / 255.0f);
+    float3 target = clamp(c, VIBE_MOMENT_EPSILON, 1.0f - VIBE_MOMENT_EPSILON);
+    Wavelengths wl;
+    wl.scene = &scene; wl.grid = grid;
+    float3 L = vibe_fourier_lagrange(spectral_moments_coarse(c, spectral_code85(c), i, wl));
+    float3x3 J;
+    float3 f = target - spectral_rgb_of_lagrange(L, &J);
+    float error = max(abs(f.x), max(abs(f.y), abs(f.z))), mu = 0.0f;
+    for (uint n = 0u; n < 40u && error > 2e-7f; ++n) {
+        float3x3 normal = transpose(J) * J;
+        float3 gradient = transpose(J) * f;
+        bool improved = false;
+        for (uint k = 0u; k < 24u && !improved; ++k) {
+            float3x3 damped = normal;
+            damped[0][0] *= 1.0f + mu; damped[1][1] *= 1.0f + mu; damped[2][2] *= 1.0f + mu;
+            if (!(abs(determinant(damped)) > 0.0f)) break;
+            float3 trial = L + spectral_inverse3(damped) * gradient;
+            float3x3 Jt;
+            float3 ft = target - spectral_rgb_of_lagrange(trial, &Jt);
+            float et = max(abs(ft.x), max(abs(ft.y), abs(ft.z)));
+            if (et < error) { L = trial; J = Jt; f = ft; error = et; mu = mu > 1e-12f ? mu * 0.1f : 0.0f; improved = true; }
+            else mu = max(mu * 10.0f, 1e-6f);
+        }
+        if (!improved) break;
+    }
+    float3 m = float3(0.0f);
+    for (uint k = 0u; k < 1024u; ++k) {
+        float x = cos(-PI + (float(k) + 0.5f) * (PI / 1024.0f));
+        float g = atan(L.x + 2.0f * L.y * x + 2.0f * L.z * (2.0f * x * x - 1.0f)) * 0.318309886f + 0.5f;
+        m += g * float3(1.0f, x, 2.0f * x * x - 1.0f);
+    }
+    grid[SPECTRAL_REFINED + 64u * slot + entry] = float4(m / 1024.0f, 0.0f);
+}
+#endif
+
 kernel void present_kernel(
     texture2d<float, access::read> hdr [[texture(0)]],
     texture2d<float, access::write> output [[texture(1)]],
@@ -5623,6 +6357,141 @@ enum SamplerMode: UInt32, Sendable {
     }
 }
 
+// Light transport: RGB, or four wavelengths per path through the spectral shader libraries
+// (VIBE_SPECTRAL; docs/SPECTRAL_DESIGN.md). REFERENCES.md: PETERSBLOG2025, PETERS2019,
+// FOURIERSRGB2019, HERO2014, CIEDATA.
+enum LightTransport: UInt32, Sendable {
+    case rgb = 0
+    case spectral = 1
+    // Host-side default: spectral only where the scene needs wavelengths (an illuminant preset other
+    // than D65, dispersion or thin film), RGB elsewhere: spectral transport cost 6-71% more frame
+    // time (1.15-1.71x the time to equal error) for RGB scenes (tests/PERFORMANCE.md).
+    case automatic = 2
+    func resolved(sceneNeedsSpectral: Bool) -> LightTransport {
+        self == .automatic ? (sceneNeedsSpectral ? .spectral : .rgb) : self
+    }
+}
+
+// Emitter spectra of spectral transport (MSL VibeIlluminant, normalized to luminance one). An
+// emitter's RGB colour tints the preset like a reflectance; D65 renders the RGB colour itself.
+enum Illuminant: UInt32, CaseIterable, Sendable {
+    case e = 0, d65 = 1, a = 2, fl11 = 3, hp1 = 4, ledB3 = 5
+    // An optional stored preset (StudioOptions.lightSpectrum / sunSpectrum): nil is the RGB colour.
+    static func resolved(_ raw: UInt32?) -> Illuminant { raw.flatMap(Illuminant.init(rawValue:)) ?? .d65 }
+}
+
+// Bundled spectral tables (build.sh copies them; test builds read build/SpectralTables).
+func spectralResourceURL(_ name: String) -> URL? {
+    runtimeResourceURL(bundled: Bundle.main.resourceURL?.appendingPathComponent(name),
+                       repositoryPath: "build/SpectralTables/" + name)
+}
+func loadSpectralTablesSource() throws -> String {
+    guard let url = spectralResourceURL("SpectralTables.metal"),
+          let text = try? String(contentsOf: url, encoding: .utf8) else {
+        throw NSError(domain: "PathTracer", code: 4, userInfo: [NSLocalizedDescriptionKey:
+            "Missing SpectralTables.metal. Build with build.sh before using spectral transport."])
+    }
+    return text
+}
+// FourierSRGB86.bin: 64-byte header (magic VTFSRGBC, format 1, 86 nodes, 3 channels, 32 bits), then
+// 86^3 x 3 little-endian float32 moments indexed (r * 86 + g) * 86 + b.
+func loadSpectralGrid() throws -> [SIMD4<Float>] {
+    func fail(_ message: String) -> NSError {
+        NSError(domain: "PathTracer", code: 4, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+    guard let url = spectralResourceURL("FourierSRGB86.bin"), let data = try? Data(contentsOf: url) else {
+        throw fail("Missing FourierSRGB86.bin. Build with build.sh before using spectral transport.")
+    }
+    let n = 86, count = n * n * n
+    guard data.count == 64 + count * 12, data.prefix(8) == Data("VTFSRGBC".utf8),
+          data.withUnsafeBytes({ $0.loadUnaligned(fromByteOffset: 8, as: SIMD4<UInt32>.self) }) == SIMD4(1, 86, 3, 32)
+    else { throw fail("FourierSRGB86.bin has an unexpected layout.") }
+    return data.withUnsafeBytes { raw in
+        (0..<count).map { i in
+            let o = 64 + i * 12
+            return SIMD4(Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: o, as: UInt32.self))),
+                         Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: o + 4, as: UInt32.self))),
+                         Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: o + 8, as: UInt32.self))), 0)
+        }
+    }
+}
+
+// Host copy of the shader's colour conversion (MSL spectral_lagrange), in double precision: moments
+// interpolated trilinearly in linear light from the grid, then the bounded MESE's Lagrange multipliers
+// (MSL vibe_fourier_lagrange; PETERS2019 Eqs. 6, 7, 10, FOURIERSRGB2019 Alg. 1 and 2). It converts
+// constant colours once per frame (SpectralScene.lightLagrange) instead of once per light sample.
+enum SpectralColour {
+    static func lagrange(_ rgb: SIMD3<Double>, grid: MTLBuffer, nodes: [Float]) -> SIMD4<Float> {
+        let c = simd_clamp(rgb, SIMD3(repeating: 0), SIMD3(repeating: 1))
+        if c.max() - c.min() <= 1e-4 { return SIMD4(Float((c.x + c.y + c.z) / 3), 0, 0, 2) }  // as MSL spectral_lagrange
+        let g = grid.contents().bindMemory(to: SIMD4<Float>.self, capacity: 86 * 86 * 86 + 8192 * 64)
+        func eotf(_ v: Double) -> Double { v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+        var i = SIMD3<Int>(0, 0, 0), code85 = SIMD3<Double>(0, 0, 0)
+        for k in 0..<3 {
+            let v = c[k]
+            code85[k] = (v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055) * 85
+            i[k] = min(max(Int(code85[k]), 0), 84)
+        }
+        // A refined cell (MSL spectral_moments): its block of exact moments at one-code spacing.
+        let slot = Int(g[(i.x * 86 + i.y) * 86 + i.z].w)
+        var base = 0, stride = (86, 86), cell = i, t = SIMD3<Double>(0, 0, 0)
+        if slot > 0 {
+            base = 86 * 86 * 86 + 64 * (slot - 1); stride = (4, 4)
+            for k in 0..<3 {
+                let s = min(max(Int(code85[k] * 3 - Double(3 * i[k])), 0), 2), n0 = Double(3 * i[k] + s)
+                let low = eotf(n0 / 255), high = eotf((n0 + 1) / 255)
+                cell[k] = s
+                t[k] = min(max((c[k] - low) / (high - low), 0), 1)
+            }
+        } else {
+            for k in 0..<3 {
+                let low = Double(nodes[i[k]]), high = Double(nodes[i[k] + 1])
+                t[k] = min(max((c[k] - low) / (high - low), 0), 1)
+            }
+        }
+        var m = SIMD3<Double>(0, 0, 0)
+        for a in 0..<2 { for b in 0..<2 { for d in 0..<2 {
+            let w = (a == 0 ? 1 - t.x : t.x) * (b == 0 ? 1 - t.y : t.y) * (d == 0 ? 1 - t.z : t.z)
+            let e = g[base + ((cell.x + a) * stride.0 + cell.y + b) * stride.1 + cell.z + d]
+            m += w * SIMD3(Double(e.x), Double(e.y), Double(e.z))
+        }}}
+        return SIMD4(SIMD3<Float>(fourierLagrange(m)), 1)
+    }
+    static func fourierLagrange(_ c: SIMD3<Double>) -> SIMD3<Double> {
+        typealias C = SIMD2<Double>
+        func mul(_ a: C, _ b: C) -> C { C(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x) }
+        func conj(_ a: C) -> C { C(a.x, -a.y) }
+        let pi = Double.pi
+        let c0 = min(max(c.x, 1e-4), 1 - 1e-4)
+        let g0p = C(sin(pi * c0), -cos(pi * c0)) / (4 * pi)
+        let g0 = 2 * g0p.x
+        var g1 = (2 * pi * c.y) * C(-g0p.y, g0p.x)
+        var g2 = pi * C(-(2 * c.z * g0p.y + c.y * g1.y), 2 * c.z * g0p.x + c.y * g1.x)
+        let q0 = 1 / g0
+        var u1 = q0 * g1
+        var n1 = simd_dot(u1, u1)
+        var keep = 0.9999
+        if n1 >= 1 { u1 *= keep / n1.squareRoot(); g1 = u1 / q0; n1 = keep * keep; keep = 0 }
+        let d1 = 1 / (1 - n1)
+        let a0 = q0 * d1
+        let a1 = -u1 * (q0 * d1)
+        var u2 = a0 * g2 + mul(a1, g1)
+        var n2 = simd_dot(u2, u2)
+        if n2 >= 1 { u2 *= keep / n2.squareRoot(); g2 = (u2 - mul(a1, g1)) / a0; n2 = keep * keep }
+        let d2 = 1 / (1 - n2)
+        let b0 = a0 * d2
+        let b1 = (a1 - mul(u2, conj(a1))) * d2
+        let b2 = -u2 * (a0 * d2)
+        let r0 = C(b0 * b0 + simd_dot(b1, b1) + simd_dot(b2, b2), 0)
+        let r1 = mul(conj(b1), C(b0, 0)) + mul(conj(b2), b1)
+        let r2 = mul(conj(b2), C(b0, 0))
+        let s0 = mul(g0p, r0) + mul(g1, r1) + mul(g2, r2)
+        let s1 = mul(g0p, r1) + mul(g1, r2)
+        let s2 = mul(g0p, r2)
+        return SIMD3(s0.y, s1.y, s2.y) * (2 / b0)
+    }
+}
+
 // How the Z++ sampler's successive frames relate while the camera moves (Uniforms.indirectReuse
 // bits 7-8; MSL z_pixel_key). A static accumulation gives every pixel aligned blocks of its
 // sequences in all four models. REFERENCES.md: ZPP2026 Sec. 4.1.
@@ -5672,6 +6541,18 @@ func makePairingTexture(side: Int, sigma: Double, seed: UInt64) -> [SIMD2<Int8>]
         let other = partner[texel]
         return SIMD2(Int8(wrapped(other % side - texel % side)), Int8(wrapped(other / side - texel / side)))
     }
+}
+
+// Spectral shader state of one device, shared by its renderers (an export renderer shares its
+// preview's): the pipelines (PathTracerRenderer.buildSpectralKernels) and the coarse moment grid.
+@MainActor final class SpectralShaderCache {
+    var kernels: PathTracerRenderer.SpectralKernels?
+    var grid: MTLBuffer?
+    var compiling = false
+    var failure: String?
+    // Whether refineSpectralGrid ran, and how many cells it refined.
+    var refined = false
+    var refinedCells = 0
 }
 
 // The three pairing textures ReSTIR PT's spatial reuse reads (MSL PT_PAIRING_SIDES: 254, 230 and
@@ -5901,6 +6782,17 @@ final class MaterialLibrary {
     private var emittersDirty = true
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
+    // Whether imported emitters exist (constant or MaterialX emission).
+    var hasEmitters: Bool {
+        emissions.values.contains { $0.max() > 0 } || materialX.values.contains { $0.emission != nil }
+    }
+    // Spectral transport's per-slot OpenPBR parameters (MSL SpectralMaterial: dispersion 20 / V_d, thin
+    // film weight, thickness in micrometres and IOR), from the slots' MaterialX constants;
+    // spectralOverrides replaces a slot's (test scenes).
+    var spectralOverrides: [Int: SIMD4<Float>] = [:]
+    var spectralMaterials: [SIMD4<Float>] {
+        (0..<SceneLimits.materials).map { spectralOverrides[$0] ?? materialX[$0]?.spectral ?? MaterialXProgram.noSpectral }
+    }
     var orderedTriangles: UnsafeBufferPointer<MeshTriangle> {
         UnsafeBufferPointer(start: triangleCount == 0 ? nil
             : triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: triangleCount),
@@ -6316,9 +7208,100 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     struct SplatKernels { let activate, layers, deepReSTIR, deepPT, reservoirs, temporal, ptTemporal: MTLComputePipelineState }
     // Stochastic pairwise MIS (SPMIS2026): reuse-cell construction and ReSTIR PT spatial reuse.
     struct SPMISKernels { let cells, select, ptShift, pt: MTLComputePipelineState }
+    nonisolated static func pipeline(_ device: MTLDevice, _ library: MTLLibrary, _ name: String) throws -> MTLComputePipelineState {
+        guard let function = library.makeFunction(name: name) else {
+            throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
+        }
+        return try device.makeComputePipelineState(function: function)
+    }
+    nonisolated static func ptKernels(_ device: MTLDevice, _ library: MTLLibrary) throws -> ReSTIRPTKernels? {
+        let names = ["restir_pt_initial_kernel", "restir_pt_temporal_kernel", "restir_pt_shift_kernel",
+                     "restir_pt_spatial_kernel", "restir_pt_duplication_kernel"]
+        guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
+        let p = try names.map { try pipeline(device, library, $0) }
+        return ReSTIRPTKernels(initial: p[0], temporal: p[1], shift: p[2], spatial: p[3], duplication: p[4])
+    }
+    nonisolated static func splatKernels(_ device: MTLDevice, _ library: MTLLibrary) throws -> SplatKernels? {
+        let names = ["splat_activate_kernel", "splat_layers_kernel", "splat_deep_restir_kernel", "restir_pt_deep_initial_kernel",
+                     "splat_reservoirs_kernel", "splat_temporal_kernel", "restir_pt_splat_temporal_kernel"]
+        guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
+        let p = try names.map { try pipeline(device, library, $0) }
+        return SplatKernels(activate: p[0], layers: p[1], deepReSTIR: p[2], deepPT: p[3], reservoirs: p[4],
+                            temporal: p[5], ptTemporal: p[6])
+    }
+    nonisolated static func spmisKernels(_ device: MTLDevice, _ library: MTLLibrary) throws -> SPMISKernels? {
+        let names = ["spmis_cells_kernel", "spmis_select_kernel", "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
+        guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
+        let p = try names.map { try pipeline(device, library, $0) }
+        return SPMISKernels(cells: p[0], select: p[1], ptShift: p[2], pt: p[3])
+    }
+    // Spectral transport's scene kernels (VIBE_SPECTRAL=1 libraries, after the generated tables), and
+    // the inverse-CDF kernel. The MetalFX guide and picking kernels have no colour transport and are
+    // the RGB libraries'. The pipelines compile concurrently (the compiler service runs them in parallel).
+    struct SpectralKernels: Sendable { let procedural, mesh: SceneKernels; let icdf, refineFlags, refineSolve: MTLComputePipelineState }
+    nonisolated static func buildSpectralKernels(device: MTLDevice, source: String, relaxedMath: Bool,
+                                                 procedural rgbProcedural: SceneKernels, mesh rgbMesh: SceneKernels) throws -> SpectralKernels {
+        let source = try loadSpectralTablesSource() + source
+        func library(meshes: Bool) throws -> MTLLibrary {
+            let options = MTLCompileOptions()
+            options.mathMode = relaxedMath ? .relaxed : .safe
+            options.preprocessorMacros = meshes ? ["VIBE_SPECTRAL": NSNumber(value: 1)]
+                : ["VIBE_SPECTRAL": NSNumber(value: 1), "VIBE_MESHES": NSNumber(value: 0)]
+            return try device.makeLibrary(source: source, options: options)
+        }
+        let libraries = [try library(meshes: true), try library(meshes: false)]
+        let names = ["restir_temporal_kernel", "shading_kernel", "restir_pt_initial_kernel", "restir_pt_temporal_kernel",
+                     "restir_pt_shift_kernel", "restir_pt_spatial_kernel", "restir_pt_duplication_kernel", "splat_activate_kernel",
+                     "splat_layers_kernel", "splat_deep_restir_kernel", "restir_pt_deep_initial_kernel", "splat_reservoirs_kernel",
+                     "splat_temporal_kernel", "restir_pt_splat_temporal_kernel", "spmis_cells_kernel", "spmis_select_kernel",
+                     "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
+        let jobs = libraries.flatMap { library in names.map { (library, $0) } }
+            + ["spectral_icdf_kernel", "spectral_refine_flags_kernel", "spectral_refine_solve_kernel"].map { (libraries[0], $0) }
+        final class Results: @unchecked Sendable {
+            let lock = NSLock()
+            var states: [MTLComputePipelineState?]
+            var failure: Error?
+            init(_ count: Int) { states = Array(repeating: nil, count: count) }
+        }
+        let results = Results(jobs.count)
+        DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
+            do {
+                let state = try pipeline(device, jobs[i].0, jobs[i].1)
+                results.lock.lock(); results.states[i] = state; results.lock.unlock()
+            } catch {
+                results.lock.lock(); results.failure = error; results.lock.unlock()
+            }
+        }
+        if let failure = results.failure { throw failure }
+        let states = results.states.map { $0! }
+        func kernels(_ k: Int, rgb: SceneKernels) -> SceneKernels {
+            let p = Array(states[(k * names.count)..<((k + 1) * names.count)])
+            return SceneKernels(temporal: p[0], shading: p[1], guides: rgb.guides, pick: rgb.pick,
+                                pt: ReSTIRPTKernels(initial: p[2], temporal: p[3], shift: p[4], spatial: p[5], duplication: p[6]),
+                                splat: SplatKernels(activate: p[7], layers: p[8], deepReSTIR: p[9], deepPT: p[10], reservoirs: p[11],
+                                                    temporal: p[12], ptTemporal: p[13]),
+                                spmis: SPMISKernels(cells: p[14], select: p[15], ptShift: p[16], pt: p[17]))
+        }
+        let extra = states.suffix(3).map { $0 }
+        return SpectralKernels(procedural: kernels(1, rgb: rgbProcedural), mesh: kernels(0, rgb: rgbMesh), icdf: extra[0],
+                               refineFlags: extra[1], refineSolve: extra[2])
+    }
     let proceduralKernels: SceneKernels
     let meshKernels: SceneKernels
-    var sceneKernels: SceneKernels { sceneIndex == 6 ? meshKernels : proceduralKernels }
+    var sceneKernels: SceneKernels {
+        if spectralFrame, let spectral = spectralShaders.kernels { return sceneIndex == 6 ? spectral.mesh : spectral.procedural }
+        return sceneIndex == 6 ? meshKernels : proceduralKernels
+    }
+    // Spectral pipelines and the moment grid, shared with renderers created with `sharing:`.
+    let spectralShaders: SpectralShaderCache
+    // Whether the frame being encoded (or the last one) traced spectrally: the light transport
+    // resolves to spectral and its pipelines are ready.
+    private(set) var spectralFrame = false
+    // The scene's wavelength inverse CDF (MSL buffer 29) and the illuminant weights it was built for.
+    var spectralSampling: MTLBuffer?
+    var spectralSamplingWeights: [Float]?
+    // Called on the main queue when background-compiled spectral pipelines become ready.
+    var onSpectralShadersReady: (() -> Void)?
     let supportsMetalFX: Bool
     var materials: MaterialLibrary
     private(set) var metalFX: MetalFXDenoiser?
@@ -6443,6 +7426,41 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var controlVariates = PathTracerRenderer.defaultControlVariates {
         didSet { if oldValue != controlVariates { resetAccumulation() } }
     }
+    // RGB or spectral light transport (docs/SPECTRAL_DESIGN.md). Spectral pipelines compile on first
+    // use; until they are ready (in the background, outside test builds) frames trace in RGB.
+    var lightTransport = PathTracerRenderer.defaultLightTransport {
+        didSet { if oldValue != lightTransport { resetAccumulation() } }
+    }
+    var activeLightTransport: LightTransport { resolvedLightTransport(lightTransport) }
+    func resolvedLightTransport(_ mode: LightTransport) -> LightTransport { mode.resolved(sceneNeedsSpectral: sceneNeedsSpectral) }
+    // Lights with an illuminant preset, and materials with dispersion or thin film, need wavelengths.
+    var sceneNeedsSpectral: Bool {
+        let weights = spectralIlluminantWeights()
+        return weights.enumerated().contains { $0.offset != Int(Illuminant.d65.rawValue) && $0.element > 0 }
+            || materials.spectralMaterials.contains { $0.x > 0 || $0.y > 0 }
+    }
+    // Whether the scene has area or sphere lights or imported emitters (StudioOptions.lightSpectrum),
+    // and a sun (StudioOptions.sunSpectrum).
+    var sceneHasLights: Bool { (1...5).contains(sceneIndex) || (sceneIndex == 6 && materials.hasEmitters) }
+    var sceneHasSun: Bool { (sceneIndex == 0 || sceneIndex == 6) && options.sunIntensity > 0 }
+    // Wavelength sampling (spectral_icdf_kernel): an equal mixture of the illuminants the scene's
+    // emitters use; the sky, environment maps and RGB-coloured lights count as D65.
+    func spectralIlluminantWeights() -> [Float] {
+        var weights = [Float](repeating: 0, count: Illuminant.allCases.count)
+        if sceneIndex == 0 || sceneIndex == 6 { weights[Int(Illuminant.d65.rawValue)] = 1 }
+        if sceneHasLights { weights[Int(Illuminant.resolved(options.lightSpectrum).rawValue)] = 1 }
+        if sceneHasSun { weights[Int(Illuminant.resolved(options.sunSpectrum).rawValue)] = 1 }
+        if !weights.contains(where: { $0 > 0 }) { weights[Int(Illuminant.d65.rawValue)] = 1 }
+        return weights
+    }
+    // Test builds compile the spectral pipelines synchronously, so every spectral frame is spectral.
+    nonisolated static var compilesSpectralShadersInBackground: Bool {
+#if VIBE_TESTING
+        return false
+#else
+        return true
+#endif
+    }
     // Random numbers of sampling decisions: PCG streams or the Z++ sampler (ZPP2026).
     var sampler = PathTracerRenderer.defaultSampler {
         didSet { if oldValue != sampler { resetAccumulation() } }
@@ -6494,6 +7512,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         switch ProcessInfo.processInfo.environment["VIBE_CONTROL_VARIATES"] {
         case "off": return .off
         case "restcv": return .restcv
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultLightTransport: LightTransport {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with either light transport.
+        switch ProcessInfo.processInfo.environment["VIBE_LIGHT_TRANSPORT"] {
+        case "rgb": return .rgb
+        case "spectral": return .spectral
         default: break
         }
 #endif
@@ -6705,7 +7734,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let withConcurrent = withFX.partialValue.addingReportingOverflow(concurrentRenderBytes)
         // Scene textures and the imported mesh (triangles, hierarchies, emitter list).
         let withTextures = withConcurrent.partialValue.addingReportingOverflow(
-            materials.uniqueTextureBytes(materials.residentTextures + materials.external.textures) + materials.meshBytes)
+            materials.uniqueTextureBytes(materials.residentTextures + materials.external.textures) + materials.meshBytes
+                + (activeLightTransport == .spectral ? Self.spectralBytes : 0))
         let total = withTextures.partialValue.addingReportingOverflow(headroom.partialValue)
         if reservoirs.overflow || fx.overflow || withResident.overflow || required.overflow || withFX.overflow
             || withConcurrent.overflow || withTextures.overflow || total.overflow {
@@ -6732,6 +7762,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             throw NSError(domain: "PathTracer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not create a Metal command queue."])
         }
         self.commandQueue = queue
+        self.spectralShaders = other.flatMap { $0.device.registryID == device.registryID ? $0.spectralShaders : nil }
+            ?? SpectralShaderCache()
 
         do {
             let shared = other.flatMap { $0.device.registryID == device.registryID ? $0 : nil }
@@ -6753,32 +7785,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             self.metalFXGuidePipeline = try shared?.metalFXGuidePipeline ?? device.makeComputePipelineState(function: fnGuides)
             self.presentPipeline = try shared?.presentPipeline ?? device.makeComputePipelineState(function: fnPresent)
             func pipeline(_ library: MTLLibrary, _ name: String) throws -> MTLComputePipelineState {
-                guard let function = library.makeFunction(name: name) else {
-                    throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
-                }
-                return try device.makeComputePipelineState(function: function)
+                try Self.pipeline(device, library, name)
             }
-            func ptKernels(_ library: MTLLibrary) throws -> ReSTIRPTKernels? {
-                let names = ["restir_pt_initial_kernel", "restir_pt_temporal_kernel", "restir_pt_shift_kernel",
-                             "restir_pt_spatial_kernel", "restir_pt_duplication_kernel"]
-                guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
-                let p = try names.map { try pipeline(library, $0) }
-                return ReSTIRPTKernels(initial: p[0], temporal: p[1], shift: p[2], spatial: p[3], duplication: p[4])
-            }
-            func splatKernels(_ library: MTLLibrary) throws -> SplatKernels? {
-                let names = ["splat_activate_kernel", "splat_layers_kernel", "splat_deep_restir_kernel", "restir_pt_deep_initial_kernel",
-                             "splat_reservoirs_kernel", "splat_temporal_kernel", "restir_pt_splat_temporal_kernel"]
-                guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
-                let p = try names.map { try pipeline(library, $0) }
-                return SplatKernels(activate: p[0], layers: p[1], deepReSTIR: p[2], deepPT: p[3], reservoirs: p[4],
-                                    temporal: p[5], ptTemporal: p[6])
-            }
-            func spmisKernels(_ library: MTLLibrary) throws -> SPMISKernels? {
-                let names = ["spmis_cells_kernel", "spmis_select_kernel", "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
-                guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
-                let p = try names.map { try pipeline(library, $0) }
-                return SPMISKernels(cells: p[0], select: p[1], ptShift: p[2], pt: p[3])
-            }
+            func ptKernels(_ library: MTLLibrary) throws -> ReSTIRPTKernels? { try Self.ptKernels(device, library) }
+            func splatKernels(_ library: MTLLibrary) throws -> SplatKernels? { try Self.splatKernels(device, library) }
+            func spmisKernels(_ library: MTLLibrary) throws -> SPMISKernels? { try Self.spmisKernels(device, library) }
             if let shared {
                 self.proceduralKernels = shared.proceduralKernels
                 self.meshKernels = shared.meshKernels
@@ -6803,6 +7814,156 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
         denoiserEnabled = supportsMetalFX
         applyPreset(.perspective)
+    }
+
+    // Spectral pipelines and moment grid for this frame: ready, compiling in the background (the frame
+    // then traces in RGB; accumulation restarts when they are ready), or, in test builds and after a
+    // failure has been reported once, decided synchronously.
+    func prepareSpectralShaders() -> Bool {
+        let cache = spectralShaders
+        if cache.kernels != nil && cache.grid != nil { return true }
+        if cache.failure != nil || cache.compiling { return false }
+        if cache.grid == nil {
+            do {
+                let grid = try loadSpectralGrid()
+                guard let buffer = device.makeBuffer(length: Int(Self.spectralGridBytes), options: .storageModeShared)
+                else { throw MaterialLibrary.error("Could not allocate the spectral moment grid.") }
+                grid.withUnsafeBytes { buffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+                buffer.label = "Spectral: FourierSRGB86 moments"
+                cache.grid = buffer
+            } catch {
+                cache.failure = error.localizedDescription
+                onError?(error.localizedDescription)
+                return false
+            }
+        }
+        if cache.kernels != nil { refineSpectralGrid(); return true }
+        let device = self.device, source = metalSource, procedural = proceduralKernels, mesh = meshKernels
+        if !Self.compilesSpectralShadersInBackground {
+            do {
+                cache.kernels = try Self.buildSpectralKernels(device: device, source: source, relaxedMath: true,
+                                                              procedural: procedural, mesh: mesh)
+                refineSpectralGrid()
+                return true
+            } catch {
+                cache.failure = "Spectral shaders failed to compile: \(error.localizedDescription)"
+                onError?(cache.failure!)
+                return false
+            }
+        }
+        cache.compiling = true
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try PathTracerRenderer.buildSpectralKernels(device: device, source: source, relaxedMath: true,
+                                                                     procedural: procedural, mesh: mesh) }
+            }.value
+            cache.compiling = false
+            switch result {
+            case .success(let kernels): cache.kernels = kernels
+            case .failure(let error): cache.failure = "Spectral shaders failed to compile: \(error.localizedDescription)"
+            }
+            guard let self else { return }
+            if cache.kernels != nil { self.refineSpectralGrid() }
+            if let failure = cache.failure { self.onError?(failure) }
+            else if self.activeLightTransport == .spectral { self.resetAccumulation() }
+            self.onSpectralShadersReady?()
+        }
+        return false
+    }
+    // Refines the grid's cells whose codes the trilinear interpolation reproduces worse than 0.35 8-bit
+    // steps (MSL spectral_moments): flags them on the GPU over every 8-bit code, assigns their blocks and
+    // solves their 64 codes exactly. Once per device, when the grid and the pipelines are ready (~0.5 s).
+    func refineSpectralGrid() {
+        let cache = spectralShaders
+        guard !cache.refined, let kernels = cache.kernels, let grid = cache.grid,
+              let flags = device.makeBuffer(length: 85 * 85 * 85 * 4, options: .storageModeShared),
+              let command = commandQueue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { return }
+        cache.refined = true
+        memset(flags.contents(), 0, flags.length)
+        var words = spectralSceneWords(lightLagrange: false)
+        encoder.setComputePipelineState(kernels.refineFlags)
+        encoder.setBytes(&words, length: words.count * 4, index: 27)
+        encoder.setBuffer(grid, offset: 0, index: 28)
+        encoder.setBuffer(flags, offset: 0, index: 0)
+        encoder.dispatchThreads(MTLSize(width: 1 << 24, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+        let flagged = flags.contents().bindMemory(to: UInt32.self, capacity: 85 * 85 * 85)
+        var cells = [UInt32]()
+        for i in 0..<(85 * 85 * 85) where flagged[i] != 0 && cells.count < Self.spectralRefinedCapacity { cells.append(UInt32(i)) }
+        cache.refinedCells = cells.count
+        guard !cells.isEmpty, let cellBuffer = cells.withUnsafeBytes({
+                  device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
+              let solve = commandQueue.makeCommandBuffer(), let solver = solve.makeComputeCommandEncoder() else { return }
+        let nodes = grid.contents().bindMemory(to: SIMD4<Float>.self, capacity: 86 * 86 * 86)
+        for (slot, cell) in cells.enumerated() {
+            let c = Int(cell), i = c / (85 * 85), j = (c / 85) % 85, k = c % 85
+            nodes[(i * 86 + j) * 86 + k].w = Float(slot + 1)
+        }
+        var count = UInt32(cells.count)
+        solver.setComputePipelineState(kernels.refineSolve)
+        solver.setBytes(&words, length: words.count * 4, index: 27)
+        solver.setBuffer(grid, offset: 0, index: 28)
+        solver.setBuffer(cellBuffer, offset: 0, index: 0)
+        solver.setBytes(&count, length: 4, index: 1)
+        solver.dispatchThreads(MTLSize(width: 64 * cells.count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        solver.endEncoding(); solve.commit(); solve.waitUntilCompleted()
+        if solve.status != .completed { onError?("The spectral grid refinement failed: \(String(describing: solve.error))") }
+    }
+    // SpectralScene (MSL, 1424 bytes): light and sun illuminants, the coarse grid's node values and
+    // the slots' spectral material parameters.
+    static let spectralGridNodes: [Float] = (0..<86).map { i in
+        let v = Double(3 * i) / 255
+        return Float(v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4))
+    }
+    func spectralSceneWords(lightLagrange solveLight: Bool = true) -> [UInt32] {
+        var words = [UInt32](repeating: 0, count: 356)
+        words[0] = Illuminant.resolved(options.lightSpectrum).rawValue
+        words[1] = Illuminant.resolved(options.sunSpectrum).rawValue
+        // The area light's colour (MSL procedural_light_emission x Uniforms.light), solved once here.
+        var chroma = SIMD4<Float>(-1, -1, -1, 0), lagrange = SIMD4<Float>(0, 0, 0, 0)
+        if solveLight, let emission = Self.proceduralLightEmission[sceneIndex], let grid = spectralShaders.grid {
+            let e = emission * options.lightColor * options.lightIntensity
+            if e.max() > 0 {
+                let c = e / e.max()
+                chroma = SIMD4(c, 0)
+                lagrange = SpectralColour.lagrange(SIMD3<Double>(c), grid: grid, nodes: Self.spectralGridNodes)
+            }
+        }
+        for c in 0..<4 { words[4 + c] = chroma[c].bitPattern; words[8 + c] = lagrange[c].bitPattern }
+        for (i, v) in Self.spectralGridNodes.enumerated() { words[12 + i] = v.bitPattern }
+        for (slot, m) in materials.spectralMaterials.enumerated() {
+            for c in 0..<4 { words[100 + slot * 4 + c] = m[c].bitPattern }
+        }
+        return words
+    }
+    // Spectral transport's device memory: the 86^3 float4 moment grid (shared by renderers of one device)
+    // and the sampling buffer.
+    nonisolated static let spectralRefinedCapacity = 8192
+    nonisolated static let spectralGridBytes: UInt64 = (86 * 86 * 86 + 8192 * 64) * 16
+    nonisolated static let spectralBytes: UInt64 = spectralGridBytes + 4 * (4 * (257 + 471) + 2 * 471)
+    // MSL procedural_light_emission: the area light of scenes 1, 3, 4 and 5 before its tint.
+    static let proceduralLightEmission: [UInt32: SIMD3<Float>] = [
+        1: SIMD3(18, 15, 10), 3: SIMD3(24, 20, 15), 4: SIMD3(32, 28, 22), 5: SIMD3(45, 42, 38)]
+    // Encodes spectral_icdf_kernel when the scene's illuminant weights changed; returns the weights the
+    // buffer will hold once the command buffer completes.
+    func encodeSpectralSampling(_ command: MTLCommandBuffer) -> [Float]? {
+        let weights = spectralIlluminantWeights()
+        if spectralSampling == nil {
+            spectralSampling = device.makeBuffer(length: (4 * (257 + 471) + 2 * 471) * 4, options: .storageModePrivate)
+            spectralSampling?.label = "Spectral: wavelength inverse CDF"
+            spectralSamplingWeights = nil
+        }
+        guard let buffer = spectralSampling, let kernels = spectralShaders.kernels else { return nil }
+        if spectralSamplingWeights == weights { return weights }
+        guard let encoder = command.makeComputeCommandEncoder() else { return nil }
+        encoder.label = "Spectral: wavelength sampling"
+        encoder.setComputePipelineState(kernels.icdf)
+        var packed = weights + [Float](repeating: 0, count: 8 - weights.count)
+        encoder.setBytes(&packed, length: packed.count * 4, index: 0)
+        encoder.setBuffer(buffer, offset: 0, index: 29)
+        encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        encoder.endEncoding()
+        return weights
     }
 
     func applyPreset(_ preset: CameraPreset) {
@@ -7025,6 +8186,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         rejectedRenderSize = nil
         // Float32 running means lose unit sample precision after 2^24 samples.
         if frameIndex >= 16_777_215 { resetAccumulation() }
+        // Light transport of this frame; accumulation restarts when it changes (spectral pipelines
+        // becoming ready, or a failure falling back to RGB).
+        let spectral = activeLightTransport == .spectral && prepareSpectralShaders()
+        if spectral != spectralFrame && frameIndex > 0 { resetAccumulation() }
+        spectralFrame = spectral
 
         let needsReSTIR = samplingMode == 0 && viewportMode == 0
         let indirectReuse = activeIndirectReuse
@@ -7241,6 +8407,22 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         uniforms.sceneGraphMode = materials.hasSceneGraph
         lastUniforms=uniforms
 
+        // Spectral transport: the scene's wavelength sampling (rebuilt when its illuminants change) and
+        // its spectral state, bound to every pass at buffers 27-29.
+        var spectralWords = [UInt32]()
+        var spectralWeights: [Float]?
+        if spectralFrame {
+            guard let weights = encodeSpectralSampling(cmdBuffer) else { return }
+            spectralWeights = weights
+            spectralWords = spectralSceneWords()
+        }
+        func bindSpectral(_ encoder: MTLComputeCommandEncoder) {
+            guard spectralFrame, let grid = spectralShaders.grid, let sampling = spectralSampling else { return }
+            spectralWords.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 27) }
+            encoder.setBuffer(grid, offset: 0, index: 28)
+            encoder.setBuffer(sampling, offset: 0, index: 29)
+        }
+
         let threadsPerGroup = MTLSize(width: 8, height: 8, depth: 1)
         let gridSize = MTLSize(width: w, height: h, depth: 1)
 
@@ -7299,6 +8481,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
             enc1.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             enc1.setBuffer(surfaces, offset: 0, index: 3)
+            bindSpectral(enc1)
             enc1.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
             enc1.endEncoding()
         }
@@ -7333,6 +8516,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     encoder.setBuffer(buffer ?? placeholder, offset: 0, index: index + 3)
                 }
                 bindSplatBuffers(encoder)
+                bindSpectral(encoder)
                 if let count {
                     encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
                 } else {
@@ -7426,6 +8610,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 }
                 encoder.setBuffer(controls, offset: 0, index: 24)
                 bindSPMIS(encoder)
+                bindSpectral(encoder)
                 if pipeline === splatTemporal, let slots = splatState?.0.capacity {
                     bindSplatBuffers(encoder)
                     encoder.dispatchThreads(MTLSize(width: w * h + slots, height: 1, depth: 1),
@@ -7473,6 +8658,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc2.setBuffer(spmis?.0 ?? placeholder, offset: 0, index: 4)
             enc2.setBuffer(spmis?.1 ?? placeholder, offset: 0, index: 5)
             enc2.setBuffer(spmis?.2 ?? placeholder, offset: 0, index: 6)
+            bindSpectral(enc2)
             enc2.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
             enc2.endEncoding()
         }
@@ -7524,6 +8710,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
         }
         if let drawable { cmdBuffer.present(drawable) }
+        if let spectralWeights { spectralSamplingWeights = spectralWeights }
         cmdBuffer.commit()
         committed = true
     }

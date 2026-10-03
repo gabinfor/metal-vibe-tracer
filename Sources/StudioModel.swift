@@ -55,6 +55,11 @@ struct StudioOptions: Codable {
   // Imported Mesh Studio sun is a directional emitter independent of the environment
   // and sunIntensity is its irradiance at normal incidence; nil keeps the sky's disc.
   var sunAngle: Float?
+  // Spectral transport's emitter spectra (Illuminant raw values): the area and sphere lights and
+  // imported emitters, and the sun. nil (projects written before the Lighting panel offered them)
+  // is the RGB colour, which spectral transport renders as D65-shaped light; RGB transport ignores both.
+  var lightSpectrum: UInt32?
+  var sunSpectrum: UInt32?
 }
 extension StudioOptions {
   static let sunAngleRange: ClosedRange<Float> = 0.1...90
@@ -75,40 +80,46 @@ extension StudioOptions {
       && environmentRotation == o.environmentRotation && lightColor == o.lightColor
       && lightIntensity == o.lightIntensity && lightSize == o.lightSize && aperture == o.aperture
       && focusDistance == o.focusDistance && sunAngle == o.sunAngle
+      && Illuminant.resolved(lightSpectrum) == Illuminant.resolved(o.lightSpectrum)
+      && Illuminant.resolved(sunSpectrum) == Illuminant.resolved(o.sunSpectrum)
   }
 }
-// The ReSTIR strategy's reuse modes and the sampler (Render inspector; the sampler applies to
-// every strategy). Each one changes the image, so a difference restarts accumulation like a
-// radiance-affecting option (StudioController.applyProject).
+// The ReSTIR strategy's reuse modes, the sampler and the light transport (Render inspector; the
+// sampler and the light transport apply to every strategy). Each one changes the image, so a
+// difference restarts accumulation like a radiance-affecting option (StudioController.applyProject).
 struct ReSTIRModes: Equatable, Sendable {
   var indirectReuse: IndirectReuse
   var spatialNeighbors: SpatialNeighborSelection
   var temporalReuse: TemporalReuse
   var controlVariates: ControlVariates
   var sampler: SamplerMode
+  var lightTransport: LightTransport
   // Projects without a stored choice use these: .automatic, or in -D VIBE_TESTING builds the
   // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE / VIBE_CONTROL_VARIATES /
-  // VIBE_SAMPLER override. A stored choice wins.
+  // VIBE_SAMPLER / VIBE_LIGHT_TRANSPORT override. A stored choice wins.
   static var defaults: ReSTIRModes {
     ReSTIRModes(
       indirectReuse: PathTracerRenderer.defaultIndirectReuse,
       spatialNeighbors: PathTracerRenderer.defaultSpatialNeighbors,
       temporalReuse: PathTracerRenderer.defaultTemporalReuse,
       controlVariates: PathTracerRenderer.defaultControlVariates,
-      sampler: PathTracerRenderer.defaultSampler)
+      sampler: PathTracerRenderer.defaultSampler,
+      lightTransport: PathTracerRenderer.defaultLightTransport)
   }
   init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse,
        controlVariates: ControlVariates = PathTracerRenderer.defaultControlVariates,
-       sampler: SamplerMode = PathTracerRenderer.defaultSampler) {
+       sampler: SamplerMode = PathTracerRenderer.defaultSampler,
+       lightTransport: LightTransport = PathTracerRenderer.defaultLightTransport) {
     self.indirectReuse = indirectReuse
     self.spatialNeighbors = spatialNeighbors
     self.temporalReuse = temporalReuse
     self.controlVariates = controlVariates
     self.sampler = sampler
+    self.lightTransport = lightTransport
   }
   @MainActor init(_ r: PathTracerRenderer) {
     self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse,
-              controlVariates: r.controlVariates, sampler: r.sampler)
+              controlVariates: r.controlVariates, sampler: r.sampler, lightTransport: r.lightTransport)
   }
   @MainActor func apply(_ r: PathTracerRenderer) {
     r.indirectReuse = indirectReuse
@@ -116,6 +127,7 @@ struct ReSTIRModes: Equatable, Sendable {
     r.temporalReuse = temporalReuse
     r.controlVariates = controlVariates
     r.sampler = sampler
+    r.lightTransport = lightTransport
   }
 }
 struct OIDNOptions: Codable, Equatable {
@@ -157,14 +169,15 @@ struct ProjectDocument: Codable {
   // Optional so version 1/2 projects written before these controls remain readable.
   var oidn: OIDNOptions?
   var viewportMode: UInt32?
-  // Raw values of IndirectReuse, SpatialNeighborSelection, TemporalReuse, ControlVariates and
-  // SamplerMode; optional so projects written before the Render inspector exposed them open with
-  // the default (automatic).
+  // Raw values of IndirectReuse, SpatialNeighborSelection, TemporalReuse, ControlVariates,
+  // SamplerMode and LightTransport; optional so projects written before the Render inspector
+  // exposed them open with the default (automatic).
   var indirectReuse: UInt32?
   var spatialNeighbors: UInt32?
   var temporalReuse: UInt32?
   var controlVariates: UInt32?
   var sampler: UInt32?
+  var lightTransport: UInt32?
   // Written only into autosaves: the document's file association and unsaved state.
   var recovery: AutosaveRecovery?
 
@@ -177,7 +190,8 @@ struct ProjectDocument: Codable {
         spatialNeighbors: spatialNeighbors.flatMap(SpatialNeighborSelection.init(rawValue:)) ?? fallback.spatialNeighbors,
         temporalReuse: temporalReuse.flatMap(TemporalReuse.init(rawValue:)) ?? fallback.temporalReuse,
         controlVariates: controlVariates.flatMap(ControlVariates.init(rawValue:)) ?? fallback.controlVariates,
-        sampler: sampler.flatMap(SamplerMode.init(rawValue:)) ?? fallback.sampler)
+        sampler: sampler.flatMap(SamplerMode.init(rawValue:)) ?? fallback.sampler,
+        lightTransport: lightTransport.flatMap(LightTransport.init(rawValue:)) ?? fallback.lightTransport)
     }
     set {
       indirectReuse = newValue.indirectReuse.rawValue
@@ -185,6 +199,7 @@ struct ProjectDocument: Codable {
       temporalReuse = newValue.temporalReuse.rawValue
       controlVariates = newValue.controlVariates.rawValue
       sampler = newValue.sampler.rawValue
+      lightTransport = newValue.lightTransport.rawValue
     }
   }
 
@@ -264,7 +279,10 @@ struct ProjectDocument: Codable {
       spatialNeighbors.map({ SpatialNeighborSelection(rawValue: $0) != nil }) ?? true,
       temporalReuse.map({ TemporalReuse(rawValue: $0) != nil }) ?? true,
       controlVariates.map({ ControlVariates(rawValue: $0) != nil }) ?? true,
-      sampler.map({ SamplerMode(rawValue: $0) != nil }) ?? true
+      sampler.map({ SamplerMode(rawValue: $0) != nil }) ?? true,
+      lightTransport.map({ LightTransport(rawValue: $0) != nil }) ?? true,
+      options.lightSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true,
+      options.sunSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true
     else { try bad(); return }
     func cameraOK(_ c: CameraState) -> Bool {
       c.yaw.isFinite && (-1.5...1.5).contains(c.pitch) && (0.0001...1_000_000).contains(c.distance)

@@ -32,7 +32,7 @@ kernel void regression_checks(device uint *results [[buffer(0)]], constant Unifo
     Material glass = { DIELECTRIC, float3(1), float3(0), 0, 1.52f };
     float3 direction, weight; float pdf;
     results[4] = sample_bsdf(glass, float3(0, 0, -1), normalize(float3(0.9f, 0, 0.435f)),
-        false, seed, direction, weight, pdf) && direction.z < 0 && all(weight == 1.0f);
+        false, seed, direction, weight, pdf, Wavelengths()) && direction.z < 0 && all(weight == 1.0f);
     results[5] = emission_weight(false, true, false, 0.2f, 1.0f) == 0.0f &&
         emission_weight(true, true, true, 0.0f, 1.0f) == 1.0f &&
         emission_weight(false, false, false, 0.2f, 1.0f) == 1.0f;
@@ -166,6 +166,8 @@ let testOutputDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.environme
     o.environmentIntensity = u.environment.x; o.environmentRotation = u.environment.y * 180 / .pi
     o.aperture = u.lens.x; o.focusDistance = u.lens.y
     o.lightColor = SIMD3<Float>(u.light.x, u.light.y, u.light.z); o.lightIntensity = 1; o.lightSize = u.light.w
+    // Emitter spectra are not part of the test view: the renderer's current presets are kept.
+    o.lightSpectrum = r.options.lightSpectrum; o.sunSpectrum = r.options.sunSpectrum
     r.options = o
     require((u.environment.z > 0.5) == (r.materials.environmentData != nil),
         "test view environment flag matches the loaded environment")
@@ -242,11 +244,13 @@ var renderOutputs = [SIMD2<Int>: MTLTexture]()
     require(lastDisplay.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }, "finite denoised image")
     let pixels = readTexture(r.accumTexture!)
     // ReSTCV (Uniforms.indirectReuse bit 5; REFERENCES.md RESTCV2026) accumulates unclamped control-variate
-    // estimates, which can be negative before they converge; presentation, exports and OIDN clamp them,
-    // and the frame MetalFX consumes is clamped. Every other estimator is nonnegative.
+    // estimates, which can be negative before they converge, and spectral transport keeps out-of-gamut
+    // (negative linear sRGB) samples; presentation, exports and OIDN clamp them, and the frame MetalFX
+    // consumes is clamped. Every other estimator is nonnegative.
     let controlVariates = r.lastUniforms.map { $0.indirectReuse & 32 != 0 } ?? false
     require(lastSamples.allSatisfy { $0.x >= 0 && $0.y >= 0 && $0.z >= 0 }, "nonnegative MetalFX input")
-    require(pixels.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite && (controlVariates || ($0.x >= 0 && $0.y >= 0 && $0.z >= 0)) },
+    require(pixels.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite
+                && (controlVariates || r.spectralFrame || ($0.x >= 0 && $0.y >= 0 && $0.z >= 0)) },
             "finite nonnegative pixels")
     r.onFrameUpdate = savedFrameUpdate; r.onError = savedError
     (r.samplingMode, r.enableSMS, r.skyMode, r.enableFog, r.viewportMode) = modes
@@ -300,6 +304,25 @@ func savePreview(_ panels: [[SIMD4<Float>]], width: Int, height: Int, name: Stri
     try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     try! rep.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent(name))
 }
+// Test kernels that read the renderer's reservoirs compile as its scene kernels do: with the spectral
+// library's definitions (PTReservoir, GI radiance lanes) while it traces spectrally, then binding its
+// spectral state (MSL SPECTRAL_BUFFERS; their spectral context is SPECTRAL_CONTEXT(u, images)).
+@MainActor func rendererTracesSpectrally() -> Bool { testRenderer.activeLightTransport == .spectral }
+@MainActor func rendererShaderLibrary(_ kernels: String, spectral: Bool? = nil) throws -> MTLLibrary {
+    let spectral = spectral ?? rendererTracesSpectrally()
+    guard spectral else { return try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions()) }
+    let options = shaderCompileOptions()
+    options.preprocessorMacros = ["VIBE_SPECTRAL": NSNumber(value: 1)]
+    return try gpu.makeLibrary(source: try loadSpectralTablesSource() + metalSource + kernels, options: options)
+}
+@MainActor func bindRendererSpectral(_ encoder: MTLComputeCommandEncoder) {
+    guard testRenderer.spectralFrame, let grid = testRenderer.spectralShaders.grid, let sampling = testRenderer.spectralSampling
+    else { return }
+    var words = testRenderer.spectralSceneWords()
+    encoder.setBytes(&words, length: words.count * 4, index: 27)
+    encoder.setBuffer(grid, offset: 0, index: 28)
+    encoder.setBuffer(sampling, offset: 0, index: 29)
+}
 // verify.py: end of shared GPU helpers
 for scene in UInt32(0)...5 {
     for mode in UInt32(0)...3 {
@@ -351,7 +374,7 @@ kernel void furnace_check(device float4 *results [[buffer(0)]], uint id [[thread
     float sum = 0, maxWeight = 0, quadrature = 0;
     for (int i = 0; i < 65536; ++i) {
         float3 direction, weight; float pdf;
-        if (sample_bsdf(white, normal, -wo, true, seed, direction, weight, pdf)) {
+        if (sample_bsdf(white, normal, -wo, true, seed, direction, weight, pdf, Wavelengths())) {
             sum += weight.x;
             maxWeight = max(maxWeight, weight.x);
         }
@@ -359,7 +382,7 @@ kernel void furnace_check(device float4 *results [[buffer(0)]], uint id [[thread
         float2 r = rand_f2(seed);
         float z = r.x, phi = TWO_PI * r.y;
         float3 wi = float3(sqrt(1.0f - z*z) * cos(phi), sqrt(1.0f - z*z) * sin(phi), z);
-        quadrature += eval_bsdf(white, normal, wo, wi).x * z * TWO_PI;
+        quadrature += eval_bsdf(white, normal, wo, wi, Wavelengths()).x * z * TWO_PI;
     }
     results[id] = float4(sum / 65536.0f, maxWeight, 0, quadrature / 65536.0f);
 }

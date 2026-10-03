@@ -93,19 +93,19 @@
         float exitReflect = 0, enterReflect = 0;
         for (int i = 0; i < 8192; ++i) {
             float3 direction, weight; float pdf;
-            if (sample_bsdf(glass, n, exiting, false, seed, direction, weight, pdf) && direction.z > 0) exitReflect += 1;
-            if (sample_bsdf(glass, n, exiting, true, seed, direction, weight, pdf) && direction.z > 0) enterReflect += 1;
+            if (sample_bsdf(glass, n, exiting, false, seed, direction, weight, pdf, Wavelengths()) && direction.z > 0) exitReflect += 1;
+            if (sample_bsdf(glass, n, exiting, true, seed, direction, weight, pdf, Wavelengths()) && direction.z > 0) enterReflect += 1;
         }
         out[18] = float4(exitReflect / 8192, enterReflect / 8192, 0, 0);
         // Grazing delta events about a tilted shading normal must stay on their geometric side.
         float3 shading = normalize(float3(0.3f, 0, 1)), grazing = normalize(float3(0.9f, 0, -0.436f));
         Material chrome = { GLOSSY, float3(0.9f), float3(0), 0.001f, 1 }; chrome.geometricNormal = n;
         float3 direction, weight; float pdf;
-        bool mirrored = sample_bsdf(chrome, shading, grazing, true, seed, direction, weight, pdf);
+        bool mirrored = sample_bsdf(chrome, shading, grazing, true, seed, direction, weight, pdf, Wavelengths());
         out[19] = float4(direction, mirrored ? 1 : 0);
         float reflections = 0, transmissions = 0, crossings = 0;
         for (int i = 0; i < 4096; ++i) {
-            if (!sample_bsdf(glass, shading, grazing, true, seed, direction, weight, pdf)) continue;
+            if (!sample_bsdf(glass, shading, grazing, true, seed, direction, weight, pdf, Wavelengths())) continue;
             bool reflected = weight.x > 0.9f;
             reflections += reflected ? 1 : 0; transmissions += reflected ? 0 : 1;
             if ((direction.z > 0) != reflected) crossings += 1;

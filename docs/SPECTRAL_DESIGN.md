@@ -1,29 +1,30 @@
 # Spectral light transport: design for the renderer integration
 
-Status, 2026-10-03: **data, tools and offline-verified math are implemented; the renderer
-integration is pending.** Nothing in `main.swift` or `Sources/` reads the spectral tables yet.
-This document is the plan for that step. Citation keys refer to [REFERENCES.md](../REFERENCES.md)
-(`PETERS2019`, `FOURIERSRGB2019`, `PETERSBLOG2025`, `HERO2014`, `CIEDATA`, `OPENPBR`,
-`ZPP2026`).
+Status, 2026-10-03: **implemented.** Spectral light transport is integrated as designed below, with
+the changes recorded in §11 ("Decisions taken in the integration"), which supersedes the plan where
+they differ. §1–§10 are kept as the design that was implemented. Citation keys refer to
+[REFERENCES.md](../REFERENCES.md) (`PETERS2019`, `FOURIERSRGB2019`, `PETERSBLOG2025`, `HERO2014`,
+`CIEDATA`, `OPENPBR`, `ZPP2026`).
 
 The approach follows Christoph Peters' spectral rendering series (`PETERSBLOG2025`): reflectance
 from sRGB through three Fourier coefficients reconstructed with the bounded MESE (`PETERS2019`,
 `FOURIERSRGB2019`), four wavelengths per path sample from one random number, importance sampled
 in proportion to illuminant × L1 norm of the colour-matching functions, and XYZ → linear sRGB
-before anything downstream. It extends the existing renderer (AGENTS.md); RGB transport stays
-the default and keeps its current behaviour bit for bit.
+before anything downstream. It extends the existing renderer (AGENTS.md); RGB transport keeps its
+behaviour bit for bit, and Automatic chooses RGB unless a scene needs wavelengths (§11).
 
 ## 1. What exists now
 
 `scripts/generate_spectral_tables.py` (stdlib Python, CPython 3.9+) writes `build/SpectralTables`.
-`build.sh` and `tests/verify.py` run it. The first run takes about 8 minutes on an M4 (10
-processes). Later runs reuse the output while the script, its pinned inputs and its parameters
-are unchanged. The two large tables are regenerated only when the code that produces them
-changes.
+`build.sh` and `tests/verify.py` run it. Since the integration the first run solves only the coarse
+grid, about 100 s on an M4 (10 processes); `FourierSRGB256.bin` is generated only with
+`--lut256` (about 8 minutes). Later runs reuse the output while the script, its pinned inputs and
+its parameters are unchanged. The large tables are regenerated only when the code that produces
+them changes.
 
 | Output | Content | Size |
 |---|---|---|
-| `FourierSRGB256.bin` | 8-bit sRGB → (c0, c1, c2), 3 × uint16 per entry, index `(r·256 + g)·256 + b` | 96 MiB + 64 B header |
+| `FourierSRGB256.bin` | Opt-in (`--lut256`) test reference: 8-bit sRGB → (c0, c1, c2), 3 × uint16 per entry, index `(r·256 + g)·256 + b` | 96 MiB + 64 B header |
 | `FourierSRGB86.bin` | Exactly solved coarse grid at codes 0, 3, …, 255, float32 | 7.3 MiB |
 | `SpectralTables.metal` | MSL include: CIE 1931 2° CMFs, phase warp, XYZ ↔ linear sRGB, six Y-normalized presets, six 1025-node wavelength inverse CDFs, accessors, bounded MESE | 151 KB source, ≈ 42 KB constants |
 | `SpectralTables.json` | Manifest: parameters, input and output SHA-256, statistics, licences | — |
@@ -377,3 +378,98 @@ ReSTIR DI and GI reservoirs come from other pixels' samples, so they store u (§
   visible hero noise.
 - **Spectral sky:** the procedural sky stays RGB-upsampled until a physically based spectral sky
   model with a verifiable source is chosen.
+
+## 11. Decisions taken in the integration (2026-10-03)
+
+The renderer integration follows §2–§8 with the changes below. Measurements: `tests/PERFORMANCE.md`
+("Spectral light transport"), `tests/Fix_spectral.swift` and `tests/SpectralTables.py`.
+
+**Tables: the coarse grid at render time, refined where it is inexact; `FourierSRGB256.bin` is
+opt-in.** Every bounded colour (material constants, filtered texture colours, MaterialX outputs, the
+normalized colour of every emitter) converts where it is used, through `FourierSRGB86.bin`: its 86³
+exact solutions are loaded once into a float4 device buffer and interpolated trilinearly in linear
+light (8 loads; the generator's `interpolate`), then reconstructed by the bounded MESE. Greys skip the
+grid: their spectra are exactly flat. Measured over all 16,777,216 8-bit codes on the GPU, the plain
+interpolation reaches **0.79 8-bit steps** at saturated cyans such as (0, 231, 254) (821 codes above
+0.5, mean 0.013); the same happens in double precision (0.786 at that code), so it is interpolation
+error near the gamut boundary, not float32 rounding. The "exact re-solve" option therefore became a
+one-time refinement when the grid is loaded (`PathTracerRenderer.refineSpectralGrid`, about
+369 ms on the M4): a GPU pass over every code flags the cells it reproduces worse than
+0.35 steps (5,189 of 614,125; the generator's re-solve threshold), and a second pass solves the 64
+codes of each such cell exactly (Levenberg–Marquardt in Lagrange space, then the moments, as the
+generator does) into an 8 MiB block that `spectral_moments` interpolates at one-code spacing. The
+round trip of the renderer's float32 path is then **max 0.459, mean 0.012 8-bit steps**
+over all codes (22 above 0.4, none above 0.5; `tests/Fix_spectral.swift`), against 0.438
+for the 256³ table, whose 16-bit quantization adds error. The 256³ table became a test reference:
+the generator writes it only with `--lut256`, `build.sh` neither generates nor bundles it, and
+`tests/SpectralTables.py` checks it when the manifest lists it. The first build solves only the grid:
+**100 s instead of about 470 s** on the M4 (10 processes), then nothing until the generator
+changes. 8-bit textures stay RGB and are filtered in RGB as before, then converted per hit
+(memory-neutral), so the moment textures of §2 and §10 were not implemented. GPU memory: 17.7 MiB (18.6 MB) for
+the grid and its refinement blocks, shared by the renderers of a device.
+
+**Library variant by preprocessor, not function constant.** Spectral libraries compile the same
+source with `VIBE_SPECTRAL=1` after `SpectralTables.metal`. RGB libraries see only the RGB code
+(`Spectrum` is `float3`, every conversion helper is the identity and `Wavelengths` is empty), and
+`tests/benchmark.py --baseline <main> --output-tolerance 0` renders every procedural scenario
+bit-identically. The spectral pipelines (both scene libraries) compile on first use, concurrently,
+in the background in the application (2.9 s on the M4 the first time; Metal's shader
+cache makes later launches fast); frames trace in RGB meanwhile and accumulation restarts when
+they are ready. Test builds compile them synchronously.
+
+**Sampling PDFs at the path's wavelengths.** §4 asked for lobe probabilities and PDFs from the RGB
+parameters, which costs a third OpenPBR preparation per vertex. Instead the preparation of lanes
+0–2 (base colour ρ(λ0..2), wavelengths λ0..2) samples directions and gives the PDF, and lane 3's
+value is divided by that same PDF. This is the generating density for every lane (HERO2014 Sec. 4.1:
+divide by the probability that generated the path), so the estimator stays unbiased, NEE MIS uses
+one consistent PDF, and ReSTIR targets, shifts and Jacobians evaluate it at the sample's own
+wavelengths. The lane-3 preparation is skipped when every lane equals lane 0 (a grey base colour
+without thin film or dispersion).
+
+**Hero wavelength on arrival.** A path keeps one wavelength (the lane chosen by `heroU`, times
+four) from its first dispersive vertex on, delta or rough: `spectral_arrive` runs before the vertex
+scatters (NEE and BSDF sampling) and never touches its emission, in pass 1, pass 2, ReSTIR PT's
+generation and every shift. Terminating rough dispersive transmission as well keeps NEE MIS
+consistent with a single PDF; the spectral MIS of `HERO2014` Sec. 3.2 for rough dispersion is not
+implemented. A ReSTIR PT suffix that passed a dispersive vertex holds only the hero lane, unscaled,
+and is flagged (`PT_RC_DISPERSIVE`), so a receiver whose prefix kept four lanes applies the factor
+of four itself. `tests/Fix_spectral.swift` checks Snell's law with the Cauchy fit at the F, d and
+C lines and that terminating every path through a glass sphere keeps the image mean.
+
+**Wavelength sampling.** One equal-weight mixture of the illuminants a scene's emitters use (D65 for
+the sky, environment maps and RGB-coloured lights; the light and sun presets), built by
+`spectral_icdf_kernel` when they change (a preset's generated table when only one is used). The
+power weighting of §3 needs emitter powers the renderer does not track; any mixture with the
+defensive term is unbiased.
+
+**Unscattered paths are exact.** Camera rays that reach an emitter or the sky add its exact linear
+sRGB (`emitter_rgb`, `environment_rgb`: the RGB colour for D65, a 1 nm sum for a preset) instead of
+a four-wavelength estimate, so visible lights and the sky carry no colour noise and MetalFX's
+noise-free mask for them stays valid.
+
+**Accumulation keeps negative values.** A single spectral sample is often outside the sRGB gamut,
+so the progressive average keeps negative channels (as ReSTCV's estimates); MetalFX receives the
+clamped frame, and display, PNG/EXR export and OIDN clamp at zero.
+
+**Reservoir layouts.** DI reservoirs keep RGB emission and store u in `weights.w`; GI reservoirs
+store their secondary radiance per wavelength in `radiance.xyzw` and u in `weights.w`; ReSTIR PT
+stores `rcRadiance` as its maximum and four 16-bit fractions in the same 12 bytes and re-derives
+its wavelengths from the replay seed. Every reservoir size is unchanged.
+
+**Caching that did not pay.** Converting a vertex's albedo once into a cached `Material` field, and
+the area light's colour once per kernel into `Wavelengths`, cut the conversions but made the frame
+5–30% slower (register pressure in the path loops). The kept caches cost no registers: the area
+light's Lagrange multipliers are solved on the host per frame (`SpectralColour`,
+`SpectralScene.lightLagrange`), the CMFs and the phase are read from a per-nanometre float4 table,
+and a D65 sun lets the environment convert in one piece.
+
+**Default: Automatic, which is RGB unless the scene needs wavelengths.** Spectral transport costs
+6–71% more frame time at 640 × 480 (Cornell with ReSTIR GI 12.6 → 18.0 ms, Pavilion 27.7 → 41.5 ms), well above Peters' ≤ 0.3 ms / 2–36%,
+and RGB scenes render statistically identical images (grey-world parity, colour round trips within
+half an 8-bit step), so at equal time it loses wherever the scene is RGB (1.15–1.71 times RGB's time to equal error).
+Automatic therefore resolves to Spectral only for an illuminant preset other than D65, dispersion
+or thin film, where RGB cannot render the effect: narrow-line spectra (FL11, HP1) on coloured surfaces, dispersion's colour fringes and thin-film iridescence, while RGB scenes differ only by RGB's interreflection error (up to 3% in one channel in the Pavilion).
+
+Not done: spectral sky models, Planckian `colorTemperature`, measured conductor spectra, per-light
+spectra for imported UsdLux lights (they follow the Light spectrum preset), and phase 2 of §4 (a
+generated float4 variant of the upstream BSDF).

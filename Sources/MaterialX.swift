@@ -38,6 +38,11 @@ struct MaterialXProgram: Codable {
   // Register holding emission_color x emission_luminance (OpenPBR nits), or nil when the
   // shader authors neither input; see REFERENCES.md MATERIALX (graph emission).
   var emission: Int32?
+  // Constant OpenPBR dispersion and thin-film inputs, which only spectral transport renders
+  // (MSL SpectralMaterial): 20 x transmission_dispersion_scale / transmission_dispersion_abbe_number,
+  // thin_film_weight, thin_film_thickness (micrometres) and thin_film_ior; nil when all are default.
+  var spectral: SIMD4<Float>?
+  static let noSpectral = SIMD4<Float>(0, 0, 0.5, 1.4)
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
       roots.enumerated().allSatisfy({ i, r in r >= (i == 8 ? -1 : 0) && r < instructions.count }),
@@ -719,9 +724,24 @@ private final class MXCompiler {
       "thin_film_ior": SIMD4(repeating: 1.4), "geometry_opacity": SIMD4(repeating: 1),
       "geometry_thin_walled": .zero,
     ]
+    // Dispersion and thin film: constants only (spectral transport; MaterialXProgram.spectral).
+    let spectralNames = ["transmission_dispersion_scale", "transmission_dispersion_abbe_number", "thin_film_weight",
+                         "thin_film_thickness", "thin_film_ior"]
+    var spectralValues: [String: Float] = [:]
+    for name in spectralNames {
+      guard let input = shader.input(name) else { continue }
+      guard !linked(input), input.attributes["type"] == "float" else {
+        try fail("\(name) must be a constant float.")
+      }
+      let v = try numbers(input, fallback: defaults[name]!).x
+      guard v.isFinite, v >= 0, name != "thin_film_ior" || v >= 1, name != "thin_film_thickness" || v <= 100 else {
+        try fail("Invalid \(name).")
+      }
+      spectralValues[name] = v
+    }
     for i in shader.children
     where i.category == "input" && !["base_diffuse_roughness", "emission_luminance", "emission_color"].contains(i.name)
-      && !inputs.contains(where: { $0.0 == i.name })
+      && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
     {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
       let frames = ["geometry_tangent": "Tworld", "geometry_coat_normal": "Nworld", "geometry_coat_tangent": "Tworld"]
@@ -775,9 +795,15 @@ private final class MXCompiler {
       let c = try value(color, default: SIMD4(1, 1, 1, 0), label: shader.name + "/emission_color")
       emissionRoot = try append(GraphInstruction(code: SIMD4(3, c, l, 0)))
     }
-    let program = MaterialXProgram(
+    var program = MaterialXProgram(
       name: shader.name, source: source, instructions: nodes, roots: roots, images: images,
       parameters: parameters, diffuseRoughness: diffuseRoot, emission: emissionRoot)
+    let scale = spectralValues["transmission_dispersion_scale"] ?? 0
+    let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
+    let spectral = SIMD4<Float>(
+      scale > 0 && abbe > 0 ? 20 * scale / abbe : 0, spectralValues["thin_film_weight"] ?? 0,
+      spectralValues["thin_film_thickness"] ?? 0.5, spectralValues["thin_film_ior"] ?? 1.4)
+    if spectral != MaterialXProgram.noSpectral { program.spectral = spectral }
     try program.validate()
     return program
   }

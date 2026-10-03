@@ -58,7 +58,9 @@
         three[gid.y * u.width + gid.x] = float4(c, 0.0f);
     }
     // PCG-mode Sampler against the uint streams: lens, lights, BSDFs, DI candidates, fog and
-    // ReSTIR PT streams must draw identical numbers (counts of mismatching trials).
+    // ReSTIR PT streams must draw identical numbers (counts of mismatching trials). RGB library
+    // only (spectral transport draws the same numbers; its helpers need a wavelength context).
+    #if !VIBE_SPECTRAL
     kernel void z_pcg_equivalence(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(1)]],
                                   device atomic_uint *mismatches [[buffer(2)]], uint id [[thread_position_in_grid]]) {
         uint2 gid = uint2(id % u.width, id / u.width);
@@ -81,14 +83,14 @@
         for (int k = 0; k < 3; ++k) {
             Material q = k == 0 ? m : k == 1 ? d : g;
             float3 d1, w1, d2, w2; float p1, p2;
-            bool r1 = sample_bsdf(q, n, view, true, seed, d1, w1, p1), r2 = sample_bsdf(q, n, view, true, s, d2, w2, p2);
+            bool r1 = sample_bsdf(q, n, view, true, seed, d1, w1, p1, Wavelengths()), r2 = sample_bsdf(q, n, view, true, s, d2, w2, p2, Wavelengths());
             same = same && r1 == r2 && (!r1 || (all(d1 == d2) && p1 == p2));
         }
         HitRecord rec = {}; rec.position = p; rec.normal = n; rec.geometricNormal = n; rec.mat = d; rec.front_face = true;
-        DIReservoir c1 = restir_di_initial(rec, view, u, seed, images), c2 = restir_di_initial(rec, view, u, s, images);
+        DIReservoir c1 = restir_di_initial(rec, view, u, seed, images, Wavelengths()), c2 = restir_di_initial(rec, view, u, s, images, Wavelengths());
         same = same && c1.weightSum == c2.weightSum && all(c1.sample.position == c2.sample.position);
         Ray fogRay = { float3(0, 0, 3), normalize(float3(0.05f, 0.1f, -1)) };
-        same = same && all(apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, seed, images) == apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, s, images));
+        same = same && all(apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, seed, images, Wavelengths()) == apply_camera_fog(float3(0.5f), fogRay, 5.0f, u, s, images, Wavelengths()));
         same = same && seed == s.state;
         uint key = pcg_hash(id * 7919u + 3u);
         uint streamA = pt_seed(key, 2u, 0u);
@@ -96,6 +98,7 @@
         same = same && all(rand_f3(streamA) == rand_f3(streamB)) && rand_f(streamA) == rand_f(streamB);
         if (!same) atomic_fetch_add_explicit(mismatches, 1u, memory_order_relaxed);
     }
+    #endif
     // Z mode: replaying a ReSTIR PT stream from its key reproduces its numbers; the two passes'
     // events and every PT stream draw different numbers from the same key; the lens event is
     // shared by both passes (it defines the pixel's primary ray).
@@ -125,7 +128,7 @@
         constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],
         constant MaterialResources &images [[buffer(2)]], const device PrimarySurface *surfaces [[buffer(3)]],
         const device PTReservoir *reservoirs [[buffer(5)]], constant int2 &offset [[buffer(6)]],
-        device float4 *identity [[buffer(7)]], device float4 *trip [[buffer(8)]], uint2 gid [[thread_position_in_grid]]) {
+        device float4 *identity [[buffer(7)]], device float4 *trip [[buffer(8)]] SPECTRAL_BUFFERS, uint2 gid [[thread_position_in_grid]]) {
         if (gid.x >= u.width || gid.y >= u.height) return;
         uint i = gid.y * u.width + gid.x;
         identity[i] = float4(-1); trip[i] = float4(-1);
@@ -136,7 +139,7 @@
         HitRecord y = load_primary_surface(surfaces[i], p);
         float3 view = float3(surfaces[i].view);
         float threshold = pt_footprint_threshold(p.w, y.geometricNormal, view);
-        PTShift s = pt_shift(r, y, view, threshold, cone, u, settings, images);
+        PTShift s = pt_shift(r, y, view, threshold, cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
         float J = pt_rc_index(r) > 0u ? s.jacobian / r.rcJacobian : 1.0f;
         identity[i] = float4(pt_luminance(s.FJ), pt_luminance(r.F), J, float(pt_rc_index(r)));
         int2 q = int2(gid) + offset;
@@ -146,20 +149,22 @@
         uint qi = uint(q.y) * u.width + uint(q.x);
         HitRecord z = load_primary_surface(surfaces[qi], qp);
         float3 zView = float3(surfaces[qi].view);
-        PTShift forward = pt_shift(r, z, zView, pt_footprint_threshold(qp.w, z.geometricNormal, zView), cone, u, settings, images);
+        PTShift forward = pt_shift(r, z, zView, pt_footprint_threshold(qp.w, z.geometricNormal, zView), cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
         if (!(pt_luminance(forward.FJ) > 0.0f)) { trip[i] = float4(0, 0, 0, float(pt_rc_index(r))); return; }
         PTReservoir shifted = r;
         float J1 = pt_rc_index(r) > 0u ? forward.jacobian / r.rcJacobian : 1.0f;
         shifted.F = forward.FJ / J1;
         if (pt_rc_index(r) > 0u) shifted.rcJacobian = forward.jacobian;
-        PTShift back = pt_shift(shifted, y, view, threshold, cone, u, settings, images);
+        PTShift back = pt_shift(shifted, y, view, threshold, cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
         float J2 = pt_rc_index(r) > 0u ? back.jacobian / shifted.rcJacobian : 1.0f;
         trip[i] = float4(pt_luminance(back.FJ / J2), pt_luminance(r.F), J1 * J2, float(pt_rc_index(r)) + 1000.0f);
     }
     """
   let library = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  // Kernels that read rendered reservoirs need their transport's layouts (rendererShaderLibrary).
+  let reservoirLibrary = try rendererShaderLibrary(kernels)
   func run(_ name: String, width: Int, height: Int = 1, _ bind: (MTLComputeCommandEncoder) -> Void) throws {
-    let state = try gpu.makeComputePipelineState(function: library.makeFunction(name: name)!)
+    let state = try gpu.makeComputePipelineState(function: (name == "z_round_trip" ? reservoirLibrary : library).makeFunction(name: name)!)
     let command = renderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
     encoder.setComputePipelineState(state)
     bind(encoder)
@@ -330,6 +335,7 @@
         $0.setBuffer(renderer.ptReservoirs!, offset: 0, index: 5)
         $0.setBytes(&offset, length: 8, index: 6)
         $0.setBuffer(identity, offset: 0, index: 7); $0.setBuffer(trip, offset: 0, index: 8)
+        bindRendererSpectral($0)
       }
       var identityTotal = 0, identityMatch = 0, tripTotal = 0, tripMatch = 0, tripFailed = 0
       for i in 0..<(rw * rh) {
