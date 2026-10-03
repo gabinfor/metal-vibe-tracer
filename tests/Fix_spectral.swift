@@ -194,24 +194,26 @@
         Wavelengths context = SPECTRAL_CONTEXT(u, images);
         for (uint j = 0u; j < 256u; ++j) {
             Wavelengths wl = spectral_wavelengths((float(tid * 256u + j) + 0.5f) / 1048576.0f, 0.5f, context);
-            sum += spectrum_rgb(select(Spectrum(0.0f), Spectrum(1.0f), abs(wl.lambda - 500.0f) <= 0.5f), wl);
+            sum += spectrum_rgb(select(Spectrum(0.0f), Spectrum(1.0f), abs(spectral_lambdas(wl) - 500.0f) <= 0.5f), wl);
         }
         out[tid] = float4(sum, 0.0f);
     }
-    // Refraction of the F, d and C lines at a dispersive dielectric (slot 5) on a hero path.
+    // The Cauchy fit at the F, d and C lines, and the refraction of a hero path's wavelength (from its
+    // number u) at a dispersive dielectric (slot 5): sin(theta_t), n(lambda_hero), n(line), cos(theta_t).
     kernel void spectral_dispersion(constant Uniforms &u [[buffer(1)]], constant MaterialResources &images [[buffer(2)]],
                                     device float4 *out [[buffer(0)]] SPECTRAL_BUFFERS, uint tid [[thread_position_in_grid]]) {
         if (tid >= 3u) return;
-        float lambdas[3] = { 486.1f, 587.6f, 656.3f };
-        Wavelengths wl = SPECTRAL_CONTEXT(u, images);
-        wl.lambda = float4(lambdas[tid]); wl.heroOnly = true; wl.hero = 0u;
+        float lines[3] = { 486.1f, 587.6f, 656.3f };
+        Wavelengths wl = spectral_wavelengths(0.15f + 0.3f * float(tid), 0.1f + 0.3f * float(tid), SPECTRAL_CONTEXT(u, images));
+        wl.heroOnly = true;
         Material glass = { DIELECTRIC, float3(1), float3(0), 0.0f, 1.5f };
         glass.slot = 5u; glass.geometricNormal = float3(0, 0, 1);
         float3 incoming = normalize(float3(sin(0.6f), 0.0f, -cos(0.6f)));
         uint seed = 7u;
         float3 d = float3(0); Spectrum w; float pdf;
         for (int i = 0; i < 256; ++i) if (sample_bsdf(glass, float3(0, 0, 1), incoming, true, seed, d, w, pdf, wl) && d.z < 0.0f) break;
-        out[tid] = float4(length(d.xy), sin(0.6f), openpbr_dispersion_adjusted_ior(1.5f, 1.0f, lambdas[tid]), d.z);
+        float n = openpbr_dispersion_adjusted_ior(1.5f, 1.0f, spectral_lambda(wl, spectral_hero(wl)));
+        out[tid] = float4(length(d.xy), n, openpbr_dispersion_adjusted_ior(1.5f, 1.0f, lines[tid]), d.z);
     }
     // One interreflection between two Cornell red walls under D65: sum rho^2 S xyz at 1 nm.
     kernel void spectral_interreflection(constant Uniforms &u [[buffer(1)]], constant MaterialResources &images [[buffer(2)]],
@@ -309,10 +311,11 @@
   try run("spectral_dispersion", width: 3) { encoder in bindUnits(encoder); encoder.setBuffer(refraction, offset: 0, index: 0) }
   let rays = (0..<3).map { refraction.contents().load(fromByteOffset: $0 * 16, as: SIMD4<Float>.self) }
   let nF = Double(rays[0].z), nd = Double(rays[1].z), nC = Double(rays[2].z)
-  print("Dispersion: n(F, d, C) = \(nF), \(nd), \(nC); V_d = \((nd - 1) / (nF - nC)); sin(theta_t) n = \(rays.map { $0.x * $0.z }), sin(theta_i) = \(rays[0].y)")
+  print("Dispersion: n(F, d, C) = \(nF), \(nd), \(nC); V_d = \((nd - 1) / (nF - nC)); sin(theta_t) n(lambda_hero) = \(rays.map { $0.x * $0.y }), sin(theta_i) = \(sin(Float(0.6)))")
   require(abs(nd - 1.5) < 1e-5 && abs((nd - 1) / (nF - nC) - 20) < 1e-3 && nF > nd && nd > nC,
     "the Cauchy fit reproduces n_d and the Abbe number")
-  require(rays.allSatisfy { abs($0.x * $0.z - $0.y) < 2e-5 && $0.w < 0 }, "each hero wavelength refracts by Snell's law with n(lambda)")
+  require(rays.allSatisfy { abs($0.x * $0.y - sin(0.6)) < 2e-5 && $0.w < 0 } && Set(rays.map { $0.y }).count == 3,
+    "each hero wavelength refracts by Snell's law with n(lambda)")
   r.materials.spectralOverrides = [:]
 
   // Saturated interreflection: one bounce between two walls of the same colour under D65.

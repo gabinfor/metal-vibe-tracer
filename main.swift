@@ -560,23 +560,23 @@ static_assert(sizeof(SpectralScene) == 1424, "Swift writes a 1424-byte SpectralS
 // Buffer 28 (SpectralShaderCache.grid): the exactly solved 86^3 grid of FourierSRGB86.bin as float4
 // (c0, c1, c2, 0), indexed (r * 86 + g) * 86 + b. Buffer 29 (PathTracerRenderer.spectralSampling),
 // written by spectral_icdf_kernel: the scene's 1025-node wavelength inverse CDF, then at float4 257
-// the linear-sRGB CMFs and Peters' phase per nanometre (rgb, phase), then the kernel's scratch.
+// the linear-sRGB CMFs and the cosine of Peters' phase per nanometre (rgb, cos phase), then the
+// kernel's scratch.
 constant uint SPECTRAL_GRID = 86u;
-constant uint SPECTRAL_CMF_TABLE = 257u;   // float4 offset of the per-nanometre (rgb CMF, phase) table
+constant uint SPECTRAL_CMF_TABLE = 257u;   // float4 offset of the per-nanometre (rgb CMF, cos phase) table
 constant uint SPECTRAL_SCRATCH = 4u * (257u + 471u);   // float offset of the kernel's scratch
 
 // Four wavelengths of one path sample from one number u: lambda_k = F^-1((u + k) / 4) for the scene's
-// piecewise-linear inverse CDF (illuminant x |rgb CMF| with a 10% defensive term), and per lane the
-// linear sRGB weights of a unit value, M xyz(lambda_k) / (4 p(lambda_k)), so that a Spectrum
-// converts with three dot products. The scene pointers ride along so that emitters and the
-// environment can be evaluated wherever a Spectrum is formed.
+// piecewise-linear inverse CDF (illuminant x |rgb CMF| with a 10% defensive term). A path keeps only
+// its numbers: the wavelengths, their densities, CMFs and reflectance phases are read back from the
+// sampling buffer where they are used (a few loads), because every register a path keeps live
+// costs more in the path loops than those loads (tests/PERFORMANCE.md, "Spectral transport cost").
+// The scene pointers ride along so that emitters and the environment can be evaluated wherever a
+// Spectrum is formed.
 struct Wavelengths {
-    float4 lambda;          // nm
-    float4 cosPhase;        // cos of Peters' warped phase of lambda_k (PETERS2019 Sec. 4.1)
-    float4 toR, toG, toB;   // linear sRGB weights per lane
     float u, heroU;         // the path's wavelength numbers (Z_WAVELENGTH dimensions 0 and 1)
-    uint hero;              // the lane kept at the path's first dispersive vertex (HERO2014)
-    bool heroOnly;          // set at that vertex; the other lanes then carry zero throughput
+    bool heroOnly;          // set at the path's first dispersive vertex (HERO2014); the lanes other
+                            // than spectral_hero(wl) then carry zero throughput
     constant SpectralScene *scene;
     const device float4 *grid;
     const device float *icdf;
@@ -584,52 +584,66 @@ struct Wavelengths {
     constant MaterialResources *images;
 };
 
-// The per-wavelength part: lambda_k, the phases and the conversion weights for numbers (u, heroU).
-void spectral_fill(thread Wavelengths &wl, float u, float heroU) {
-    const device float *table = wl.icdf;
-    // Colours are defined by 1 nm sums (the generator's colour model, the XYZ -> sRGB matrix and the
-    // presets' luminance), so the CMFs and illuminants are evaluated per 1 nm bin, at the nearest
-    // node: the estimator's expectation is then exactly those sums (a grey under D65 renders as RGB
-    // does). The reflectance phase is piecewise linear (Peters' 5 nm warp), read from the same table.
-    const device float4 *cmf = (const device float4 *)wl.icdf + SPECTRAL_CMF_TABLE;
-    for (uint k = 0u; k < 4u; ++k) {
-        float x = (u + float(k)) * 0.25f * float(VIBE_ICDF_SEGMENTS);
-        uint i = min(uint(x), VIBE_ICDF_SEGMENTS - 1u);
-        float low = table[i], width = table[i + 1u] - low;
-        float lambda = low + (x - float(i)) * width;
-        float n = clamp(lambda - VIBE_LAMBDA_MIN, 0.0f, float(VIBE_SPECTRAL_SAMPLES - 1u));
-        uint j = min(uint(n), VIBE_SPECTRAL_SAMPLES - 2u);
-        float4 c0 = cmf[j], c1 = cmf[j + 1u];
-        float f = n - float(j);
-        // The density actually sampled: 1 / (segments x node spacing), so f / p stays unbiased.
-        float3 rgb = (f < 0.5f ? c0.xyz : c1.xyz) * (0.25f * float(VIBE_ICDF_SEGMENTS) * width);
-        wl.lambda[k] = lambda;
-        wl.cosPhase[k] = cos(mix(c0.w, c1.w, f));
-        wl.toR[k] = rgb.x; wl.toG[k] = rgb.y; wl.toB[k] = rgb.z;
-    }
-    wl.u = u; wl.heroU = heroU;
-    wl.hero = min(uint(heroU * 4.0f), 3u);
-    wl.heroOnly = false;
-}
 Wavelengths spectral_wavelengths(float u, float heroU, constant SpectralScene *scene, const device float4 *grid,
                                  const device float *icdf, constant Uniforms *uniforms, constant MaterialResources *images) {
     Wavelengths wl;
     wl.scene = scene; wl.grid = grid; wl.icdf = icdf; wl.uniforms = uniforms; wl.images = images;
-    spectral_fill(wl, u, heroU);
+    wl.u = u; wl.heroU = heroU; wl.heroOnly = false;
     return wl;
 }
 // The same scene with other wavelength numbers (reused samples, ReSTIR PT paths).
 Wavelengths spectral_wavelengths(float u, float heroU, thread const Wavelengths &context) {
     Wavelengths wl = context;
-    spectral_fill(wl, u, heroU);
+    wl.u = u; wl.heroU = heroU; wl.heroOnly = false;
     return wl;
 }
 Wavelengths spectral_wavelengths(float u, thread const Wavelengths &context) {
     return spectral_wavelengths(u, context.heroU, context);
 }
+// The lane kept at the path's first dispersive vertex, chosen uniformly by heroU (HERO2014).
+uint spectral_hero(thread const Wavelengths &wl) { return min(uint(wl.heroU * 4.0f), 3u); }
 
+// Lane k's wavelength lambda_k = F^-1((u + k) / 4) and its share of the four-wavelength estimate,
+// 1 / (4 p(lambda_k)) with the density actually sampled, 1 / (segments x node spacing), so f / p
+// stays unbiased.
+float spectral_lambda(thread const Wavelengths &wl, uint k, thread float &weight) {
+    float x = (wl.u + float(k)) * 0.25f * float(VIBE_ICDF_SEGMENTS);
+    uint i = min(uint(x), VIBE_ICDF_SEGMENTS - 1u);
+    float low = wl.icdf[i], width = wl.icdf[i + 1u] - low;
+    weight = 0.25f * float(VIBE_ICDF_SEGMENTS) * width;
+    return low + (x - float(i)) * width;
+}
+float spectral_lambda(thread const Wavelengths &wl, uint k) {
+    float share;
+    return spectral_lambda(wl, k, share);
+}
+float4 spectral_lambdas(thread const Wavelengths &wl) {
+    return float4(spectral_lambda(wl, 0u), spectral_lambda(wl, 1u), spectral_lambda(wl, 2u), spectral_lambda(wl, 3u));
+}
+// The 1 nm bin of lambda. Colours are defined by 1 nm sums (the generator's colour model, the
+// XYZ -> sRGB matrix and the presets' luminance), so CMFs, illuminants and the reflectance phase are
+// all evaluated at the nearest node: the estimator's expectation is then
+// exactly those sums (a grey under D65 renders as RGB does, a reflectance's colour is its 1 nm sum).
+uint spectral_bin(float lambda) {
+    return min(uint(clamp(lambda - VIBE_LAMBDA_MIN + 0.5f, 0.0f, float(VIBE_SPECTRAL_SAMPLES - 1u))), VIBE_SPECTRAL_SAMPLES - 1u);
+}
+// cos of Peters' warped phase (PETERS2019 Sec. 4.1) at each lambda_k's 1 nm bin.
+float4 spectral_cos_phase(thread const Wavelengths &wl) {
+    const device float4 *cmf = (const device float4 *)wl.icdf + SPECTRAL_CMF_TABLE;
+    return float4(cmf[spectral_bin(spectral_lambda(wl, 0u))].w, cmf[spectral_bin(spectral_lambda(wl, 1u))].w,
+                  cmf[spectral_bin(spectral_lambda(wl, 2u))].w, cmf[spectral_bin(spectral_lambda(wl, 3u))].w);
+}
+// Linear sRGB of a Spectrum: sum_k s_k M xyz(lambda_k) / (4 p(lambda_k)), with the CMFs of
+// lambda_k's 1 nm bin.
 float3 spectrum_rgb(Spectrum s, thread const Wavelengths &wl) {
-    return float3(dot(s, wl.toR), dot(s, wl.toG), dot(s, wl.toB));
+    const device float4 *cmf = (const device float4 *)wl.icdf + SPECTRAL_CMF_TABLE;
+    float3 rgb = float3(0.0f);
+    for (uint k = 0u; k < 4u; ++k) {
+        float weight;
+        float lambda = spectral_lambda(wl, k, weight);
+        rgb += (s[k] * weight) * cmf[spectral_bin(lambda)].xyz;
+    }
+    return rgb;
 }
 float spectrum_max(Spectrum s) { return max(max(s.x, s.y), max(s.z, s.w)); }
 float wavelength_u(thread const Wavelengths &wl) { return wl.u; }
@@ -699,24 +713,24 @@ float4 spectral_lagrange(float3 rgb, thread const Wavelengths &wl) {
 // Bounded reflectance rho(lambda_k) from those multipliers (PETERS2019 Eq. 11).
 Spectrum spectral_from_lagrange(float4 L, thread const Wavelengths &wl) {
     if (L.w == 2.0f) return Spectrum(L.x);
-    float4 x = wl.cosPhase;
+    float4 x = spectral_cos_phase(wl);
     float4 series = L.x + 2.0f * L.y * x + 2.0f * L.z * (2.0f * x * x - 1.0f);
     return atan(series) * 0.318309886f + 0.5f;
 }
 Spectrum spectral_reflectance(float3 rgb, thread const Wavelengths &wl) {
     return spectral_from_lagrange(spectral_lagrange(rgb, wl), wl);
 }
-// An illuminant's 1 nm bin at lambda (see spectral_fill).
+// An illuminant's 1 nm bin at lambda (spectral_bin).
 float spectral_illuminant(uint illuminant, float lambda) {
-    uint j = min(uint(clamp(lambda - VIBE_LAMBDA_MIN + 0.5f, 0.0f, float(VIBE_SPECTRAL_SAMPLES - 1u))), VIBE_SPECTRAL_SAMPLES - 1u);
-    return vibe_illuminant_spd[min(illuminant, VIBE_ILLUMINANT_COUNT - 1u)][j];
+    return vibe_illuminant_spd[min(illuminant, VIBE_ILLUMINANT_COUNT - 1u)][spectral_bin(lambda)];
 }
 // Unbounded RGB radiance e of an emitter with illuminant S (normalized to luminance one).
 Spectrum spectral_emission(float3 e, uint illuminant, thread const Wavelengths &wl) {
     float s = max(e.x, max(e.y, e.z));
     if (!(s > 0.0f)) return Spectrum(0.0f);
-    Spectrum S = Spectrum(spectral_illuminant(illuminant, wl.lambda.x), spectral_illuminant(illuminant, wl.lambda.y),
-                          spectral_illuminant(illuminant, wl.lambda.z), spectral_illuminant(illuminant, wl.lambda.w));
+    float4 lambda = spectral_lambdas(wl);
+    Spectrum S = Spectrum(spectral_illuminant(illuminant, lambda.x), spectral_illuminant(illuminant, lambda.y),
+                          spectral_illuminant(illuminant, lambda.z), spectral_illuminant(illuminant, lambda.w));
     // The area light's colour is converted once per frame on the host (SpectralScene.lightLagrange).
     float3 c = e / s;
     float4 L;
@@ -762,10 +776,10 @@ bool spectral_dispersive(Material m, thread const Wavelengths &wl) {
 void spectral_arrive(Material m, thread Spectrum &throughput, thread Wavelengths &wl) {
     if (wl.heroOnly || !spectral_dispersive(m, wl)) return;
     wl.heroOnly = true;
-    throughput *= select(Spectrum(0.0f), Spectrum(4.0f), uint4(0u, 1u, 2u, 3u) == wl.hero);
+    throughput *= select(Spectrum(0.0f), Spectrum(4.0f), uint4(0u, 1u, 2u, 3u) == spectral_hero(wl));
 }
 Spectrum spectral_hero_lane(float value, thread const Wavelengths &wl) {
-    return select(Spectrum(0.0f), Spectrum(value), uint4(0u, 1u, 2u, 3u) == wl.hero);
+    return select(Spectrum(0.0f), Spectrum(value), uint4(0u, 1u, 2u, 3u) == spectral_hero(wl));
 }
 // The reflectance of a material's albedo; `rgb` is the value RGB transport uses (the saturated or raw
 // albedo, which convert alike).
@@ -1968,13 +1982,16 @@ PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavele
     PreparedBsdf p;
     p.hero = 4u;
     if (wl.heroOnly && spectral_dispersive(mat, wl)) {
-        p.hero = wl.hero; p.flat = true;
-        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[wl.hero]), float3(wl.lambda[wl.hero]), sm);
+        p.hero = spectral_hero(wl); p.flat = true;
+        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[p.hero]), float3(spectral_lambda(wl, p.hero)), sm);
         return p;
     }
     p.flat = albedo.x == albedo.y && albedo.y == albedo.z && !(sm.thinFilmWeight > 0.0f) && !spectral_dispersive(mat, wl);
-    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, wl.lambda.xyz, sm);
-    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(wl.lambda.w), sm);
+    // The upstream BSDF reads wavelengths only for dispersion and thin film.
+    float4 lambda = sm.thinFilmWeight > 0.0f || sm.dispersion > 0.0f ? spectral_lambdas(wl)
+        : float4(OpenPBR_BaseRgbWavelengths_nm, OpenPBR_BaseRgbWavelengths_nm.x);
+    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm);
+    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm);
     return p;
 }
 Spectrum prepared_lanes(thread const PreparedBsdf &p, float3 a, float b) {
@@ -2506,7 +2523,7 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
         float ior = mat.ior;
 #if VIBE_SPECTRAL
         if (wl.heroOnly && spectral_dispersive(mat, wl))
-            ior = openpbr_dispersion_adjusted_ior(mat.ior, spectral_material(mat, wl).dispersion, wl.lambda[wl.hero]);
+            ior = openpbr_dispersion_adjusted_ior(mat.ior, spectral_material(mat, wl).dispersion, spectral_lambda(wl, spectral_hero(wl)));
 #endif
         Spectrum tint = spectral_albedo(mat, mat.albedo, wl);
         float eta = frontFace ? 1.0f / ior : ior;
@@ -6041,7 +6058,7 @@ kernel void spectral_icdf_kernel(device float *table [[buffer(29)]], constant fl
     device float4 *cmf = (device float4 *)table + SPECTRAL_CMF_TABLE;
     for (uint i = 0u; i < VIBE_SPECTRAL_SAMPLES; ++i)
         cmf[i] = float4(VIBE_XYZ_TO_LINEAR_SRGB * float3(vibe_cmf_x[i], vibe_cmf_y[i], vibe_cmf_z[i]),
-                        vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i)));
+                        cos(vibe_fourier_phase(VIBE_LAMBDA_MIN + float(i))));
     device float *density = table + SPECTRAL_SCRATCH;
     device float *cdf = density + VIBE_SPECTRAL_SAMPLES;
     float w[6] = { weights[0].x, weights[0].y, weights[0].z, weights[0].w, weights[1].x, weights[1].y };
