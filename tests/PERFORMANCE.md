@@ -27,11 +27,17 @@ Every mode's 64-frame mean agreed with the reference within about 2 tile-cluster
 
 ## Frame time and equal time — pending
 
-Interleaved timing runs on the shared GPU were too noisy to rank the modes (per-round medians varied by up to 2× while other jobs ran), and the paired-ratio runs were stopped before completion. Pending GPU validation: frame-time cost of spectral MIS at rough dispersive vertices (four lobe preparations per vertex) and of splitting (up to four camera continuations), and equal-time MSE. Scenes without dispersion run the earlier code path (every mode renders identically, `tests/Fix_spectral-mis.swift`).
+Interleaved timing runs on the shared GPU were too noisy to rank the modes (per-round medians varied by up to 2× while other jobs ran), and the paired-ratio runs were stopped before completion. The full suite passed on the GPU on 2026-10-04 (179 PASS, `REFERENCES.md` "October 4 validation"), including spectral MIS weight balance (|sum − 1| ≤ 2.4e-7) and splitting on smooth glass (1.01× the hero error at 32×24, no gain reproduced). Still pending: frame-time cost of spectral MIS at rough dispersive vertices (four lobe preparations per vertex) and of splitting (up to four camera continuations), and equal-time MSE. Scenes without dispersion run the earlier code path (every mode renders identically, `tests/Fix_spectral-mis.swift`).
 
 ## Default
 
 `DispersionSampling.automatic` resolves to hero termination (2026-10-04): the GPU suite's rough-glass fixture measured spectral MIS at about 4.1× the hero error (open issue; the development-time gains above are not reproduced), so spectral MIS and splitting are experimental and opt-in.
+
+# Acceleration structure builds — October 4, 2026
+
+Batched per-asset builds and instance-structure refits (`REFERENCES.md` `METALRT`, "Builds, compaction and refits"). Full suite on Apple M4 16 GB, macOS 27, `a4bce56`, without the Metal debug layer: 179 PASS, 0 FAIL. `tests/Fix_accel.swift` 6b: a publish built 3 structures in 3 command buffers (asset builds, compaction, instance structure). Instanced scene (7,988,480 rendered triangles from 199,712 stored, 320×240, MIS, depth 8): hardware traversal 4.25 ms per frame, build 47 ms, 46.8 MiB; software 7.41 ms, build 28 ms, 30.4 MiB; mean radiance 0.55424 against 0.55426. Refit time against a rebuild was not measured.
+
+Spectral frame times in the same run (320×240, RGB/spectral): Cornell GI 20.1/18.1 ms, Pavilion GI 27.1/28.2 ms (+4%), Pavilion MIS 23.0/24.0 ms (+4%); the smaller relative cost than the 640×480 figures below is consistent with low-resolution runs, not a new measurement of the default.
 
 # Spectral transport cost — October 3, 2026
 
@@ -144,7 +150,7 @@ With **Light transport → RGB** (and Automatic in RGB scenes) every procedural 
 
 # Z++ sampler — October 2, 2026
 
-**Update, October 4 (pending GPU validation):** the measurements in this section predate the key-layout fix (`REFERENCES.md` `ZPP2026`, "One key per pixel and frame"). Before the fix, still accumulations shared sample sets across aligned pixel blocks and showed square tiles. The static, moving-camera, bias and timing tables below have to be re-measured with the fixed layout; `tests/Fix_zsampler-blocks.swift` checks the absence of block-correlated error against PCG. **Sampler → Automatic** resolves to PCG until then.
+**Update, October 4:** the key-layout fix passed its GPU block check on 2026-10-04 (`tests/Fix_zsampler-blocks.swift`, Pavilion ReSTIR GI, 16 frames: luma block-error excess at 2/4/8 px 1.03/1.10/1.24 for Z++ against 1.01/1.05/1.19 for PCG; adjacent-pixel correlation 0.0047 against 0.0039). The measurements in this section predate the key-layout fix (`REFERENCES.md` `ZPP2026`, "One key per pixel and frame"). Before the fix, still accumulations shared sample sets across aligned pixel blocks and showed square tiles. The static, moving-camera, bias and timing tables below have to be re-measured with the fixed layout; `tests/Fix_zsampler-blocks.swift` checks the absence of block-correlated error against PCG. **Sampler → Automatic** resolves to PCG until then.
 
 The Z++ sampler (`REFERENCES.md` `ZPP2026`; `SamplerMode.zSampling`, **Sampler → Z++**) against the earlier per-pixel PCG streams (`SamplerMode.pcg`). Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `1124b00` plus this change (uncommitted at measurement; the shaders measured equal the committed ones except that the static and timing runs used the PerPixel temporal model, which renders still views statistically identically to the default ReShuffle-like model; and, before the last change, every accumulation shared one Owen scramble, which leaves error magnitudes unchanged; the bias runs below use the final shaders). Scratch drivers render through the production `renderFrame` path at 320×240 (errors) and 640×480 (times), path depth 16; other GPU work shared the machine. The unedited figures are in [`PERFORMANCE-zsampling-raw.txt`](PERFORMANCE-zsampling-raw.txt).
 

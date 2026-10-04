@@ -586,5 +586,6 @@ so iridescence is strong only on less reflective metals (the test uses F0 = 0.5)
 - *A learned spectral denoiser* (Noizet et al. 2026): needs per-bin radiance and a trained network
   that MetalFX and OIDN do not provide.
 
-Pending GPU validation: equal-time ratios and the frame-time cost of spectral MIS and splitting
-(the timing runs were stopped before completing), and confirmation of every test above on the GPU.
+GPU validation (2026-10-04, full suite, 179 PASS): every test above passed on the GPU with the
+adjusted expectations (hero default, splitting a non-regression check, spectral MIS gain reported as
+a note). Still pending: equal-time ratios and the frame-time cost of spectral MIS and splitting.

@@ -277,6 +277,10 @@ Acceleration structure (2026-09-28): imported meshes moved from one median-split
 
 Acceleration validation (2026-09-28, Apple M4 16 GB, macOS 27, Swift 6.4): `./build.sh` passed with no warnings; `MTL_DEBUG_LAYER=1 python3 tests/verify.py --require-reference` exited 0 (120 PASS, 0 FAIL, no compiler warnings) with the default (hardware) traversal, with `VIBE_ACCELERATION=twoLevel` and with `VIBE_ACCELERATION=flat`; `--studio-only` and `--usd-only` passed; `/usr/bin/python3 tests/USDChecks.py` passed.
 
+## Follow-up, 2026-10-04
+
+Later work on `main` (papers, spectral transport, samplers, acceleration builds) is recorded in `REFERENCES.md` and `tests/PERFORMANCE.md`. Validation (2026-10-04, `a4bce56`, Apple M4 16 GB, macOS 27): `python3 tests/verify.py` exited 0 with 179 PASS and 0 FAIL (`build/checks/runs/verify-20261004-145119-12165`), without `MTL_DEBUG_LAYER` this time, so Metal API validation of the batched builds and refits remains to be repeated under the debug layer. Open issues carried from that run: spectral MIS measures 4.1× the hero error on the rough-glass fixture (hero termination stays the default), splitting shows no gain at the fixture size, and **Sampler → Automatic** stays PCG until Z++ is re-measured at equal time.
+
 ## Remaining limitations and partial fixes
 
 - **R-101 (residual):** the `SceneGraph` assets are the document's host copy of imported triangles, beside the GPU buffer. *(Updated 2026-09-28: `USDImporter.load` no longer builds a transient flattened copy to place the orbit pivot; see "USD orbit pivot" under "Follow-up, 2026-09-28".)*
