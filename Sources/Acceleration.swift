@@ -334,6 +334,12 @@ struct MeshSceneLayout {
   var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude), hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
   // Hardware traversal: the instance acceleration structure over `instances`.
   var scene: MTLAccelerationStructure?
+  // What `scene` was built over, so a transform-only edit can refit it instead of rebuilding
+  // (MaterialLibrary.buildSceneStructure): the instanced structures in descriptor order, each
+  // instance's index into them, and the refits applied since its last full build.
+  var sceneReferences: [MTLAccelerationStructure] = []
+  var sceneIndices: [UInt32] = []
+  var sceneRefits = 0
   // Everything the shader reaches through the hardware structures (for residency).
   var structures: [MTLResource] { (scene.map { [$0] } ?? []) + assets.compactMap(\.structure) }
 
@@ -698,43 +704,141 @@ extension MaterialLibrary {
   // two-level software traversal runs on the same buffers.
   var hardwareTraversal: Bool { acceleration == .hardware && device.supportsRaytracing }
 
-  // Builds one acceleration structure and waits for it (edits publish synchronously); primitive
-  // structures are then compacted (about 10% smaller, measured watertight alike). `pending` counts
+  // Builds a batch of acceleration structures and waits for them (edits publish synchronously);
+  // primitive structures are then compacted where that shrinks them (about 10% smaller,
+  // measured watertight alike). Every uncompacted structure of the batch is live at once, so
+  // their total is checked against the budget before anything is allocated. `pending` counts
   // the structures this publish has already built, which stay live beside the published mesh.
+  // Scratch memory and compaction targets are transient and, as before, not budgeted.
+  func buildStructures(_ descriptors: [MTLAccelerationStructureDescriptor], compact: Bool = false,
+                       pending: inout UInt64) throws -> [MTLAccelerationStructure] {
+    if accelerationQueue == nil { accelerationQueue = device.makeCommandQueue() }
+    let total = descriptors.reduce(UInt64(0)) { $0 + UInt64(device.accelerationStructureSizes(descriptor: $1).accelerationStructureSize) }
+    guard let queue = accelerationQueue, total + pending + meshBytes <= meshBudget
+    else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
+    var commands = 0
+    defer { accelerationCommandCount += commands }
+    let structures = try Self.buildStructures(descriptors, device: device, queue: queue, compact: compact, commands: &commands)
+    pending += structures.reduce(UInt64(0)) { $0 + UInt64($1.allocatedSize) }
+    return structures
+  }
   func buildStructure(_ descriptor: MTLAccelerationStructureDescriptor, compact: Bool = false,
                       pending: inout UInt64) throws -> MTLAccelerationStructure {
-    if accelerationQueue == nil { accelerationQueue = device.makeCommandQueue() }
-    let sizes = device.accelerationStructureSizes(descriptor: descriptor)
-    guard let queue = accelerationQueue, UInt64(sizes.accelerationStructureSize) + pending + meshBytes <= meshBudget
-    else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
-    let structure = try Self.buildStructure(descriptor, device: device, queue: queue, compact: compact)
-    pending += UInt64(structure.allocatedSize)
-    return structure
+    try buildStructures([descriptor], compact: compact, pending: &pending)[0]
   }
   static func buildStructure(_ descriptor: MTLAccelerationStructureDescriptor, device: MTLDevice, queue: MTLCommandQueue,
                              compact: Bool) throws -> MTLAccelerationStructure {
-    let sizes = device.accelerationStructureSizes(descriptor: descriptor)
-    guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
-      let scratch = device.makeBuffer(length: max(16, sizes.buildScratchBufferSize), options: .storageModePrivate),
-      let compacted = device.makeBuffer(length: 8, options: .storageModeShared),
+    var commands = 0
+    return try buildStructures([descriptor], device: device, queue: queue, compact: compact, commands: &commands)[0]
+  }
+  // Scratch regions start at multiples of this. Metal states no scratch-offset alignment; 256
+  // bytes meets every buffer-offset alignment it does state and wastes < 256 bytes per build.
+  static let scratchAlignment = 256
+  // METALRT batched builds: one command buffer and one acceleration-structure encoder build every
+  // structure and write every compacted size; one wait; then one command buffer compacts those
+  // that shrink; one more wait. `commands` counts the committed command buffers.
+  //
+  // Scratch: Metal synchronizes an encoder's commands on the acceleration structures and the
+  // descriptors' resources (so a compacted-size query after its build is ordered), but documents
+  // no ordering of the scratch buffer between builds of one encoder, whose contents are
+  // "undefined after the build has started". Builds in one encoder may therefore run
+  // concurrently, so each build gets its own disjoint region of one shared scratch buffer
+  // (sum of the builds' buildScratchBufferSize, each rounded up to scratchAlignment) rather than
+  // one region sized for the largest build and reused.
+  static func buildStructures(_ descriptors: [MTLAccelerationStructureDescriptor], device: MTLDevice, queue: MTLCommandQueue,
+                              compact: Bool, commands: inout Int) throws -> [MTLAccelerationStructure] {
+    guard !descriptors.isEmpty else { return [] }
+    let sizes = descriptors.map { device.accelerationStructureSizes(descriptor: $0) }
+    var offsets: [Int] = [], scratchLength = 0
+    for size in sizes {
+      offsets.append(scratchLength)
+      let region = max(16, size.buildScratchBufferSize)
+      let (padded, overflow) = region.addingReportingOverflow(scratchAlignment - 1)
+      let (end, past) = scratchLength.addingReportingOverflow(padded / scratchAlignment * scratchAlignment)
+      guard !overflow, !past else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
+      scratchLength = end
+    }
+    // Everything is allocated before encoding; a failure releases what was allocated (ARC) and
+    // leaves no partial result.
+    var structures: [MTLAccelerationStructure] = []
+    for size in sizes {
+      guard let structure = device.makeAccelerationStructure(size: size.accelerationStructureSize)
+      else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
+      structures.append(structure)
+    }
+    guard let scratch = device.makeBuffer(length: scratchLength, options: .storageModePrivate),
+      let compacted = device.makeBuffer(length: 8 * descriptors.count, options: .storageModeShared),
       let command = queue.makeCommandBuffer(), let encoder = command.makeAccelerationStructureCommandEncoder()
     else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
-    encoder.build(accelerationStructure: structure, descriptor: descriptor, scratchBuffer: scratch, scratchBufferOffset: 0)
-    if compact { encoder.writeCompactedSize(accelerationStructure: structure, buffer: compacted, offset: 0, sizeDataType: .ulong) }
+    memset(compacted.contents(), 0, compacted.length)
+    for i in descriptors.indices {
+      encoder.build(accelerationStructure: structures[i], descriptor: descriptors[i], scratchBuffer: scratch,
+                    scratchBufferOffset: offsets[i])
+    }
+    if compact {
+      for i in descriptors.indices {
+        encoder.writeCompactedSize(accelerationStructure: structures[i], buffer: compacted, offset: 8 * i, sizeDataType: .ulong)
+      }
+    }
     encoder.endEncoding()
     command.commit()
+    commands += 1
     command.waitUntilCompleted()
     guard command.status == .completed else { throw Self.error("Could not build the mesh acceleration structure.") }
-    let size = compacted.contents().load(as: UInt64.self)
-    guard compact, size > 0, size < UInt64(sizes.accelerationStructureSize), let small = device.makeAccelerationStructure(size: Int(size)),
-      let copy = queue.makeCommandBuffer(), let copier = copy.makeAccelerationStructureCommandEncoder()
-    else { return structure }
-    copier.copyAndCompact(sourceAccelerationStructure: structure, destinationAccelerationStructure: small)
+    guard compact else { return structures }
+    // Compact only where it shrinks; a structure whose smaller copy cannot be allocated stays
+    // uncompacted, as do all of them if no command buffer is available.
+    var targets: [(Int, MTLAccelerationStructure)] = []
+    for i in descriptors.indices {
+      let size = compacted.contents().load(fromByteOffset: 8 * i, as: UInt64.self)
+      if size > 0, size < UInt64(sizes[i].accelerationStructureSize), let small = device.makeAccelerationStructure(size: Int(size)) {
+        targets.append((i, small))
+      }
+    }
+    guard !targets.isEmpty, let copy = queue.makeCommandBuffer(), let copier = copy.makeAccelerationStructureCommandEncoder()
+    else { return structures }
+    for (i, small) in targets { copier.copyAndCompact(sourceAccelerationStructure: structures[i], destinationAccelerationStructure: small) }
     copier.endEncoding()
     copy.commit()
+    commands += 1
     copy.waitUntilCompleted()
     guard copy.status == .completed else { throw Self.error("Could not compact the mesh acceleration structure.") }
-    return small
+    var result = structures
+    for (i, small) in targets { result[i] = small }
+    return result
+  }
+  // METALRT refit: `source` (built with usage .refit) refitted into a new structure for the
+  // instance transforms in `descriptor`, which must describe the same instance count and
+  // instanced structures. Never in place: the published instance structure may be read by
+  // frames still in flight on the render queue (bind() keeps it resident until they finish),
+  // and this queue does not order against that one, so the refit only reads it and writes a
+  // fresh destination that publishing then swaps in, exactly like a rebuild.
+  func refitStructure(_ source: MTLAccelerationStructure, descriptor: MTLAccelerationStructureDescriptor,
+                      pending: inout UInt64) throws -> MTLAccelerationStructure {
+    if accelerationQueue == nil { accelerationQueue = device.makeCommandQueue() }
+    let sizes = device.accelerationStructureSizes(descriptor: descriptor)
+    // The destination must be at least as large as the (uncompacted) source.
+    let size = max(source.size, sizes.accelerationStructureSize)
+    guard let queue = accelerationQueue, UInt64(size) + pending + meshBytes <= meshBudget
+    else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
+    var scratch: MTLBuffer?
+    if sizes.refitScratchBufferSize > 0 {
+      guard let buffer = device.makeBuffer(length: sizes.refitScratchBufferSize, options: .storageModePrivate)
+      else { throw Self.error("Could not allocate the mesh acceleration structure.") }
+      scratch = buffer
+    }
+    guard let destination = device.makeAccelerationStructure(size: size),
+      let command = queue.makeCommandBuffer(), let encoder = command.makeAccelerationStructureCommandEncoder()
+    else { throw Self.error("Could not allocate the mesh acceleration structure.") }
+    encoder.refit(sourceAccelerationStructure: source, descriptor: descriptor, destinationAccelerationStructure: destination,
+                  scratchBuffer: scratch, scratchBufferOffset: 0)
+    encoder.endEncoding()
+    command.commit()
+    accelerationCommandCount += 1
+    command.waitUntilCompleted()
+    guard command.status == .completed else { throw Self.error("Could not refit the mesh acceleration structure.") }
+    pending += UInt64(destination.allocatedSize)
+    return destination
   }
 
   // METALRT gate at run time. Apple does not document the intersector's watertightness, and
@@ -847,13 +951,15 @@ extension MaterialLibrary {
     guard let largest = missing.map({ layout.assets[$0].count }).max() else { return }
     guard let indexBuffer = MaterialLibrary.unweldedIndices(device, count: largest)
     else { throw Self.error("Could not allocate the mesh acceleration structure.") }
-    for i in missing {
-      let descriptor = MaterialLibrary.primitiveDescriptor(
+    let descriptors = missing.map { i in
+      MaterialLibrary.primitiveDescriptor(
         vertices: triangleBuffer, offset: layout.assets[i].triangleBase * MeshSceneLayout.triangleStride,
         count: layout.assets[i].count, indices: indexBuffer)
-      layout.assets[i].structure = try buildStructure(descriptor, compact: true, pending: &pending)
-      assetBuildCount += 1
     }
+    // One batch for every missing asset; the layout changes only once all of them are built.
+    let structures = try buildStructures(descriptors, compact: true, pending: &pending)
+    for (i, structure) in zip(missing, structures) { layout.assets[i].structure = structure }
+    assetBuildCount += missing.count
   }
   // Triangle k of a MeshTriangle array indexes vertices 8k, 8k + 1 and 8k + 2 (its a, b, c).
   static func unweldedIndices(_ device: MTLDevice, count: Int) -> MTLBuffer? {
@@ -879,16 +985,28 @@ extension MaterialLibrary {
     descriptor.geometryDescriptors = [geometry]
     return descriptor
   }
+  // Consecutive refits before the instance structure is rebuilt: refitting keeps the build's
+  // hierarchy and only grows its boxes, so trace quality drifts with repeated large moves.
+  static let sceneRefitLimit = 32
   // The instance acceleration structure: instance k of `layout.instances` is instance_id k.
-  func buildSceneStructure(_ layout: MeshSceneLayout, pending: inout UInt64) throws -> MTLAccelerationStructure? {
-    guard !layout.instances.isEmpty else { return nil }
+  // A transform-only edit of `previous` (same instance count, instanced structures and
+  // per-instance indices) refits its structure into a new one; any other change rebuilds.
+  // Built with usage .refit (so it can be refitted later) but not .preferFastBuild: transform
+  // edits, the frequent case, now refit, so full builds follow only structural edits, and every
+  // ray traverses this structure.
+  func buildSceneStructure(_ layout: inout MeshSceneLayout, previous: MeshSceneLayout?, pending: inout UInt64) throws {
+    layout.scene = nil
+    layout.sceneReferences = []
+    layout.sceneIndices = []
+    layout.sceneRefits = 0
+    guard !layout.instances.isEmpty else { return }
     var compact: [Int: Int] = [:], structures: [MTLAccelerationStructure] = []
     for (i, asset) in layout.assets.enumerated() {
       guard let structure = asset.structure else { continue }
       compact[i] = structures.count
       structures.append(structure)
     }
-    var descriptors: [MTLAccelerationStructureInstanceDescriptor] = []
+    var descriptors: [MTLAccelerationStructureInstanceDescriptor] = [], indices: [UInt32] = []
     for instance in layout.instances {
       guard let index = compact[instance.asset] else { throw Self.error("A mesh asset has no acceleration structure.") }
       let m = instance.world
@@ -900,14 +1018,29 @@ extension MaterialLibrary {
       d.intersectionFunctionTableOffset = 0
       d.accelerationStructureIndex = UInt32(index)
       descriptors.append(d)
+      indices.append(UInt32(index))
     }
+    // A new instance-descriptor buffer every time, also for a refit: published buffers are never
+    // written by the CPU (ReusableResources), and a candidate library prepared off the main
+    // thread may hold the same layout. Builds read it only while they run.
     guard let buffer = descriptors.withUnsafeBytes({ device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) })
     else { throw Self.error("Could not allocate the mesh acceleration structure.") }
     let descriptor = MTLInstanceAccelerationStructureDescriptor()
+    descriptor.usage = .refit
     descriptor.instancedAccelerationStructures = structures
     descriptor.instanceCount = descriptors.count
     descriptor.instanceDescriptorBuffer = buffer
-    return try buildStructure(descriptor, pending: &pending)
+    if let previous, let source = previous.scene, previous.sceneRefits < Self.sceneRefitLimit, previous.sceneIndices == indices,
+      previous.sceneReferences.count == structures.count, zip(previous.sceneReferences, structures).allSatisfy({ $0 === $1 })
+    {
+      layout.scene = try refitStructure(source, descriptor: descriptor, pending: &pending)
+      layout.sceneRefits = previous.sceneRefits + 1
+      sceneRefitCount += 1
+    } else {
+      layout.scene = try buildStructure(descriptor, pending: &pending)
+    }
+    layout.sceneReferences = structures
+    layout.sceneIndices = indices
   }
 
   // Builds the TLAS and instance table of `layout` and publishes it with `triangleBuffer`.
@@ -915,9 +1048,17 @@ extension MaterialLibrary {
                     keepScene: Bool = false) throws {
     var layout = layout, pending = pending
     // Hardware traversal: a new instance structure for every instance change (the per-asset
-    // structures are kept), so transform edits cost one small build; binding edits keep it.
+    // structures are kept); transform-only edits refit the published one into it, other
+    // instance changes rebuild it, and binding edits keep it.
     if !(keepScene && layout.scene != nil) {
-      layout.scene = hardwareTraversal ? try buildSceneStructure(layout, pending: &pending) : nil
+      if hardwareTraversal {
+        try buildSceneStructure(&layout, previous: meshLayout, pending: &pending)
+      } else {
+        layout.scene = nil
+        layout.sceneReferences = []
+        layout.sceneIndices = []
+        layout.sceneRefits = 0
+      }
     }
     let blob = layout.sceneBlob(accelerator: layout.scene?.gpuResourceID)
     let header = blob.withUnsafeBytes { $0.load(as: MeshSceneHeader.self) }

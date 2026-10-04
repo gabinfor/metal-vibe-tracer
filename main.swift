@@ -7053,6 +7053,9 @@ final class MaterialLibrary {
     var meshLayout: MeshSceneLayout?
     // Asset hierarchies built and top levels built (edit-path accounting).
     var assetBuildCount = 0, sceneBuildCount = 0
+    // Hardware traversal: instance structures refitted instead of rebuilt, and command buffers
+    // committed for acceleration-structure work (batched builds, compactions, refits).
+    var sceneRefitCount = 0, accelerationCommandCount = 0
     // Builds hardware acceleration structures (created on first use).
     var accelerationQueue: MTLCommandQueue?
     static var defaultAcceleration: MeshAcceleration {
