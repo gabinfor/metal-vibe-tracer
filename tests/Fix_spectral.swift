@@ -482,7 +482,10 @@
   let plain = render(glass, samples: 1024)
   let all = Array(0..<plain.count)
   r.materials.spectralOverrides = [5: SIMD4(1e-6, 0, 0.5, 1.4)]
+  // The earlier termination everywhere (tests/Fix_spectral-mis.swift checks splitting and spectral MIS).
+  r.dispersionSampling = .hero
   let hero = render(glass, samples: 1024)
+  r.dispersionSampling = PathTracerRenderer.defaultDispersionSampling
   let sphere = lastNormals.indices.filter { Int(lastNormals[$0].w) == 2 }
   let dHero = difference(hero, plain, all, width: 48), refGlass = channels(plain, all)
   let dSphere = difference(hero, plain, sphere, width: 48)
