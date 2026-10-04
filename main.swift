@@ -2551,6 +2551,25 @@ bool light_visible(float3 p, float3 n, LightSample ls, uint sceneIndex, constant
     return !scene_occluded(shadow, sceneIndex, d - endpointTolerance, materialImages, u);
 }
 
+#if VIBE_SPECTRAL
+// OPENPBR "Thin film" on an ideal mirror (the delta conductor of sample_bsdf, which the upstream BSDF
+// does not cover): the upstream Airy reflectance of film over metal (openpbr_thin_film_and_base_
+// reflectance, with the metal's F0 and a white F82 tint, as prepare_openpbr_lanes passes them) at each
+// lane's wavelength, blended with the film-free Fresnel by thin_film_weight and the upstream presence
+// ramp, as openpbr_reflection_coefficient blends them for rough lobes.
+Spectrum spectral_thin_film_mirror(Material mat, Spectrum standard, Spectrum f0, float cosI, thread const Wavelengths &wl) {
+    SpectralMaterial sm = spectral_material(mat, wl);
+    float thickness = sm.thinFilmThickness * 1000.0f;
+    float presence = sm.thinFilmWeight * openpbr_thin_film_presence_multiplier(thickness);
+    if (!(presence > 0.0f)) return standard;
+    float4 lambda = spectral_lambdas(wl);
+    OpenPBR_ThinFilmResults a = openpbr_thin_film_and_base_reflectance(cosI, 1.0f, sm.thinFilmIOR, float3(1.5f), false,
+        f0.xyz, float3(1.0f), false, true, thickness, lambda.xyz);
+    OpenPBR_ThinFilmResults b = openpbr_thin_film_and_base_reflectance(cosI, 1.0f, sm.thinFilmIOR, float3(1.5f), false,
+        float3(f0.w), float3(1.0f), false, true, thickness, float3(lambda.w));
+    return mix(standard, Spectrum(a.reflectance_metal, b.reflectance_metal.x), presence);
+}
+#endif
 bool is_delta(Material mat) {
     return mat.type == DIELECTRIC || (mat.type == GLOSSY && mat.roughness < 0.02f);
 }
@@ -2603,6 +2622,9 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
         // Conductor Fresnel (Schlick) per wavelength, with F0 the reflectance spectrum.
         Spectrum f0 = spectral_albedo(mat, mat.albedo, wl);
         weight = f0 + (1.0f - f0) * pow(1.0f - cosI, 5.0f);
+#if VIBE_SPECTRAL
+        weight = spectral_thin_film_mirror(mat, weight, f0, cosI, wl);
+#endif
         return dot(direction, geometric) > 0.0f;
     }
     if (mat.type == DIFFUSE) {
