@@ -551,6 +551,88 @@
     }
     print("PASS: fix-accel \(mode) edit paths: transforms, visibility and bindings keep asset hierarchies; geometry edits rebuild only edited assets")
 
+    // 6b. METALRT build paths (hardware only): missing asset structures build in one batch (one
+    // build pass and at most one compaction pass), checked against the budget as a whole before
+    // anything is allocated; transform-only edits refit the instance structure into a new one,
+    // with the same hits as a rebuild; structural edits and the refit limit rebuild it.
+    if mode == .hardware {
+      let assets = [patch(10).triangles, patch(14).triangles, patch(18).triangles]
+      var graph = SceneGraph()
+      let material = try graph.addMaterial("A")
+      for (k, triangles) in assets.enumerated() {
+        let asset = MeshAsset(name: "asset \(k)", triangles: triangles, subsets: ["S"])
+        graph.assets.append(asset)
+        graph.nodes.append(SceneNode(name: "n\(k)", mesh: asset.id,
+          transform: ObjectSettings(positionScale: SIMD4(Float(3 * k), 0, 0, 1)), bindings: [material.id]))
+      }
+      try graph.validate()
+      // Uncompacted sizes of the batch, from an identical publish on another library.
+      let sizing = try library(mode)
+      try sizing.setMesh(graph)
+      let indices = MaterialLibrary.unweldedIndices(gpu, count: assets.map(\.count).max()!)!
+      let uncompacted = sizing.meshLayout!.assets.map { a in
+        UInt64(gpu.accelerationStructureSizes(descriptor: MaterialLibrary.primitiveDescriptor(
+          vertices: sizing.triangleBuffer, offset: a.triangleBase * MeshSceneLayout.triangleStride, count: a.count,
+          indices: indices)).accelerationStructureSize)
+      }
+      let l = try library(mode)
+      let priorLayout = l.meshLayout, priorBuffer = l.triangleBuffer, priorCommands = l.accelerationCommandCount
+      // Every asset fits alone, but not the batch beside the new triangle buffer.
+      l.meshBudgetOverride = l.meshBytes + UInt64(sizing.triangleBuffer.length) + uncompacted.reduce(0, +) - 1
+      var refused = false
+      do { try l.setMesh(graph) } catch { refused = true }
+      require(refused && uncompacted.count == 3 && uncompacted.max()! < uncompacted.reduce(0, +)
+        && l.triangleBuffer === priorBuffer && l.accelerationCommandCount == priorCommands
+        && l.meshLayout?.scene === priorLayout?.scene && l.meshLayout?.assets.count == priorLayout?.assets.count,
+        "a batch over the mesh budget fails before any GPU work and publishes nothing")
+      l.meshBudgetOverride = nil
+      try l.setMesh(graph); l.hasSceneGraph = true
+      let built = l.meshLayout!.assets.compactMap(\.structure)
+      let batchCommands = l.accelerationCommandCount - priorCommands
+      func probe(_ x: Float) throws -> Hit { try trace(l, [SIMD4(x, 3, 0.1, 10), SIMD4(0, -1, 0, 0)])[0] }
+      let objects = try (0..<3).map { try probe(Float(3 * $0)).object }
+      print("\(mode) batched asset build: \(built.count) structures in \(batchCommands) command buffers (instance structure included)")
+      require(Set(built.map { ObjectIdentifier($0) }).count == 3 && batchCommands <= 3 && l.sceneRefitCount == 0
+        && l.meshLayout?.sceneRefits == 0 && objects == [64, 65, 66], "three missing asset structures build in one batch")
+      // A transform-only edit refits into a new structure and traces like a fresh build.
+      let buffer = l.triangleBuffer!, scene = l.meshLayout?.scene, builds = l.assetBuildCount
+      var moved = graph
+      moved.nodes[1].transform.positionScale.x = 3.4
+      moved.nodes[2].transform.positionScale.z = 0.3
+      let commands = l.accelerationCommandCount
+      try l.setMesh(moved)
+      require(l.sceneRefitCount == 1 && l.meshLayout?.sceneRefits == 1 && l.meshLayout?.scene != nil
+        && l.meshLayout?.scene !== scene && l.triangleBuffer === buffer && l.assetBuildCount == builds
+        && l.accelerationCommandCount == commands + 1, "a transform-only edit refits the instance structure into a new one")
+      let fresh = try library(mode)
+      try fresh.setMesh(moved); fresh.hasSceneGraph = true
+      var rays: [SIMD4<Float>] = []
+      for i in 0..<48 { for j in 0..<6 {
+        rays += [SIMD4(Float(i) * 0.2 - 1.5, 3, Float(j) * 0.35 - 0.9, 10), SIMD4(simd_normalize(SIMD3<Float>(0.05, -1, 0.02)), 0)]
+      } }
+      let refitted = try trace(l, rays), rebuilt = try trace(fresh, rays)
+      let agree = zip(refitted, rebuilt).allSatisfy { a, b in
+        a.object == b.object && a.triangle == b.triangle && abs(a.t - b.t) <= 1e-6 * max(1, abs(b.t))
+      }
+      require(fresh.sceneRefitCount == 0 && refitted.filter { $0.object >= 64 }.count > 100 && agree,
+        "a refitted instance structure gives the hits of a rebuilt one")
+      // A structural edit (an instance hidden) rebuilds.
+      var hidden = moved
+      hidden.nodes[2].transform.rotationHidden.w = 1
+      try l.setMesh(hidden)
+      require(l.sceneRefitCount == 1 && l.meshLayout?.sceneRefits == 0 && l.meshLayout?.instances.count == 2,
+        "an instance-count change rebuilds the instance structure")
+      // The refit limit forces a rebuild.
+      var walk = hidden, chain: [Int] = []
+      for step in 1...(MaterialLibrary.sceneRefitLimit + 1) {
+        walk.nodes[0].transform.positionScale.z = Float(step) * 0.01
+        try l.setMesh(walk)
+        chain.append(l.meshLayout?.sceneRefits ?? -1)
+      }
+      require(chain == Array(1...MaterialLibrary.sceneRefitLimit) + [0], "refits chain up to the limit, then rebuild")
+      print("PASS: fix-accel \(mode) batched asset builds, budget rollback, instance refits and refit/rebuild selection")
+    }
+
   }
   try gate(.twoLevel)
   if gpu.supportsRaytracing { try gate(.hardware) }
