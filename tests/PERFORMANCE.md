@@ -1,3 +1,38 @@
+# Dispersion sampling — October 4, 2026
+
+`DispersionSampling` (`REFERENCES.md` "October 4 dispersion sampling", `HERO2014`, `CMIS2020`; [docs/SPECTRAL_DESIGN.md](../docs/SPECTRAL_DESIGN.md) §13) against the earlier hero-wavelength termination. Setup: Apple M4, spectral transport, Cornell glass & mirror (scene 3) with the glass sphere (slot 5) as smooth legacy dielectric or rough OpenPBR glass (IOR 1.52), OpenPBR dispersion 1 (Abbe 20) or 0.5 (Abbe 40), and a prism (imported mesh, scene 6). 240×180, MIS strategy, 64 frames with the Z++ sampler, against a 2,048-frame reference rendered with PCG (independent numbers) by spectral MIS with splitting. Linear MSE over the image (and over the glass and mirror pixels). Scratch drivers through the production `renderFrame` path; the shaders measured equal the committed ones except the spectral MIS overlap gate, which the sweep varied (the committed gate, 0.25, disables spectral MIS exactly where the sweep found no gain: the roughness 0.03–0.05 rows).
+
+## Equal sample count (MSE relative to the hero termination)
+
+| Glass | Spectral MIS | Splitting | Both |
+| --- | ---: | ---: | ---: |
+| Smooth, Abbe 20 | 1.000 | 0.966 (glass 0.76) | 0.966 |
+| Smooth, Abbe 40 | 1.000 | 0.970 (glass 0.79) | 0.970 |
+| Rough 0.05, Abbe 20 | 0.859 (glass 0.63) | 1.000 | 0.859 |
+| Rough 0.05, Abbe 40 | 0.796 (glass 0.61) | 1.000 | 0.796 |
+| Rough 0.1, Abbe 20 | 0.707 (glass 0.58) | 1.000 | 0.707 |
+| Rough 0.1, Abbe 40 | 0.635 (glass 0.42) | 1.000 | 0.635 |
+| Rough 0.2, Abbe 20 | 0.583 (glass 0.41) | 1.000 | 0.583 |
+| Rough 0.2, Abbe 40 | 0.539 (glass 0.39) | 1.000 | 0.539 |
+| Rough 0.4, Abbe 20 | 0.514 (glass 0.30) | 1.000 | 0.514 |
+| Rough 0.4, Abbe 40 | 0.509 (glass 0.29) | 1.000 | 0.509 |
+| Prism, roughness 0.15 | 0.430 (glass 0.44) | 1.000 | 0.430 |
+| Prism, roughness 0.03 | 0.999 | 1.000 | 0.999 |
+
+With the PCG sampler, splitting lowered the smooth Abbe 20 image error by 15% (glass pixels 66%); bounded splitting (one lane continued past the next scattering vertex) by 10%. Comparison strips (equal samples: hero, spectral MIS, gated variants, splitting, both, then the reference) were written to `build/checks/spectral-mis/` (scratch, not committed): spectral MIS visibly removes most of the coloured speckle on rough spheres and the prism while keeping their fringes; on smooth glass splitting mainly cleans the sphere itself.
+
+## Mean radiance (bias)
+
+Every mode's 64-frame mean agreed with the reference within about 2 tile-clustered standard errors per channel (±0.4–0.8%), and the hero-termination reference (1,024 frames, PCG) agreed with the spectral MIS + splitting reference within 0.13% (≤ 2.2 SE) in every configuration.
+
+## Frame time and equal time — pending
+
+Interleaved timing runs on the shared GPU were too noisy to rank the modes (per-round medians varied by up to 2× while other jobs ran), and the paired-ratio runs were stopped before completion. Pending GPU validation: frame-time cost of spectral MIS at rough dispersive vertices (four lobe preparations per vertex) and of splitting (up to four camera continuations), and equal-time MSE. Scenes without dispersion run the earlier code path (every mode renders identically, `tests/Fix_spectral-mis.swift`).
+
+## Default
+
+`DispersionSampling.automatic` resolves to spectral MIS: its equal-sample gain (29–57% lower error at roughness ≥ 0.1) is far above any plausible cost of four lobe evaluations at the few dispersive vertices, and the overlap gate keeps it off where it measured no gain. Splitting stays opt-in until its equal-time figure is measured. `VIBE_DISPERSION=hero|mis|split|mis-split` selects a mode in `-D VIBE_TESTING` builds.
+
 # Spectral transport cost — October 3, 2026
 
 Cost reductions of spectral light transport and the switch of **Light transport → Automatic** to spectral (`REFERENCES.md` "October 3 spectral transport cost", `SMITS1999`; [docs/SPECTRAL_DESIGN.md](../docs/SPECTRAL_DESIGN.md) §12). Setup as in the section below: Apple M4 (10-core GPU, 16 GB), macOS 27.0, scratch drivers through the production `renderFrame` path, 640×480, depth 16, Z++ sampler, medians of frames 5–12 over interleaved rounds. Each step was measured A/B: both shader versions compiled into one process under the same host code and interleaved with RGB, so that the ratio of one run is robust to other GPU work on the machine. The unedited figures are in [`PERFORMANCE-spectral-cost-raw.txt`](PERFORMANCE-spectral-cost-raw.txt).

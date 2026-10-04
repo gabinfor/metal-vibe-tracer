@@ -536,3 +536,53 @@ visible change. The grey-world offset of §11 (up to 0.3% per channel at 512 fra
 sampler's correlated wavelength numbers, not bias: with PCG it is within 0.03%, and with Z++ it falls
 to 0.04% at 2,048 frames; single frames show an image-wide chroma shift of 0.12% RMS (no flicker).
 
+
+## 13. Dispersion sampling (2026-10-04)
+
+§11 kept one lane from a path's first dispersive vertex on, delta or rough, so dispersive glass was
+much grainier than the rest of a spectral image. `DispersionSampling` now chooses per interface type
+(`REFERENCES.md` "October 4 dispersion sampling", `HERO2014`, `CMIS2020`; measurements in
+`tests/PERFORMANCE.md`, "Dispersion sampling"; tests in `tests/Fix_spectral-mis.swift`):
+
+- **Rough dispersive lobes (OpenPBR transmission, never delta): spectral MIS, the default.** The
+  hero lane samples the direction from its own lobe; all four lanes evaluate value and PDF there;
+  the path carries R_k = Π p_k / p_hero over its dispersive vertices and each lane is weighted by the
+  balance heuristic over the four hero techniques (`spectral_mis_sample`, `spectral_mis_eval`).
+  NEE/BSDF MIS keeps the power heuristic with the hero's PDF inside each hero technique. It applies
+  where the lanes' lobes overlap, α ≥ 0.25 (n_d − 1)/V_d: at roughness 0.03–0.05 the lobes are a
+  fraction of the index spread apart and the weights approach the termination's (measured 0–20% less
+  error), at 0.1–0.4 it lowered the error by 29–49% (glass pixels 42–71%) at equal samples.
+- **Delta dispersive interfaces (the legacy dielectric): lane splitting, opt-in.** No direction is
+  shared, so MIS cannot help (`CMIS2020` Sec. 5.2). The shading pass traces the camera's continuation
+  once per lane from the first delta dispersive vertex before any scattering (bounded: four
+  continuations at most), each lane with weight one (`spectral_split`). Measured 3% less image error
+  (24% on the glass pixels) with Z++ and 15% (66% on glass) with PCG at equal samples, for one to
+  four extra camera continuations per pixel; equal-time runs were inconclusive on the shared GPU, so
+  it stays opt-in (`VIBE_DISPERSION=split|mis-split`).
+- **ReSTIR PT and GI keep the hero termination.** Their paths, shifts, replay and reconnection
+  Jacobians are unchanged; a shifted path's integrand stays one function of the path and its
+  wavelength numbers.
+
+**Thin film on ideal mirrors** now colours the reflection (`spectral_thin_film_mirror`): the delta
+conductor had used plain Schlick Fresnel and ignored `thin_film_*`.
+
+**Evaluated and rejected:**
+
+- *Bounded splitting* (split at the delta vertex, continue only the original hero lane, times four,
+  after the next scattering vertex): 10% lower equal-sample error than the hero termination on the
+  smooth spheres, against 15% for full splitting at about the same cost; removed.
+- *Per-vertex lane mixture* (re-choosing the sampling lane at every rough dispersive vertex and
+  dividing by the four lanes' average PDF there, which keeps the PDF scalar): unbiased, but at
+  roughness 0.05 the error rose 2.4× against the termination (lanes whose lobes miss the sampled
+  direction are divided by a quarter of the PDF); the path-level balance heuristic above replaced it.
+- *Dispersive MetalFX guides* (each colour channel's guide following that channel's refraction
+  through dispersive glass): the denoised glass error changed by under 0.5% at 4 and 16 frames.
+- *Wavelength reuse through ReSTIR* (letting reservoirs gather other pixels' wavelength sets at a
+  dispersive vertex): the design already carries each sample's wavelengths (§5), so reuse already
+  mixes wavelength sets across pixels; a wavelength-domain shift at a delta vertex has a direction
+  that differs per wavelength and needs a new shift and Jacobian, with no prior work found. Not done.
+- *A learned spectral denoiser* (Noizet et al. 2026): needs per-bin radiance and a trained network
+  that MetalFX and OIDN do not provide.
+
+Pending GPU validation: equal-time ratios and the frame-time cost of spectral MIS and splitting
+(the timing runs were stopped before completing), and confirmation of every test above on the GPU.
