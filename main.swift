@@ -116,9 +116,9 @@ void sampler_candidate(thread uint &, uint, uint, uint, uint) {}
 // Owen-scrambled low-discrepancy constituents indexed along a recursively shuffled Morton
 // (Z) curve of the image, so that the Monte Carlo error of neighbouring pixels complements
 // (blue-noise-like "Z noise") while every pixel's samples over successive frames form
-// consecutive blocks of the sequence (Z++ temporal Z sampling). One 32-bit key per pixel
-// and frame identifies all of its samples: dimension d's sequence index is a per-dimension
-// base-4 digit shuffle of the key, so ReSTIR PT's random replay stores the key as its seed.
+// scrambled nets of its own sequence (Z++ temporal Z sampling, with the key layout of Sampler).
+// One 32-bit key per pixel and frame identifies all of its samples, so ReSTIR PT's random
+// replay stores the key as its seed.
 // 1D constituents are van der Corput points, 2D ones the first two Sobol' dimensions and 3D
 // ones the O2m3 sequence of ZPP2026 Sec. 4.3 (Fig. 15), which is a (0, 2m, 3)-net over
 // every aligned block of 4^m points, with (0, 2m, 2)-net pairwise projections.
@@ -211,35 +211,64 @@ struct Sampler {
     uint subBits;
     bool z;
 };
-// Sequence index of `dimension`: a nested binary scramble of the key (Owen scrambling of the key
-// read as a fraction, so each bit flips depending only on the bits above it). Like z_shuffle it
-// maps aligned blocks onto aligned blocks, so per-frame masks and per-pixel nets survive, and
-// independent scrambles decorrelate the dimensions (padding). The key's pixel part is already
-// quadrant-shuffled (z_pixel_key), which randomizes each node's pairing of its four children.
+// Z key layout (z_pixel_key): bits 14-31 hold the pixel code Q, the pixel's shuffled Morton index
+// XOR the accumulation's temporal index (unique within 512 x 512 pixels), and bits 0-13 the frame J
+// of the accumulation. A pixel's draw at frame J is its frame-0 Z-mask point (a Z mask over the
+// image, indexed by Q) digitally shifted by point J of its own sequence (z_frame_offset), so each
+// pixel accumulates a shifted, scrambled net while its neighbours accumulate different ones.
+#define Z_FRAME_BITS 14u
+uint z_pixel_code(uint key) { return key >> Z_FRAME_BITS; }
+uint z_frame(thread const Sampler &s) { return ((s.key & ((1u << Z_FRAME_BITS) - 1u)) << s.subBits) | s.sub; }
+// Frame-0 sequence index of `dimension`: a nested binary scramble of Q (Owen scrambling of Q read
+// as a fraction, so each bit flips depending only on the bits above it). Like z_shuffle it maps
+// aligned blocks of pixels onto aligned blocks of indices, so each frame-0 mask holds nets, and
+// independent scrambles decorrelate the dimensions (padding).
 uint z_index(thread const Sampler &s, uint dimension) {
-    return z_owen((s.key << s.subBits) | s.sub, z_owen_seed(dimension, 3u));
+    return z_owen(z_pixel_code(s.key), z_owen_seed(dimension, 3u));
 }
-// A dimension's scrambles also depend on the key's top 8 bits, which a still accumulation keeps
-// (the ReShuffle-like model draws them from a hash of its start): each accumulation is then one of
-// 256 independent Owen randomizations, while all pixels and frames of it share one (masks and nets).
-uint z_dimension(thread Sampler &s) { return s.dimension++ | ((s.key >> 24) << 17); }
+// A dimension's scrambles also depend on Q's top 6 bits, which change with the accumulation's
+// temporal index: each 64 x 64-pixel region of an accumulation is one of 64 Owen randomizations.
+uint z_dimension(thread Sampler &s) { return s.dimension++ | ((z_pixel_code(s.key) >> 12) << 17); }
+// Sequence index of frame J (J > 0) in `dimension`: a nested uniform shuffle of J that fixes 0 and
+// maps every aligned block [0, 2^k) onto itself, independent per dimension (padding over frames).
+uint z_frame_index(uint J, uint dimension) {
+    uint seed = z_owen_seed(dimension, 4u);
+    return z_owen(J, seed) ^ z_owen(0u, seed);
+}
+// A coordinate of the pixel's own sequence: a nested scramble per pixel and dimension that fixes 0
+// and keeps the top two bits, so siblings of a 2 x 2 block stay stratified in every frame.
+uint z_frame_offset(thread const Sampler &s, uint v, uint d, uint axis) {
+    uint seed = z_owen_seed(d, axis) ^ z_mix(z_pixel_code(s.key) ^ 0x68e31da4u);
+    return ((z_owen(v, seed) ^ z_owen(0u, seed)) & 0x3FFFFFFFu) | (v & 0xC0000000u);
+}
 float rand_f(thread Sampler &s) {
     if (!s.z) return rand_f(s.state);
-    uint d = z_dimension(s);
-    return z_float(z_owen(reverse_bits(z_index(s, d)), z_owen_seed(d, 0u)));
+    uint d = z_dimension(s), J = z_frame(s);
+    uint x = z_owen(reverse_bits(z_index(s, d)), z_owen_seed(d, 0u));
+    if (J != 0u) x ^= z_frame_offset(s, reverse_bits(z_frame_index(J, d)), d, 0u);
+    return z_float(x);
 }
 float2 rand_f2(thread Sampler &s) {
     if (!s.z) return rand_f2(s.state);
-    uint d = z_dimension(s), i = z_index(s, d);
-    return float2(z_float(z_owen(reverse_bits(i), z_owen_seed(d, 0u))),
-                  z_float(z_owen(z_sobol1(i), z_owen_seed(d, 1u))));
+    uint d = z_dimension(s), i = z_index(s, d), J = z_frame(s);
+    uint2 x = uint2(z_owen(reverse_bits(i), z_owen_seed(d, 0u)), z_owen(z_sobol1(i), z_owen_seed(d, 1u)));
+    if (J != 0u) {
+        uint k = z_frame_index(J, d);
+        x ^= uint2(z_frame_offset(s, reverse_bits(k), d, 0u), z_frame_offset(s, z_sobol1(k), d, 1u));
+    }
+    return float2(z_float(x.x), z_float(x.y));
 }
 float3 rand_f3(thread Sampler &s) {
     if (!s.z) return rand_f3(s.state);
-    uint d = z_dimension(s), V = reverse_bits(z_index(s, d));
-    return float3(z_float(z_owen(z_o2m3_x(V), z_owen_seed(d, 0u))),
-                  z_float(z_owen(z_o2m3_y(V), z_owen_seed(d, 1u))),
-                  z_float(z_owen(z_o2m3_z(V), z_owen_seed(d, 2u))));
+    uint d = z_dimension(s), V = reverse_bits(z_index(s, d)), J = z_frame(s);
+    uint3 x = uint3(z_owen(z_o2m3_x(V), z_owen_seed(d, 0u)), z_owen(z_o2m3_y(V), z_owen_seed(d, 1u)),
+                    z_owen(z_o2m3_z(V), z_owen_seed(d, 2u)));
+    if (J != 0u) {
+        uint W = reverse_bits(z_frame_index(J, d));
+        x ^= uint3(z_frame_offset(s, z_o2m3_x(W), d, 0u), z_frame_offset(s, z_o2m3_y(W), d, 1u),
+                   z_frame_offset(s, z_o2m3_z(W), d, 2u));
+    }
+    return float3(z_float(x.x), z_float(x.y), z_float(x.z));
 }
 float rand_decision(thread Sampler &s) { return rand_f(s.state); }
 // Whether draws are Z constituents, which callers may join into one rand_f3 where the PCG
@@ -383,22 +412,24 @@ bool restir_pt_control_variates(constant Uniforms &u) { return restir_pt_active(
 bool sampler_z(constant Uniforms &u) { return (u.indirectReuse & 64u) != 0u; }
 uint sampler_z_temporal(constant Uniforms &u) { return (u.indirectReuse >> 7) & 3u; }
 
-// Z++ key of a pixel for this frame: the recursively shuffled Morton index (Ahmed and Wonka's
-// pixel ordering) XOR a temporal index t (ZPP2026 Eq. 3). A progressive accumulation that
-// started at sample s0 is at frame j = frameIndex - 1, and t = T(s0) XOR j: over its first
-// 2^n frames a pixel's keys are then one aligned block of 2^n keys, so every dimension gives
-// it a complete (0, n)-net, and each frame is a Z mask. While the camera moves every frame
-// starts an accumulation, and T sets how successive frames relate: the identity (per-pixel
-// model), the TZ interlacing of Eq. 5, or a hash (a fresh block, as ReShuffle decorrelates).
-// STZ also applies Eq. 6 to the pixel index. Unlike the paper, the XOR precedes the
-// per-dimension shuffle (z_index), so one key serves all dimensions; see REFERENCES.md.
+// Z++ key of a pixel for this frame (layout: Sampler): the recursively shuffled Morton index (Ahmed
+// and Wonka's pixel ordering) XOR a temporal index t (ZPP2026 Eq. 3) as the pixel code, and the frame
+// j of the accumulation in the low 14 bits. While the camera moves every frame starts an
+// accumulation (j = 0, so the frame is a Z mask), and T sets how successive starts relate: the
+// identity (per-pixel model), the TZ interlacing of Eq. 5, or a hash (a fresh block, as ReShuffle
+// decorrelates); STZ also applies Eq. 6 to the pixel index. A still accumulation keeps t and steps
+// j through each pixel's own sequence (rand_f), so every pixel accumulates its own nets. XOR-ing j
+// into the pixel code instead (Eq. 3) gave every pixel of an aligned 2^k block the same sample sets
+// over 4^k frames: square tiles in still renders; see REFERENCES.md ZPP2026.
 uint z_pixel_key(uint2 gid, constant Uniforms &u) {
     uint model = sampler_z_temporal(u);
     uint j = max(u.frameIndex, 1u) - 1u, s0 = u.sampleIndex - j;
     uint t = model == 1u || model == 2u ? s0 ^ ((s0 & 0xAAAAAAAAu) << 1) : model == 3u ? z_mix(s0 ^ 0x2c1b3c6du) : s0;
     uint k = z_shuffle(z_morton(gid), 0xffffffffu);
     if (model == 2u) k ^= k << 2;
-    return k ^ t ^ j;
+    // Frames beyond 2^14 of one accumulation start a fresh randomization.
+    if ((j >> Z_FRAME_BITS) != 0u) t ^= z_mix(j >> Z_FRAME_BITS);
+    return ((k ^ t) << Z_FRAME_BITS) | (j & ((1u << Z_FRAME_BITS) - 1u));
 }
 // Pass 1 and pass 2 of a pixel start from this sampler (the PCG state both passes used before).
 Sampler pixel_sampler(uint2 gid, constant Uniforms &u) {
@@ -3369,9 +3400,10 @@ Sampler pt_sampler(uint seed, uint pathVertex, uint stream, constant Uniforms &u
     return s;
 }
 // Replay seed of a new path tree of the pixel `gid`; deep splatting domains (layer > 0) XOR the
-// layer into bits 26-28 of the key (a distant block, so never another pixel's key of this frame).
+// layer into bits 11-13 of the key, its frame field: frame 2048 * layer of the pixel's own sequence,
+// which a moving frame (frame 0, when splatting runs) never draws itself.
 uint pt_initial_seed(uint2 gid, uint layer, uint pcgSeed, constant Uniforms &u) {
-    return sampler_z(u) ? z_pixel_key(gid, u) ^ (layer << 26) : pcgSeed;
+    return sampler_z(u) ? z_pixel_key(gid, u) ^ (layer << 11) : pcgSeed;
 }
 
 // RESTIRPTE2026 Eq. 5 right-hand side: c/100 times the squared primary footprint radius
@@ -6389,9 +6421,9 @@ enum SamplerMode: UInt32, Sendable {
     // Z++: Owen-scrambled 1D / 2D Sobol' and 3D O2m3 constituents indexed along a recursively
     // shuffled Morton curve, with Z++ temporal indexing (MSL z_pixel_key, Sampler).
     case zSampling = 1
-    // Host-side default: PCG for now. The current Z++ implementation shows block-shaped correlated
-    // noise at low sample counts (most visible with spectral transport), so Automatic resolves to
-    // PCG until that is fixed; Z++ stays selectable. See tests/PERFORMANCE.md.
+    // Host-side default: PCG until the Z++ key-layout fix of 2026-10-04 (each pixel accumulates its
+    // own scrambled nets instead of sharing its block's sample sets) is re-measured at equal time;
+    // Z++ stays selectable. See tests/PERFORMANCE.md.
     case automatic = 2
     func resolved() -> SamplerMode {
         self == .automatic ? .pcg : self
