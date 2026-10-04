@@ -6659,11 +6659,11 @@ enum DispersionSampling: UInt32, Sendable {
     case spectralMIS = 1
     case split = 2
     case spectralMISSplit = 3
-    // Host-side default: spectral MIS, which lowered the error of rough dispersive glass by 29-49% at
-    // equal samples; splitting stays opt-in (3% lower error on smooth glass for one to four extra
-    // camera continuations). Equal-time figures are pending (tests/PERFORMANCE.md, "Dispersion sampling").
+    // Host-side default: hero termination. Spectral MIS and splitting are experimental: spectral MIS
+    // measured 29-49% lower error during development but about 4x higher in the test suite's rough-glass
+    // fixture, an open issue (docs/SPECTRAL_DESIGN.md); both stay selectable.
     case automatic = 4
-    func resolved() -> DispersionSampling { self == .automatic ? .spectralMIS : self }
+    func resolved() -> DispersionSampling { self == .automatic ? .hero : self }
 }
 
 // Emitter spectra of spectral transport (MSL VibeIlluminant, normalized to luminance one). An

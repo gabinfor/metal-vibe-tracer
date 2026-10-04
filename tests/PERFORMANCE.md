@@ -31,7 +31,7 @@ Interleaved timing runs on the shared GPU were too noisy to rank the modes (per-
 
 ## Default
 
-`DispersionSampling.automatic` resolves to spectral MIS: its equal-sample gain (29–57% lower error at roughness ≥ 0.1) is far above any plausible cost of four lobe evaluations at the few dispersive vertices, and the overlap gate keeps it off where it measured no gain. Splitting stays opt-in until its equal-time figure is measured. `VIBE_DISPERSION=hero|mis|split|mis-split` selects a mode in `-D VIBE_TESTING` builds.
+`DispersionSampling.automatic` resolves to hero termination (2026-10-04): the GPU suite's rough-glass fixture measured spectral MIS at about 4.1× the hero error (open issue; the development-time gains above are not reproduced), so spectral MIS and splitting are experimental and opt-in.
 
 # Spectral transport cost — October 3, 2026
 

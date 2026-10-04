@@ -544,7 +544,7 @@ much grainier than the rest of a spectral image. `DispersionSampling` now choose
 (`REFERENCES.md` "October 4 dispersion sampling", `HERO2014`, `CMIS2020`; measurements in
 `tests/PERFORMANCE.md`, "Dispersion sampling"; tests in `tests/Fix_spectral-mis.swift`):
 
-- **Rough dispersive lobes (OpenPBR transmission, never delta): spectral MIS, the default.** The
+- **Rough dispersive lobes (OpenPBR transmission, never delta): spectral MIS, experimental and off by default.** Open issue (2026-10-04): the suite's 32×24 rough-glass fixture (PCG sampler, 16 vs 512 samples) measures spectral MIS at about 4.1× the hero-termination error with an unbiased mean, against the 29–49% gain measured during development; until this is explained, `DispersionSampling.automatic` resolves to hero termination. The
   hero lane samples the direction from its own lobe; all four lanes evaluate value and PDF there;
   the path carries R_k = Π p_k / p_hero over its dispersive vertices and each lane is weighted by the
   balance heuristic over the four hero techniques (`spectral_mis_sample`, `spectral_mis_eval`).
@@ -552,7 +552,7 @@ much grainier than the rest of a spectral image. `DispersionSampling` now choose
   where the lanes' lobes overlap, α ≥ 0.25 (n_d − 1)/V_d: at roughness 0.03–0.05 the lobes are a
   fraction of the index spread apart and the weights approach the termination's (measured 0–20% less
   error), at 0.1–0.4 it lowered the error by 29–49% (glass pixels 42–71%) at equal samples.
-- **Delta dispersive interfaces (the legacy dielectric): lane splitting, opt-in.** No direction is
+- **Delta dispersive interfaces (the legacy dielectric): lane splitting, opt-in and experimental** (the suite's 32×24 fixture shows no gain — glass-pixel MSE ×1.01 vs hero termination with PCG — so only non-regression is tested; the development-time gain needs re-measuring). No direction is
   shared, so MIS cannot help (`CMIS2020` Sec. 5.2). The shading pass traces the camera's continuation
   once per lane from the first delta dispersive vertex before any scattering (bounded: four
   continuations at most), each lane with weight one (`spectral_split`). Measured 3% less image error
@@ -564,7 +564,9 @@ much grainier than the rest of a spectral image. `DispersionSampling` now choose
   wavelength numbers.
 
 **Thin film on ideal mirrors** now colours the reflection (`spectral_thin_film_mirror`): the delta
-conductor had used plain Schlick Fresnel and ignored `thin_film_*`.
+conductor had used plain Schlick Fresnel and ignored `thin_film_*`. The visible effect depends on
+the base: over a highly reflective metal (F0 near 1) a lossless film barely changes the reflectance,
+so iridescence is strong only on less reflective metals (the test uses F0 = 0.5).
 
 **Evaluated and rejected:**
 
