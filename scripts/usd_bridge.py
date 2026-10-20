@@ -2,10 +2,11 @@
 """OPENUSD: read a composed stage with Pixar's SDK; emit a bounded renderer snapshot.
 No input file is executed. This process only loads USD's installed core plugins.
 """
-import sys, pathlib, os, json, math, uuid, hashlib, argparse, xml.etree.ElementTree as ET
+import sys, pathlib, os, json, math, uuid, hashlib, argparse, struct, xml.etree.ElementTree as ET
+from array import array
 HERE=pathlib.Path(__file__).resolve().parent
 # Mirror SceneLimits.triangles (stored, distinct meshes) and SceneLimits.renderedTriangles.
-STORED_TRIANGLES=1000000;RENDERED_TRIANGLES=64000000
+STORED_TRIANGLES=16000000;RENDERED_TRIANGLES=64000000
 # SceneLimits.materials (1024) minus the 8 procedural slots, and SceneLimits.nodes.
 MATERIALS=1016;NODES=65535
 # The bundled SDK is a CPython 3.9 wheel; any other interpreter gets a concise requirement message.
@@ -214,6 +215,35 @@ class MaterialTranslator:
         self.add('open_pbr_surface','surfaceshader',inputs)
         return ET.tostring(self.root,encoding='unicode')
 
+# Indexed mesh output (docs/SCENE_STORAGE_DESIGN.md, phase 3): Swift MeshGeometry.payload, one
+# binary .vtmesh sidecar per distinct asset instead of JSON triangles. Corners weld when their
+# float32 position, normal and UV bits are identical; faces are three vertex indices and a subset.
+assert array('I').itemsize==4
+class MeshWriter:
+    def __init__(self):self.vertices=array('f');self.faces=array('I');self.weld={};self.count=0
+    def corner(self,p,n,uv):
+        key=struct.pack('<8f',p[0],p[1],p[2],n[0],n[1],n[2],uv[0],uv[1])
+        i=self.weld.get(key)
+        if i is None:i=len(self.weld);self.weld[key]=i;self.vertices.frombytes(key)
+        return i
+    def add(self,ps,ns,uvs,subset):
+        if not math.isfinite(sum(ps[0])+sum(ps[1])+sum(ps[2])+sum(ns[0])+sum(ns[1])+sum(ns[2])+sum(uvs[0])+sum(uvs[1])+sum(uvs[2])):fail('non-finite mesh data')
+        self.faces.extend((self.corner(ps[0],ns[0],uvs[0]),self.corner(ps[1],ns[1],uvs[1]),self.corner(ps[2],ns[2],uvs[2]),subset));self.count+=1
+    def add_triangle(self,t):
+        self.add([t['a'],t['b'],t['c']],[t['na'],t['nb'],t['nc']],[t['uvab'][0:2],t['uvab'][2:4],t['uvc'][0:2]],int(t['uvc'][2]))
+    def payload(self):return b'VTMESH01'+struct.pack('<II',len(self.weld),self.count)+self.vertices.tobytes()+self.faces.tobytes()
+def write_mesh(directory,writer):
+    data=writer.payload();digest=hashlib.sha256(data).hexdigest();dest=pathlib.Path(directory)/(digest+'.vtmesh')
+    if not dest.exists():dest.write_bytes(data)
+    return {'file':str(dest),'vertices':len(writer.weld),'faces':writer.count},digest
+def read_mesh(info):
+    # The triangles of a .vtmesh sidecar as dictionaries (checks and tools).
+    data=pathlib.Path(info['file']).read_bytes();nv,nf=struct.unpack_from('<II',data,8)
+    v=struct.unpack_from('<%df'%(8*nv),data,16);f=struct.unpack_from('<%dI'%(4*nf),data,16+32*nv);out=[]
+    for k in range(nf):
+        a,b,c,subset=f[4*k:4*k+4];va,vb,vc=v[8*a:8*a+8],v[8*b:8*b+8],v[8*c:8*c+8]
+        out.append(dict(a=list(va[:3])+[1],b=list(vb[:3])+[1],c=list(vc[:3])+[1],na=list(va[3:6])+[0],nb=list(vb[3:6])+[0],nc=list(vc[3:6])+[0],uvab=list(va[6:8])+list(vb[6:8]),uvc=list(vc[6:8])+[subset,0]))
+    return out
 def sphere_proxy(radius):
     # A once-subdivided icosahedron with outward, one-sided faces, scaled to the sphere's area 4*pi*r^2.
     t=(1+math.sqrt(5))/2
@@ -340,7 +370,7 @@ def import_stage(filename,directory,frame=None):
                     index={'constant':0,'uniform':face,'vertex':vertex,'varying':vertex,'faceVarying':corner}.get(str(interp))
                     if index is None or index>=len(values):fail(path+': invalid primvar interpolation/count')
                     return list(values[index])
-                holes=set(mesh.GetHoleIndicesAttr().Get(time) or []);offset=0;triangles=[];left=str(mesh.GetOrientationAttr().Get(time))=='leftHanded';dropped=fanned=0
+                holes=set(mesh.GetHoleIndicesAttr().Get(time) or []);offset=0;writer=MeshWriter();left=str(mesh.GetOrientationAttr().Get(time))=='leftHanded';dropped=fanned=0
                 for face,count in enumerate(counts):
                     faceIndices=list(indices[offset:offset+count]);base=offset;offset+=count
                     if face in holes:continue
@@ -350,18 +380,19 @@ def import_stage(filename,directory,frame=None):
                         ps=[list(points[faceIndices[i]]) for i in corners];ng=normalize(cross(sub(ps[1],ps[0]),sub(ps[2],ps[0])))
                         ns=[normalize(sample(normals,normalInterp,face,base+i,faceIndices[i],ng)) for i in corners]
                         uvs=[sample(uv,uvInterp,face,base+i,faceIndices[i],[0,0]) for i in corners]
-                        triangles.append(dict(a=ps[0]+[1],b=ps[1]+[1],c=ps[2]+[1],na=ns[0]+[0],nb=ns[1]+[0],nc=ns[2]+[0],uvab=[uvs[0][0],1-uvs[0][1],uvs[1][0],1-uvs[1][1]],uvc=[uvs[2][0],1-uvs[2][1],faceSlots[face],0]))
+                        writer.add(ps,ns,[(uvs[0][0],1-uvs[0][1]),(uvs[1][0],1-uvs[1][1]),(uvs[2][0],1-uvs[2][1])],faceSlots[face])
                 if dropped:report.append(path+': '+str(dropped)+' degenerate faces dropped')
                 if fanned:report.append(path+': '+str(fanned)+' non-simple polygons fan-triangulated')
-                if not triangles:report.append(path+': mesh has no renderable faces; skipped');continue
-                rendered+=len(triangles)
-                if rendered>RENDERED_TRIANGLES:fail('Stage exceeds 64,000,000 rendered triangles')
-                key=hashlib.sha256(json.dumps({'triangles':triangles,'subsets':subsetNames},separators=(',',':')).encode()).hexdigest()
+                if not writer.count:report.append(path+': mesh has no renderable faces; skipped');continue
+                rendered+=writer.count
+                if rendered>RENDERED_TRIANGLES:fail(f'Stage exceeds {RENDERED_TRIANGLES:,} rendered triangles')
+                info,digest=write_mesh(directory,writer);writer=None
+                key=hashlib.sha256((digest+json.dumps(subsetNames)).encode()).hexdigest()
                 if key not in assetCache:
                     # Identical meshes share one asset: Swift instances it (SceneLimits).
-                    stored+=len(triangles)
-                    if stored>STORED_TRIANGLES:fail('Stage exceeds 1,000,000 stored (distinct) triangles')
-                    asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':subsetNames};assets.append(asset);assetCache[key]=asset['id']
+                    stored+=info['faces']
+                    if stored>STORED_TRIANGLES:fail(f'Stage exceeds {STORED_TRIANGLES:,} stored (distinct) triangles')
+                    asset={'id':uid(),'name':str(prim.GetName()),'mesh':info,'subsets':subsetNames};assets.append(asset);assetCache[key]=asset['id']
                 node['mesh']=assetCache[key];node['bindings']=bindings
                 # Per-binding displayColors let Swift split a material its compiler rejects.
                 fallbackColors[node['id']]=colors
@@ -410,7 +441,10 @@ def import_stage(filename,directory,frame=None):
                 material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':emission}
                 if len(materials)>=MATERIALS:fail(f'Stage exceeds {MATERIALS} materials including lights')
                 materials.append(material)
-                asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':['Emission']};assets.append(asset);stored+=len(triangles)
+                lightMesh=MeshWriter()
+                for t in triangles:lightMesh.add_triangle(t)
+                info,_=write_mesh(directory,lightMesh)
+                asset={'id':uid(),'name':str(prim.GetName()),'mesh':info,'subsets':['Emission']};assets.append(asset);stored+=len(triangles)
                 pp,parentID,local=attach(prim,world)
                 nodes.append({'id':uid(),'name':str(prim.GetName()),'parent':parentID,'mesh':asset['id'],'transform':identity_settings(),'bindings':[material['id']],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]})
                 rendered+=len(triangles)

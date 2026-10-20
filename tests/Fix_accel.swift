@@ -697,7 +697,7 @@
     let flat = try library(.flat)
     var refused = false
     do { try flat.setMesh(big) } catch { refused = true }
-    require(refused, "the flat BVH refuses more than \(SceneLimits.triangles) rendered triangles")
+    require(refused, "the flat BVH refuses more than \(SceneLimits.flatTriangles) rendered triangles")
     let saved = testRenderer.materials.acceleration
     func timed(_ graph: SceneGraph, _ mode: MeshAcceleration, eye: SIMD3<Float>) throws -> (build: Double, gpu: Double, mean: Float, bytes: UInt64) {
       testRenderer.materials.acceleration = mode

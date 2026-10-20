@@ -152,7 +152,7 @@
   require(equivalent(legacy, fromV1) && fromV1.version == 1, "version 1 flat-mesh project opens unchanged")
   let v1Resaved = try fromV1.encodeForSaving()
   let fromV1Resaved = try ProjectDocument.decodeProject(v1Resaved, near: nil)
-  require(equivalent(legacy, fromV1Resaved) && fromV1Resaved.version == 3
+  require(equivalent(legacy, fromV1Resaved) && fromV1Resaved.version == ProjectAssets.formatVersion
     && object(v1Resaved)["triangleData"] is String, "version 1 project resaves as format 3 with a binary flat mesh")
   print("PASS: fix-project-format version 1 and 2 projects open and resave (R-45, R-74)")
 
@@ -163,7 +163,7 @@
   try fromV3.validate()
   let table = object(v3)["assetTable"] as? [String: [String: Any]] ?? [:]
   let sharedKey = ProjectAssets.reference(for: sharedPNG)
-  require(fromV3.version == 3 && equivalent(document, fromV3), "format 3 project round-trips")
+  require(fromV3.version == ProjectAssets.formatVersion && equivalent(document, fromV3), "format 3 project round-trips")
   require(
     occurrences(v2Text, escaped(sharedPNG)) == 3 && occurrences(v3Text, escaped(sharedPNG)) == 1
       && occurrences(v3Text, sharedKey) == 4 && table[sharedKey]?["data"] is String,
@@ -355,11 +355,12 @@
   })
   rejects("a version 2 file with an asset table", json: mutated { $0["version"] = 2 })
   rejects("a format 3 file without an asset table", json: mutated { $0["assetTable"] = nil })
-  rejects("a newer format", json: mutated { $0["version"] = 4 })
+  rejects("a newer format", json: mutated { $0["version"] = ProjectAssets.formatVersion + 1 })
   var v2Object = object(try JSONEncoder().encode(small))
   v2Object["scenes"] = (setMap(mapKey)["scenes"])
   rejects("a reference in a version 2 file", json: v2Object)
-  let limitEntries = (0..<3).reduce(into: [String: ProjectAssets.Entry]()) { table, i in
+  let overLimit = Int(ProjectAssets.maximumTableBytes / ProjectAssets.maximumEntryBytes) + 1
+  let limitEntries = (0..<overLimit).reduce(into: [String: ProjectAssets.Entry]()) { table, i in
     table[ProjectAssets.reference(for: Data([UInt8(i)]))] = ProjectAssets.Entry(size: ProjectAssets.maximumEntryBytes)
   }
   do {
@@ -400,7 +401,30 @@
   controller.beginSaveProject(v3URL) { saved = $0 }
   idle()
   let savedObject = object(try Data(contentsOf: v3URL))
-  require(saved == true && savedObject["assetTable"] != nil && savedObject["version"] as? Int == 3, "Studio saves format 3")
+  require(saved == true && savedObject["assetTable"] != nil && savedObject["version"] as? Int == ProjectAssets.formatVersion,
+    "Studio saves the current format")
+  // Format 4 (docs/SCENE_STORAGE_DESIGN.md, phase 3) stores graph meshes as MeshGeometry payloads;
+  // a format 3 file's 128-byte triangle payload for the same asset still opens, welded identically.
+  do {
+    let graphDocument = controller.project
+    let asset = graphDocument.graph!.assets[0]
+    let (json, _) = try graphDocument.encodedProject()
+    var file = object(json)
+    let meshKey = (file["meshData"] as! [String: String])[asset.id.uuidString]!
+    var table = file["assetTable"] as! [String: [String: Any]]
+    let payload = Data(base64Encoded: table[meshKey]!["data"] as! String)!
+    require(payload.prefix(8) == MeshGeometry.magic && payload.count == 16 + asset.geometry.bytes
+      && payload.count * 3 < asset.geometry.count * MemoryLayout<MeshTriangle>.stride,
+      "format 4 stores an indexed mesh payload (\(payload.count) B for \(asset.geometry.count) triangles)")
+    let legacy = ProjectAssets.triangleData(asset.triangles), legacyKey = ProjectAssets.reference(for: legacy)
+    table[legacyKey] = ["size": legacy.count, "data": legacy.base64EncodedString()]
+    table[meshKey] = nil
+    file["assetTable"] = table
+    file["meshData"] = [asset.id.uuidString: legacyKey]
+    file["version"] = 3
+    let reopened = try ProjectDocument.decodeProject(try JSONSerialization.data(withJSONObject: file), near: nil)
+    require(reopened.graph!.assets[0].geometry.same(as: asset.geometry), "a format 3 graph mesh payload welds to the same geometry")
+  }
   try reset()
   grouped {
     controller.beginOpenProject(v3URL)
@@ -408,7 +432,7 @@
   }
   require(controller.projectURL == v3URL && testRenderer.materials.payloads[20] == mapB
     && testRenderer.materials.materialX[10]?.images[0].data == sharedPNG
-    && controller.project.graph?.assets.first?.triangles.count == 20_000, "Studio reopens its format 3 save")
+    && controller.project.graph?.assets.first?.geometry.count == 20_000, "Studio reopens its saved project")
   testRenderer.yaw += 0.2
   controller.changed(reset: false)
   try controller.flushAutosave()

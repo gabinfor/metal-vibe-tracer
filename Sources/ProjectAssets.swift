@@ -17,11 +17,14 @@ import Synchronization
 //   "assetTable":   {"sha256:<hex>": {"size": <bytes>, "data": "<base64>"}}  ("data" absent: sidecar)
 //   "meshData":     {"<MeshAsset.id>": "sha256:<hex>"}  scene-graph mesh triangles
 //   "triangleData": "sha256:<hex>"                      legacy flat mesh triangles
-// Mesh payloads are the MeshTriangle array's bytes: 32 little-endian Float32 values per
-// triangle in field order a, b, c, na, nb, nc, uvab, uvc. The corresponding "triangles"
-// arrays in the document are empty.
+// The legacy flat mesh payload is the MeshTriangle array's bytes: 32 little-endian Float32
+// values per triangle in field order a, b, c, na, nb, nc, uvab, uvc. Scene-graph mesh payloads
+// are the same in format 3; since format 4 (docs/SCENE_STORAGE_DESIGN.md, phase 3) they are
+// MeshGeometry.payload ("VTMESH01", counts, 32-byte vertices, 16-byte faces), about a quarter
+// of the size. Format 3 mesh payloads are welded on load. The corresponding "triangles" arrays
+// in the document are empty.
 enum ProjectAssets {
-  static let formatVersion = 3
+  static let formatVersion = 4
   static let sidecarFolderName = "AutosaveAssets"
   static let referencePrefix = "sha256:"
   static let triangleBytes = MemoryLayout<MeshTriangle>.stride
@@ -29,7 +32,9 @@ enum ProjectAssets {
   // the environment (256 MiB); images count against ProjectDocument.embeddedAssetLimit and
   // meshes against the stored (graph) and legacy flat triangle limits.
   static let maximumEntryBytes = 256 * 1024 * 1024
-  static let maximumMeshBytes = 2 * SceneLimits.triangles * triangleBytes
+  // Formats 1-3: flat and graph triangles of 128 bytes; format 4 graph meshes at most 112 bytes
+  // per face (three unshared vertices and the face).
+  static let maximumMeshBytes = 2 * SceneLimits.flatTriangles * triangleBytes + SceneLimits.triangles * 112
   static let maximumTableBytes = ProjectDocument.embeddedAssetLimit + maximumMeshBytes
   // Seven scenes of maps and MaterialX images, the environment, the flat mesh and at most
   // one entry per stored triangle for mesh assets.
@@ -276,12 +281,15 @@ enum ProjectAssets {
         for (i, asset) in graph.assets.enumerated() where indices[asset.id] == nil { indices[asset.id] = i }
         var stored = 0
         for (id, reference) in meshes {
-          guard let uuid = UUID(uuidString: id), let i = indices[uuid], graph.assets[i].triangles.isEmpty,
+          guard let uuid = UUID(uuidString: id), let i = indices[uuid], graph.assets[i].geometry.isEmpty,
             let data = table[reference]
           else { throw invalid("a mesh reference is dangling.") }
-          stored += data.count / triangleBytes
+          let geometry = data.prefix(8) == MeshGeometry.magic
+            ? try MeshGeometry(payload: data, maximumFaces: SceneLimits.triangles - stored)
+            : MeshGeometry(triangles: try triangles(data))
+          stored += geometry.count
           guard stored <= SceneLimits.triangles else { throw invalid("stored meshes exceed the triangle limit.") }
-          graph.assets[i].triangles = try triangles(data)
+          graph.assets[i].geometry = geometry
         }
         document.graph = graph
       }
@@ -387,9 +395,9 @@ extension ProjectDocument {
     }
     var meshData: [String: String] = [:]
     if var graph = copy.graph {
-      for i in graph.assets.indices where !graph.assets[i].triangles.isEmpty {
-        meshData[graph.assets[i].id.uuidString] = collector.intern(ProjectAssets.triangleData(graph.assets[i].triangles))
-        graph.assets[i].triangles = []
+      for i in graph.assets.indices where !graph.assets[i].geometry.isEmpty {
+        meshData[graph.assets[i].id.uuidString] = collector.intern(graph.assets[i].geometry.payload)
+        graph.assets[i].geometry = MeshGeometry()
       }
       copy.graph = graph
     }

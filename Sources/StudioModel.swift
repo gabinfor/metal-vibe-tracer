@@ -205,15 +205,17 @@ struct ProjectDocument: Codable {
 
   // Aggregate embedded asset bytes (maps, MaterialX images, environment) across all scenes.
   static let embeddedAssetLimit = 512 * 1024 * 1024
-  // Open accepts everything validate() accepts: JSON embeds assets as base64
-  // (4/3 size), each of up to SceneLimits.triangles flat and graph triangles encodes in
-  // at most ~600 bytes (507 measured with worst-case floats), and 64 MiB covers
-  // settings, graphs and names. Saving refuses anything larger, so every saved
-  // project reopens. Format 3 (ProjectAssets) stores each distinct payload once and
-  // triangles as 128-byte binary records (171 bytes as base64), so the version 1/2
-  // bound also covers it; an autosave's JSON is smaller still.
+  // Open accepts everything validate() accepts: JSON embeds assets as base64 (4/3 size).
+  // Formats 1-3 held at most SceneLimits.flatTriangles flat and graph triangles each, at most
+  // ~600 bytes per JSON triangle (507 measured with worst-case floats; format 3's 128-byte
+  // records are 171 as base64). Format 4 stores graph meshes as MeshGeometry payloads, at most
+  // 112 bytes per face (three unshared 32-byte vertices and the face; 150 as base64), and its
+  // legacy flat mesh as format 3 does. 64 MiB covers settings, graphs and names. Saving
+  // refuses anything larger, so every saved project reopens.
+  static let perFormat4Face = 160
   static let maximumFileBytes =
-    embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.triangles * 600 + 64 * 1024 * 1024
+    embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.flatTriangles * 600 + SceneLimits.triangles * perFormat4Face
+    + 64 * 1024 * 1024
 
   // Identical payloads (a map or image shared by several slots, programs or scenes) are
   // stored once in the asset table and count once.
@@ -404,6 +406,7 @@ enum OBJMesh {
     var subsetIndices: [[String: Int]] = []
     var objects = Set<String>()
     var current: (part: Int, subset: Int)?
+    var builders: [MeshGeometry.Builder] = []
     func number(_ s: Substring) throws -> Float {
       guard let n = Float(s), n.isFinite, abs(n) < 1e8 else {
         throw failure("OBJ contains an invalid number.")
@@ -511,6 +514,7 @@ enum OBJMesh {
               objects.insert(object)
               part = result.count
               result.append(OBJPart(object: object, group: group))
+              builders.append(MeshGeometry.Builder())
               subsetIndices.append([:])
               partIndices[object, default: [:]][group] = part
             }
@@ -523,7 +527,8 @@ enum OBJMesh {
             }
             current = (part, subset)
           }
-          result[part].triangles.append(
+          // Corners with the same position, UV and normal (OBJ's shared v/vt/vn) weld.
+          builders[part].add(
             MeshTriangle(
               a: SIMD4(a.0, 1), b: SIMD4(b.0, 1), c: SIMD4(c.0, 1), na: SIMD4(a.2 ?? n, 0),
               nb: SIMD4(b.2 ?? n, 0), nc: SIMD4(c.2 ?? n, 0),
@@ -539,6 +544,7 @@ enum OBJMesh {
       throw MaterialLibrary.error(
         skipped > 0 ? "OBJ contains no usable faces (\(skipped) degenerate faces skipped)." : "OBJ contains no usable faces.")
     }
+    for i in result.indices { result[i].geometry = builders[i].geometry }
     return result
   }
   static func build(_ input: [MeshTriangle]) -> ([MeshTriangle], [MeshNode]) {
@@ -1091,7 +1097,8 @@ extension MaterialLibrary {
       }
       var layout = MeshSceneLayout()
       try publishTwoLevel(
-        assets: [(MeshSceneLayout.legacyAsset, triangles)], document: triangles, layout: &layout
+        assets: [(MeshSceneLayout.legacyAsset, MeshGeometry(triangles: triangles))], document: triangles,
+        legacyExtras: triangles.map(MeshStreams.extra), layout: &layout
       ) { layout in
         if !triangles.isEmpty { try layout.addInstance(node: -1, asset: 0, world: matrix_identity_float4x4, slots: []) }
       }
@@ -1109,14 +1116,14 @@ extension MaterialLibrary {
     if acceleration != .flat {
       try graph.validate()
       var layout = MeshSceneLayout()
-      try publishTwoLevel(assets: graph.assets.map { ($0.id, $0.triangles) }, document: [], layout: &layout) { layout in
+      try publishTwoLevel(assets: graph.assets.map { ($0.id, $0.geometry) }, document: [], layout: &layout) { layout in
         try layout.addInstances(graph)
       }
       return
     }
     let count = try graph.renderTriangleCount()
-    guard count <= SceneLimits.triangles else {
-      throw Self.error("The flat BVH renders at most \(SceneLimits.triangles.formatted()) triangles.")
+    guard count <= SceneLimits.flatTriangles else {
+      throw Self.error("The flat BVH renders at most \(SceneLimits.flatTriangles.formatted()) triangles.")
     }
     let t = try triangleStorage(count)
     let target = t.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, count))
@@ -1231,7 +1238,7 @@ extension MaterialLibrary {
       var rebuilt = streams
       rebuilt.faces = faces
       // The rebound triangles no longer equal the document array the layout remembers.
-      layout.assets[0].source = []
+      layout.assets[0].source = MeshGeometry()
       try restoreMesh(MeshResources(triangles: [], triangleBuffer: placeholderTriangles, triangleCount: ordered.count,
         nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: layout, streams: rebuilt))
       return

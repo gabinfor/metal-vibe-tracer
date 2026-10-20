@@ -397,8 +397,14 @@
   let worst = MeshTriangle(a: v, b: v, c: v, na: v, nb: v, nc: v, uvab: v, uvc: v)
   let perTriangle = try JSONEncoder().encode(Array(repeating: worst, count: 1000)).count / 1000
   require(perTriangle <= 600, "triangle JSON bound holds (\(perTriangle) B)")
-  require(ProjectDocument.maximumFileBytes >= ProjectDocument.embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.triangles * perTriangle,
-    "open limit covers base64 assets and both triangle stores")
+  // Format 4: a face with three unshared vertices is the worst case for MeshGeometry payloads.
+  var unshared = MeshGeometry.Builder()
+  for k in 0..<1000 { var t = worst; t.a.x = Float(k); t.b.x = Float(k) + 0.5; t.c.x = Float(k) + 0.25; t.uvc.z = 0; unshared.add(t) }
+  let perFace = (unshared.geometry.payload.base64EncodedString().utf8.count + 999) / 1000
+  require(perFace <= ProjectDocument.perFormat4Face, "format 4 mesh payload bound holds (\(perFace) B per face)")
+  require(ProjectDocument.maximumFileBytes >= ProjectDocument.embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.flatTriangles * perTriangle
+      + SceneLimits.triangles * perFace,
+    "open limit covers base64 assets, both triangle stores of formats 1-3, and format 4 mesh payloads")
   print("PASS: save and autosave only write projects the open path accepts")
 }
 try fixGPUMemoryChecks()

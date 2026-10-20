@@ -226,10 +226,10 @@
   require(ReSTIRModes(testRenderer) == chosen, "five picks set five modes")
   let saved = try controller.snapshot().encodeForSaving()
   let savedObject = try JSONSerialization.jsonObject(with: saved) as! [String: Any]
-  require(savedObject["version"] as? Int == 3 && savedObject["indirectReuse"] as? Int == 2
+  require(savedObject["version"] as? Int == ProjectAssets.formatVersion && savedObject["indirectReuse"] as? Int == 2
     && savedObject["spatialNeighbors"] as? Int == 0 && savedObject["temporalReuse"] as? Int == 1
     && savedObject["controlVariates"] as? Int == 0 && savedObject["sampler"] as? Int == 0,
-    "format 3 stores the five raw modes")
+    "the saved format stores the five raw modes")
   let reopened = try ProjectDocument.decodeProject(saved, near: nil)
   require(reopened.restirModes == chosen, "a saved project reopens with its modes")
   try reset(procedural)

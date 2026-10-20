@@ -34,7 +34,7 @@ sun=UsdLux.DistantLight.Define(stage,'/Sun');sun.CreateIntensityAttr(2)
 stage.GetRootLayer().Save()
 result=bridge.import_stage(str(out/'scene.usda'),out)
 check(len(result['assets'])==1 and sum(bool(n.get('mesh')) for n in result['nodes'])==2,result['report'])
-check(len(result['assets'][0]['triangles'])==3,'concave face triangulation')
+check(result['assets'][0]['mesh']['faces']==3,'concave face triangulation')
 check(len(result['cameras'])==1 and result['sun'] is not None,"len(result['cameras'])==1 and result['sun'] is not None")
 check(all(m.get('mtlx') for m in result['materials']),"all(m.get('mtlx') for m in result['materials'])")
 (out/'snapshot.json').write_text(json.dumps(result))
@@ -47,7 +47,7 @@ check(bridge.import_stage(str(out/'scene.usdz'),out)['assets'],"bridge.import_st
 plain=Usd.Stage.CreateNew(str(out/'details.usda'));UsdGeom.SetStageMetersPerUnit(plain,1)
 m=UsdGeom.Mesh.Define(plain,'/M');m.CreatePointsAttr([(0,0,0),(1,0,0),(1,1,0),(0,1,0)]);m.CreateFaceVertexCountsAttr([3,3]);m.CreateFaceVertexIndicesAttr([0,1,2,0,2,3]);m.CreateSubdivisionSchemeAttr('none');m.CreateHoleIndicesAttr([1]);st=UsdGeom.PrimvarsAPI(m).CreatePrimvar('st',Sdf.ValueTypeNames.TexCoord2fArray,'faceVarying');st.Set([(0,0),(1,0),(1,1),(0,1)]);st.SetIndices([0,1,2,0,2,3]);m.CreateVisibilityAttr('invisible')
 plain.GetRootLayer().Save();detail=bridge.import_stage(str(out/'details.usda'),out)
-check(len(detail['assets'][0]['triangles'])==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1,"len(detail['assets'][0]['triangles'])==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1")
+check(detail['assets'][0]['mesh']['faces']==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1,"detail['assets'][0]['mesh']['faces']==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1")
 print('PASS: USD composition, instances, units/up-axis matrices, concave triangulation, primvars/holes, bindings, camera/sun, USDC and USDZ')
 # A small authored area-lit scene supports a meaningful GPU PDF/energy test.
 lightFile=out/'area.usda';lightFile.unlink(missing_ok=True)
@@ -60,7 +60,7 @@ disk=UsdLux.DiskLight.Define(coverage,'/Disk');disk.CreateRadiusAttr(.5);disk.Cr
 sphere=UsdLux.SphereLight.Define(coverage,'/Sphere');sphere.CreateRadiusAttr(.25);sphere.CreateIntensityAttr(2);sphere.AddTranslateOp().Set((1,1,0))
 coverage.GetRootLayer().Save()
 coverage_result=bridge.import_stage(str(out/'light-coverage.usda'),out)
-check(len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8,"len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8")
+check(len(coverage_result['assets'])==2 and coverage_result['assets'][0]['mesh']['faces']==8,"len(coverage_result['assets'])==2 and coverage_result['assets'][0]['mesh']['faces']==8")
 check(any('disk light imported' in line for line in coverage_result['report']),"any('disk light imported' in line for line in coverage_result['report'])")
 check(any('sphere light imported' in line for line in coverage_result['report']),"any('sphere light imported' in line for line in coverage_result['report'])")
 # Reference scene override is separate; upstream files and notices remain unchanged.
@@ -104,7 +104,7 @@ cam=UsdGeom.Camera.Define(robust,'/Cam');cam.AddTranslateOp().Set((.5,.5,5))
 robust.GetRootLayer().Save()
 rb=bridge.import_stage(str(out/'robust.usda'),out);report='\n'.join(rb['report'])
 byName={n['name']:n for n in rb['nodes']};assetOf={a['id']:a for a in rb['assets']}
-check(len(assetOf[byName['Good']['mesh']]['triangles'])==5,report)
+check(assetOf[byName['Good']['mesh']]['mesh']['faces']==5,report)
 check('/Good: 3 degenerate faces dropped' in report and '/Good: 1 non-simple polygons fan-triangulated' in report,report)
 check('/Empty: mesh without points or topology skipped' in report and 'mesh' not in byName['Empty'],report)
 check(byName['Zero']['transform']['rotationHidden'][3]==1 and report.count('zero or singular world scale')==1,report)
@@ -134,7 +134,7 @@ tiny=UsdLux.RectLight.Define(power,'/Tiny');tiny.CreateWidthAttr(.001);tiny.Crea
 power.GetRootLayer().Save();pw=bridge.import_stage(str(out/'power.usda'),out)
 emission={m['path']:m['emission'][0] for m in pw['materials']};powerAssets={a['id']:a for a in pw['assets']}
 for node in pw['nodes'][1:]:
- tris=powerAssets[node['mesh']]['triangles'];path='/'+node['name']
+ tris=bridge.read_mesh(powerAssets[node['mesh']]['mesh']);path='/'+node['name']
  radiantArea=sum(triangle_area(t) for t in tris)*emission[path]
  expected={'/Disk':3*math.pi*.25,'/DiskN':3,'/Sphere':3*4*math.pi*.0625,'/SphereN':3}.get(path)
  if expected:check(abs(radiantArea/expected-1)<1e-6,(path,radiantArea,expected))
@@ -210,7 +210,7 @@ def snapshot(**patch):
 fast,fastTime=snapshot()
 # The pre-2026-09-28 conversion: iterate each Gf value, index the Vt arrays per corner.
 slow,slowTime=snapshot(vec=lambda v:[float(x) for x in v],rows=lambda values:values)
-converted=json.loads(fast);check(sum(len(a['triangles']) for a in converted['assets'])==2*(n*n-2)+3+1+2,'conversion fixture triangle count')
+converted=json.loads(fast);check(sum(a['mesh']['faces'] for a in converted['assets'])==2*(n*n-2)+3+1+2,'conversion fixture triangle count')
 check(fast==slow,'bulk Vt conversion changes the bridge snapshot')
 print('USD bridge conversion (%d triangles): %.3f s bulk, %.3f s per corner'%(2*(n*n-2)+6,fastTime,slowTime))
 check(fastTime*3<slowTime,'bulk Vt conversion is not faster than per-corner Gf conversion (%.3f s against %.3f s)'%(fastTime,slowTime))

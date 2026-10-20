@@ -30,8 +30,17 @@ struct USDImportSnapshot: Decodable {
     var angle: Float?
     var normalize: Bool?
   }
+  // A mesh asset: its indexed geometry is a .vtmesh sidecar (MeshGeometry.payload) beside the
+  // snapshot, written by usd_bridge.py's MeshWriter.
+  struct Asset: Decodable {
+    struct Mesh: Decodable { var file: String; var vertices: Int; var faces: Int }
+    var id: UUID
+    var name: String
+    var mesh: Mesh
+    var subsets: [String]
+  }
   var nodes: [SceneNode]
-  var assets: [MeshAsset]
+  var assets: [Asset]
   var materials: [Material]
   var cameras: [Camera]
   var environment: Environment?
@@ -186,7 +195,17 @@ enum USDImporter {
     }.map { String($0.prefix(1200)) }
     var p = source
     // USD opens as a complete scene; it does not merge lighting or IDs into an existing import.
-    var graph = SceneGraph(assets: snapshot.assets, nodes: snapshot.nodes, materials: [])
+    var stored = 0
+    let assets = try snapshot.assets.map { asset -> MeshAsset in
+      let geometry = try MeshGeometry(payload: Data(contentsOf: URL(fileURLWithPath: asset.mesh.file)),
+        maximumFaces: SceneLimits.triangles - stored)
+      guard geometry.count == asset.mesh.faces, geometry.vertices.count == asset.mesh.vertices else {
+        throw MaterialLibrary.error("OpenUSD helper wrote inconsistent mesh data.")
+      }
+      stored += geometry.count
+      return MeshAsset(id: asset.id, name: asset.name, geometry: geometry, subsets: asset.subsets)
+    }
+    var graph = SceneGraph(assets: assets, nodes: snapshot.nodes, materials: [])
     var state = SceneState()
     var uncompiled = Set<UUID>()
     for material in snapshot.materials {

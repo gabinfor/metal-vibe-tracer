@@ -11,16 +11,50 @@ enum SceneLimits {
   static let storedMaterials = 64
   // Object IDs of imported nodes start at `materials` and are 32-bit.
   static let nodes = 65_535
-  // Stored (unique) mesh triangles: document assets, the graph-less mesh and the flat BVH.
-  static let triangles = 1_000_000
+  // Stored (unique) mesh triangles: document assets and the graph-less mesh. Memory is
+  // governed by MaterialLibrary.meshBudget, which binds first on small GPUs.
+  static let triangles = 16_000_000
+  // The flat reference BVH (128-byte world triangles) and project formats 1-3, which predate
+  // the indexed geometry, hold at most this many.
+  static let flatTriangles = 1_000_000
   // Rendered triangles: instances of the stored ones (two-level acceleration only).
   static let renderedTriangles = 64_000_000
 }
 struct MeshAsset: Codable {
   var id = UUID()
   var name: String
-  var triangles: [MeshTriangle]
+  // Indexed geometry (MeshGeometry); faces' subsets index `subsets`.
+  var geometry: MeshGeometry
   var subsets: [String]
+  init(id: UUID = UUID(), name: String, geometry: MeshGeometry, subsets: [String]) {
+    self.id = id; self.name = name; self.geometry = geometry; self.subsets = subsets
+  }
+  init(id: UUID = UUID(), name: String, triangles: [MeshTriangle], subsets: [String]) {
+    self.init(id: id, name: name, geometry: MeshGeometry(triangles: triangles), subsets: subsets)
+  }
+  // A MeshTriangle view for small meshes, tools and tests: reading decodes every face and
+  // writing re-welds, so large-mesh code paths use `geometry`.
+  var triangles: [MeshTriangle] {
+    get { geometry.triangles }
+    set { geometry = MeshGeometry(triangles: newValue) }
+  }
+  // JSON keeps the MeshTriangle array of project formats 1 and 2 (format 3 and later store
+  // mesh payloads separately and leave it empty).
+  enum CodingKeys: String, CodingKey { case id, name, triangles, subsets }
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+    name = try c.decode(String.self, forKey: .name)
+    geometry = MeshGeometry(triangles: try c.decode([MeshTriangle].self, forKey: .triangles))
+    subsets = try c.decode([String].self, forKey: .subsets)
+  }
+  func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(id, forKey: .id)
+    try c.encode(name, forKey: .name)
+    try c.encode(geometry.triangles, forKey: .triangles)
+    try c.encode(subsets, forKey: .subsets)
+  }
 }
 struct SceneMaterial: Codable {
   var id = UUID()
@@ -39,8 +73,9 @@ struct SceneNode: Codable {
 struct OBJPart {
   var object: String
   var group: String
-  var triangles: [MeshTriangle] = []
+  var geometry = MeshGeometry()
   var subsets: [String] = []
+  var triangles: [MeshTriangle] { geometry.triangles }
 }
 struct SceneGraph: Codable {
   var assets: [MeshAsset] = []
@@ -68,7 +103,7 @@ struct SceneGraph: Codable {
         parents[part.object] = object.id
         parent = object.id
       }
-      let asset = MeshAsset(name: part.group, triangles: part.triangles, subsets: part.subsets)
+      let asset = MeshAsset(name: part.group, geometry: part.geometry, subsets: part.subsets)
       assets.append(asset)
       var bindings: [UUID] = []
       for name in part.subsets {
@@ -148,7 +183,7 @@ struct SceneGraph: Codable {
   func sameGeometry(as other: SceneGraph) -> Bool {
     guard assets.count == other.assets.count, nodes.count == other.nodes.count else { return false }
     for (a, b) in zip(assets, other.assets) {
-      guard a.id == b.id, a.subsets.count == b.subsets.count, sameBytes(a.triangles, b.triangles)
+      guard a.id == b.id, a.subsets.count == b.subsets.count, a.geometry.same(as: b.geometry)
       else { return false }
     }
     for (a, b) in zip(nodes, other.nodes) {
@@ -182,23 +217,19 @@ struct SceneGraph: Codable {
     var triangles = 0
     var storedTriangles = 0
     for asset in assets {
-      storedTriangles += asset.triangles.count
+      storedTriangles += asset.geometry.count
       guard !asset.subsets.isEmpty else {
         try fail("mesh has no material subsets.")
         return
       }
-      for t in asset.triangles {
-        guard
-          [t.a, t.b, t.c, t.na, t.nb, t.nc, t.uvab, t.uvc].allSatisfy({ p in
-            (0..<4).allSatisfy { p[$0].isFinite && abs(p[$0]) < 1e8 }
-          }),
-          t.a.w == 1, t.b.w == 1, t.c.w == 1,
-          t.na.w == 0, t.nb.w == 0, t.nc.w == 0,
-          t.uvc.z >= 0, t.uvc.z < Float(asset.subsets.count), t.uvc.z.rounded() == t.uvc.z
-        else {
-          try fail("invalid triangle or subset.")
-          return
-        }
+      // Every vertex attribute finite and below 1e8; faces index vertices and subsets.
+      let vertexCount = UInt32(asset.geometry.vertices.count), subsetCount = UInt32(asset.subsets.count)
+      let limit = SIMD8<Float>(repeating: 1e8)
+      guard asset.geometry.vertices.allSatisfy({ v in all(simd_abs(v) .< limit) }),
+        asset.geometry.faces.allSatisfy({ f in f.x < vertexCount && f.y < vertexCount && f.z < vertexCount && f.w < subsetCount })
+      else {
+        try fail("invalid triangle or subset.")
+        return
       }
     }
     guard storedTriangles <= SceneLimits.triangles else {
@@ -248,7 +279,7 @@ struct SceneGraph: Codable {
           try fail("missing mesh or material binding.")
           return
         }
-        triangles += asset.triangles.count
+        triangles += asset.geometry.count
       }
     }
     guard triangles <= SceneLimits.renderedTriangles else {
@@ -296,7 +327,7 @@ struct SceneGraph: Codable {
   // The number of triangles forEachRenderTriangle visits (visible mesh instances).
   func renderTriangleCount() throws -> Int {
     try validate()
-    let counts = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0.triangles.count) })
+    let counts = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0.geometry.count) })
     return nodes.reduce(0) { total, node in
       guard let id = node.mesh, let count = counts[id], !worldTransform(node.id).1 else { return total }
       return total + count
@@ -329,7 +360,8 @@ struct SceneGraph: Codable {
               SIMD3(world.columns.2.x, world.columns.2.y, world.columns.2.z)
             ))))
       let slots = node.bindings.map { slotsByID[$0]! }
-      for var t in asset.triangles {
+      for i in 0..<asset.geometry.count {
+        var t = asset.geometry.triangle(i)
         let subset = Int(t.uvc.z)
         let slot = slots[subset]
         t.a = world * t.a

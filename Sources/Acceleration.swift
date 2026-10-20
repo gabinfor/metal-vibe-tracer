@@ -356,9 +356,9 @@ enum WideBVH {
 struct MeshSceneLayout {
   struct Asset {
     var id: UUID
-    // The document's own triangle array, retained by reference (shared storage, not a copy)
-    // so the next publish can tell unchanged assets from edited ones.
-    var source: [MeshTriangle]
+    // The document's own geometry, retained by reference (shared storage, not a copy) so the
+    // next publish can tell unchanged assets from edited ones.
+    var source: MeshGeometry
     var triangleBase: Int, count: Int
     var nodeBase: Int, nodeCount: Int
     var lo: SIMD3<Float>, hi: SIMD3<Float>, maxAbs: Float
@@ -439,43 +439,20 @@ struct MeshSceneLayout {
 }
 
 extension MeshSceneLayout {
-  // Local bounds, 6 floats per triangle, for the BLAS build.
-  static func bounds(_ triangles: UnsafeBufferPointer<MeshTriangle>) -> [Float] {
-    [Float](unsafeUninitializedCapacity: 6 * triangles.count) { b, initialized in
-      for (i, t) in triangles.enumerated() {
-        let a = SIMD3(t.a.x, t.a.y, t.a.z), p = SIMD3(t.b.x, t.b.y, t.b.z), q = SIMD3(t.c.x, t.c.y, t.c.z)
-        let l = simd_min(simd_min(a, p), q), h = simd_max(simd_max(a, p), q)
-        b[6 * i] = l.x; b[6 * i + 1] = l.y; b[6 * i + 2] = l.z
-        b[6 * i + 3] = h.x; b[6 * i + 4] = h.y; b[6 * i + 5] = h.z
+  // Local bounds, 6 floats per face, for the BLAS build.
+  static func bounds(_ g: MeshGeometry) -> [Float] {
+    g.vertices.withUnsafeBufferPointer { v in
+      [Float](unsafeUninitializedCapacity: 6 * g.count) { b, initialized in
+        for (i, f) in g.faces.enumerated() {
+          let a = v[Int(f.x)], p = v[Int(f.y)], q = v[Int(f.z)]
+          let pa = SIMD3(a[0], a[1], a[2]), pb = SIMD3(p[0], p[1], p[2]), pc = SIMD3(q[0], q[1], q[2])
+          let l = simd_min(simd_min(pa, pb), pc), h = simd_max(simd_max(pa, pb), pc)
+          b[6 * i] = l.x; b[6 * i + 1] = l.y; b[6 * i + 2] = l.z
+          b[6 * i + 3] = h.x; b[6 * i + 4] = h.y; b[6 * i + 5] = h.z
+        }
+        initialized = 6 * g.count
       }
-      initialized = 6 * triangles.count
     }
-  }
-
-  // An asset's triangles in BLAS order (`order`) as faces with asset-relative vertex indices
-  // and welded vertices. Vertices weld only when all eight attribute bit patterns are equal, so
-  // decoding is exact (0 and -0 stay distinct).
-  static func encode(_ source: UnsafeBufferPointer<MeshTriangle>, order: [Int32]) -> (faces: [MeshFace], vertices: [MeshVertex]) {
-    var index: [SIMD8<UInt32>: UInt32] = [:]
-    index.reserveCapacity(source.count)
-    var vertices: [MeshVertex] = []
-    vertices.reserveCapacity(source.count)
-    func vertex(_ p: SIMD4<Float>, _ n: SIMD4<Float>, _ u: Float, _ v: Float) -> UInt32 {
-      let value = MeshVertex(p.x, p.y, p.z, n.x, n.y, n.z, u, v)
-      let key = unsafeBitCast(value, to: SIMD8<UInt32>.self)
-      if let i = index[key] { return i }
-      let i = UInt32(vertices.count)
-      vertices.append(value)
-      index[key] = i
-      return i
-    }
-    let faces = order.map { item -> MeshFace in
-      let t = source[Int(item)]
-      let tag = t.uvc.z.isFinite && t.uvc.z >= 0 && t.uvc.z < 4e9 ? UInt32(t.uvc.z) : 0
-      return MeshFace(vertex(t.a, t.na, t.uvab.x, t.uvab.y), vertex(t.b, t.nb, t.uvab.z, t.uvab.w),
-        vertex(t.c, t.nc, t.uvc.x, t.uvc.y), tag)
-    }
-    return (faces, vertices)
   }
 
   static func linear(_ m: simd_float4x4) -> simd_float3x3 {
@@ -510,9 +487,9 @@ extension MeshSceneLayout {
     let reach = simd_reduce_max(simd_abs(translation)) + Self.norm(linear) * a.maxAbs
     if node >= 0, !(reach < 1e8) {
       // The bound is conservative: only an exact check of the corners can reject.
-      for t in a.source {
-        for p in [t.a, t.b, t.c] {
-          let v = world * p
+      for vertex in a.source.vertices {
+        do {
+          let v = world * SIMD4(vertex[0], vertex[1], vertex[2], 1)
           guard (0..<3).allSatisfy({ v[$0].isFinite && abs(v[$0]) < 1e8 }) else {
             throw MaterialLibrary.error("Hierarchy transform exceeds the supported scene extent.")
           }
@@ -676,9 +653,10 @@ extension MaterialLibrary {
   // Publishes a two-level mesh: assets whose ID and triangles match the published layout keep
   // their hierarchy and encoded geometry (and, when nothing else changed, the whole streams);
   // the others are built and encoded. `instances` then adds the visible instances.
+  // `legacyExtras` (graph-less mesh only): per face in document order, its uvc.w and na.w.
   func publishTwoLevel(
-    assets inputs: [(UUID, [MeshTriangle])], document: [MeshTriangle], layout: inout MeshSceneLayout,
-    instances: (inout MeshSceneLayout) throws -> Void
+    assets inputs: [(UUID, MeshGeometry)], document: [MeshTriangle], legacyExtras: [UInt32]? = nil,
+    layout: inout MeshSceneLayout, instances: (inout MeshSceneLayout) throws -> Void
   ) throws {
     let previous = meshLayout, previousStreams = meshStreams
     var reused = [Int?](repeating: nil, count: inputs.count)
@@ -686,10 +664,17 @@ extension MaterialLibrary {
       var byID: [UUID: Int] = [:]
       for (i, asset) in previous.assets.enumerated() { byID[asset.id] = i }
       for (i, input) in inputs.enumerated() {
-        if let j = byID[input.0], sameBytes(previous.assets[j].source, input.1) { reused[i] = j }
+        if let j = byID[input.0], previous.assets[j].source.same(as: input.1) { reused[i] = j }
+      }
+      // A graph-less mesh's extras are not part of its geometry: reuse it only without them.
+      if inputs.count == 1, inputs[0].0 == MeshSceneLayout.legacyAsset,
+        legacyExtras?.contains(where: { $0 != 0 }) ?? false || previousStreams?.extras != nil
+      {
+        reused[0] = nil
       }
     }
     let stored = inputs.reduce(0) { $0 + $1.1.count }
+    let legacy = inputs.count == 1 && inputs[0].0 == MeshSceneLayout.legacyAsset
     guard stored <= SceneLimits.triangles else {
       throw Self.error("Stored mesh assets exceed the \(SceneLimits.triangles.formatted()) triangle limit.")
     }
@@ -703,18 +688,12 @@ extension MaterialLibrary {
       for i in inputs.indices { layout.assets[i].source = inputs[i].1 }
       streams = previousStreams
     } else {
-      // New assets: hierarchy, then faces in BLAS order with welded vertices.
-      var built: [Int: (nodes: [MeshWideNode], faces: [MeshFace], vertices: [MeshVertex], extras: [UInt32])] = [:]
-      let legacy = inputs.count == 1 && inputs[0].0 == MeshSceneLayout.legacyAsset
+      // New assets: a hierarchy, then the document's faces in BLAS order; vertices are copied.
+      var built: [Int: (nodes: [MeshWideNode], order: [Int32])] = [:]
       for (i, input) in inputs.enumerated() where reused[i] == nil && !input.1.isEmpty {
-        let result = input.1.withUnsafeBufferPointer { source in
-          let bounds = MeshSceneLayout.bounds(source)
-          let tree = bounds.withUnsafeBufferPointer { WideBVH.build(bounds: $0, count: source.count, leafSize: 2) }
-          let encoded = MeshSceneLayout.encode(source, order: tree.order)
-          let extras = legacy ? tree.order.map { MeshStreams.extra(source[Int($0)]) } : []
-          return (nodes: tree.nodes, faces: encoded.faces, vertices: encoded.vertices, extras: extras)
-        }
-        built[i] = result
+        let bounds = MeshSceneLayout.bounds(input.1)
+        let tree = bounds.withUnsafeBufferPointer { WideBVH.build(bounds: $0, count: input.1.count, leafSize: 2) }
+        built[i] = (tree.nodes, tree.order)
         assetBuildCount += 1
       }
       var faceBase = 0, vertexBase = 0, nodeBase = 0
@@ -736,7 +715,7 @@ extension MaterialLibrary {
           asset = MeshSceneLayout.Asset(
             id: input.0, source: input.1, triangleBase: 0, count: input.1.count, nodeBase: 0, nodeCount: nodes.count,
             lo: lo, hi: hi, maxAbs: nodes.isEmpty ? 0 : max(simd_reduce_max(simd_abs(lo)), simd_reduce_max(simd_abs(hi))))
-          asset.vertexCount = built[i]?.vertices.count ?? 0
+          asset.vertexCount = input.1.vertices.count
         }
         asset.triangleBase = faceBase
         asset.vertexBase = vertexBase
@@ -773,16 +752,19 @@ extension MaterialLibrary {
           (nodes + asset.nodeBase).update(
             from: previousStreams.nodes.contents().bindMemory(to: MeshWideNode.self, capacity: old.nodeBase + old.nodeCount)
               + old.nodeBase, count: old.nodeCount)
-        } else if let encoded = built[i] {
-          for (k, face) in encoded.faces.enumerated() { faces[asset.triangleBase + k] = face &+ shift }
-          encoded.vertices.withUnsafeBufferPointer { (vertices + asset.vertexBase).update(from: $0.baseAddress!, count: $0.count) }
-          encoded.nodes.withUnsafeBufferPointer { (nodes + asset.nodeBase).update(from: $0.baseAddress!, count: $0.count) }
+        } else if let tree = built[i] {
+          let source = inputs[i].1
+          source.faces.withUnsafeBufferPointer { f in
+            for (k, item) in tree.order.enumerated() { faces[asset.triangleBase + k] = f[Int(item)] &+ shift }
+          }
+          source.vertices.withUnsafeBufferPointer { (vertices + asset.vertexBase).update(from: $0.baseAddress!, count: $0.count) }
+          tree.nodes.withUnsafeBufferPointer { (nodes + asset.nodeBase).update(from: $0.baseAddress!, count: $0.count) }
         }
       }
       var s = MeshStreams(faces: f, vertices: v, nodes: n)
       if legacy {
-        // The only asset: reused (identical bytes) keeps its extras, a new one has them encoded.
-        let extras = built[0]?.extras ?? []
+        // The only asset: reused (identical bytes) keeps its extras, a new one has them permuted.
+        let extras = built[0].map { tree in tree.order.map { legacyExtras?[Int($0)] ?? 0 } } ?? []
         if let kept = previousStreams?.extras, reused[0] != nil { s.extras = kept }
         else if !extras.isEmpty {
           s.extras = extras.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }

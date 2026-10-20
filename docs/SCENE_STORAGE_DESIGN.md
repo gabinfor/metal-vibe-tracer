@@ -1,6 +1,6 @@
 # Large-scene storage: design proposal
 
-Status: **2026-10-20. Phases 0–2 are implemented (results below); phases 3 and 4 are proposals.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
+Status: **2026-10-20. Phases 0–3 are implemented (results below); phase 4's large-scene validation with downloaded scenes remains.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
 
 ## Goal
 
@@ -117,7 +117,16 @@ With the watertight 86 B hardware BLAS, the resident total is about **112 B per 
 - The pick encoding `64 + node` becomes a tagged ID.
 - Proposed caps: **1,024 materials**, 4,096 material textures, and 65,536 scene nodes.
 
-### Phase 3: limits, import and projects
+### Phase 3: limits, import and projects — done 2026-10-20
+
+- **Document model:** `MeshAsset.geometry` is a `MeshGeometry` (Sources/MeshGeometry.swift) with the GPU encoding: 32-byte exact vertices welded by attribute bits and 16-byte faces (indices and subset), 32 B per triangle at V/T = 0.5 against 128. `MeshAsset.triangles` remains a decoding view for small meshes, tools and tests. Validation, flattening, comparison and publishing use the geometry; publishing copies vertices and permutes faces into BLAS order, with no re-welding.
+- **OBJ** welds shared `v`/`vt`/`vn` corners while parsing. **USD:** `usd_bridge.py` writes one binary `.vtmesh` sidecar per distinct asset instead of JSON triangles (see `OPENUSD` in REFERENCES.md for the 1-ulp tie-rounding change it brings).
+- **Project format 4:** graph meshes are `MeshGeometry.payload`; formats 1–3 open (format 3's 128-byte graph payloads weld on load) and save as format 4. The legacy graph-less mesh keeps the 128-byte payload.
+- **Limits:** `SceneLimits.triangles` 16 M stored (not 32 M: San Miguel is about 10 M, and the 3 GiB `meshBudget` of a 16 GB M4 binds near 20 M with hardware traversal); the flat reference path keeps 1 M (`SceneLimits.flatTriangles`); the open-file bound is about 4.2 GiB.
+- **Measured** (`scripts/measure_mesh_memory.py`, welded grid, Apple M4): 10 M triangles publish in 1.07 s (software) and 2.31 s (hardware), with 575 MiB and 1,396 MiB of GPU mesh memory (60 and 146 B per triangle) and a 320 MB document; document plus GPU is about 178 B per triangle against about 374 before phase 1.
+- Full GPU suite: 181 PASS.
+
+#### Original proposal
 
 - `SceneLimits.triangles` rises to **32 M stored**; on a 16 GB M4, `meshBudget` binds first, at about 27 M. Rendered triangles are bounded by 32-bit IDs. Memory stays governed by `meshBudget` and `renderMemoryError`, which now count the actual streams and structures.
 - **USD bridge:** emits indexed meshes as a binary sidecar (positions, normals, UVs, indices, subsets), not JSON triangles. **OBJ:** keeps shared vertices instead of expanding faces.

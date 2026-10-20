@@ -1,3 +1,16 @@
+# Indexed documents and 10 M-triangle publishes — October 20, 2026
+
+`python3 scripts/measure_mesh_memory.py 999698 9999392` (one welded grid asset built as `MeshGeometry`, 0.50 vertices per triangle; Apple M4, macOS 27.0.1):
+
+| Triangles | Traversal | Document | GPU faces + vertices + BLAS | Hardware BLAS | GPU total | Publish |
+| --- | --- | --- | --- | --- | --- | --- |
+| 999,698 | software | 32.0 B | 16.0 + 16.0 + 32.2 | — | 64.2 B (61 MiB) | 0.11 s |
+| 999,698 | hardware | 32.0 B | 16.0 + 16.0 + 32.2 | 86.1 | 150.3 B (143 MiB) | 0.19 s |
+| 9,999,392 | software | 32.0 B | 16.0 + 16.0 + 28.3 | — | 60.3 B (575 MiB) | 1.07 s |
+| 9,999,392 | hardware | 32.0 B | 16.0 + 16.0 + 28.3 | 86.1 | 146.4 B (1,396 MiB) | 2.31 s |
+
+Publishing no longer welds (the document is already indexed), so 1 M-triangle publishes take 0.11 / 0.19 s instead of 0.28 / 0.36 s.
+
 # 1,024-slot material table — October 20, 2026
 
 Phase 2 of `docs/SCENE_STORAGE_DESIGN.md` against `main` (`ec31256`), Apple M4, export path, raw EXR, two alternating rounds: ASWF Shader Ball (960×720, 256 spp, ReSTIR PT and spectral defaults) 195 / 191 s on `main` and 193 / 189 s with the larger argument buffer and the settings buffer; built-in Pavilion (960×540, 256 spp) 16 / 15 s and 15 / 15 s. Both images are byte-identical to `main`.
