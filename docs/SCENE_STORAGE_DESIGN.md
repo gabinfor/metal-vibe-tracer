@@ -1,6 +1,6 @@
 # Large-scene storage: design proposal
 
-Status: **2026-10-20. Phases 0 and 1 are implemented (results below); phases 2–4 are proposals.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
+Status: **2026-10-20. Phases 0–2 are implemented (results below); phases 3 and 4 are proposals.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
 
 ## Goal
 
@@ -99,7 +99,17 @@ With the watertight 86 B hardware BLAS, the resident total is about **112 B per 
 - **Software BLAS:** nodes move to their own buffer, which ends the 128-byte coupling. The 4-wide 128-byte node stays for now.
 - **Emitters and NEE:** keep rendered triangle IDs (32-bit). With the phase 0 fix they are exact up to 2^32.
 
-### Phase 2: material table
+### Phase 2: material table — done 2026-10-20
+
+- **Capacities:** `SceneLimits.materials` 1,024 (1,016 imported plus the eight procedural slots), `graphImages` 4,096, `nodes` 65,535; MSL `MATERIAL_SLOTS` / `GRAPH_IMAGES` match (checked in `Fix_gpu-memory`). Object IDs of imported nodes start at `MATERIAL_SLOTS`.
+- **Settings:** `SurfaceSettings` for every slot is one buffer bound at index 1 (replacing the 4 KB `setBytes`), rebuilt on the next bind after an edit.
+- **Spectral parameters** moved from `SpectralScene` (now 368 bytes) into the material argument buffer (`spectralMaterials`), read through `Wavelengths.images`.
+- **Argument buffer:** small members at IDs 0–14, then `graphImages[4096]` at 16 and `maps[4096]` at 4112 (`MaterialLibrary.Argument`).
+- **Projects:** in memory every `SceneState` has full capacity; files store the slots up to the last one in use, at least 64 (`SceneState.trimmed`), and decoding pads them back (`padded`). Existing 8- and 64-slot projects open unchanged.
+- **USD bridge** caps follow (`MATERIALS` 1,016, `NODES` 65,535).
+- `tests/Fix_accel.swift` (`fixMaterialSlotChecks`) traces 300 quads bound to slots 8–307 and checks each slot's settings, a base-colour map at texture index 1,152, an emitter at slot 307, and the project trim/pad round trip. Full GPU suite: 181 PASS.
+
+#### Original proposal
 
 - `SurfaceSettings`, `ObjectSettings`, emissions, spectral parameters and `GraphHeader` move from `setBytes` and fixed arrays into **device buffers sized to the material count**.
 - Textures move to an argument-buffer array sized to the scene, or a table of `gpuResourceID`s, both indexed by `slot * 4 + channel`.

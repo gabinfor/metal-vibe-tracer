@@ -379,6 +379,7 @@ extension ProjectDocument {
     let collector = ProjectAssets.Collector()
     var copy = self
     copy.version = ProjectAssets.formatVersion
+    copy.scenes = copy.scenes.mapValues { $0.trimmed }
     var triangleData: String?
     if !copy.triangles.isEmpty {
       triangleData = collector.intern(ProjectAssets.triangleData(copy.triangles))
@@ -415,7 +416,11 @@ extension ProjectDocument {
       }
       return try resolver.data(decoder)
     }
-    return try decoder.decode(ProjectAssets.DecodedFile.self, from: data).document
+    var document = try decoder.decode(ProjectAssets.DecodedFile.self, from: data).document
+    // Files store each scene's slots up to the last one in use (encodedProject); in memory every
+    // state has the full SceneLimits.materials capacity.
+    document.scenes = document.scenes.mapValues { $0.padded }
+    return document
   }
   // Writes an autosave or recovery copy: payloads missing from AutosaveAssets/ first (each
   // atomically), then the JSON atomically, then unreferenced sidecars are collected. A

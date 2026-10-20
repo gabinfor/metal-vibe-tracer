@@ -114,7 +114,7 @@
       Ray r={rays[2*id].xyz,rays[2*id+1].xyz}; HitRecord h;
       float scale=rays[2*id].w;
       out[id]=float4(0);
-      if(!trace_scene(r,6,h,images,u) || h.objectID<64) return;
+      if(!trace_scene(r,6,h,images,u) || h.objectID<MATERIAL_SLOTS) return;
       uint seed=id*977u+3u; float self=0, shadowed=0;
       for(int k=0;k<16;++k) {
           float3 d=sample_cosine_hemisphere(k<8 ? h.geometricNormal : -h.geometricNormal,seed);
@@ -280,7 +280,7 @@
         if x.t < 0 { continue }
         worst[kind] = max(worst[kind], abs(x.t - reference) / max(1e-30, x.error))
         if x.occluded != y.occluded && abs(rays[2 * i].w - x.t) > 2 * x.error { occlusion += 1 }
-        guard x.object >= 64 || y.object >= 64 else { continue }
+        guard x.object >= SceneLimits.materials || y.object >= SceneLimits.materials else { continue }
         meshHits += 1
         // The rendered-triangle ID names the flat BVH's world triangle, except at an exact tie on a
         // shared edge (equal t), where either neighbour is the closest hit.
@@ -332,7 +332,7 @@
         }
       }
       let hits = try trace(two, rays)
-      let closestMisses = hits.filter { $0.t < 0 || $0.object < 64 }.count, anyMisses = hits.filter { !$0.occluded }.count
+      let closestMisses = hits.filter { $0.t < 0 || $0.object < SceneLimits.materials }.count, anyMisses = hits.filter { !$0.occluded }.count
       print("\(mode) instanced watertightness: \(hits.count) rays at shared edges/vertices of \(matrices.count) instances, \(closestMisses) closest-hit misses, \(anyMisses) any-hit misses")
       require(closestMisses == 0 && anyMisses == 0, "rays at shared edges and vertices never pass between instanced triangles")
 
@@ -385,7 +385,7 @@
       }
       let x = try trace(two, rays), y = try trace(flat, rays)
       var mismatched = 0, compared = [0, 0, 0]
-      for i in x.indices where x[i].object >= 64 && y[i].object >= 64 {
+      for i in x.indices where x[i].object >= SceneLimits.materials && y[i].object >= SceneLimits.materials {
         let a = x[i], b = y[i]
         guard simd_distance(a.a, b.a) <= 1e-5 * max(1, simd_length(b.a)) else { continue }  // shared-edge ties
         compared[i / 3000] += 1
@@ -482,7 +482,7 @@
       var hit = try probe(3)
       // Hardware traversal builds a primitive acceleration structure beside each software BLAS.
       let perAsset = mode == .hardware ? 2 : 1
-      require(l.assetBuildCount == 2 * perAsset && l.sceneBuildCount == 1 && hit.object == 65, "initial publish builds both assets once")
+      require(l.assetBuildCount == 2 * perAsset && l.sceneBuildCount == 1 && hit.object == SceneLimits.materials + 1, "initial publish builds both assets once")
       // Two-level geometry lives in the streams (faces, vertices, BLAS nodes); a kept face
       // buffer means no asset was rebuilt or re-encoded.
       let streams = l.meshStreams!, buffer = streams.faces, builds = l.assetBuildCount
@@ -492,13 +492,13 @@
       hit = try probe(6)
       var vacated = try probe(3)
       require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.sceneBuildCount == 2
-        && hit.object == 65 && vacated.object < 64, "a transform edit rebuilds only the top level")
+        && hit.object == SceneLimits.materials + 1 && vacated.object < SceneLimits.materials, "a transform edit rebuilds only the top level")
       var hidden = moved
       hidden.nodes[2].transform.rotationHidden.w = 1
       try l.setMesh(hidden)
       vacated = try probe(-3)
       require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.renderedTriangleCount == 2 * first.count
-        && vacated.object < 64, "a visibility edit rebuilds only the top level")
+        && vacated.object < SceneLimits.materials, "a visibility edit rebuilds only the top level")
       var rebound = hidden
       rebound.nodes[1].bindings = [m1.id]
       let meshBuilds = l.meshBuildCount, instances = l.meshLayout?.scene
@@ -520,7 +520,7 @@
       let nodesAfter = Data(bytes: l.meshStreams!.nodes.contents().advanced(by: reused.nodeBase * 128), count: reused.nodeCount * 128)
       hit = try probe(-3)
       require(l.meshStreams?.faces !== buffer && l.assetBuildCount == builds + perAsset && sameBytes(before, after) && nodesBefore == nodesAfter
-        && l.triangleCount == first.count + 2 * 14 * 14 && hit.object == 66, "a geometry edit rebuilds only the edited asset")
+        && l.triangleCount == first.count + 2 * 14 * 14 && hit.object == SceneLimits.materials + 2, "a geometry edit rebuilds only the edited asset")
       // The same paths through the studio controller (undoable edits of the live library), unless
       // the suite runs on the flat reference path (VIBE_ACCELERATION=flat).
       var document = ProjectDocument()
@@ -598,7 +598,7 @@
       let objects = try (0..<3).map { try probe(Float(3 * $0)).object }
       print("\(mode) batched asset build: \(built.count) structures in \(batchCommands) command buffers (instance structure included)")
       require(Set(built.map { ObjectIdentifier($0) }).count == 3 && batchCommands <= 3 && l.sceneRefitCount == 0
-        && l.meshLayout?.sceneRefits == 0 && objects == [64, 65, 66], "three missing asset structures build in one batch")
+        && l.meshLayout?.sceneRefits == 0 && objects == [SceneLimits.materials, SceneLimits.materials + 1, SceneLimits.materials + 2], "three missing asset structures build in one batch")
       // A transform-only edit refits into a new structure and traces like a fresh build.
       let buffer = l.meshStreams!.faces, scene = l.meshLayout?.scene, builds = l.assetBuildCount
       var moved = graph
@@ -619,7 +619,7 @@
       let agree = zip(refitted, rebuilt).allSatisfy { a, b in
         a.object == b.object && a.triangle == b.triangle && abs(a.t - b.t) <= 1e-6 * max(1, abs(b.t))
       }
-      require(fresh.sceneRefitCount == 0 && refitted.filter { $0.object >= 64 }.count > 100 && agree,
+      require(fresh.sceneRefitCount == 0 && refitted.filter { $0.object >= SceneLimits.materials }.count > 100 && agree,
         "a refitted instance structure gives the hits of a rebuilt one")
       // A structural edit (an instance hidden) rebuilds.
       var hidden = moved
@@ -921,3 +921,92 @@ try fixAccelChecks()
   print("PASS: fix-accel DI reservoir light IDs (exact to \(ids.max()!))")
 }
 try fixDILightIDChecks()
+
+// Phase 2 of docs/SCENE_STORAGE_DESIGN.md: more than 64 materials. One mesh asset of 300 quads,
+// each its own subset bound to its own material (slots 8-307), with distinct surface colours read
+// from the settings buffer, a base-colour map at a slot whose map index exceeds the former
+// 256-texture array, and an emitter at the last slot.
+@MainActor func fixMaterialSlotChecks() throws {
+  let quads = 300
+  var triangles: [MeshTriangle] = []
+  let up = SIMD4<Float>(0, 1, 0, 0)
+  for k in 0..<quads {
+    let x = Float(2 * k), s = Float(k)
+    func p(_ dx: Float, _ dz: Float) -> SIMD4<Float> { SIMD4(x + dx, 0, dz, 1) }
+    triangles.append(MeshTriangle(a: p(0, 0), b: p(0, 1), c: p(1, 1), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 0, 1), uvc: SIMD4(1, 1, s, 0)))
+    triangles.append(MeshTriangle(a: p(0, 0), b: p(1, 1), c: p(1, 0), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 1, 1), uvc: SIMD4(1, 0, s, 0)))
+  }
+  var graph = SceneGraph()
+  let materials = try (0..<quads).map { try graph.addMaterial("M\($0)") }
+  let asset = MeshAsset(name: "quads", triangles: triangles, subsets: (0..<quads).map { "S\($0)" })
+  graph.assets.append(asset)
+  graph.nodes.append(SceneNode(name: "quads", mesh: asset.id, transform: ObjectSettings(positionScale: SIMD4(0, 0, 0, 1)),
+    bindings: materials.map(\.id)))
+  try graph.validate()
+  require(materials.last!.slot == 8 + quads - 1, "material slots run past 64")
+  // A red 2 x 2 PNG.
+  let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8, samplesPerPixel: 4,
+    hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 8, bitsPerPixel: 32)!
+  for i in 0..<4 { bitmap.bitmapData![4 * i] = 255; bitmap.bitmapData![4 * i + 1] = 0; bitmap.bitmapData![4 * i + 2] = 0; bitmap.bitmapData![4 * i + 3] = 255 }
+  let red = bitmap.representation(using: .png, properties: [:])!
+  func color(_ k: Int) -> SIMD4<Float> { SIMD4(0.2 + 0.7 * Float(k) / Float(quads), 0.5, 0.9 - 0.7 * Float(k) / Float(quads), 1) }
+  var state = SceneState()
+  for (k, m) in materials.enumerated() {
+    state.surfaces[m.slot].enabled = 1
+    state.surfaces[m.slot].color = color(k)
+  }
+  let mapped = 280, emitter = quads - 1
+  state.surfaces[materials[mapped].slot].mapMask = 1
+  state.maps[materials[mapped].slot * 4] = red
+  state.names[materials[mapped].slot * 4] = "red.png"
+  state.emissions = [materials[emitter].slot: SIMD3<Float>(3, 2, 1)]
+  require(materials[mapped].slot * 4 >= 256, "the mapped slot's texture index is past the former 256-texture array")
+  let library = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+  try library.restore(state)
+  try library.setMesh(graph)
+  library.hasSceneGraph = true
+  let kernels = """
+    kernel void slot_probe(constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],
+        constant MaterialResources &images [[buffer(2)]], device float4 *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        Ray r={float3(2.0f*float(id)+0.3f,5,0.6f),float3(0,-1,0)}; HitRecord h;
+        if(!trace_scene(r,6,h,images,u)) { out[2*id]=float4(-1); return; }
+        resolve_material(h,r,u,settings,images,0);
+        out[2*id]=float4(float(h.mat.slot),float(h.objectID),h.mat.type==EMISSIVE ? 1.0f : 0.0f,0);
+        out[2*id+1]=float4(h.mat.type==EMISSIVE ? h.mat.emission : h.mat.albedo,0);
+    }
+    """
+  let probe = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  var u = makeUniforms(scene: 6, mode: 0, width: 1, height: 1)
+  u.environment.w = Float(library.nodeCount)
+  u.lens.z = 1
+  let out = gpu.makeBuffer(length: quads * 32, options: .storageModeShared)!
+  let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+  encoder.setComputePipelineState(try gpu.makeComputePipelineState(function: probe.makeFunction(name: "slot_probe")!))
+  require(library.bind(encoder), "slot probe binds scene resources")
+  encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+  encoder.setBuffer(out, offset: 0, index: 3)
+  encoder.dispatchThreads(MTLSize(width: quads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+  encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+  require(command.status == .completed, "slot probe GPU command")
+  let values = out.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2 * quads)
+  var wrong: [Int] = []
+  for k in 0..<quads {
+    let head = values[2 * k], value = values[2 * k + 1]
+    let expected: SIMD3<Float> = k == emitter ? SIMD3(3, 2, 1)
+      : k == mapped ? SIMD3(color(k).x, 0, 0) : SIMD3(color(k).x, color(k).y, color(k).z)
+    let ok = head.x == Float(materials[k].slot) && head.y == Float(SceneLimits.materials)
+      && (head.z == 1) == (k == emitter) && simd_reduce_max(simd_abs(SIMD3(value.x, value.y, value.z) - expected)) < 1e-4
+    if !ok { wrong.append(k) }
+  }
+  require(wrong.isEmpty, "\(quads) materials resolve their own slot, settings, map and emission (wrong: \(wrong.prefix(5)), first \(wrong.first.map { (values[2 * $0], values[2 * $0 + 1]) } as Any))")
+  // Project files store the slots in use (here 308), and decoding restores full capacity.
+  var document = ProjectDocument()
+  document.scene = 6; document.graph = graph; document.scenes[6] = state; document.version = 2
+  let (json, _) = try document.encodedProject()
+  let decoded = try ProjectDocument.decodeProject(json, near: nil)
+  require(state.trimmed.surfaces.count == 8 + quads && decoded.scenes[6]!.surfaces.count == SceneLimits.materials
+    && decoded.scenes[6]!.sameResources(as: state) && SceneState().trimmed.surfaces.count == SceneLimits.storedMaterials,
+    "project files trim unused slots and decoding pads them back")
+  print("PASS: fix-accel \(quads) materials past the former 64-slot limit (settings buffer, map \(materials[mapped].slot * 4), emitter slot \(materials[emitter].slot))")
+}
+try fixMaterialSlotChecks()

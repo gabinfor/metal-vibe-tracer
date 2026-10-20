@@ -299,7 +299,8 @@ struct ProjectDocument: Codable {
     }
     guard (environmentData?.count ?? 0) <= 256 * 1024 * 1024 else { try bad(); return }
     for (index, state) in scenes {
-      guard (0...6).contains(index), [8, SceneLimits.materials].contains(state.surfaces.count),
+      guard (0...6).contains(index),
+        state.surfaces.count == 8 || (SceneLimits.storedMaterials...SceneLimits.materials).contains(state.surfaces.count),
         state.objects.count == state.surfaces.count,
         state.maps.count == state.surfaces.count * 4, state.names.count == state.maps.count
       else {
@@ -665,7 +666,28 @@ func sameBytes<T>(_ a: [T], _ b: [T]) -> Bool {
   }
 }
 extension SceneState {
-  // Legacy eight-slot states compare and restore as full-capacity states.
+  // The slots up to the last one in use, and at least SceneLimits.storedMaterials: what a
+  // project file stores (decoding pads it back with `padded`).
+  var trimmed: SceneState {
+    let defaultSurface = SurfaceSettings(), defaultObject = ObjectSettings()
+    var used = -1
+    for i in surfaces.indices where !sameBytes([surfaces[i]], [defaultSurface]) { used = max(used, i) }
+    for i in objects.indices where !sameBytes([objects[i]], [defaultObject]) { used = max(used, i) }
+    for i in maps.indices where maps[i] != nil || (names.indices.contains(i) && names[i] != "None") { used = max(used, i / 4) }
+    for slot in (emissions ?? [:]).keys { used = max(used, slot) }
+    for slot in (materialX ?? [:]).keys { used = max(used, slot) }
+    let count = min(surfaces.count, max(SceneLimits.storedMaterials, used + 1))
+    guard count < surfaces.count, objects.count == surfaces.count, maps.count == 4 * surfaces.count,
+      names.count == maps.count
+    else { return self }
+    var s = self
+    s.surfaces.removeLast(surfaces.count - count)
+    s.objects.removeLast(objects.count - count)
+    s.maps.removeLast(maps.count - 4 * count)
+    s.names.removeLast(names.count - 4 * count)
+    return s
+  }
+  // Legacy eight-slot and trimmed states compare and restore as full-capacity states.
   var padded: SceneState {
     var s = self
     s.surfaces += Array(repeating: SurfaceSettings(), count: max(0, SceneLimits.materials - s.surfaces.count))

@@ -152,7 +152,7 @@
       float3 eye=eyes[gid.y], target=targets[gid.x].xyz;
       Ray r={eye,normalize(target-eye)}; HitRecord h;
       atomic_fetch_add_explicit(&out[0],1,memory_order_relaxed);
-      bool hit=trace_scene(r,6,h,images,u) && h.objectID>=64;
+      bool hit=trace_scene(r,6,h,images,u) && h.objectID>=MATERIAL_SLOTS;
       if(!hit) atomic_fetch_add_explicit(&out[1],1,memory_order_relaxed);
       if(!scene_occluded(r,6,length(target-eye)*1.001f+1e-3f,images,u)) atomic_fetch_add_explicit(&out[2],1,memory_order_relaxed);
       float tMin=ray_t_min(eye,u), best=1e20f; bool mesh=false; HitRecord p;

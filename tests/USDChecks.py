@@ -115,10 +115,11 @@ fallbacks=[m for m in rb['materials'] if m['path']=='/Looks/Bad'];check(sorted(m
 check('/Red: material /Looks/Bad fallback to displayColor' in report and '/Blue: material /Looks/Bad fallback to displayColor' in report,report)
 # Per-color fallbacks never push a stage past the material limit; the overflow shares the first fallback.
 many=Usd.Stage.CreateNew(str(out/'many-colors.usda'));badMany=UsdShade.Material.Define(many,'/Looks/Bad');badMany.CreateSurfaceOutput().ConnectToSource(UsdShade.Shader.Define(many,'/Looks/Bad/S').ConnectableAPI(),'surface')
-for i in range(60):
- m=quad(many,'/Q%d'%i,(2*i,0,0));m.CreateDisplayColorAttr([(i/60,0,1)]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(badMany)
+manyCount=bridge.MATERIALS+4
+for i in range(manyCount):
+ m=quad(many,'/Q%d'%i,(2*i,0,0));m.CreateDisplayColorAttr([(i/manyCount,0,1)]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(badMany)
 many.GetRootLayer().Save();mc=bridge.import_stage(str(out/'many-colors.usda'),out)
-check(len(mc['materials'])==56 and sum('material limit reached' in l for l in mc['report'])==4,mc['report'][:3])
+check(len(mc['materials'])==bridge.MATERIALS and sum('material limit reached' in l for l in mc['report'])==4,mc['report'][:3])
 env=pathlib.Path(rb['environment']['file']).read_bytes();texel=env[-4:];scale=2.0**(texel[3]-136)
 check(rb['environment']['intensity']==2 and env.startswith(b'#?RADIANCE') and [round(c*scale,3) for c in texel[:3]]==[.25,.5,1],texel)
 check('/Dome: untextured dome imported as a constant-color environment' in report and rb['cameras'][0]['focus'] is None,"'/Dome: untextured dome imported as a constant-color environment' in report and rb['cameras'][0]['focus'] is None")

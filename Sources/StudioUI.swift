@@ -2139,8 +2139,8 @@ final class StudioController: NSViewController {
       guard let self, let slot, self.renderer.materials === resources,
         self.renderer.sceneIndex == scene, self.renderer.interactionGeneration == generation
       else { return }
-      if slot >= 64, let graph = self.project.graph, graph.nodes.indices.contains(slot - 64) {
-        let node = graph.nodes[slot - 64]
+      if slot >= SceneLimits.materials, let graph = self.project.graph, graph.nodes.indices.contains(slot - SceneLimits.materials) {
+        let node = graph.nodes[slot - SceneLimits.materials]
         self.selectedNode = node.id
         self.selectedSubset = 0
         self.selectedSlot =

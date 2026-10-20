@@ -4,9 +4,13 @@ import simd
 // REFERENCES.md: PBRT2023, OBJ2026, MATERIALX. Local scene model and GPU bridge.
 // Stable document IDs are independent of GPU slots and BVH triangle ordering.
 enum SceneLimits {
-  static let materials = 64
-  static let graphImages = 128
-  static let nodes = 256
+  // GPU capacities (MSL MATERIAL_SLOTS and GRAPH_IMAGES; docs/SCENE_STORAGE_DESIGN.md phase 2).
+  static let materials = 1024
+  static let graphImages = 4096
+  // Slots a new SceneState stores; states grow to the slot they use (SceneState.reserve).
+  static let storedMaterials = 64
+  // Object IDs of imported nodes start at `materials` and are 32-bit.
+  static let nodes = 65_535
   // Stored (unique) mesh triangles: document assets, the graph-less mesh and the flat BVH.
   static let triangles = 1_000_000
   // Rendered triangles: instances of the stored ones (two-level acceleration only).
@@ -84,7 +88,7 @@ struct SceneGraph: Codable {
   mutating func addMaterial(_ name: String) throws -> SceneMaterial {
     let used = Set(materials.map(\.slot))
     guard let slot = (8..<SceneLimits.materials).first(where: { !used.contains($0) }) else {
-      throw MaterialLibrary.error("This scene has reached the 56 imported-material limit.")
+      throw MaterialLibrary.error("This scene has reached the \(SceneLimits.materials - 8) imported-material limit.")
     }
     let material = SceneMaterial(name: name, slot: slot)
     materials.append(material)

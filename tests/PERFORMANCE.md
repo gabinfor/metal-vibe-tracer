@@ -1,3 +1,7 @@
+# 1,024-slot material table — October 20, 2026
+
+Phase 2 of `docs/SCENE_STORAGE_DESIGN.md` against `main` (`ec31256`), Apple M4, export path, raw EXR, two alternating rounds: ASWF Shader Ball (960×720, 256 spp, ReSTIR PT and spectral defaults) 195 / 191 s on `main` and 193 / 189 s with the larger argument buffer and the settings buffer; built-in Pavilion (960×540, 256 spp) 16 / 15 s and 15 / 15 s. Both images are byte-identical to `main`.
+
 # Indexed mesh storage — October 20, 2026
 
 `python3 scripts/measure_mesh_memory.py 999698` (production `MaterialLibrary.setMesh` of one 999,698-triangle welded grid asset, 501,264 vertices; Apple M4, macOS 27.0.1). Resident `meshBytes` per triangle:

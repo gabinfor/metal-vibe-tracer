@@ -6,6 +6,8 @@ import sys, pathlib, os, json, math, uuid, hashlib, argparse, xml.etree.ElementT
 HERE=pathlib.Path(__file__).resolve().parent
 # Mirror SceneLimits.triangles (stored, distinct meshes) and SceneLimits.renderedTriangles.
 STORED_TRIANGLES=1000000;RENDERED_TRIANGLES=64000000
+# SceneLimits.materials (1024) minus the 8 procedural slots, and SceneLimits.nodes.
+MATERIALS=1016;NODES=65535
 # The bundled SDK is a CPython 3.9 wheel; any other interpreter gets a concise requirement message.
 if sys.version_info[:2]!=(3,9):sys.exit('USD import failed: the bundled OpenUSD SDK requires /usr/bin/python3 CPython 3.9 (Xcode Command Line Tools); found Python '+sys.version.split()[0]+'.')
 sys.path.insert(0,str(HERE/'OpenUSD' if (HERE/'OpenUSD').exists() else HERE.parent/'build/OpenUSD'))
@@ -270,12 +272,12 @@ def import_stage(filename,directory,frame=None):
         # A failed translation falls back per displayColor, so prims sharing it keep their own colors.
         key=path if mtlx else path+'|display:'+str(color)
         if key in materialIndex:return materialIndex[key],color
-        if len(materials)>=56 and path in materialIndex:
+        if len(materials)>=MATERIALS and path in materialIndex:
             report.append(str(prim.GetPath())+': material limit reached; shares the first displayColor fallback of '+path)
             return materialIndex[path],color
         item={'id':uid(),'name':material.GetPrim().GetName() if material else 'Display color','color':color,'path':path}
         if mtlx:item['mtlx']=mtlx
-        if len(materials)>=56:fail('Stage exceeds 56 imported materials')
+        if len(materials)>=MATERIALS:fail(f'Stage exceeds {MATERIALS} imported materials')
         materials.append(item);materialIndex[key]=item['id']
         if path:materialIndex.setdefault(path,item['id'])
         return item['id'],color
@@ -313,7 +315,7 @@ def import_stage(filename,directory,frame=None):
                     if pp not in collapsed:report.append(path+': zero or singular world scale; subtree hidden')
                     collapsed.add(path)
                 nodes.append(node);nodeIDs[path]=node['id'];worlds[path]=world
-                if len(nodes)>256:fail('Stage exceeds 256 imported hierarchy nodes')
+                if len(nodes)>NODES:fail(f'Stage exceeds {NODES:,} imported hierarchy nodes')
                 if not prim.IsA(UsdGeom.Mesh):continue
                 if prim.HasAPI(UsdLux.MeshLightAPI):report.append(path+': MeshLightAPI emission not applied; mesh imported as a surface')
                 mesh=UsdGeom.Mesh(prim);points=mesh.GetPointsAttr().Get(time);counts=mesh.GetFaceVertexCountsAttr().Get(time);indices=mesh.GetFaceVertexIndicesAttr().Get(time)
@@ -406,7 +408,7 @@ def import_stage(filename,directory,frame=None):
                     report.append(path+': emission %.3g exceeds the supported 1e8 and was scaled down'%max(emission))
                     emission=[x*(1e8/max(emission)) for x in emission]
                 material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':emission}
-                if len(materials)>=56:fail('Stage exceeds 56 materials including lights')
+                if len(materials)>=MATERIALS:fail(f'Stage exceeds {MATERIALS} materials including lights')
                 materials.append(material)
                 asset={'id':uid(),'name':str(prim.GetName()),'triangles':triangles,'subsets':['Emission']};assets.append(asset);stored+=len(triangles)
                 pp,parentID,local=attach(prim,world)
@@ -435,7 +437,7 @@ def import_stage(filename,directory,frame=None):
             elif prim.HasAPI(UsdLux.VolumeLightAPI):report.append(path+': VolumeLightAPI emission and volume geometry '+prim.GetTypeName()+' are not imported')
             elif prim.HasAPI(UsdLux.LightAPI):report.append(path+': unsupported light type '+prim.GetTypeName())
             elif prim.IsA(UsdGeom.Gprim) or prim.GetTypeName() in ('PointInstancer','Volume'):report.append(path+': unsupported geometry '+prim.GetTypeName())
-    if len(nodes)>256 or rendered>RENDERED_TRIANGLES or stored>STORED_TRIANGLES:fail('Stage exceeds renderer capacity including lights')
+    if len(nodes)>NODES or rendered>RENDERED_TRIANGLES or stored>STORED_TRIANGLES:fail('Stage exceeds renderer capacity including lights')
     if not assets:fail('No supported meshes were found')
     report.insert(1,f'{len(assets)} mesh assets, {len(nodes)} nodes, {len(materials)} materials, {rendered} triangles')
     return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report,'fallbackColors':fallbackColors}

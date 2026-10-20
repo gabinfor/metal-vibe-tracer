@@ -297,8 +297,10 @@
   require(groupParts.count == 20_000 && Date().timeIntervalSince(start) < 5,
     "OBJ part lookup is constant time")
   var limited = SceneGraph()
+  var tooMany = "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+  for i in 0...SceneLimits.nodes { tooMany += "g G\(i)\nf 1 2 3\n" }
   do {
-    _ = try limited.addOBJ(groups, name: "groups")
+    _ = try limited.addOBJ(tooMany, name: "groups")
     require(false, "reject an OBJ exceeding the node limit")
   } catch {
     require(error.localizedDescription.contains("too many objects and groups"), "node limit message is actionable")

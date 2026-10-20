@@ -102,8 +102,22 @@
       index += 1
     }
   }
-  require(MemoryLayout<SurfaceSettings>.stride * SceneLimits.materials <= 4096
-      && renderer.materials.settings.count == SceneLimits.materials, "SurfaceSettings fit setBytes")
+  // Every slot's SurfaceSettings is bound as one buffer (index 1), so the slot count is no longer
+  // bound by setBytes' 4 KB; MSL MATERIAL_SLOTS and GRAPH_IMAGES match SceneLimits.
+  require(renderer.materials.settings.count == SceneLimits.materials, "one SurfaceSettings per material slot")
+  do {
+    let probe = try gpu.makeLibrary(source: metalSource + "\nkernel void slot_counts(device uint *out [[buffer(0)]]) { out[0] = MATERIAL_SLOTS; out[1] = GRAPH_IMAGES; }",
+      options: shaderCompileOptions())
+    let out = gpu.makeBuffer(length: 8, options: .storageModeShared)!
+    let command = renderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(try gpu.makeComputePipelineState(function: probe.makeFunction(name: "slot_counts")!))
+    encoder.setBuffer(out, offset: 0, index: 0)
+    encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    require(out.contents().load(as: UInt32.self) == UInt32(SceneLimits.materials)
+      && out.contents().load(fromByteOffset: 4, as: UInt32.self) == UInt32(SceneLimits.graphImages),
+      "MSL MATERIAL_SLOTS and GRAPH_IMAGES equal SceneLimits")
+  }
   print("PASS: shared struct sizes and offsets match between Swift and Metal")
 
   // R-21: with full-size sentinel reservoirs bound, the temporal kernel writes no

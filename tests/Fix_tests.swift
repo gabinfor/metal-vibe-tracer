@@ -228,7 +228,7 @@
     var picked: Int? = -1
     r.pick(SIMD2<Float>(0.5, 0.5)) { picked = $0 }
     waitUntil({ picked != -1 })
-    require(picked == 64 + meshIndex, "pick_kernel returns the graph node under the cursor (\(String(describing: picked)))")
+    require(picked == SceneLimits.materials + meshIndex, "pick_kernel returns the graph node under the cursor (\(String(describing: picked)))")
     controller.selectedNode = nil
     controller.pick(SIMD2<Float>(0.5, 0.5))
     waitUntil({ controller.selectedNode != nil })

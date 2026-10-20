@@ -551,24 +551,32 @@ struct MeshFace { uint a, b, c, tag; };
 struct MeshWideNode { float4 lox, loy, loz, hix, hiy, hiz; int4 child; int4 count; };
 struct GraphInstruction { int4 code; float4 value, extra, auxiliary; };
 struct GraphHeader { int4 roots0, roots1, roots2, info; };
+// Material slots (SceneLimits.materials) and MaterialX graph images (SceneLimits.graphImages).
+// Slots 0-7 are the procedural scenes' surfaces; imported materials take 8 and up. Object IDs
+// of imported scene-graph nodes start after the slots (MATERIAL_SLOTS + node index).
+#define MATERIAL_SLOTS 1024u
+#define GRAPH_IMAGES 4096u
+// Argument-buffer IDs: small members first, then the two texture arrays (MaterialLibrary.Argument).
 struct MaterialResources {
-    array<texture2d<float>, 256> maps [[id(0)]];
-    texture2d<float> environmentMap [[id(256)]];
-    device MeshTriangle *triangles [[id(257)]];
-    device MeshNode *nodes [[id(258)]];
-    device ObjectSettings *objects [[id(259)]];
-    array<texture2d<float>,128> graphImages [[id(260)]];
-    device GraphInstruction *graphInstructions [[id(388)]];
-    device GraphHeader *graphHeaders [[id(389)]];
-    device float4 *emissions [[id(390)]];
-    device uint *emitters [[id(391)]];
-    texture2d<float> environmentRows [[id(392)]];
-    texture2d<float> environmentColumns [[id(393)]];
-    device MeshFace *faces [[id(394)]];
-    device MeshVertex *vertices [[id(395)]];
-    device MeshWideNode *blasNodes [[id(396)]];
+    texture2d<float> environmentMap [[id(0)]];
+    device MeshTriangle *triangles [[id(1)]];
+    device MeshNode *nodes [[id(2)]];
+    device ObjectSettings *objects [[id(3)]];
+    device GraphInstruction *graphInstructions [[id(4)]];
+    device GraphHeader *graphHeaders [[id(5)]];
+    device float4 *emissions [[id(6)]];
+    device uint *emitters [[id(7)]];
+    texture2d<float> environmentRows [[id(8)]];
+    texture2d<float> environmentColumns [[id(9)]];
+    device MeshFace *faces [[id(10)]];
+    device MeshVertex *vertices [[id(11)]];
+    device MeshWideNode *blasNodes [[id(12)]];
     // Graph-less (legacy) mesh only: per face, its stored uvc.w (low 16 bits) and na.w (high 16).
-    device uint *faceExtras [[id(397)]];
+    device uint *faceExtras [[id(13)]];
+    // Per slot: the spectral OpenPBR parameters (MSL SpectralMaterial, MaterialLibrary.spectralMaterials).
+    device float4 *spectralMaterials [[id(14)]];
+    array<texture2d<float>, GRAPH_IMAGES> graphImages [[id(16)]];
+    array<texture2d<float>, MATERIAL_SLOTS * 4> maps [[id(4112)]];
 };
 
 // Radiance of the area light of scenes 1, 3, 4 and 5 before the light tint (Uniforms.light).
@@ -604,9 +612,8 @@ struct SpectralScene {
     uint dispersionSampling; // DispersionSampling bits: 1 spectral MIS at rough dispersive lobes, 2 lane splitting at delta ones
     uint padding1;
     float nodes[88];          // linear sRGB of the coarse grid's nodes, codes 0, 3, ..., 255 (86 used)
-    SpectralMaterial materials[64];
 };
-static_assert(sizeof(SpectralScene) == 1392, "Swift writes a 1392-byte SpectralScene");
+static_assert(sizeof(SpectralScene) == 368, "Swift writes a 368-byte SpectralScene");
 // Buffer 28 (SpectralShaderCache.grid): the exactly solved 86^3 grid of FourierSRGB86.bin as float4
 // (c0, c1, c2, 0), indexed (r * 86 + g) * 86 + b. Buffer 29 (PathTracerRenderer.spectralSampling),
 // written by spectral_icdf_kernel: the scene's 1025-node wavelength inverse CDF, then at float4 257
@@ -829,7 +836,10 @@ float3 emitter_rgb(float3 e, thread const Wavelengths &wl) { return spectral_emi
 
 SpectralMaterial spectral_material(Material m, thread const Wavelengths &wl) {
     SpectralMaterial none = { 0.0f, 0.0f, 0.0f, 1.4f };
-    return m.slot < 64u ? wl.scene->materials[m.slot] : none;
+    if (m.slot >= MATERIAL_SLOTS) return none;
+    float4 p = wl.images->spectralMaterials[m.slot];
+    SpectralMaterial r = { p.x, p.y, p.z, p.w };
+    return r;
 }
 // Whether the material's index of refraction depends on wavelength (OpenPBR "Dispersion").
 bool spectral_dispersive(Material m, thread const Wavelengths &wl) {
@@ -1671,7 +1681,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
         mesh_hit_attributes(rec,tri,b1,b2,local.direction);
         rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=uses_scene_graph(u) ? uint(tri.uvc.z) : 7;
         if(uses_scene_graph(u) && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
-        rec.objectID=uses_scene_graph(u) ? 64+uint(tri.uvc.w)-1 : 7;
+        rec.objectID=uses_scene_graph(u) ? MATERIAL_SLOTS+uint(tri.uvc.w)-1 : 7;
         rec.triangle=instance.range.z+uint(m.triangle);
         world_hit(rec,o);
         return true;
@@ -1695,7 +1705,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             mesh_hit_attributes(rec,tri,b1,b2,local.direction);
             rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=uses_scene_graph(u) ? uint(tri.uvc.z) : 7;
             if(uses_scene_graph(u) && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
-            rec.objectID=uses_scene_graph(u) ? 64+uint(tri.uvc.w)-1 : 7;
+            rec.objectID=uses_scene_graph(u) ? MATERIAL_SLOTS+uint(tri.uvc.w)-1 : 7;
             rec.triangle=uint(node.links.z+k);
             world_hit(rec,o);
         }
@@ -1875,8 +1885,8 @@ struct SurfaceSettings {
     float normalStrength;
     uint padding;
 };
-// All 64 slots are uploaded with setBytes, whose payload limit is 4 KB.
-static_assert(sizeof(SurfaceSettings) * 64 <= 4096, "SurfaceSettings payload exceeds setBytes");
+// All MATERIAL_SLOTS slots live in one buffer (MaterialLibrary.settingsBuffer), bound at index 1.
+static_assert(sizeof(SurfaceSettings) == 64, "Swift SurfaceSettings layout");
 
 
 float4 sample_material_map(constant MaterialResources &images, uint slot, uint channel,
@@ -1965,7 +1975,7 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
     hit.mat.inside = !hit.front_face;
     hit.mat.tangent = hit.tangent;
     hit.mat.geometricNormal = hit.geometricNormal;
-    if (hit.mat.type == EMISSIVE || hit.mat.slot >= 64) return;
+    if (hit.mat.type == EMISSIVE || hit.mat.slot >= MATERIAL_SLOTS) return;
     uint slot = hit.mat.slot;
     SurfaceSettings config = settings[slot];
     if (config.enabled != 0) {
@@ -2251,14 +2261,14 @@ float imported_emitter_area_pdf(uint index,constant MaterialResources &images) {
     uint count=images.emitters[0];
     if(count==0) return 0.0f;
     float total=as_type<float>(images.emitters[2*count+1]);uint slot=uint(scene_triangle(index,images).uvc.z);
-    if(slot<8 || slot>=64 || !(total>0)) return 0.0f;
+    if(slot<8 || slot>=MATERIAL_SLOTS || !(total>0)) return 0.0f;
     return images.emissions[slot].w/total;
 }
 // Radiance a MaterialX emitter sends from a sampled point (barycentrics b1, b2) toward p,
 // evaluated with the graph exactly as at a BSDF hit on that point (finest image level).
 float3 imported_graph_emission(uint index,float b1,float b2,float3 p,float3 position,float3 wi,constant MaterialResources &images) {
     MeshTriangle t=scene_triangle(index,images);uint slot=uint(t.uvc.z);
-    if(slot>=64 || images.graphHeaders[slot].info.y==0 || images.graphHeaders[slot].info.w<0) return float3(0);
+    if(slot>=MATERIAL_SLOTS || images.graphHeaders[slot].info.y==0 || images.graphHeaders[slot].info.w<0) return float3(0);
     HitRecord h={};Ray ray={p,wi};
     h.t=length(position-p);h.position=position;h.triangle=index;
     mesh_hit_attributes(h,t,b1,b2,wi);
@@ -6334,7 +6344,7 @@ kernel void pick_kernel(constant Uniforms &u [[buffer(0)]],
     float scale=tan(u.cameraPos.w*PI/360.0f);
     Ray ray={u.cameraPos.xyz,normalize(f+right*uv.x*(float(u.width)/u.height)*scale-up*uv.y*scale)};
     HitRecord hit;
-    result[0]=trace_scene(ray,u.sceneIndex,hit,images,u) && (hit.mat.type!=EMISSIVE || hit.objectID>=64) ? hit.objectID : 0xffffffffu;
+    result[0]=trace_scene(ray,u.sceneIndex,hit,images,u) && (hit.mat.type!=EMISSIVE || hit.objectID>=MATERIAL_SLOTS) ? hit.objectID : 0xffffffffu;
 }
 
 #if VIBE_SPECTRAL
@@ -7058,7 +7068,10 @@ struct SurfaceSettings: Codable {
 final class MaterialLibrary {
     static let names = ["Unassigned", "Floor", "Copper sphere", "Gold ring", "Chrome sphere", "Glass sphere", "Plinth", "Imported mesh"]
     static let mapNames = ["Base color (sRGB)", "Roughness (linear R)", "Metalness (linear R)", "Normal (+Y, linear)"]
-    var settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
+    // Every slot's surface settings, bound as a buffer at index 1 (rebuilt on the next bind after
+    // any edit; frames already encoded keep the buffer they bound).
+    var settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials) { didSet { settingsBuffer = nil } }
+    private var settingsBuffer: MTLBuffer?
     var images: [MTLTexture] = []
     private var defaultTextures: [MTLTexture] = []
     var fileNames = Array(repeating: "None", count: SceneLimits.materials * 4)
@@ -7129,7 +7142,7 @@ final class MaterialLibrary {
     // Spectral transport's per-slot OpenPBR parameters (MSL SpectralMaterial: dispersion 20 / V_d, thin
     // film weight, thickness in micrometres and IOR), from the slots' MaterialX constants;
     // spectralOverrides replaces a slot's (test scenes).
-    var spectralOverrides: [Int: SIMD4<Float>] = [:]
+    var spectralOverrides: [Int: SIMD4<Float>] = [:] { didSet { bindingsDirty = true } }
     var spectralMaterials: [SIMD4<Float>] {
         (0..<SceneLimits.materials).map { spectralOverrides[$0] ?? materialX[$0]?.spectral ?? MaterialXProgram.noSpectral }
     }
@@ -7317,6 +7330,13 @@ final class MaterialLibrary {
         }
     }
 
+    // MSL MaterialResources IDs: small members, then the graph images and the material maps.
+    enum Argument {
+        static let environment = 0, triangles = 1, nodes = 2, objects = 3, graphInstructions = 4, graphHeaders = 5
+        static let emissions = 6, emitters = 7, environmentRows = 8, environmentColumns = 9
+        static let faces = 10, vertices = 11, blasNodes = 12, faceExtras = 13, spectralMaterials = 14
+        static let graphImages = 16, maps = graphImages + SceneLimits.graphImages
+    }
     func rebuildArguments(_ replacement: [MTLTexture]) throws {
         guard let buffer = bindingBuffer(length: argumentEncoder.encodedLength) else {
             throw Self.error("Could not allocate material bindings.")
@@ -7327,24 +7347,27 @@ final class MaterialLibrary {
         var bound: [MTLResource] = []
         func setTexture(_ texture: MTLTexture, _ index: Int) { argumentEncoder.setTexture(texture, index: index); bound.append(texture) }
         func setBuffer(_ buffer: MTLBuffer, _ index: Int) { argumentEncoder.setBuffer(buffer, offset: 0, index: index); bound.append(buffer) }
-        for (i, texture) in replacement.enumerated() { setTexture(texture, i) }
-        setTexture(environmentTexture,256)
-        setTexture(environmentRows,392)
-        setTexture(environmentColumns,393)
-        setBuffer(triangleBuffer,257)
-        setBuffer(nodeBuffer,258)
+        for (i, texture) in replacement.enumerated() { setTexture(texture, Argument.maps + i) }
+        setTexture(environmentTexture,Argument.environment)
+        setTexture(environmentRows,Argument.environmentRows)
+        setTexture(environmentColumns,Argument.environmentColumns)
+        setBuffer(triangleBuffer,Argument.triangles)
+        setBuffer(nodeBuffer,Argument.nodes)
         let streams = meshStreams ?? placeholderStreams!
-        setBuffer(streams.faces,394)
-        setBuffer(streams.vertices,395)
-        setBuffer(streams.nodes,396)
-        setBuffer(streams.extras ?? placeholderStreams.faces,397)
+        setBuffer(streams.faces,Argument.faces)
+        setBuffer(streams.vertices,Argument.vertices)
+        setBuffer(streams.nodes,Argument.blasNodes)
+        setBuffer(streams.extras ?? placeholderStreams.faces,Argument.faceExtras)
+        guard let spectral = spectralMaterials.withUnsafeBytes({ bindingBuffer(bytes: $0.baseAddress!, length: $0.count) })
+        else { throw Self.error("Could not allocate spectral material parameters.") }
+        setBuffer(spectral,Argument.spectralMaterials)
         // Hardware traversal reaches these through the node buffer's resource ID.
         bound += meshLayout?.structures ?? []
         guard let objectBuffer=objects.withUnsafeBytes({ bindingBuffer(bytes:$0.baseAddress!,length:$0.count) }) else { throw Self.error("Could not allocate object settings.") }
-        setBuffer(objectBuffer,259)
-        for i in 0..<SceneLimits.graphImages { setTexture(i < graphTextures.count ? graphTextures[i] : replacement[0],260+i) }
-        setBuffer(graphInstructionBuffer,388)
-        setBuffer(graphHeaderBuffer,389)
+        setBuffer(objectBuffer,Argument.objects)
+        for i in 0..<SceneLimits.graphImages { setTexture(i < graphTextures.count ? graphTextures[i] : replacement[0],Argument.graphImages+i) }
+        setBuffer(graphInstructionBuffer,Argument.graphInstructions)
+        setBuffer(graphHeaderBuffer,Argument.graphHeaders)
         var emissionValues=Array(repeating:SIMD4<Float>(repeating:0),count:SceneLimits.materials)
         for (slot,value) in emissions {if emissionValues.indices.contains(slot){emissionValues[slot]=SIMD4(value,0)}}
         // .w is each emitting slot's light-selection weight (imported_emitter_area_pdf):
@@ -7383,7 +7406,7 @@ final class MaterialLibrary {
             guard let buffer=emitterValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}) else{throw Self.error("Could not allocate scene emitters.")}
             ib = buffer
         }
-        setBuffer(eb,390);setBuffer(ib,391)
+        setBuffer(eb,Argument.emissions);setBuffer(ib,Argument.emitters)
         var seen = Set<ObjectIdentifier>()
         bound = bound.filter { seen.insert(ObjectIdentifier($0)).inserted }
         // Replace atomically; previously encoded frames retain their original
@@ -7437,9 +7460,11 @@ final class MaterialLibrary {
         // buffer and useResources retains every resource it points to, so
         // later swaps cannot free resources that encoded frames still read.
         encoder.useResources(boundResources, usage: .read)
-        settings.withUnsafeBytes { bytes in
-            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 1)
+        if settingsBuffer == nil {
+            settingsBuffer = settings.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
         }
+        guard let settingsBuffer else { return false }
+        encoder.setBuffer(settingsBuffer, offset: 0, index: 1)
         encoder.setBuffer(argumentBuffer, offset: 0, index: 2)
         return true
     }
@@ -8276,21 +8301,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         solver.endEncoding(); solve.commit(); solve.waitUntilCompleted()
         if solve.status != .completed { onError?("The spectral grid refinement failed: \(String(describing: solve.error))") }
     }
-    // SpectralScene (MSL, 1392 bytes): light and sun illuminants, the coarse grid's node values and
-    // the slots' spectral material parameters.
+    // SpectralScene (MSL, 368 bytes): light and sun illuminants, dispersion sampling and the coarse
+    // grid's node values. The slots' spectral material parameters are in the material argument buffer.
     static let spectralGridNodes: [Float] = (0..<86).map { i in
         let v = Double(3 * i) / 255
         return Float(v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4))
     }
     func spectralSceneWords() -> [UInt32] {
-        var words = [UInt32](repeating: 0, count: 348)
+        var words = [UInt32](repeating: 0, count: 92)
         words[0] = Illuminant.resolved(options.lightSpectrum).rawValue
         words[1] = Illuminant.resolved(options.sunSpectrum).rawValue
         words[2] = dispersionSampling.resolved().rawValue
         for (i, v) in Self.spectralGridNodes.enumerated() { words[4 + i] = v.bitPattern }
-        for (slot, m) in materials.spectralMaterials.enumerated() {
-            for c in 0..<4 { words[92 + slot * 4 + c] = m[c].bitPattern }
-        }
         return words
     }
     // Spectral transport's device memory: the 86^3 float4 moment grid (shared by renderers of one device)
