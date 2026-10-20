@@ -52,11 +52,12 @@ source files are unchanged. The downloaded assets and renders/projects generated
 by the tests are optional local files under build/, not bundled with the
 application. See Examples/OpenUSD/README.md.
 
-The repository does contain one derived render of this asset:
-docs/images/shaderball-studio.jpg, a Metal Vibe Tracer image of the adapted
-scene described above, lit additionally by a CC0 Poly Haven environment. It is derived from the CC-BY-4.0 asset
-(https://creativecommons.org/licenses/by/4.0/); its adjacent attribution and
-statement of changes are in docs/images/README.md. It is not bundled with the
+The repository does contain two derived renders of this asset:
+docs/images/shaderball-studio.jpg and docs/images/shaderball-loft.jpg, Metal Vibe
+Tracer images of the adapted scene described above, lit additionally by CC0 Poly
+Haven environments. They are derived from the CC-BY-4.0 asset
+(https://creativecommons.org/licenses/by/4.0/); their adjacent attribution and
+statement of changes are in docs/images/README.md. They are not bundled with the
 application.
 
 ## Intel Open Image Denoise

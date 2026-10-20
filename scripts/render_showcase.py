@@ -59,6 +59,8 @@ struct Shot: Decodable {
   var sunAzimuth: Float?, sunElevation: Float?, sunIntensity: Float?
   var environmentIntensity: Float?, environmentRotation: Float?
   var lightIntensity: Float?, lightSize: Float?
+  var lightSpectrum: UInt32?, sunSpectrum: UInt32?
+  var lightColor: [Float]?
   var width: Int, height: Int
   var samples: UInt32?
 }
@@ -107,6 +109,9 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
   if let v = shot.environmentRotation { p.options.environmentRotation = v }
   if let v = shot.lightIntensity { p.options.lightIntensity = v }
   if let v = shot.lightSize { p.options.lightSize = v }
+  if let v = shot.lightSpectrum { p.options.lightSpectrum = v }
+  if let v = shot.sunSpectrum { p.options.sunSpectrum = v }
+  if let v = shot.lightColor { p.options.lightColor = SIMD3<Float>(v[0], v[1], v[2]) }
   p.options.outputWidth = shot.width
   p.options.outputHeight = shot.height
   p.options.exportSamples = shot.samples ?? 1024

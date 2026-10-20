@@ -19,6 +19,20 @@ Metal Vibe Tracer is a GPU path tracer with an interactive studio UI. It impleme
 
 These images were rendered with spectral transport and denoised with Open Image Denoise, through the app's own export path (`python3 scripts/render_showcase.py`). The environments are Poly Haven's Art Studio and Studio Small 01 HDRIs (CC0). The Shader Ball render is an adapted work of the [ASWF Standard Shader Ball](https://github.com/usd-wg/assets/tree/3b75c2dad6a494897557dcca0098257bcf42a8c6/full_assets/StandardShaderBall) by the ASWF USD Working Group (geometry and textures by Chris Rydalch), [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). The changes are described in [docs/images/README.md](docs/images/README.md).
 
+## Gallery
+
+**Spectral illuminants.** The same Cornell box lit by CIE illuminant A (incandescent), FL11 (narrow-band fluorescent) and HP1 (high-pressure sodium), set with **Light spectrum**. Sodium light has almost no green in its spectrum, so the green wall goes nearly black. RGB transport ignores these presets.
+
+| Incandescent (A) | Fluorescent (FL11) | Sodium (HP1) |
+| --- | --- | --- |
+| ![Cornell box under incandescent light](docs/images/spectral-incandescent-a.jpg) | ![Cornell box under narrow-band fluorescent light](docs/images/spectral-fluorescent-fl11.jpg) | ![Cornell box under sodium light, with a near-black green wall](docs/images/spectral-sodium-hp1.jpg) |
+
+| Thin-lens depth of field | Twilight sky | Shader Ball, side view |
+| --- | --- | --- |
+| ![Pavilion close-up focused on the copper sphere, foreground cylinder out of focus](docs/images/pavilion-depth-of-field.jpg) | ![Pavilion under the twilight sky preset with soft beam shadows](docs/images/pavilion-twilight.jpg) | ![ASWF Standard Shader Ball from the side, lit by an HDRI](docs/images/shaderball-loft.jpg) |
+
+The side-view Shader Ball is under the same CC-BY-4.0 attribution as above, and its environment is Poly Haven's Photo Studio Loft Hall (CC0). Every shot is listed in `scripts/showcase.json`.
+
 ## Features
 
 - **Path tracing:** ReSTIR with Standard MIS, light-only, and BSDF-only comparison modes. Imported scenes use ReSTIR PT, which reuses whole paths, including glossy, mirror and glass paths, with the improvements of ReSTIR PT Enhanced (Lin et al., SIGGRAPH 2022 and I3D 2026; `RESTIRPT2022`, `RESTIRPTE2026` in [REFERENCES.md](REFERENCES.md)). The procedural scenes use ReSTIR direct lighting with first-bounce diffuse ReSTIR GI, which is faster there; its spatial reuse can pick neighbours by compatibility-guided selection (Junkins et al., HPG 2026; `COMPATRESTIR2026`). An opt-in stochastic pairwise MIS spatial reuse (Hedstrom et al., Eurographics 2026; `SPMIS2026`) reuses DI, GI or PT samples from 64-pixel reuse cells without bias. ReSTIR PT shades pixels with spatio-temporal control variates (Shi et al., SIGGRAPH 2026; `RESTCV2026`): colour estimates accumulated over neighbouring pixels and frames, corrected by the reservoirs' own difference estimates, which lowers colour noise without bias.
