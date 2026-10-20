@@ -851,6 +851,20 @@ Wenzel Jakob, Sébastien Speierer, Nicolas Roussel, Merlin Nimier-David, Delio V
 
 **Used in:** `scripts/compare_mitsuba.py`, a development tool that is not bundled and not a build dependency. It installs into `build/mitsuba-venv` and renders the built-in Cornell (scene 1), Cornell Glass & Mirror (scene 3) and Veach MIS (scene 2) scenes with the `metal_ad_rgb` and `metal_ad_spectral` variants (path integrator, `max_depth` = path depth + 1, box pixel filter, vertical field of view). It compares them with raw linear EXR exports from `scripts/render_showcase.py` (Standard MIS and ReSTIR, RGB and spectral, no denoiser). The scenes are rebuilt from `trace_scene`: DIFFUSE is Mitsuba's `diffuse`, DIELECTRIC is `dielectric` with IOR 1.52, and GLOSSY is a `conductor` (delta) or a two-sided GGX `roughconductor` with alpha = roughness² and the `GULBRANDSEN2014` complex IOR. Mitsuba does not implement the OpenPBR metal, so rough plates compare the GGX lobe and Fresnel only. Results of 2026-10-20 (4,096 spp Vibe, 16,384 spp Mitsuba): Cornell mean radiance within 0.02% (RGB MIS and ReSTIR) and 0.14% (spectral, whose RGB-to-spectrum uplifting differs from Mitsuba's); Glass & Mirror within 0.4%; Veach MIS within 0.04% overall, but its near-mirror plate (roughness 0.005, delta path, seen from its back face) is about 17% brighter than Mitsuba while the rough plates match within 0.2%. That plate is an open issue.
 
+### BITTERLI2016 — Rendering resources (Mitsuba 3 scene versions)
+
+Benedikt Bitterli. **Rendering Resources**, 2016, with Mitsuba 3 versions of the scenes. [Scene collection, per-scene licenses and authors](https://benedikt-bitterli.me/resources/), checked 2026-10-20. Downloaded 2026-10-20 to `build/scenes/` (git-ignored, not redistributed):
+
+| Scene (archive) | Author | License |
+| --- | --- | --- |
+| Veach, Bidir Room (`veach-bidir.zip`) and Veach, Ajar (`veach-ajar.zip`) | Benedikt Bitterli | CC0 1.0 |
+| Glass of Water (`glass-of-water.zip`) | aXel | CC0 1.0 |
+| Contemporary Bathroom (`bathroom.zip`) | Mareck | CC0 1.0 |
+| Country Kitchen (`kitchen.zip`) and The White Room (`living-room-2.zip`) | Jay-Artist | CC BY 3.0 |
+| Modern Hall (`staircase2.zip`) | NewSee2l035 | CC BY 3.0 |
+
+**Used in:** `scripts/mitsuba_to_usd.py` (Mitsuba XML to a USD stage with OpenPBR materials, geometry loaded by `MITSUBA3`) and `scripts/compare_scene.py` (the app's render of the USD against Mitsuba's render of the XML), development tools for phase 4 of `docs/SCENE_STORAGE_DESIGN.md`. Renders of CC BY scenes that are published must credit the author and link the license. Results of 2026-10-20 (half resolution, RGB, Standard MIS, the scene's own path depth; app 1,024 spp, Mitsuba 4,096, Veach Bidir 4,096 and 16,384), mean radiance ratio app / Mitsuba per channel: Veach Bidir 1.00 / 1.00 / 0.99; Veach Ajar 1.07 / 1.06 / 1.06; Glass of Water 1.06 / 1.06 / 1.06; Country Kitchen 0.98 / 0.97 / 0.96; Contemporary Bathroom 1.06 / 1.05 / 1.05; The White Room 1.19 / 1.16 / 1.14; Modern Hall 0.90 / 0.84 / 0.79. Known causes: opacity masks (blinds, lampshades, rug) are dropped because the renderer has no alpha cutouts; conductors lose their OpenPBR edge tint (no `specular_color` in the app's MaterialX compiler); Beckmann roughness becomes GGX; bump maps are dropped; thin dielectrics become solid. Modern Hall's deficit is not yet explained.
+
 ### GULBRANDSEN2014 — Metal Fresnel from reflectivity and edge tint
 
 Ole Gulbrandsen. **Artist Friendly Metallic Fresnel.** *Journal of Computer Graphics Techniques* 3(4), 64–72, 2014. [Journal page and reference implementation](https://jcgt.org/published/0003/04/03/). Checked 2026-10-20.

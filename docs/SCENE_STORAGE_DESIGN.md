@@ -132,7 +132,11 @@ With the watertight 86 B hardware BLAS, the resident total is about **112 B per 
 - **USD bridge:** emits indexed meshes as a binary sidecar (positions, normals, UVs, indices, subsets), not JSON triangles. **OBJ:** keeps shared vertices instead of expanding faces.
 - **Project format 4:** stores the indexed streams. Formats 1–3 open and convert. The ~1.85 GiB file cap fits about 70 M triangles of geometry at 26 B each.
 
-### Phase 4: validation
+### Phase 4: validation — group A done 2026-10-20
+
+Bitterli's Mitsuba 3 scenes (`BITTERLI2016` in REFERENCES.md) go through `scripts/mitsuba_to_usd.py` into the app's USD import and are compared with Mitsuba's render of the same XML by `scripts/compare_scene.py`; see `BITTERLI2016` for the per-scene numbers. Veach Bidir agrees within 1%; most others within 2–7%, limited by opacity masks (the renderer has no alpha cutouts), the missing conductor edge tint, Beckmann-to-GGX and dropped bump maps. Next: alpha cutouts in every traversal, then MTL import, bump-to-normal conversion and a streaming OBJ reader for Crytek Sponza, San Miguel and Bistro (downloaded).
+
+#### Original proposal
 
 - GPU suite: updated layout tests and new tests for indexed attributes, mirrored instances, transient unwelded builds, more than 64 materials, and the DI encoding above 2^24.
 - Mitsuba comparison unchanged: radiance must match the current results (Cornell within 0.02%).
