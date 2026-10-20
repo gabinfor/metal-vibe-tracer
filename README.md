@@ -5,10 +5,7 @@
 **A spectral GPU path tracer for macOS, built with Swift and Metal.**<br>
 Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 
-![macOS 26+](https://img.shields.io/badge/macOS-26%2B-000000?logo=apple&logoColor=white)
-![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)
-![Metal](https://img.shields.io/badge/Metal-ray%20tracing-8A8A8A)
-![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-000000?logo=apple&logoColor=white) ![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white) ![Metal](https://img.shields.io/badge/Metal-ray%20tracing-8A8A8A) ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
 </div>
 
