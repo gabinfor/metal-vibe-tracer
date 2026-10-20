@@ -575,6 +575,9 @@ struct MaterialResources {
     device uint *faceExtras [[id(13)]];
     // Per slot: the spectral OpenPBR parameters (MSL SpectralMaterial, MaterialLibrary.spectralMaterials).
     device float4 *spectralMaterials [[id(14)]];
+    // Alpha cutouts: per slot the register of MaterialX geometry_opacity (-1: opaque), then at
+    // MATERIAL_SLOTS the number of cutout slots (MaterialLibrary.rebuildArguments).
+    device int *opacityRoots [[id(15)]];
     array<texture2d<float>, GRAPH_IMAGES> graphImages [[id(16)]];
     array<texture2d<float>, MATERIAL_SLOTS * 4> maps [[id(4112)]];
 };
@@ -1489,6 +1492,76 @@ MeshTriangle scene_triangle(uint id, constant MaterialResources &images) {
     MeshInstance m=instances[low]; float b1=0, b2=0;
     return instance_triangle(instance_source(m.range.x+(id-m.range.z),m,images),m,images,b1,b2);
 }
+// Opacity (MaterialXProgram.opacity; docs/SCENE_STORAGE_DESIGN.md phase 4): OpenPBR geometry_opacity is
+// coverage, so a candidate hit is kept with probability equal to it (stochastic transparency): 0 is
+// cut out, 1 always kept, and a value in between is unbiased over the rays that test it. The random
+// number hashes the ray and the triangle, so a ray decides the same way wherever it is traced. The
+// slot's MaterialX instructions are evaluated up to the opacity register at the hit's UV, sampling
+// images at mip 0 (traversal has no ray footprint); normal-map instructions evaluate to 0. Scenes
+// without opacity skip every check.
+bool mesh_cutouts(constant MaterialResources &images) { return images.opacityRoots[MATERIAL_SLOTS] > 0; }
+float2 mesh_uv(MeshTriangle t, float b1, float b2) { return (1.0f-b1-b2)*t.uvab.xy+b1*t.uvab.zw+b2*t.uvc.xy; }
+float cutout_random(Ray r, uint a, uint b) {
+    uint h=pcg_hash(b^0x2545f491u);
+    h=pcg_hash(h^a); h=pcg_hash(h^as_type<uint>(r.origin.x)); h=pcg_hash(h^as_type<uint>(r.origin.y));
+    h=pcg_hash(h^as_type<uint>(r.origin.z)); h=pcg_hash(h^as_type<uint>(r.direction.x));
+    h=pcg_hash(h^as_type<uint>(r.direction.y)); h=pcg_hash(h^as_type<uint>(r.direction.z));
+    return float(h>>8)*(1.0f/16777216.0f);
+}
+// Not inlined, so its register file is not copied into every traversal loop.
+__attribute__((noinline)) bool material_cut(uint slot, float2 uv, constant MaterialResources &images, float random) {
+    if(slot>=MATERIAL_SLOTS) return false;
+    int root=images.opacityRoots[slot]; if(root<0) return false;
+    GraphHeader h=images.graphHeaders[slot];
+    float4 values[64];
+    for(int i=0;i<=root && i<64;++i) {
+        GraphInstruction n=images.graphInstructions[h.info.x+i];
+        float4 a=i>0?values[n.code.y]:float4(0),b=i>0?values[n.code.z]:float4(0),c=i>0?values[n.code.w]:float4(0);
+        float4 v=n.value;
+        switch(n.code.x) {
+        case 0:break;
+        case 1:v=float4(uv.x,1.0f-uv.y,0,0);break;
+        case 2:{
+            constexpr sampler periodic(coord::normalized,address::repeat,filter::linear);
+            constexpr sampler clampU(coord::normalized,s_address::clamp_to_edge,t_address::repeat,filter::linear);
+            constexpr sampler clampV(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear);
+            constexpr sampler clampUV(coord::normalized,address::clamp_to_edge,filter::linear);
+            uint index=uint(n.value.x); float2 st=float2(a.x,1.0f-a.y);
+            v=n.value.z>0 ? images.graphImages[index].sample(n.value.w>0?clampUV:clampU,st,level(0))
+                : images.graphImages[index].sample(n.value.w>0?clampV:periodic,st,level(0));
+            if(n.value.y>0) v=float4(v.x); break;
+        }
+        case 3:v=a*b;break;
+        case 4:v=a+b;break;
+        case 5:v=mix(a,b,c);break;
+        case 6:v=float4(a[uint(n.value.x)]);break;
+        case 7:v=clamp(a,b,c);break;
+        case 8:v=float4(0);break;
+        case 9:v=a-b;break;
+        case 10:{float angle=n.value.x;v=float4(cos(angle)*a.x+sin(angle)*a.y,-sin(angle)*a.x+cos(angle)*a.y,0,0);break;}
+        case 11:v=a;break;
+        }
+        values[i]=all(isfinite(v))?v:float4(0);
+    }
+    return random>=values[root].x;
+}
+// The material slot of stored face `tag` (its uvc.z) as instance `m` renders it: the scene-graph
+// binding, or for a graph-less mesh its stored slot (scene-graph scenes) or the imported-mesh slot 7.
+uint instance_face_slot(MeshInstance m, uint tag, bool graphSlots, constant MaterialResources &images) {
+    if(m.binding.y!=0) {
+        const device uint *slots=(const device uint *)((device const char *)images.nodes+16*mesh_header(images).info.z);
+        return slots[m.binding.x+tag];
+    }
+    return graphSlots ? tag : 7u;
+}
+// Whether instance m's face `primitive` (relative to m.range.x) is cut out at barycentrics (b1, b2)
+// for the object-space ray `local`. Shared by the two-level and hardware traversals, out of line.
+__attribute__((noinline)) bool face_cut(MeshInstance m, uint primitive, float b1, float b2, Ray local, bool graphSlots,
+                                        constant MaterialResources &images) {
+    MeshFace face=images.faces[m.range.x+primitive];
+    return material_cut(instance_face_slot(m,face.tag,graphSlots,images),mesh_uv(face_triangle(face,images.vertices),b1,b2),images,
+        cutout_random(local,m.range.z,primitive));
+}
 // Stored triangle i (BVH order): the flat buffer's record, or a two-level face decoded.
 MeshTriangle stored_triangle(uint i, constant MaterialResources &images) {
     return mesh_two_level(images) ? face_triangle(images.faces[i],images.vertices) : images.triangles[i];
@@ -1530,7 +1603,8 @@ int wide_order(bool4 hit, float4 nearT, thread int *order, thread float *key) {
 // Closest hit in one asset's BLAS, in object space. The host keeps BLAS depth <= 20, so the
 // stack (at most 3 net pushes per level) never overflows.
 void blas_closest(device const MeshWideNode *nodes, device const MeshFace *faces, device const MeshVertex *vertices, Ray local, float rootMax,
-                  float tMin, thread float &closest, thread int &hit, thread float &hb1, thread float &hb2) {
+                  float tMin, thread float &closest, thread int &hit, thread float &hb1, thread float &hb2,
+                  MeshInstance instance, bool cut, bool graphSlots, constant MaterialResources &images) {
     WatertightRay watertight=watertight_ray(local);
     WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+rootMax));
     int stack[64]; int top=0; stack[top++]=0;
@@ -1544,7 +1618,9 @@ void blas_closest(device const MeshWideNode *nodes, device const MeshFace *faces
             int first=-node.child[k]-1;
             for(int q=0;q<node.count[k];++q) {
                 float t,b1,b2;
-                if(!intersect_mesh_triangle(face_triangle(faces[first+q],vertices),watertight,tMin,closest,t,b1,b2)) continue;
+                MeshTriangle tri=face_triangle(faces[first+q],vertices);
+                if(!intersect_mesh_triangle(tri,watertight,tMin,closest,t,b1,b2)) continue;
+                if(cut && face_cut(instance,uint(first+q),b1,b2,local,graphSlots,images)) continue;
                 closest=t; hit=first+q; hb1=b1; hb2=b2;
             }
         }
@@ -1554,7 +1630,7 @@ void blas_closest(device const MeshWideNode *nodes, device const MeshFace *faces
 // Any hit in [tMin, tMax - slack) of one asset; slack is the endpoint surface's own bound
 // (see scene_occluded), from the instance transform and the triangle's local corners.
 bool blas_any(device const MeshWideNode *nodes, device const MeshFace *faces, device const MeshVertex *vertices, Ray local, MeshInstance instance,
-              float tMin, float tMax, bool slack) {
+              float tMin, float tMax, bool slack, bool cut, bool graphSlots, constant MaterialResources &images) {
     WatertightRay watertight=watertight_ray(local);
     WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+instance.bound.z));
     int stack[64]; int top=0; stack[top++]=0;
@@ -1567,9 +1643,11 @@ bool blas_any(device const MeshWideNode *nodes, device const MeshFace *faces, de
             int first=-node.child[k]-1;
             for(int q=0;q<node.count[k];++q) {
                 MeshTriangle tri=face_triangle(faces[first+q],vertices);
-                float t,b1,b2,local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
-                float s=slack ? max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local)) : 0.0f;
-                if(intersect_mesh_triangle(tri,watertight,tMin,tMax-s,t,b1,b2)) return true;
+                float t,b1,b2,extent=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
+                float s=slack ? max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*extent)) : 0.0f;
+                if(!intersect_mesh_triangle(tri,watertight,tMin,tMax-s,t,b1,b2)) continue;
+                if(cut && face_cut(instance,uint(first+q),b1,b2,local,graphSlots,images)) continue;
+                return true;
             }
         }
     }
@@ -1579,8 +1657,30 @@ struct MeshHit { float t, b1, b2; int triangle; uint instance; };
 // TLAS traversal. Its boxes are world bounds of transformed object bounds, grown per ray by
 // lo.w * (|origin| + hi.w): the rounding of the object-space ray, amplified by the largest
 // transform condition number, never culls an instance whose object-space traversal hits.
-bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &images, thread MeshHit &h) {
+bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &images, thread MeshHit &h, bool graphSlots) {
     MeshSceneHeader header=mesh_header(images);
+    bool cut=mesh_cutouts(images);
+    if(HARDWARE_MESHES && header.counts.w!=0 && cut) {
+        // Cutouts: every triangle is a candidate (forced non-opaque); opaque points are committed,
+        // and the query only reports candidates nearer than the committed hit.
+        raytracing::intersection_params params;
+        params.assume_geometry_type(raytracing::geometry_type::triangle);
+        params.force_opacity(raytracing::forced_opacity::non_opaque);
+        raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(
+            raytracing::ray(r.origin,r.direction,tMin,tMax),mesh_accelerator(images).scene,params);
+        device const MeshInstance *instances=mesh_instances(images);
+        while(query.next()) {
+            MeshInstance instance=instances[query.get_candidate_instance_id()];
+            float2 bc=query.get_candidate_triangle_barycentric_coord();
+            if(!face_cut(instance,query.get_candidate_primitive_id(),bc.x,bc.y,instance_ray(instance,r),graphSlots,images))
+                query.commit_triangle_intersection();
+        }
+        if(query.get_committed_intersection_type()!=raytracing::intersection_type::triangle) return false;
+        float2 bc=query.get_committed_triangle_barycentric_coord();
+        h.t=query.get_committed_distance(); h.b1=bc.x; h.b2=bc.y;
+        h.triangle=int(query.get_committed_primitive_id()); h.instance=query.get_committed_instance_id();
+        return true;
+    }
     if(HARDWARE_MESHES && header.counts.w!=0) {
         // Same instances and primitive order as the software hierarchy, so the hit resolves alike.
         raytracing::intersector<raytracing::triangle_data,raytracing::instancing> closest;
@@ -1607,16 +1707,40 @@ bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &ima
             uint index=uint(-node.child[k]-1);
             MeshInstance instance=instances[index];
             int triangle=-1; float b1=0, b2=0;
-            blas_closest(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance.bound.z,tMin,closest,triangle,b1,b2);
+            blas_closest(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance.bound.z,tMin,closest,triangle,b1,b2,
+                instance,cut,graphSlots,images);
             if(triangle>=0) { h.t=closest; h.b1=b1; h.b2=b2; h.triangle=triangle; h.instance=index; found=true; }
         }
         for(int j=m-1;j>=0;--j) { int k=order[j]; if(node.child[k]>0 && key[j]<=closest && top<32) stack[top++]=node.child[k]; }
     }
     return found;
 }
-bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialResources &images) {
+bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialResources &images, bool graphSlots) {
     MeshSceneHeader header=mesh_header(images);
     device const MeshInstance *instances=mesh_instances(images);
+    bool cut=mesh_cutouts(images);
+    if(HARDWARE_MESHES && header.counts.w!=0 && cut) {
+        // Cutouts: one query over the whole segment; a candidate blocks unless it is the endpoint
+        // surface (within its own slack, as blas_any decides) or a cut-out point.
+        raytracing::intersection_params params;
+        params.assume_geometry_type(raytracing::geometry_type::triangle);
+        params.force_opacity(raytracing::forced_opacity::non_opaque);
+        raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(
+            raytracing::ray(r.origin,r.direction,tMin,tMax),mesh_accelerator(images).scene,params);
+        while(query.next()) {
+            MeshInstance instance=instances[query.get_candidate_instance_id()];
+            if(slack) {
+                MeshTriangle tri=face_triangle(images.faces[instance.range.x+query.get_candidate_primitive_id()],images.vertices);
+                float local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
+                if(query.get_candidate_triangle_distance()>=tMax-max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local))) continue;
+            }
+            float2 bc=query.get_candidate_triangle_barycentric_coord();
+            if(face_cut(instance,query.get_candidate_primitive_id(),bc.x,bc.y,instance_ray(instance,r),graphSlots,images)) continue;
+            query.abort();
+            return true;
+        }
+        return false;
+    }
     if(HARDWARE_MESHES && header.counts.w!=0) {
         // Any opaque hit before tMax - S (S bounds every triangle's slack), then the candidates
         // in [tMax - S, tMax) against their own slack, exactly as blas_any decides.
@@ -1650,7 +1774,8 @@ bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialR
             if(!hit[k]) continue;
             if(node.child[k]>0) { if(top<32) stack[top++]=node.child[k]; continue; }
             MeshInstance instance=instances[-node.child[k]-1];
-            if(blas_any(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance,tMin,tMax,slack)) return true;
+            if(blas_any(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance,tMin,tMax,slack,
+                cut,graphSlots,images)) return true;
         }
     }
     return false;
@@ -1669,7 +1794,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
     float closest=hit ? rec.t/o.positionScale.w : 1e20f;
     if(mesh_two_level(images)) {
         MeshHit m;
-        if(!mesh_closest(local,tMin/o.positionScale.w,closest,images,m)) return hit;
+        if(!mesh_closest(local,tMin/o.positionScale.w,closest,images,m,uses_scene_graph(u))) return hit;
         MeshInstance instance=mesh_instances(images)[m.instance];
         MeshTriangle stored=instance_source(instance.range.x+uint(m.triangle),instance,images);
         float b1=m.b1, b2=m.b2;
@@ -1687,6 +1812,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
         return true;
     }
     WatertightRay watertight=watertight_ray(local);
+    bool cut=mesh_cutouts(images);
     MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
     while(top>0) {
@@ -1697,6 +1823,8 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             MeshTriangle tri=images.triangles[node.links.z+k];
             float t,b1,b2;
             if(!intersect_mesh_triangle(tri,watertight,tMin/o.positionScale.w,closest,t,b1,b2)) continue;
+            if(cut && material_cut(uses_scene_graph(u) ? uint(tri.uvc.z) : 7u,mesh_uv(tri,b1,b2),images,
+                cutout_random(local,0u,uint(node.links.z+k)))) continue;
             closest=t; hit=true; float b0=1-b1-b2;
             // Rebuild the point from barycentrics: it then lies on the triangle
             // within vertex-magnitude rounding, independent of the ray length.
@@ -1724,8 +1852,9 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
     if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float nearT=tMin/o.positionScale.w, farT=tMax/o.positionScale.w;
-    if(mesh_two_level(images)) return mesh_occluded(local,nearT,farT,uses_scene_graph(u),images);
+    if(mesh_two_level(images)) return mesh_occluded(local,nearT,farT,uses_scene_graph(u),images,uses_scene_graph(u));
     WatertightRay watertight=watertight_ray(local);
+    bool cut=mesh_cutouts(images);
     MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
     while(top>0) {
@@ -1735,7 +1864,10 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
         for(int k=0;k<node.links.w;++k) {
             MeshTriangle tri=images.triangles[node.links.z+k];
             float t,b1,b2,slack=uses_scene_graph(u) ? mesh_hit_error(tri,float3(0),u) : 0.0f;
-            if(intersect_mesh_triangle(tri,watertight,nearT,farT-slack,t,b1,b2)) return true;
+            if(!intersect_mesh_triangle(tri,watertight,nearT,farT-slack,t,b1,b2)) continue;
+            if(cut && material_cut(uses_scene_graph(u) ? uint(tri.uvc.z) : 7u,mesh_uv(tri,b1,b2),images,
+                cutout_random(local,0u,uint(node.links.z+k)))) continue;
+            return true;
         }
     }
     return false;
@@ -7334,7 +7466,7 @@ final class MaterialLibrary {
     enum Argument {
         static let environment = 0, triangles = 1, nodes = 2, objects = 3, graphInstructions = 4, graphHeaders = 5
         static let emissions = 6, emitters = 7, environmentRows = 8, environmentColumns = 9
-        static let faces = 10, vertices = 11, blasNodes = 12, faceExtras = 13, spectralMaterials = 14
+        static let faces = 10, vertices = 11, blasNodes = 12, faceExtras = 13, spectralMaterials = 14, opacityRoots = 15
         static let graphImages = 16, maps = graphImages + SceneLimits.graphImages
     }
     func rebuildArguments(_ replacement: [MTLTexture]) throws {
@@ -7361,6 +7493,17 @@ final class MaterialLibrary {
         guard let spectral = spectralMaterials.withUnsafeBytes({ bindingBuffer(bytes: $0.baseAddress!, length: $0.count) })
         else { throw Self.error("Could not allocate spectral material parameters.") }
         setBuffer(spectral,Argument.spectralMaterials)
+        // Alpha cutouts: per slot the MaterialX register of geometry_opacity (-1: opaque), then the
+        // number of cutout slots, which lets traversal skip every check in scenes without any.
+        var opacityRoots = [Int32](repeating: -1, count: SceneLimits.materials + 1)
+        var cutouts: Int32 = 0
+        for (slot, program) in materialX where (0..<SceneLimits.materials).contains(slot) {
+            if let root = program.opacity { opacityRoots[slot] = root; cutouts += 1 }
+        }
+        opacityRoots[SceneLimits.materials] = cutouts
+        guard let opacity = opacityRoots.withUnsafeBytes({ bindingBuffer(bytes: $0.baseAddress!, length: $0.count) })
+        else { throw Self.error("Could not allocate material opacity roots.") }
+        setBuffer(opacity,Argument.opacityRoots)
         // Hardware traversal reaches these through the node buffer's resource ID.
         bound += meshLayout?.structures ?? []
         guard let objectBuffer=objects.withUnsafeBytes({ bindingBuffer(bytes:$0.baseAddress!,length:$0.count) }) else { throw Self.error("Could not allocate object settings.") }

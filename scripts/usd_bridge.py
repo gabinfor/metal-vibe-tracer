@@ -188,7 +188,7 @@ class MaterialTranslator:
         ident=str(shader.GetIdAttr().Get())
         inputs=[]
         if ident=='UsdPreviewSurface':
-            for key,default in [('useSpecularWorkflow',0),('opacity',1),('opacityThreshold',0),('displacement',0)]:
+            for key,default in [('useSpecularWorkflow',0),('displacement',0)]:
                 i=shader.GetInput(key)
                 if i and (i.GetConnectedSource() or get(shader,key,default,self.time)!=default):fail('Unsupported PreviewSurface input '+key)
             mapping=[('diffuseColor','base_color','color3',[.18]*3),('roughness','specular_roughness','float',.5),('metallic','base_metalness','float',0),('ior','specular_ior','float',1.5),('clearcoat','coat_weight','float',0),('clearcoatRoughness','coat_roughness','float',.01)]
@@ -199,6 +199,13 @@ class MaterialTranslator:
             if emissive and (emissive.GetConnectedSource() or any(vec(get(shader,'emissiveColor',Gf.Vec3f(0),self.time)))):
                 inputs.append(('emission_color','color3',self.expression(emissive,'color3',[0,0,0])))
                 inputs.append(('emission_luminance','float',1.0))
+            # Opacity becomes OpenPBR geometry_opacity, which the renderer treats as coverage (stochastic
+            # transparency): a hit is kept with probability equal to it.
+            opacity=shader.GetInput('opacity')
+            if opacity and (opacity.GetConnectedSource() or float(get(shader,'opacity',1,self.time))!=1):
+                inputs.append(('geometry_opacity','float',self.expression(opacity,'float',1)))
+                threshold=float(get(shader,'opacityThreshold',0,self.time))
+                if threshold>0:self.report.append(str(shader.GetPath())+': opacityThreshold %g not applied; opacity rendered as coverage'%threshold)
             normal=shader.GetInput('normal')
             if normal and (normal.GetConnectedSource() or normal.Get(self.time) is not None):
                 n=self.expression(normal,'vector3',[0,0,1])

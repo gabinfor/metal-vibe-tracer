@@ -42,6 +42,10 @@ struct MaterialXProgram: Codable {
   // (MSL SpectralMaterial): 20 x transmission_dispersion_scale / transmission_dispersion_abbe_number,
   // thin_film_weight, thin_film_thickness (micrometres) and thin_film_ior; nil when all are default.
   var spectral: SIMD4<Float>?
+  // Register holding OpenPBR geometry_opacity, or nil when it is unauthored or constant 1. The
+  // renderer keeps a hit with that probability (stochastic transparency; docs/SCENE_STORAGE_DESIGN.md,
+  // phase 4), so 0 is cut out and partial coverage is unbiased.
+  var opacity: Int32?
   static let noSpectral = SIMD4<Float>(0, 0, 0.5, 1.4)
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
@@ -53,6 +57,9 @@ struct MaterialXProgram: Codable {
     }
     if let root = emission, !(0..<instructions.count).contains(Int(root)) {
       throw MaterialLibrary.error("Invalid emission output.")
+    }
+    if let root = opacity, !(0..<instructions.count).contains(Int(root)) {
+      throw MaterialLibrary.error("Invalid opacity output.")
     }
     for (i, n) in instructions.enumerated() {
       guard (0...11).contains(n.code.x),
@@ -721,7 +728,7 @@ private final class MXCompiler {
       "coat_color": SIMD4(repeating: 1), "coat_roughness_anisotropy": .zero,
       "coat_ior": SIMD4(repeating: 1.6), "coat_darkening": SIMD4(repeating: 1),
       "thin_film_weight": .zero, "thin_film_thickness": SIMD4(repeating: 0.5),
-      "thin_film_ior": SIMD4(repeating: 1.4), "geometry_opacity": SIMD4(repeating: 1),
+      "thin_film_ior": SIMD4(repeating: 1.4),
       "geometry_thin_walled": .zero,
     ]
     // Dispersion and thin film: constants only (spectral transport; MaterialXProgram.spectral).
@@ -740,7 +747,7 @@ private final class MXCompiler {
       spectralValues[name] = v
     }
     for i in shader.children
-    where i.category == "input" && !["base_diffuse_roughness", "emission_luminance", "emission_color"].contains(i.name)
+    where i.category == "input" && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity"].contains(i.name)
       && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
     {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
@@ -795,9 +802,19 @@ private final class MXCompiler {
       let c = try value(color, default: SIMD4(1, 1, 1, 0), label: shader.name + "/emission_color")
       emissionRoot = try append(GraphInstruction(code: SIMD4(3, c, l, 0)))
     }
+    // Opacity (coverage): geometry_opacity, constant or connected. A constant 1 is opaque.
+    var opacityRoot: Int32?
+    if let input = shader.input("geometry_opacity") {
+      guard input.attributes["type"] == "float" else { try fail("geometry_opacity must be a float.") }
+      let constant = linked(input) ? Float(0) : try numbers(input, fallback: SIMD4(repeating: 1)).x
+      if linked(input) || constant < 1 {
+        opacityRoot = try value(input, default: SIMD4(repeating: 1), label: shader.name + "/geometry_opacity")
+      }
+    }
     var program = MaterialXProgram(
       name: shader.name, source: source, instructions: nodes, roots: roots, images: images,
       parameters: parameters, diffuseRoughness: diffuseRoot, emission: emissionRoot)
+    program.opacity = opacityRoot
     let scale = spectralValues["transmission_dispersion_scale"] ?? 0
     let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
     let spectral = SIMD4<Float>(

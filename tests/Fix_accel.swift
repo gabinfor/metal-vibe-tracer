@@ -1010,3 +1010,129 @@ try fixDILightIDChecks()
   print("PASS: fix-accel \(quads) materials past the former 64-slot limit (settings buffer, map \(materials[mapped].slot * 4), emitter slot \(materials[emitter].slot))")
 }
 try fixMaterialSlotChecks()
+
+// Phase 4 of docs/SCENE_STORAGE_DESIGN.md: alpha cutouts. A quad at y = 1 whose material's
+// geometry_opacity is a 2 x 1 mask (black, white) over an opaque quad at y = 0: rays through the
+// black half reach the lower quad and shadow rays pass, rays through the white half stop on the
+// upper one, on the flat, two-level and hardware traversals alike.
+@MainActor func fixCutoutChecks() throws {
+  let folder = testOutputDirectory.appendingPathComponent("cutout", isDirectory: true)
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  let mask = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 3,
+    hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 6, bitsPerPixel: 24)!
+  for c in 0..<3 { mask.bitmapData![c] = 0; mask.bitmapData![3 + c] = 255 }
+  try mask.representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent("mask.png"))
+  let document = """
+    <materialx version="1.39">
+     <image name="mask" type="float"><input name="file" type="filename" value="mask.png"/></image>
+     <open_pbr_surface name="Cut" type="surfaceshader"><input name="geometry_opacity" type="float" nodename="mask"/></open_pbr_surface>
+    </materialx>
+    """
+  let imported = try MaterialXImporter.read(Data(document.utf8), baseURL: folder, source: "Cut.mtlx")
+  require(imported.materials.count == 1 && imported.materials[0].opacity != nil, "geometry_opacity compiles to an opacity register")
+  let up = SIMD4<Float>(0, 1, 0, 0)
+  func quad(_ y: Float) -> [MeshTriangle] {
+    func p(_ x: Float, _ z: Float) -> SIMD4<Float> { SIMD4(x, y, z, 1) }
+    return [MeshTriangle(a: p(0, 0), b: p(0, 1), c: p(1, 1), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 0, 1), uvc: SIMD4(1, 1, 0, 0)),
+            MeshTriangle(a: p(0, 0), b: p(1, 1), c: p(1, 0), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 1, 1), uvc: SIMD4(1, 0, 0, 0))]
+  }
+  var graph = SceneGraph()
+  let cutMaterial = try graph.addMaterial("Cut"), solidMaterial = try graph.addMaterial("Solid")
+  for (name, y, material) in [("top", Float(1), cutMaterial), ("bottom", Float(0), solidMaterial)] {
+    let asset = MeshAsset(name: name, triangles: quad(y), subsets: ["S"])
+    graph.assets.append(asset)
+    graph.nodes.append(SceneNode(name: name, mesh: asset.id, transform: ObjectSettings(positionScale: SIMD4(0, 0, 0, 1)), bindings: [material.id]))
+  }
+  var state = SceneState()
+  state.materialX = [cutMaterial.slot: imported.materials[0]]
+  let kernels = """
+    kernel void cutout_probe(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+        device float4 *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        float x = id == 0 ? 0.25f : 0.75f;
+        Ray r = {float3(x, 3, 0.5f), float3(0, -1, 0)}; HitRecord h;
+        bool hit = trace_scene(r, 6, h, images, u);
+        out[id] = float4(hit ? h.t : -1.0f, hit ? float(h.objectID) : -1.0f, scene_occluded(r, 6, 2.5f, images, u) ? 1.0f : 0.0f, 0);
+    }
+    """
+  let probe = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  let pipeline = try gpu.makeComputePipelineState(function: probe.makeFunction(name: "cutout_probe")!)
+  var modes: [MeshAcceleration] = [.flat, .twoLevel]
+  if gpu.supportsRaytracing { modes.append(.hardware) }
+  for mode in modes {
+    let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    l.acceleration = mode
+    try l.restore(state)
+    try l.setMesh(graph)
+    l.hasSceneGraph = true
+    var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+    u.environment = SIMD4(0, 0, 0, Float(l.nodeCount))
+    u.lens.z = 1
+    u.sunParams.w = 0
+    let out = gpu.makeBuffer(length: 32, options: .storageModeShared)!
+    let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(pipeline)
+    require(l.bind(encoder), "cutout probe binds scene resources")
+    encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+    encoder.setBuffer(out, offset: 0, index: 3)
+    encoder.dispatchThreads(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 2, height: 1, depth: 1))
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    require(command.status == .completed, "cutout probe GPU command")
+    let v = out.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2)
+    let node = Float(SceneLimits.materials)
+    let ok = abs(v[0].x - 3) < 1e-4 && v[0].y == node + 1 && v[0].z == 0
+      && abs(v[1].x - 2) < 1e-4 && v[1].y == node && v[1].z == 1
+    require(ok, "\(mode): cut-out half passes to the lower quad and casts no shadow, opaque half stops rays (\(v[0]), \(v[1]))")
+  }
+  // Partial coverage: a constant geometry_opacity of 0.25 stops a quarter of camera and shadow rays.
+  let partial = try MaterialXImporter.read(Data("""
+    <materialx version="1.39">
+     <open_pbr_surface name="Quarter" type="surfaceshader"><input name="geometry_opacity" type="float" value="0.25"/></open_pbr_surface>
+    </materialx>
+    """.utf8), baseURL: folder, source: "Quarter.mtlx")
+  require(partial.materials.first?.opacity != nil, "a constant partial geometry_opacity compiles to an opacity register")
+  state.materialX = [cutMaterial.slot: partial.materials[0]]
+  // Separate kernels: one kernel tracing a varying ray with both trace_scene and scene_occluded
+  // crashes the shader compiler service (XPC_ERROR_CONNECTION_INTERRUPTED; also before cutouts).
+  let fractionKernels = """
+    float2 fraction_point(uint id) { return float2((float(id % 128u) + 0.5f) / 128.0f, (float(id / 128u) + 0.5f) / 128.0f); }
+    kernel void cutout_fraction_trace(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+        device atomic_uint *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        float2 p = fraction_point(id); Ray r = {float3(p.x, 3, p.y), float3(0, -1, 0)}; HitRecord h;
+        if (trace_scene(r, 6, h, images, u) && abs(h.t - 2.0f) < 1e-3f) atomic_fetch_add_explicit(&out[0], 1u, memory_order_relaxed);
+    }
+    kernel void cutout_fraction_shadow(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+        device atomic_uint *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        float2 p = fraction_point(id); Ray r = {float3(p.x, 3, p.y), float3(0, -1, 0)};
+        if (scene_occluded(r, 6, 2.5f, images, u)) atomic_fetch_add_explicit(&out[1], 1u, memory_order_relaxed);
+    }
+    """
+  let fractionLibrary = try gpu.makeLibrary(source: metalSource + fractionKernels, options: shaderCompileOptions())
+  let fractionPipelines = try ["cutout_fraction_trace", "cutout_fraction_shadow"].map {
+    try gpu.makeComputePipelineState(function: fractionLibrary.makeFunction(name: $0)!)
+  }
+  for mode in modes {
+    let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    l.acceleration = mode
+    try l.restore(state)
+    try l.setMesh(graph)
+    l.hasSceneGraph = true
+    var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+    u.environment = SIMD4(0, 0, 0, Float(l.nodeCount)); u.lens.z = 1; u.sunParams.w = 0
+    let out = gpu.makeBuffer(length: 8, options: .storageModeShared)!
+    memset(out.contents(), 0, 8)
+    let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    for fractionPipeline in fractionPipelines {
+      encoder.setComputePipelineState(fractionPipeline)
+      require(l.bind(encoder), "partial-opacity probe binds scene resources")
+      encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+      encoder.setBuffer(out, offset: 0, index: 3)
+      encoder.dispatchThreads(MTLSize(width: 16384, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    let stopped = Double(out.contents().load(as: UInt32.self)) / 16384, shadowed = Double(out.contents().load(fromByteOffset: 4, as: UInt32.self)) / 16384
+    print("\(mode) partial opacity 0.25: \(stopped) of camera rays and \(shadowed) of shadow rays stop on the quad")
+    require(abs(stopped - 0.25) < 0.02 && abs(shadowed - 0.25) < 0.02, "\(mode): partial opacity is unbiased coverage")
+  }
+  print("PASS: fix-accel opacity cutouts and partial coverage on \(modes.map { "\($0)" }.joined(separator: ", ")) traversal")
+}
+try fixCutoutChecks()

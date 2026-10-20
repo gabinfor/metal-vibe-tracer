@@ -16,7 +16,8 @@ MITSUBA3, GULBRANDSEN2014, OPENPBR):
   dielectric/rough...  transmission_weight 1, specular_ior = int_ior / ext_ior, roughness sqrt(alpha)
   thindielectric       as dielectric (thin walls are not represented)
   twosided             its inner BSDF (the app's meshes are two-sided)
-  bumpmap, mask        their inner BSDF; bump and opacity are reported and dropped
+  bumpmap              its inner BSDF; bump is reported and dropped
+  mask                 geometry_opacity (the app renders it as coverage, like Mitsuba's mask)
   area emitter         emission_color x emission_luminance = radiance (one-sided, like Mitsuba's)
 Textures: bitmap files keep their path (sRGB unless raw); checkerboards are baked to PNG.
 """
@@ -223,8 +224,14 @@ def material(node, names):
         report.append(f'{names}: {kind} dropped (no bump mapping)')
         return material(inner(), names)
     if kind == 'mask':
-        report.append(f'{names}: opacity mask dropped (no alpha cutouts)')
-        return material(inner(), names)
+        # OpenPBR geometry_opacity: coverage, stochastic in both renderers.
+        m = material(inner(), names)
+        opacity = colour_input(node, 'opacity', [1, 1, 1])
+        if 'texture' in opacity:
+            m['geometry_opacity'] = {'texture': opacity['texture']}
+        elif sum(opacity['value']) / 3 < 1:
+            m['geometry_opacity'] = {'value': sum(opacity['value']) / 3}
+        return m
     roughness = lambda: math.sqrt(float(value(prop(node, 'alpha').get('value')))) if prop(node, 'alpha') is not None else 0.1 ** 0.5
     if kind == 'diffuse':
         return {'base_color': colour_input(node, 'reflectance', [0.5] * 3), 'specular_weight': {'value': 0.0}}
@@ -356,11 +363,12 @@ def material_prim(key, node, emission, label):
                       f'            color3f inputs:in1.connect = </Scene/Materials/{name}/{tex}.outputs:out>',
                       f'            color3f inputs:in2 = ({tint[0]:.9g}, {tint[1]:.9g}, {tint[2]:.9g})',
                       '            color3f outputs:out', '        }']
-        lines += [f'        def Shader "{tex}"', '        {', '            uniform token info:id = "ND_image_color3"',
+        channel = 'float' if tex == 'Tex_geometry_opacity' else 'color3'
+        lines += [f'        def Shader "{tex}"', '        {', f'            uniform token info:id = "ND_image_{channel}"',
                   f'            asset inputs:file = @{file}@ (', f'                colorSpace = "{space}"', '            )']
         if scale != [1, 1]:
             lines += [f'            float2 inputs:texcoord.connect = </Scene/Materials/{name}/{tex}_uv.outputs:out>']
-        lines += ['            color3f outputs:out', '        }']
+        lines += [f'            {"float" if channel == "float" else "color3f"} outputs:out', '        }']
         if scale != [1, 1]:
             lines += [f'        def Shader "{tex}_uv"', '        {', '            uniform token info:id = "ND_multiply_vector2"',
                       f'            float2 inputs:in1.connect = </Scene/Materials/{name}/{tex}_tc.outputs:out>',

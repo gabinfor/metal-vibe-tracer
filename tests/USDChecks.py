@@ -96,7 +96,7 @@ zero=UsdGeom.Xform.Define(robust,'/Zero');zero.AddScaleOp().Set((0,0,0));quad(ro
 reset=quad(robust,'/Zero/Reset');reset.SetResetXformStack(True);reset.AddTranslateOp().Set((5,0,0))
 UsdLux.MeshLightAPI.Apply(quad(robust,'/Lamp',(20,0,0)).GetPrim())
 UsdLux.VolumeLightAPI.Apply(UsdVol.Volume.Define(robust,'/Fog').GetPrim())
-bad=UsdShade.Material.Define(robust,'/Looks/Bad');bs=UsdShade.Shader.Define(robust,'/Looks/Bad/S');bs.CreateIdAttr('UsdPreviewSurface');bs.CreateInput('opacity',Sdf.ValueTypeNames.Float).Set(.5);bad.CreateSurfaceOutput().ConnectToSource(bs.ConnectableAPI(),'surface')
+bad=UsdShade.Material.Define(robust,'/Looks/Bad');bs=UsdShade.Shader.Define(robust,'/Looks/Bad/S');bs.CreateIdAttr('UsdPreviewSurface');bs.CreateInput('displacement',Sdf.ValueTypeNames.Float).Set(.1);bad.CreateSurfaceOutput().ConnectToSource(bs.ConnectableAPI(),'surface')
 for name,color,x in [('Red',(1,0,0),10),('Blue',(0,0,1),12)]:
  m=quad(robust,'/'+name,(x,0,0));m.CreateDisplayColorAttr([color]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(bad)
 dome=UsdLux.DomeLight.Define(robust,'/Dome');dome.CreateColorAttr((.25,.5,1));dome.CreateIntensityAttr(2)
@@ -113,6 +113,12 @@ check(byName['Reset']['parent']==rb['nodes'][0]['id'] and byName['Reset']['matri
 check('/Lamp: MeshLightAPI emission not applied' in report and '/Fog: VolumeLightAPI emission' in report,report)
 fallbacks=[m for m in rb['materials'] if m['path']=='/Looks/Bad'];check(sorted(m['color'] for m in fallbacks)==[[0,0,1],[1,0,0]] and not any(m.get('mtlx') for m in fallbacks),"sorted(m['color'] for m in fallbacks)==[[0,0,1],[1,0,0]] and not any(m.get('mtlx') for m in fallbacks)")
 check('/Red: material /Looks/Bad fallback to displayColor' in report and '/Blue: material /Looks/Bad fallback to displayColor' in report,report)
+# PreviewSurface opacity becomes OpenPBR geometry_opacity (coverage in the renderer); a threshold is reported.
+cut=Usd.Stage.CreateNew(str(out/'cutout.usda'));UsdGeom.SetStageMetersPerUnit(cut,1);cq=quad(cut,'/Q',(0,0,0))
+cm=UsdShade.Material.Define(cut,'/Looks/Cut');cs=UsdShade.Shader.Define(cut,'/Looks/Cut/S');cs.CreateIdAttr('UsdPreviewSurface');cs.CreateInput('opacity',Sdf.ValueTypeNames.Float).Set(.25);cs.CreateInput('opacityThreshold',Sdf.ValueTypeNames.Float).Set(.5)
+cm.CreateSurfaceOutput().ConnectToSource(cs.ConnectableAPI(),'surface');UsdShade.MaterialBindingAPI.Apply(cq.GetPrim()).Bind(cm);cut.GetRootLayer().Save()
+cr=bridge.import_stage(str(out/'cutout.usda'),out);cmat=[m for m in cr['materials'] if m['path']=='/Looks/Cut']
+check(len(cmat)==1 and 'geometry_opacity' in cmat[0].get('mtlx','') and any('opacityThreshold 0.5 not applied' in l for l in cr['report']),cr['report'])
 # Per-color fallbacks never push a stage past the material limit; the overflow shares the first fallback.
 many=Usd.Stage.CreateNew(str(out/'many-colors.usda'));badMany=UsdShade.Material.Define(many,'/Looks/Bad');badMany.CreateSurfaceOutput().ConnectToSource(UsdShade.Shader.Define(many,'/Looks/Bad/S').ConnectableAPI(),'surface')
 manyCount=bridge.MATERIALS+4

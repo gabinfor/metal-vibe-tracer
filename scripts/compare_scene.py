@@ -8,7 +8,7 @@ The USD comes from scripts/mitsuba_to_usd.py (run here). Both renders use the XM
 radiance without a denoiser; Mitsuba keeps the scene's own pixel filter. Writes metrics like
 scripts/compare_mitsuba.py and a side-by-side image (app | Mitsuba | relative block difference).
 Differences come from the material mapping documented in mitsuba_to_usd.py, from dropped bump
-maps and opacity masks, and from noise.
+maps, and from noise.
 """
 import argparse
 import json
