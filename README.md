@@ -1,60 +1,98 @@
+<div align="center">
+
 # Metal Vibe Tracer
 
-An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Explore lighting and materials in real time, import scenes, and export denoised renders.
+**A spectral GPU path tracer for macOS, built with Swift and Metal.**<br>
+Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
+
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-000000?logo=apple&logoColor=white)
+![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)
+![Metal](https://img.shields.io/badge/Metal-ray%20tracing-8A8A8A)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+
+</div>
 
 ![Architectural Pavilion lit by an HDRI environment: mirror, copper and glass spheres and a gold cylinder](docs/images/pavilion-hdri.jpg)
 
-## Overview
+<p align="center"><sub>The built-in Pavilion scene lit by an HDRI environment, with spectral transport and a thin-lens camera. 1024 spp, denoised with Open Image Denoise.</sub></p>
 
-Metal Vibe Tracer is a GPU path tracer with an interactive studio UI. It implements recent real-time resampling research (ReSTIR DI, GI and PT, with 2025–2026 papers on reuse and variance reduction) on top of Metal hardware ray tracing, and it supports spectral light transport, OpenPBR materials, MaterialX graphs, and OpenUSD scene import.
+## Highlights
 
-- **Built on research papers:** every adopted method is cited, and [REFERENCES.md](REFERENCES.md) records how each one was adapted and which code implements it.
-- **Defaults chosen by measurement:** each new method is compared with the existing one on error, bias and frame time. It becomes the default only where it wins at equal time. The figures are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md).
-- **Tested on the GPU:** the verification suite runs the production shaders and render path on Metal (179 checks passed on 2026-10-04, Apple M4).
-- **Honest about limitations:** open issues and experimental modes are listed under [Known limitations](#known-limitations).
-
-| Caustics and interreflection | OpenUSD import with OpenPBR shading |
-| --- | --- |
-| ![Cornell box with a mirror sphere and a glass sphere casting a caustic](docs/images/cornell-glass-mirror.jpg) | ![ASWF Standard Shader Ball rendered by Metal Vibe Tracer](docs/images/shaderball-studio.jpg) |
-
-These images were rendered with spectral transport and denoised with Open Image Denoise, through the app's own export path (`python3 scripts/render_showcase.py`). The environments are Poly Haven's Art Studio and Studio Small 01 HDRIs (CC0). The Shader Ball render is an adapted work of the [ASWF Standard Shader Ball](https://github.com/usd-wg/assets/tree/3b75c2dad6a494897557dcca0098257bcf42a8c6/full_assets/StandardShaderBall) by the ASWF USD Working Group (geometry and textures by Chris Rydalch), [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). The changes are described in [docs/images/README.md](docs/images/README.md).
+- 🔬 **Recent research, implemented and cited.** ReSTIR DI, GI and PT, plus 2025–2026 papers on spatial reuse, reservoir splatting and control variates. [REFERENCES.md](REFERENCES.md) maps every method to the code that implements it.
+- 🌈 **Spectral light transport.** Four wavelengths per path, CIE illuminants, dispersion and thin-film interference, through every ReSTIR mode.
+- 📏 **Defaults chosen by measurement.** A new method becomes the default only where it wins at equal render time. The figures are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md).
+- 🧪 **Tested on the GPU.** The verification suite runs the production shaders and render path on Metal (179 checks passed on 2026-10-04, Apple M4).
+- 🎬 **Production formats.** OpenPBR surfaces, MaterialX graphs, OpenUSD scenes, and OpenEXR export.
 
 ## Gallery
 
-**Spectral illuminants.** The same Cornell box lit by CIE illuminant A (incandescent), FL11 (narrow-band fluorescent) and HP1 (high-pressure sodium), set with **Light spectrum**. Sodium light has almost no green in its spectrum, so the green wall goes nearly black. RGB transport ignores these presets.
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/cornell-glass-mirror.jpg" alt="Cornell box with a mirror sphere and a glass sphere casting a caustic"></td>
+    <td width="50%"><img src="docs/images/shaderball-loft.jpg" alt="ASWF Standard Shader Ball imported from OpenUSD, side view, lit by an HDRI"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Caustics and interreflection.</b> A glass sphere focuses the area light onto the floor.</sub></td>
+    <td align="center"><sub><b>OpenUSD import.</b> The ASWF Standard Shader Ball, with its materials mapped to OpenPBR.</sub></td>
+  </tr>
+</table>
 
-| Incandescent (A) | Fluorescent (FL11) | Sodium (HP1) |
-| --- | --- | --- |
-| ![Cornell box under incandescent light](docs/images/spectral-incandescent-a.jpg) | ![Cornell box under narrow-band fluorescent light](docs/images/spectral-fluorescent-fl11.jpg) | ![Cornell box under sodium light, with a near-black green wall](docs/images/spectral-sodium-hp1.jpg) |
+<table>
+  <tr>
+    <td width="33%"><img src="docs/images/spectral-incandescent-a.jpg" alt="Cornell box under incandescent light"></td>
+    <td width="33%"><img src="docs/images/spectral-fluorescent-fl11.jpg" alt="Cornell box under narrow-band fluorescent light"></td>
+    <td width="33%"><img src="docs/images/spectral-sodium-hp1.jpg" alt="Cornell box under sodium light, with a near-black green wall"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Incandescent</b> (CIE A)</sub></td>
+    <td align="center"><sub><b>Fluorescent</b> (CIE FL11)</sub></td>
+    <td align="center"><sub><b>Sodium</b> (CIE HP1)</sub></td>
+  </tr>
+</table>
 
-| Thin-lens depth of field | Twilight sky | Shader Ball, side view |
-| --- | --- | --- |
-| ![Pavilion close-up focused on the copper sphere, foreground cylinder out of focus](docs/images/pavilion-depth-of-field.jpg) | ![Pavilion under the twilight sky preset with soft beam shadows](docs/images/pavilion-twilight.jpg) | ![ASWF Standard Shader Ball from the side, lit by an HDRI](docs/images/shaderball-loft.jpg) |
+<p align="center"><sub><b>Spectral illuminants.</b> The same box under three <b>Light spectrum</b> presets. Sodium light has almost no green in its spectrum, so the green wall goes nearly black. RGB transport ignores these presets.</sub></p>
 
-The side-view Shader Ball is under the same CC-BY-4.0 attribution as above, and its environment is Poly Haven's Photo Studio Loft Hall (CC0). Every shot is listed in `scripts/showcase.json`.
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/pavilion-depth-of-field.jpg" alt="Pavilion close-up focused on the copper sphere, with the foreground cylinder out of focus"></td>
+    <td width="50%"><img src="docs/images/pavilion-twilight.jpg" alt="Pavilion under the twilight sky preset with soft beam shadows"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Thin-lens depth of field.</b> Focus on the copper sphere, with the gold cylinder in front out of focus.</sub></td>
+    <td align="center"><sub><b>Procedural sky.</b> The Twilight preset, with soft shadows from the roof beams.</sub></td>
+  </tr>
+</table>
+
+<sub>Every image was rendered through the app's own export path with `python3 scripts/render_showcase.py` (shots in [`scripts/showcase.json`](scripts/showcase.json)). The environments are Poly Haven HDRIs (CC0). The Shader Ball render is an adapted work of the [ASWF Standard Shader Ball](https://github.com/usd-wg/assets/tree/3b75c2dad6a494897557dcca0098257bcf42a8c6/full_assets/StandardShaderBall) by the ASWF USD Working Group (geometry and textures by Chris Rydalch), [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). The changes are listed in [docs/images/README.md](docs/images/README.md).</sub>
 
 ## Features
 
+| | |
+| --- | --- |
+| **Path tracing** | ReSTIR DI with first-bounce ReSTIR GI on procedural scenes, and ReSTIR PT for imported scenes. Standard MIS, light-only and BSDF-only modes for comparison. |
+| **Light transport** | Spectral (default) or RGB. CIE illuminant presets, dispersion, and thin film. |
+| **Materials** | OpenPBR surfaces, image textures, normal maps, and a subset of MaterialX graphs. |
+| **Scenes** | Six procedural test scenes, OBJ import, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Up to 64 million rendered triangles. |
+| **Acceleration** | Two-level instancing on Metal hardware ray tracing, with an exact software 4-wide BVH as a fallback. |
+| **Camera and lighting** | Thin-lens depth of field, procedural skies, HDRI environments, and editable area lights. |
+| **Denoising** | MetalFX for the interactive preview, and Open Image Denoise for snapshots and exports. |
+| **Viewport** | Beauty, albedo, world normals, depth, and material/roughness views. |
+| **Projects** | Portable `.vtrace` files with embedded assets, saved camera views, undo/redo, and autosave recovery. |
+| **Export** | sRGB PNG and linear HDR OpenEXR (32-bit float) at independent resolutions and sample counts. |
+
+<details>
+<summary><b>Technical details</b></summary>
+
 - **Path tracing:** ReSTIR with Standard MIS, light-only, and BSDF-only comparison modes. Imported scenes use ReSTIR PT, which reuses whole paths, including glossy, mirror and glass paths, with the improvements of ReSTIR PT Enhanced (Lin et al., SIGGRAPH 2022 and I3D 2026; `RESTIRPT2022`, `RESTIRPTE2026` in [REFERENCES.md](REFERENCES.md)). The procedural scenes use ReSTIR direct lighting with first-bounce diffuse ReSTIR GI, which is faster there; its spatial reuse can pick neighbours by compatibility-guided selection (Junkins et al., HPG 2026; `COMPATRESTIR2026`). An opt-in stochastic pairwise MIS spatial reuse (Hedstrom et al., Eurographics 2026; `SPMIS2026`) reuses DI, GI or PT samples from 64-pixel reuse cells without bias. ReSTIR PT shades pixels with spatio-temporal control variates (Shi et al., SIGGRAPH 2026; `RESTCV2026`): colour estimates accumulated over neighbouring pixels and frames, corrected by the reservoirs' own difference estimates, which lowers colour noise without bias.
 - **Light transport:** RGB or spectral. Spectral transport traces four wavelengths per path, after Christoph Peters' spectral rendering series (bounded-MESE reflectance spectra from sRGB, wavelengths importance-sampled by illuminant and colour-matching functions; `PETERS2019`, `FOURIERSRGB2019`, `PETERSBLOG2025`), with CIE illuminant presets for lights and the sun, dispersion and thin film (`HERO2014` for dispersive glass), through every ReSTIR mode. Automatic, the default since October 3, 2026, uses it for every scene.
-- **Materials:** OpenPBR surfaces, image textures, normal maps, and a supported subset of MaterialX graphs.
-- **Scenes:** six procedural test scenes, OBJ import, and OpenUSD scene import with hierarchy, instances, materials, lights, and cameras. Imported meshes are traced as instances through a two-level acceleration structure: Metal hardware ray tracing where a launch-time check finds it watertight (Apple M4 does), otherwise an exact software 4-wide SAH hierarchy. Up to 1,000,000 stored and 64,000,000 rendered triangles.
-- **Lighting:** procedural skies, HDRI environments, editable area lights, and a thin-lens camera.
-- **Denoising:** MetalFX interactive preview and Open Image Denoise for in-app snapshots and offline exports.
-- **Viewport:** beauty, albedo, world normals, depth, and material/roughness views.
-- **Projects:** portable `.vtrace` files with embedded assets stored once each, saved camera views, undo/redo, and autosave recovery.
-- **Export:** sRGB PNG and linear HDR OpenEXR (32-bit float RGB) at independent resolutions and sample counts.
+- **Scenes:** imported meshes are traced as instances through a two-level acceleration structure: Metal hardware ray tracing where a launch-time check finds it watertight (Apple M4 does), otherwise an exact software 4-wide SAH hierarchy. Up to 1,000,000 stored and 64,000,000 rendered triangles.
+- **Thin lens:** a uniform circular aperture and a focus plane perpendicular to the camera's forward axis (`PBRT2023`). The G-buffer, shading and MetalFX guide passes share each pixel's lens sample. It is a thin-lens approximation, not a multi-element optical model.
 
-## Requirements
-
-- macOS 26 or later
-- A Metal-capable GPU; tested on Apple M4
-- Xcode 27 command-line tools (Swift 6.4). The app, the GPU test suite and the benchmark compile in the Swift 6 language mode (`-swift-version 6`), so a Swift 6 toolchain is required.
-- Internet access for the first build
-
-MetalFX preview requires a supported GPU. OpenUSD import uses the command-line tools’ `/usr/bin/python3` (CPython 3.9); the import helper refuses other Python versions with a message.
+</details>
 
 ## Getting started
+
+**Requirements:** macOS 26 or later, a Metal-capable GPU (tested on Apple M4), Xcode 27 command-line tools (Swift 6.4), and internet access for the first build.
 
 ```sh
 git clone https://github.com/gabinfor/metal-vibe-tracer.git
@@ -63,11 +101,20 @@ cd metal-vibe-tracer
 open build/MetalVibeTracer.app
 ```
 
-The first build downloads pinned OpenUSD 26.8 and Open Image Denoise 2.5.0 runtimes, and solves the spectral colour grid from the vendored CIE data (`scripts/generate_spectral_tables.py`, about 100 s on an M4; cached afterwards). Later builds reuse the cache after checking it. The OIDN cache records every file's SHA-256 and the target architecture, so a cache made by an older build is prepared once more. A cached OpenUSD wheel that fails its checksum is moved to `build/usd-wheel/rejected/` and downloaded again. OpenPBR shader sources are vendored, and Metal shaders compile at runtime; the separate Metal command-line toolchain is not required.
+The first build downloads pinned OpenUSD 26.8 and Open Image Denoise 2.5.0 runtimes, and solves the spectral colour grid from the vendored CIE data (about 100 s on an M4; cached afterwards).
+
+<details>
+<summary><b>Build details</b></summary>
+
+The app, the GPU test suite and the benchmark compile in the Swift 6 language mode (`-swift-version 6`), so a Swift 6 toolchain is required. MetalFX preview requires a supported GPU. OpenUSD import uses the command-line tools’ `/usr/bin/python3` (CPython 3.9); the import helper refuses other Python versions with a message.
+
+The spectral colour grid is solved by `scripts/generate_spectral_tables.py`. Later builds reuse the cache after checking it. The OIDN cache records every file's SHA-256 and the target architecture, so a cache made by an older build is prepared once more. A cached OpenUSD wheel that fails its checksum is moved to `build/usd-wheel/rejected/` and downloaded again. OpenPBR shader sources are vendored, and Metal shaders compile at runtime; the separate Metal command-line toolchain is not required.
 
 `build.sh` compiles first and then assembles a staging bundle. `scripts/check_bundle.py` runs the bundled helpers from `/` with a minimal environment, and the staged bundle replaces `build/MetalVibeTracer.app` only if that check passes. The app loads its shaders, USD helper and OIDN runtime from its bundle only, never from the launch directory.
 
 If the checkout is inside iCloud Drive (for example `~/Documents`), the build marks `build/` with `com.apple.fileprovider.ignore#P` so that the roughly 1 GB tree stays local. Older builds may have left conflict copies such as `build/OpenUSD 2` or duplicate `.app` bundles. They are unused and can be deleted by hand. A checkout outside iCloud-synced folders avoids the issue.
+
+</details>
 
 ## Usage
 
@@ -86,36 +133,41 @@ Choose a scene in the inspector, then adjust its camera, lighting, materials, an
 | Frame selection / all imported objects | ⌘F / ⇧⌘F |
 | Close window / minimize / hide | ⌘W / ⌘M / ⌘H |
 
+For a final image, open **Export**, choose a resolution and sample count, and select OIDN, raw, or MetalFX output. See the [user guide](docs/USER_GUIDE.md) for material controls, project behavior, import coverage, and export details.
+
+<details>
+<summary><b>Export and project details</b></summary>
+
 The **Window** menu provides Minimize, Zoom and Bring All to Front. ⌘E and **Settings…** reveal the inspector if it is hidden.
 
-Use **OIDN Preview Current Frame** to denoise the current accumulation inside the app. For a final image, open **Export**, choose a resolution and sample count, and select OIDN, raw, or MetalFX output. PNG includes display adjustments and is sRGB-encoded. OpenEXR stores linear HDR radiance as 32-bit float RGB without an alpha channel, so values above 65504 are kept. MetalFX output, in the preview or in an export, is a display estimate, not radiometric data. The suite measured MetalFX/raw region-mean ratios of 1.03 on diffuse Cornell surfaces, 0.87 on diffuse Pavilion surfaces, 0.69 on reflective regions and 0.77 on the grazing gold cylinder. For linear radiance, export the raw or OIDN source as OpenEXR.
+Use **OIDN Preview Current Frame** to denoise the current accumulation inside the app. PNG includes display adjustments and is sRGB-encoded. OpenEXR stores linear HDR radiance as 32-bit float RGB without an alpha channel, so values above 65504 are kept. MetalFX output, in the preview or in an export, is a display estimate, not radiometric data. The suite measured MetalFX/raw region-mean ratios of 1.03 on diffuse Cornell surfaces, 0.87 on diffuse Pavilion surfaces, 0.69 on reflective regions and 0.77 on the grazing gold cylinder. For linear radiance, export the raw or OIDN source as OpenEXR.
 
 Projects embed imported assets and can be reopened without the original files. Since project format 3, each distinct image, environment or mesh is stored once per file, and autosaves write only assets that changed, as separate sidecar files. Older projects open and are saved as format 3; builds from before this change cannot open format-3 projects. Open, New and Open USD Scene ask Save / Don't Save / Cancel when the document has unsaved changes; a replaced unsaved document is also kept as `Autosave-previous.vtrace`. The app restores its latest autosave on startup, together with its project file association and edited state. An autosave that cannot be restored is moved aside as `Autosave-unrestorable-<date>.vtrace` and never overwritten. Quit waits for pending saves.
 
-See the [user guide](docs/USER_GUIDE.md) for material controls, project behavior, import coverage, and export details.
+</details>
 
-## Example assets
+### Example assets
 
 - [MaterialX examples](Examples/MaterialX/README.md)
 - [OpenUSD examples and reference scenes](Examples/OpenUSD/README.md)
-- [Poly Haven HDRI test selection](Examples/HDRI/README.md)
-
-To download the optional 4K HDRI selection locally (needed by `scripts/render_showcase.py`, which renders the README images through the export path):
-
-```sh
-python3 scripts/fetch_test_hdris.py
-```
+- [Poly Haven HDRI test selection](Examples/HDRI/README.md). Download it with `python3 scripts/fetch_test_hdris.py`. `scripts/render_showcase.py` needs it to render the README images.
 
 ## Development
 
 The renderer and embedded Metal kernels live in `main.swift`. App controls, project handling, importers, and export code are in `Sources/`.
 
 ```sh
-./build.sh
-python3 tests/verify.py
+./build.sh                                # build the app bundle
+python3 tests/verify.py                   # run the GPU verification suite
+MTL_DEBUG_LAYER=1 python3 tests/verify.py # with Metal API validation
+python3 tests/benchmark.py                # time the production render path
+python3 scripts/render_showcase.py        # re-render the README images
 ```
 
-The verification suite runs the production shaders on Metal and checks rendering, materials, denoising, imports, project persistence, and UI construction. GPU checks go through the production `PathTracerRenderer.renderFrame` path. GPU access is required. Native file dialogs and mouse interactions require manual checks.
+The verification suite runs the production shaders on Metal and checks rendering, materials, denoising, imports, project persistence, and UI construction. GPU checks go through the production `PathTracerRenderer.renderFrame` path. Native file dialogs and mouse interactions require manual checks.
+
+<details>
+<summary><b>Test harness and benchmark details</b></summary>
 
 `python3 tests/verify.py [--studio-only | --usd-only] [--require-reference]` runs the full suite, the Studio subset, or the OpenUSD subset. `--require-reference` makes a missing ASWF Shader Ball download fail instead of being skipped with a message. Unknown flags are rejected.
 
@@ -123,22 +175,23 @@ The verification suite runs the production shaders on Metal and checks rendering
 
 Each run writes diagnostic images and fixtures to its own `build/checks/runs/verify-<time>-<pid>/` directory, and `build/checks/latest` points to the newest run. The last three runs are kept. On GPUs without MetalFX's temporal denoised scaler, the MetalFX checks print `SKIP` and the suite exercises the raw fallback path instead.
 
-For Metal API validation:
-
-```sh
-MTL_DEBUG_LAYER=1 python3 tests/verify.py
-```
-
-The September 2026 audit, its remediation and the 2026-10-04 validation are archived in
-[docs/archive/](docs/archive/README.md).
-The application is currently distributed as an unsigned local build; signing,
-notarization, and clean-machine installation remain release packaging work.
-
 `python3 tests/benchmark.py [--baseline /path/to/previous/main.swift] [--report FILE] [--frames 12] [--rounds 2] [--output-tolerance 0.05]` times the production `renderFrame` path on fixed scenes. A baseline's shaders are compared only when their Uniforms layout, argument-buffer length and kernel bindings match the current host code, and each scenario's mean raw radiance agrees within `--output-tolerance`. Otherwise no timings are printed. Current measurements, from September 28, 2026 at `84db5e3`, are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md), with the unedited report in [tests/PERFORMANCE-raw.txt](tests/PERFORMANCE-raw.txt). The October 2 Z++ sampler figures (static, moving-camera and MetalFX error, bias and time against PCG) head that file, with their raw measurements in [tests/PERFORMANCE-zsampling-raw.txt](tests/PERFORMANCE-zsampling-raw.txt); the September 29 figures for spatio-temporal control variates (per-frame, MetalFX and static error, bias, time and memory against resampled shading) follow, with their raw measurements in [tests/PERFORMANCE-restcv-raw.txt](tests/PERFORMANCE-restcv-raw.txt); the stochastic pairwise MIS figures follow, with theirs in [tests/PERFORMANCE-spmis-raw.txt](tests/PERFORMANCE-spmis-raw.txt). The September 29 reservoir-splatting figures (moving-camera error in disoccluded pixels, time, memory and bias against reprojection) follow, with their raw measurements in [tests/PERFORMANCE-splatting-raw.txt](tests/PERFORMANCE-splatting-raw.txt); the September 29 ReSTIR PT figures (error, bias, time and memory against ReSTIR GI) follow, with their reports in [tests/PERFORMANCE-restir-pt-raw.txt](tests/PERFORMANCE-restir-pt-raw.txt); the September 29 spatial neighbour selection figures follow, with their report in [tests/PERFORMANCE-neighbors-raw.txt](tests/PERFORMANCE-neighbors-raw.txt). Earlier speedup figures, which predate ReSTIR GI and could not be reproduced, have been withdrawn.
 
-See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
+`scripts/render_showcase.py` renders the shots in `scripts/showcase.json` through `StudioController.startExport` with Open Image Denoise, as Export does in the app. `--scale` and `--samples` override every shot for quick framing previews.
+
+</details>
+
+The September 2026 audit, its remediation and the 2026-10-04 validation are archived in [docs/archive/](docs/archive/README.md). The application is currently distributed as an unsigned local build; signing, notarization, and clean-machine installation remain release packaging work. See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
 
 ## Known limitations
+
+- **ReSTIR PT costs 1.3–2.3× the frame time**, so it is the default only for imported scenes, where it wins at equal time. Procedural scenes use first-bounce ReSTIR GI.
+- **Some spectral features are experimental.** Spectral MIS for rough dispersive glass measured about 4× the default's error (an open issue), and the sky models and imported UsdLux spectra are not spectral.
+- **Import coverage is partial.** OpenUSD import is a snapshot (no animation, subdivision, volumes, curves or USD export), and MaterialX support is a bounded importer.
+- **Fog and the ring-caustic boost** are approximate preview effects.
+
+<details>
+<summary><b>All limitations, with measurements</b></summary>
 
 - On the procedural scenes, ReSTIR GI reuses only the first diffuse indirect vertex; deeper and glossy transport use ordinary path tracing, and its practical reuse is biased by up to +0.25% of mean radiance. ReSTIR PT reuses every path and agreed with MIS within ±0.1%, but its shifts cost 1.3–2.3× the frame time: on the procedural scenes it lowers error by 0–20% at equal sample count but raises it by 22–105% at equal time, so the default (`IndirectReuse.automatic`) uses it only for imported scenes, where it wins at equal time (8–25% lower error). While the camera moves it lowers per-frame error by 37–75% in most scenes, at 1.7–3.6× the frame time. The **Indirect reuse** popup on the Render page overrides the default per project. Test builds (`-D VIBE_TESTING`) change the default everywhere with `VIBE_INDIRECT_REUSE=gi|pt|unified`. Use Standard MIS with fog and ring boost disabled for reference comparisons: at equal time it beats both ReSTIR modes for converged images on most scenes.
 - ReSTIR PT reuses temporally only while the view changes; its duplication-map decorrelation (biased) is off, and replay stream compaction, light tiles and dual motion vectors are not implemented.
@@ -154,11 +207,11 @@ See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, a
 - MetalFX can soften detail. OIDN works on the accumulated image; raw output remains available for comparison.
 - Fog and the optional ring-caustic boost are approximate preview effects.
 
+</details>
+
 ## Acknowledgments
 
-Built with Apple Metal and MetalFX, Adobe OpenPBR, OpenUSD, and Intel Open Image Denoise. Optional HDRI test assets are from Poly Haven under CC0.
-
-Third-party licenses and attribution are retained with the vendored dependencies and bundled resources. Full citations and implementation notes are in [REFERENCES.md](REFERENCES.md).
+Built with Apple Metal and MetalFX, Adobe OpenPBR, OpenUSD, and Intel Open Image Denoise. HDRI environments are from Poly Haven under CC0. Third-party licenses and attribution are retained with the vendored dependencies and bundled resources. Full citations and implementation notes are in [REFERENCES.md](REFERENCES.md).
 
 ## License
 
