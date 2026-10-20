@@ -1,3 +1,16 @@
+# Hardware acceleration-structure layouts — October 20, 2026
+
+Apple M4, macOS 27.0.1. `xcrun swiftc -O -swift-version 6 scripts/measure_acceleration.swift -o build/measure_acceleration && build/measure_acceleration 1000000 10000000`. The fixture is a welded displaced grid; each case builds and compacts one primitive structure. Throughput is closest-hit rays with random origins and directions inside the grid's box (4 M rays, best of three passes).
+
+| BLAS input | Shared-edge leaks | B/triangle (compacted) | 10 M build + compaction | 10 M Mrays/s |
+| --- | --- | --- | --- | --- |
+| `MeshTriangle` records (production) | 0 | 86.1 | 0.92 s | 379 |
+| Unwelded `float3` + identity indices | 0 | 86.1 | 0.90 s | 378 |
+| Unwelded `float3`, no indices | 25 / 29,196 | 45.0 (44.2 with `MinimizeMemory`) | 0.46 s | 449 |
+| Welded `float3` + indices | 25 / 29,196 | 45.0 | 0.40 s | 446 |
+
+`PreferFastIntersection` and `MinimizeMemory` change neither leaks nor watertight sizes. The 1 M-triangle throughput runs were disturbed by another GPU job (282–1,151 Mrays/s across repeats) and are not reported. Leak counts are identical across all three usage flags.
+
 # Dispersion sampling — October 4, 2026
 
 `DispersionSampling` (`REFERENCES.md` "October 4 dispersion sampling", `HERO2014`, `CMIS2020`; [docs/SPECTRAL_DESIGN.md](../docs/SPECTRAL_DESIGN.md) §13) against the earlier hero-wavelength termination. Setup: Apple M4, spectral transport, Cornell glass & mirror (scene 3) with the glass sphere (slot 5) as smooth legacy dielectric or rough OpenPBR glass (IOR 1.52), OpenPBR dispersion 1 (Abbe 20) or 0.5 (Abbe 40), and a prism (imported mesh, scene 6). 240×180, MIS strategy, 64 frames with the Z++ sampler, against a 2,048-frame reference rendered with PCG (independent numbers) by spectral MIS with splitting. Linear MSE over the image (and over the glass and mirror pixels). Scratch drivers through the production `renderFrame` path; the shaders measured equal the committed ones except the spectral MIS overlap gate, which the sweep varied (the committed gate, 0.25, disables spectral MIS exactly where the sweep found no gain: the roughness 0.03–0.05 rows).

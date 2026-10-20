@@ -873,3 +873,46 @@
   print("PASS: fix-accel hardware intersector gate")
 }
 try fixAccelChecks()
+
+// The ReSTIR DI reservoir keeps the light ID (imported triangle + 2) in posDir.w of an rgba32Float
+// texture. float(id) rounded IDs above 2^24, which the 64 M rendered-triangle limit allows; the
+// stored bits must round-trip exactly, including through a texture store and load.
+@MainActor func fixDILightIDChecks() throws {
+  let kernels = """
+    kernel void di_id_store(device const uint *ids [[buffer(0)]], texture2d<float, access::write> t [[texture(0)]],
+        uint gid [[thread_position_in_grid]]) {
+        t.write(float4(0.5f, -1.0f, 2.0f, restir_di_pack_light(ids[gid])), uint2(gid, 0));
+    }
+    kernel void di_id_load(device uint *out [[buffer(0)]], texture2d<float, access::read> t [[texture(0)]],
+        uint gid [[thread_position_in_grid]]) {
+        LightSample s = restir_di_stored_sample(t.read(uint2(gid, 0)), float4(1.0f), float3(0.0f, 0.0f, 5.0f), 0.0f);
+        out[gid] = s.isDirectional;
+    }
+    """
+  let library = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  let ids: [UInt32] = [0, 1, 2, 3, 16_777_215, 16_777_216 + 2, 16_777_219, 64_000_001, 1 << 30, 0x7E7F_FFFF]
+  let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: ids.count, height: 1, mipmapped: false)
+  descriptor.usage = [.shaderRead, .shaderWrite]
+  descriptor.storageMode = .private
+  guard let texture = gpu.makeTexture(descriptor: descriptor),
+    let input = ids.withUnsafeBytes({ gpu.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
+    let output = gpu.makeBuffer(length: ids.count * 4, options: .storageModeShared),
+    let command = testRenderer.commandQueue.makeCommandBuffer()
+  else { throw MaterialLibrary.error("Could not allocate the DI light-ID check.") }
+  for (name, buffer) in [("di_id_store", input), ("di_id_load", output)] {
+    let encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(try gpu.makeComputePipelineState(function: library.makeFunction(name: name)!))
+    encoder.setBuffer(buffer, offset: 0, index: 0)
+    encoder.setTexture(texture, index: 0)
+    encoder.dispatchThreads(MTLSize(width: ids.count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: ids.count, height: 1, depth: 1))
+    encoder.endEncoding()
+  }
+  command.commit(); command.waitUntilCompleted()
+  require(command.status == .completed, "DI light-ID GPU command")
+  let decoded = Array(UnsafeBufferPointer(start: output.contents().bindMemory(to: UInt32.self, capacity: ids.count), count: ids.count))
+  require(decoded == ids, "DI reservoir light IDs round-trip exactly above 2^24: \(decoded) != \(ids)")
+  // The previous float(id) encoding loses the low bits of these IDs.
+  require(UInt32(Float(16_777_219)) != 16_777_219, "the float(id) encoding was lossy above 2^24")
+  print("PASS: fix-accel DI reservoir light IDs (exact to \(ids.max()!))")
+}
+try fixDILightIDChecks()

@@ -2956,12 +2956,19 @@ DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, 
     return r;
 }
 
+// The light ID of a stored DI sample (LightSample.isDirectional: 0 finite light, 1 sun, imported
+// triangle + 2) in posDir.w. Its bits are stored, offset into the normal floats so that no ID is a
+// denormal a store could flush; 0 stays +0.0, which is what empty reservoirs write. float(id) was
+// exact only below 2^24 rendered triangles.
+float restir_di_pack_light(uint id) { return id == 0u ? 0.0f : as_type<float>(id + 0x00800000u); }
+uint restir_di_unpack_light(float w) { uint bits = as_type<uint>(w); return bits == 0u ? 0u : bits - 0x00800000u; }
+
 // A stored DI sample (the reservoir texture layout) seen from the shading point p; u is the
 // reservoir's weights.w.
 LightSample restir_di_stored_sample(float4 posDir, float4 emitPdf, float3 p, float u) {
     LightSample s = {};
     s.position = posDir.xyz;
-    s.isDirectional = uint(posDir.w);
+    s.isDirectional = restir_di_unpack_light(posDir.w);
     s.wi = (s.isDirectional == 1) ? s.position : normalize(s.position - p);
     s.emission = emitPdf.xyz;
     s.pdf = emitPdf.w;
@@ -2992,7 +2999,7 @@ void restir_di_encode(DIReservoir r, HitRecord rec, float3 view, constant Unifor
     float current_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, r.sample, u.sceneIndex, u.light.w, images, wl);
     float W = (r.M > 0.0f && current_p_hat > 0.0f) ? (r.weightSum / (r.M * current_p_hat)) : 0.0f;
     float3 storeDirPos = (r.sample.isDirectional == 1) ? r.sample.wi : r.sample.position;
-    posDir = float4(storeDirPos, float(r.sample.isDirectional));
+    posDir = float4(storeDirPos, restir_di_pack_light(r.sample.isDirectional));
     emitPdf = float4(r.sample.emission, r.sample.pdf);
     weights = float4(r.weightSum, r.M, W, r.sample.u);
 }
@@ -5721,7 +5728,7 @@ kernel void shading_kernel(
 
                 LightSample selectedSample = {};
                 selectedSample.position = cPosDir.xyz;
-                selectedSample.isDirectional = uint(cPosDir.w);
+                selectedSample.isDirectional = restir_di_unpack_light(cPosDir.w);
                 selectedSample.wi = (selectedSample.isDirectional == 1) ? selectedSample.position : normalize(selectedSample.position - pos);
                 selectedSample.emission = cEmitPdf.xyz;
                 selectedSample.pdf = cEmitPdf.w;
@@ -5761,7 +5768,7 @@ kernel void shading_kernel(
 
                                 LightSample nSample = {};
                                 nSample.position = nPosDir.xyz;
-                                nSample.isDirectional = uint(nPosDir.w);
+                                nSample.isDirectional = restir_di_unpack_light(nPosDir.w);
                                 nSample.wi = (nSample.isDirectional == 1) ? nSample.position : normalize(nSample.position - pos);
                                 nSample.emission = nEmitPdf.xyz;
                                 nSample.pdf = nEmitPdf.w;
