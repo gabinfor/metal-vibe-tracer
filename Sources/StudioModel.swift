@@ -379,16 +379,31 @@ struct ProjectDocument: Codable {
 }
 
 // REFERENCES.md: OBJ2026, PBRT2023. Independent OBJ reader; no external importer.
+private extension CChar { var isWhitespaceByte: Bool { self == 0x20 || (self >= 0x09 && self <= 0x0D) } }
 enum OBJMesh {
   static func load(_ text: String) throws -> [MeshTriangle] { try parts(text).flatMap(\.triangles) }
   static func parts(_ text: String) throws -> [OBJPart] {
     var skipped = 0
     return try parts(text, skipped: &skipped)
   }
-  // skipped counts faces left out because their edges are (numerically) collinear.
-  // `nodeBudget` bounds the scene nodes the parts create (one per object, one per
-  // object/group part) so oversized hierarchies fail before the whole file is parsed.
   static func parts(_ text: String, skipped: inout Int, nodeBudget: Int = Int.max) throws -> [OBJPart] {
+    var libraries: [String] = []
+    return try parts(Data(text.utf8), skipped: &skipped, nodeBudget: nodeBudget, libraries: &libraries)
+  }
+  // Streams the file's bytes (a memory-mapped file is never copied into a String), so files of
+  // several GB parse within the triangle limit. skipped counts faces left out because their edges
+  // are (numerically) collinear. `nodeBudget` bounds the scene nodes the parts create (one per
+  // object, one per object/group part) so oversized hierarchies fail before the whole file is
+  // parsed. `libraries` receives each `mtllib` statement's argument text.
+  static func parts(_ data: Data, skipped: inout Int, nodeBudget: Int = Int.max, libraries: inout [String]) throws
+    -> [OBJPart]
+  {
+    try data.withUnsafeBytes { raw in
+      try parts(raw.bindMemory(to: UInt8.self), skipped: &skipped, nodeBudget: nodeBudget, libraries: &libraries)
+    }
+  }
+  private static func parts(_ bytes: UnsafeBufferPointer<UInt8>, skipped: inout Int, nodeBudget: Int,
+                            libraries: inout [String]) throws -> [OBJPart] {
     var positions: [SIMD3<Float>] = []
     var normals: [SIMD3<Float>] = []
     var uvs: [SIMD2<Float>] = []
@@ -397,7 +412,7 @@ enum OBJMesh {
     var group = "Mesh"
     var material = "Default"
     var total = 0
-    var lineNumber = 0, physicalLine = 0, pending = ""
+    var lineNumber = 0
     func failure(_ message: String) -> Error {
       MaterialLibrary.error("\(message.dropLast()) on line \(lineNumber).")
     }
@@ -407,87 +422,106 @@ enum OBJMesh {
     var objects = Set<String>()
     var current: (part: Int, subset: Int)?
     var builders: [MeshGeometry.Builder] = []
-    func number(_ s: Substring) throws -> Float {
-      guard let n = Float(s), n.isFinite, abs(n) < 1e8 else {
-        throw failure("OBJ contains an invalid number.")
+    var scratch = [CChar](repeating: 0, count: 64)
+    var fields: [Range<Int>] = []
+    var corners: [(SIMD3<Float>, SIMD2<Float>, SIMD3<Float>?)] = []
+    func number(_ line: UnsafeBufferPointer<UInt8>, _ r: Range<Int>) throws -> Float {
+      var value: Float?
+      if r.count < scratch.count {
+        value = scratch.withUnsafeMutableBufferPointer { s -> Float? in
+          for (k, i) in r.enumerated() { s[k] = CChar(bitPattern: line[i]) }
+          s[r.count] = 0
+          var end: UnsafeMutablePointer<CChar>?
+          let n = strtof(s.baseAddress!, &end)
+          return end == s.baseAddress! + r.count && !s[0].isWhitespaceByte ? n : nil
+        }
       }
+      guard let n = value, n.isFinite, abs(n) < 1e8 else { throw failure("OBJ contains an invalid number.") }
       return n
     }
-    func index(_ s: Substring, count: Int) throws -> Int {
-      guard let n = Int(s), n != 0, n != Int.min else {
-        throw failure("Invalid OBJ index.")
+    func index(_ line: UnsafeBufferPointer<UInt8>, _ r: Range<Int>, count: Int) throws -> Int {
+      var i = r.lowerBound, negative = false, n = 0
+      if i < r.upperBound, line[i] == 0x2B || line[i] == 0x2D { negative = line[i] == 0x2D; i += 1 }
+      guard i < r.upperBound, r.upperBound - i <= 18 else { throw failure("Invalid OBJ index.") }
+      while i < r.upperBound {
+        let d = Int(line[i]) - 0x30
+        guard d >= 0 && d <= 9 else { throw failure("Invalid OBJ index.") }
+        n = n * 10 + d
+        i += 1
       }
-      let i = n > 0 ? n - 1 : count + n
-      guard i >= 0 && i < count else { throw failure("OBJ index is out of bounds.") }
-      return i
+      guard n != 0 else { throw failure("Invalid OBJ index.") }
+      let k = negative ? count - n : n - 1
+      guard k >= 0 && k < count else { throw failure("OBJ index is out of bounds.") }
+      return k
     }
-    // The empty tail flushes a continuation on the file's last line.
-    let physicalLines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
-    for raw in [physicalLines, [""]].joined() {
-      physicalLine += 1
-      if pending.isEmpty { lineNumber = physicalLine }
-      // A trailing backslash outside a comment continues the statement.
-      if let last = raw.lastIndex(where: { !$0.isWhitespace }), raw[last] == "\\",
-        !raw[..<last].contains("#")
-      {
-        pending += raw[..<last] + " "
-        continue
+    func rest(_ line: UnsafeBufferPointer<UInt8>) -> String {
+      fields.dropFirst().map { String(decoding: UnsafeBufferPointer(rebasing: line[$0]), as: UTF8.self) }
+        .joined(separator: " ")
+    }
+    func keyword(_ line: UnsafeBufferPointer<UInt8>, _ word: StaticString) -> Bool {
+      let r = fields[0]
+      guard r.count == word.utf8CodeUnitCount else { return false }
+      for k in 0..<r.count where line[r.lowerBound + k] != word.utf8Start[k] { return false }
+      return true
+    }
+    func statement(_ line: UnsafeBufferPointer<UInt8>) throws {
+      // Fields are whitespace-separated, up to a comment.
+      fields.removeAll(keepingCapacity: true)
+      var i = 0
+      while i < line.count, line[i] != 0x23 {
+        if line[i] == 0x20 || line[i] == 0x09 { i += 1; continue }
+        let start = i
+        while i < line.count, line[i] != 0x20, line[i] != 0x09, line[i] != 0x23 { i += 1 }
+        fields.append(start..<i)
       }
-      let line = pending.isEmpty ? raw : Substring(pending + raw)
-      pending = ""
-      let fields = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
-        .split(whereSeparator: \.isWhitespace)
-      guard let kind = fields.first else { continue }
-      if kind == "o" {
-        object = fields.dropFirst().joined(separator: " ")
+      guard !fields.isEmpty else { return }
+      if keyword(line, "o") {
+        object = rest(line)
         group = "Mesh"
         current = nil
-        continue
-      }
-      if kind == "g" {
-        group = fields.dropFirst().joined(separator: " ")
+      } else if keyword(line, "g") {
+        group = rest(line)
         current = nil
-        continue
-      }
-      if kind == "usemtl" {
-        material = fields.dropFirst().joined(separator: " ")
+      } else if keyword(line, "usemtl") {
+        material = rest(line)
         current = nil
-        continue
-      }
-      if kind == "v" || kind == "vn" {
+      } else if keyword(line, "mtllib") {
+        if fields.count > 1 { libraries.append(rest(line)) }
+      } else if keyword(line, "v") || keyword(line, "vn") {
         guard fields.count >= 4 else { throw failure("Incomplete OBJ vertex.") }
-        let v = try SIMD3<Float>(number(fields[1]), number(fields[2]), number(fields[3]))
-        if kind == "v" {
+        let v = try SIMD3<Float>(number(line, fields[1]), number(line, fields[2]), number(line, fields[3]))
+        if fields[0].count == 1 {
           positions.append(v)
         } else {
           normals.append(simd_length_squared(v) > 1e-12 ? simd_normalize(v) : SIMD3<Float>(0, 1, 0))
         }
-      } else if kind == "vt" {
+      } else if keyword(line, "vt") {
         // "vt u" is valid OBJ; v defaults to 0.
         guard fields.count >= 2 else { throw failure("Incomplete OBJ UV.") }
-        uvs.append(try SIMD2<Float>(number(fields[1]), 1 - (fields.count >= 3 ? number(fields[2]) : 0)))
-      } else if kind == "f" {
+        uvs.append(try SIMD2<Float>(number(line, fields[1]), 1 - (fields.count >= 3 ? number(line, fields[2]) : 0)))
+      } else if keyword(line, "f") {
         guard fields.count >= 4, fields.count <= 4097 else {
           throw failure("OBJ face must contain 3–4096 vertices.")
         }
-        var vertices: [(SIMD3<Float>, SIMD2<Float>, SIMD3<Float>?)] = []
+        corners.removeAll(keepingCapacity: true)
         for f in fields.dropFirst() {
-          let parts = f.split(separator: "/", omittingEmptySubsequences: false)
-          guard parts.count <= 3 else { throw failure("Invalid OBJ face.") }
-          let p = positions[try index(parts[0], count: positions.count)]
-          let uv =
-            parts.count > 1 && !parts[1].isEmpty
-            ? uvs[try index(parts[1], count: uvs.count)] : .zero
-          let n =
-            parts.count > 2 && !parts[2].isEmpty
-            ? normals[try index(parts[2], count: normals.count)] : nil
-          vertices.append((p, uv, n))
+          // v, v/vt, v//vn or v/vt/vn.
+          var slashes: [Int] = []
+          for k in f where line[k] == 0x2F { slashes.append(k) }
+          guard slashes.count <= 2 else { throw failure("Invalid OBJ face.") }
+          let ends = slashes + [f.upperBound]
+          let p = positions[try index(line, f.lowerBound..<ends[0], count: positions.count)]
+          let uvRange = slashes.count >= 1 ? slashes[0] + 1..<ends[1] : 0..<0
+          let uv = uvRange.isEmpty ? SIMD2<Float>.zero : uvs[try index(line, uvRange, count: uvs.count)]
+          let nRange = slashes.count == 2 ? slashes[1] + 1..<ends[2] : 0..<0
+          let n = nRange.isEmpty ? nil : normals[try index(line, nRange, count: normals.count)]
+          corners.append((p, uv, n))
         }
         // Convex polygons use fan triangulation; triangulate concave faces before import.
-        for i in 1..<(vertices.count - 1) {
-          let a = vertices[0]
-          let b = vertices[i]
-          let c = vertices[i + 1]
+        for i in 1..<(corners.count - 1) {
+          let a = corners[0]
+          let b = corners[i]
+          let c = corners[i + 1]
           let e1 = b.0 - a.0, e2 = c.0 - a.0
           let cross = simd_cross(e1, e2)
           // Relative test: sub-millimetre faces in meter units stay; only collinear
@@ -540,6 +574,33 @@ enum OBJMesh {
         }
       }
     }
+    // Physical lines end at LF, CR, CR LF, VT or FF (Swift's newline characters in ASCII). A
+    // trailing backslash outside a comment continues the statement on the next line.
+    var pending: [UInt8] = []
+    var physical = 0, start = 0
+    while start <= bytes.count {
+      var end = start
+      while end < bytes.count, bytes[end] != 0x0A, bytes[end] != 0x0D, bytes[end] != 0x0B, bytes[end] != 0x0C { end += 1 }
+      physical += 1
+      if pending.isEmpty { lineNumber = physical }
+      let raw = UnsafeBufferPointer(rebasing: bytes[start..<end])
+      var last = raw.count - 1
+      while last >= 0, raw[last] == 0x20 || raw[last] == 0x09 { last -= 1 }
+      if last >= 0, raw[last] == 0x5C, !raw[..<last].contains(0x23) {
+        pending += raw[..<last]
+        pending.append(0x20)
+      } else if pending.isEmpty {
+        try statement(raw)
+      } else {
+        pending += raw
+        try pending.withUnsafeBufferPointer { try statement($0) }
+        pending.removeAll(keepingCapacity: true)
+      }
+      if end == bytes.count { break }
+      start = end + (bytes[end] == 0x0D && end + 1 < bytes.count && bytes[end + 1] == 0x0A ? 2 : 1)
+    }
+    // A continuation on the file's last line still ends its statement.
+    if !pending.isEmpty { try pending.withUnsafeBufferPointer { try statement($0) } }
     guard !result.isEmpty else {
       throw MaterialLibrary.error(
         skipped > 0 ? "OBJ contains no usable faces (\(skipped) degenerate faces skipped)." : "OBJ contains no usable faces.")
@@ -844,13 +905,27 @@ extension MaterialLibrary {
   // cannot express (16-bit data; RG8 sRGB, which would also decode alpha) are expanded
   // to RGBA on the CPU.
   func decodeTexture(_ data: Data, srgb: Bool) throws -> MTLTexture {
-    let texture = try loader.newTexture(
-      data: data,
-      options: [
-        .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
-        .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-        .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
-      ])
+    let options: [MTKTextureLoader.Option: Any] = [
+      .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
+      .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+      .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
+    ]
+    let texture: MTLTexture
+    do {
+      texture = try loader.newTexture(data: data, options: options)
+    } catch {
+      // MTKTextureLoader rejects some PNG layouts (8-bit palette images, as in Bistro's MTL
+      // textures); Core Graphics decodes them to RGBA8 with their stored values.
+      guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+        let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8,
+          bytesPerRow: 4 * image.width, space: CGColorSpaceCreateDeviceRGB(),
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+      else { throw error }
+      context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+      guard let rgba = context.makeImage() else { throw error }
+      return try loader.newTexture(cgImage: rgba, options: options)
+    }
     let format = texture.pixelFormat
     if srgb, [.r8Unorm, .r16Unorm, .rg16Unorm, .rgba16Unorm, .rg8Unorm, .rg8Unorm_srgb].contains(format) {
       return try expandedSRGB(data)

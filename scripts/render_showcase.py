@@ -3,7 +3,7 @@
 Usage: python3 scripts/render_showcase.py [--shots FILE] [--only NAME ...] [--scale S] [--samples N] [--out DIR]
 
 Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD
-file or opens a .vtrace project, optionally loads an HDRI, sets the camera, lens and render modes, and exports
+file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera, lens and render modes, and exports
 through StudioController.startExport with Open Image Denoise, exactly like Export in the app. A shot with
 "raw": true exports linear radiance as OpenEXR without a denoiser instead (renderer comparisons).
 --scale and --samples override every shot for quick framing previews. Images go to --out
@@ -47,6 +47,7 @@ struct Shot: Decodable {
   var scene: UInt32?
   var project: String?
   var usd: String?
+  var obj: String?
   var hdri: String?
   var sky: UInt32?
   var fog: UInt32?
@@ -79,6 +80,17 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
   var p: ProjectDocument
   if let path = shot.usd {
     p = try USDImporter.load(URL(fileURLWithPath: path), into: ProjectDocument()).document
+  } else if let path = shot.obj {
+    let url = URL(fileURLWithPath: path)
+    var skipped = 0, report: [String] = []
+    let start = Date()
+    p = ProjectDocument()
+    _ = try p.appendOBJ(try Data(contentsOf: url, options: .alwaysMapped), name: url.lastPathComponent,
+      folder: url.deletingLastPathComponent(), skipped: &skipped, report: &report)
+    print("\(url.lastPathComponent): imported in \(String(format: "%.1f", Date().timeIntervalSince(start))) s, "
+      + "\(p.graph?.assets.reduce(0) { $0 + $1.geometry.count } ?? 0) triangles, \(skipped) degenerate faces skipped, "
+      + "\(p.scenes[6]?.materialX?.count ?? 0) MaterialX materials")
+    for line in report { print("  " + line) }
   } else if let path = shot.project {
     let url = URL(fileURLWithPath: path)
     p = try ProjectDocument.decodeProject(try Data(contentsOf: url), near: url)

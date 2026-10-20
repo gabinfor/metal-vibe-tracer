@@ -2029,27 +2029,29 @@ final class StudioController: NSViewController {
     guard !isBusy else { return }
     let record = undoRecord("Import OBJ")
     let document = snapshot()
-    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, (UUID, Int, Int)) in
+    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, (UUID, Int, Int, [String])) in
       guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
       var document = document  // The build runs on projectIOQueue with its own copy.
-      let objData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
-      guard let objText = String(data: objData, encoding: .utf8) else {
-        throw MaterialLibrary.error("OBJ must be UTF-8 text.")
-      }
+      // Memory-mapped and streamed: files of several GB parse without a text copy.
+      let objData = try self.readBounded(url, maximum: 8 << 30)
       var skipped = 0
-      let root = try document.appendOBJ(objText, name: url.lastPathComponent, skipped: &skipped)
-      return (document, (root, document.graph?.materials.last?.slot ?? 1, skipped))
+      var report: [String] = []
+      let root = try document.appendOBJ(objData, name: url.lastPathComponent, folder: url.deletingLastPathComponent(),
+        skipped: &skipped, report: &report)
+      return (document, (root, document.graph?.materials.last?.slot ?? 1, skipped, report))
     }) { [weak self] result in
       guard let self else { return }
       switch result {
-      case .success(let (root, slot, skipped)):
+      case .success(let (root, slot, skipped, report)):
         self.commit(record)
         self.selectedNode = root
         self.selectedSlot = slot
         self.frameMesh(recordUndo: false)
         self.changed()
-        if skipped > 0 {
-          self.show("Imported \(url.lastPathComponent); skipped \(skipped) degenerate faces.")
+        if skipped > 0 || !report.isEmpty {
+          self.show("Imported \(url.lastPathComponent)"
+            + (skipped > 0 ? "; skipped \(skipped) degenerate faces" : "")
+            + (report.isEmpty ? "." : "; see the import report in the scene hierarchy."))
         }
       case .failure(let error): self.showError(error.localizedDescription)
       }

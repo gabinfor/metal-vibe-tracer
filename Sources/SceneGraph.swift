@@ -87,8 +87,13 @@ struct SceneGraph: Codable {
     return try addOBJ(text, name: name, skipped: &skipped)
   }
   mutating func addOBJ(_ text: String, name: String, skipped: inout Int) throws -> UUID {
+    var libraries: [String] = []
+    return try addOBJ(Data(text.utf8), name: name, skipped: &skipped, libraries: &libraries)
+  }
+  mutating func addOBJ(_ data: Data, name: String, skipped: inout Int, libraries: inout [String]) throws -> UUID {
     // The root node is created below; each object and part adds one more.
-    let parts = try OBJMesh.parts(text, skipped: &skipped, nodeBudget: SceneLimits.nodes - nodes.count - 1)
+    let parts = try OBJMesh.parts(data, skipped: &skipped, nodeBudget: SceneLimits.nodes - nodes.count - 1,
+      libraries: &libraries)
     let root = SceneNode(name: name)
     nodes.append(root)
     var parents: [String: UUID] = [:]
@@ -408,6 +413,13 @@ extension ProjectDocument {
     return try appendOBJ(text, name: name, skipped: &skipped)
   }
   mutating func appendOBJ(_ text: String, name: String, skipped: inout Int) throws -> UUID {
+    var report: [String] = []
+    return try appendOBJ(Data(text.utf8), name: name, folder: nil, skipped: &skipped, report: &report)
+  }
+  // `folder` resolves the OBJ's mtllib files (OBJMaterials); nil imports without materials.
+  mutating func appendOBJ(_ data: Data, name: String, folder: URL?, skipped: inout Int, report: inout [String]) throws
+    -> UUID
+  {
     var p = self
     var graph = p.graph ?? SceneGraph()
     if p.graph == nil, !p.triangles.isEmpty {
@@ -444,8 +456,31 @@ extension ProjectDocument {
       }
       p.scenes[6] = migrated
     }
-    let root = try graph.addOBJ(
-      text, name: name, skipped: &skipped)
+    let existing = graph.materials.count
+    var libraries: [String] = []
+    let root = try graph.addOBJ(data, name: name, skipped: &skipped, libraries: &libraries)
+    if let folder, !libraries.isEmpty {
+      let added = graph.materials[existing...]
+      let (programs, colors) = try OBJMaterials.programs(
+        libraries: libraries, folder: folder, names: Set(added.map(\.name)), report: &report)
+      var state = p.scenes[6] ?? SceneState()
+      for material in added {
+        if let kd = colors[material.name] {
+          state.surfaces[material.slot].enabled = 1
+          state.surfaces[material.slot].color = SIMD4(simd_clamp(kd, .zero, SIMD3(repeating: 1)), 1)
+        }
+        if let program = programs[material.name] {
+          if state.materialX == nil { state.materialX = [:] }
+          state.materialX?[material.slot] = program
+        }
+      }
+      p.scenes[6] = state
+      guard p.embeddedAssetBytes <= ProjectDocument.embeddedAssetLimit else {
+        throw MaterialLibrary.error(
+          "\(name)'s textures need \(p.embeddedAssetBytes >> 20) MiB, beyond the \(ProjectDocument.embeddedAssetLimit >> 20) MiB of images a project embeds.")
+      }
+    }
+    if !report.isEmpty { p.importReport = (p.importReport ?? []) + ["\(name):"] + report }
     p.graph = graph
     p.triangles = []
     p.meshName = "\(graph.assets.count) meshes"

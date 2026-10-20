@@ -153,7 +153,7 @@ extension StudioController {
   func graphObjectPanel() {
     heading("Scene hierarchy")
     if project.importReport != nil {
-      button("USD import report…") { [weak self] in self?.showUSDReport() }
+      button("Import report…") { [weak self] in self?.showUSDReport() }
     }
     selectGraphNode()
     if let graph = project.graph, let node = graph.nodes.first(where: { $0.id == selectedNode }) {

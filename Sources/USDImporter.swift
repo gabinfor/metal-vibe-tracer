@@ -400,12 +400,12 @@ enum USDImporter {
 extension StudioController {
   func showUSDReport() {
     let alert = NSAlert()
-    alert.messageText = "OpenUSD import report"
+    alert.messageText = "Import report"
     let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 320))
     scroll.hasVerticalScroller = true
     let text = NSTextView(frame: scroll.bounds)
     text.isEditable = false
-    text.string = project.importReport?.joined(separator: "\n\n") ?? "No USD import report."
+    text.string = project.importReport?.joined(separator: "\n\n") ?? "No import report."
     text.font = .systemFont(ofSize: 12)
     scroll.documentView = text
     alert.accessoryView = scroll

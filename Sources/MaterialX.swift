@@ -879,7 +879,7 @@ extension MaterialLibrary {
           continue
         }
         guard textures.count < SceneLimits.graphImages else {
-          throw Self.error("Scene exceeds 128 MaterialX images.")
+          throw Self.error("Scene exceeds \(SceneLimits.graphImages) MaterialX images.")
         }
         bindings[image.srgb ? 1 : 0][image.data] = textures.count
         imageIndices.append(textures.count)

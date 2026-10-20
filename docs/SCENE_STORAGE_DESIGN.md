@@ -1,6 +1,6 @@
 # Large-scene storage: design proposal
 
-Status: **2026-10-20. Phases 0–3 are implemented (results below); phase 4's large-scene validation with downloaded scenes remains.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
+Status: **2026-10-20. Phases 0–3 are implemented (results below); phase 4 imports Bitterli's scenes (group A) and McGuire's Sponza, San Miguel and Bistro interior (group B); the Bistro exterior's texture budget remains.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
 
 ## Goal
 
@@ -134,7 +134,9 @@ With the watertight 86 B hardware BLAS, the resident total is about **112 B per 
 
 ### Phase 4: validation — group A done 2026-10-20
 
-Bitterli's Mitsuba 3 scenes (`BITTERLI2016` in REFERENCES.md) go through `scripts/mitsuba_to_usd.py` into the app's USD import and are compared with Mitsuba's render of the same XML by `scripts/compare_scene.py`; see `BITTERLI2016` for the per-scene numbers. Veach Bidir agrees within 1%; most others within 2–7%, limited by the missing conductor edge tint, Beckmann-to-GGX and dropped bump maps. Alpha cutouts (stochastic coverage from OpenPBR `geometry_opacity`) now run in every traversal; with them Country Kitchen's mean ratio moves from 0.97 to 0.99. Next: MTL import, bump-to-normal conversion and a streaming OBJ reader for Crytek Sponza, San Miguel and Bistro (downloaded).
+Bitterli's Mitsuba 3 scenes (`BITTERLI2016` in REFERENCES.md) go through `scripts/mitsuba_to_usd.py` into the app's USD import and are compared with Mitsuba's render of the same XML by `scripts/compare_scene.py`; see `BITTERLI2016` for the per-scene numbers. Veach Bidir agrees within 1%; most others within 2–7%, limited by the missing conductor edge tint, Beckmann-to-GGX and dropped bump maps. Alpha cutouts (stochastic coverage from OpenPBR `geometry_opacity`) now run in every traversal; with them Country Kitchen's mean ratio moves from 0.97 to 0.99. 
+
+**Group B (2026-10-20):** a streaming OBJ reader, MTL materials translated to OpenPBR MaterialX, and bump-to-normal conversion (`MTL2026`, `MCGUIRE2017` in REFERENCES.md). Crytek Sponza (262 k triangles), San Miguel (10.0 M triangles, 287 materials, 12 s import) and the Bistro interior (1.0 M) import and render, with alpha-cutout foliage. The Bistro exterior needs 671 MiB of textures, beyond the 512 MiB a project embeds; raising that limit or downscaling textures on import is the open decision. There is no reference renderer comparison for these scenes yet.
 
 #### Original proposal
 

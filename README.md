@@ -69,7 +69,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 | **Path tracing** | ReSTIR DI with first-bounce ReSTIR GI on procedural scenes, and ReSTIR PT for imported scenes. Standard MIS, light-only and BSDF-only modes for comparison. |
 | **Light transport** | Spectral (default) or RGB. CIE illuminant presets, dispersion, and thin film. |
 | **Materials** | OpenPBR surfaces, image textures, normal maps, and a subset of MaterialX graphs. |
-| **Scenes** | Six procedural test scenes, OBJ import, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Up to 64 million rendered triangles. |
+| **Scenes** | Six procedural test scenes, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Up to 64 million rendered triangles. |
 | **Acceleration** | Two-level instancing on Metal hardware ray tracing, with an exact software 4-wide BVH as a fallback. |
 | **Camera and lighting** | Thin-lens depth of field, procedural skies, HDRI environments, and editable area lights. |
 | **Denoising** | MetalFX for the interactive preview, and Open Image Denoise for snapshots and exports. |
