@@ -4,7 +4,8 @@ Usage: python3 scripts/render_showcase.py [--shots FILE] [--only NAME ...] [--sc
 
 Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD
 file or opens a .vtrace project, optionally loads an HDRI, sets the camera, lens and render modes, and exports
-through StudioController.startExport with Open Image Denoise, exactly like Export in the app.
+through StudioController.startExport with Open Image Denoise, exactly like Export in the app. A shot with
+"raw": true exports linear radiance as OpenEXR without a denoiser instead (renderer comparisons).
 --scale and --samples override every shot for quick framing previews. Images go to --out
 (default build/showcase); copy the chosen ones to docs/images by hand.
 """
@@ -63,6 +64,9 @@ struct Shot: Decodable {
   var lightColor: [Float]?
   var width: Int, height: Int
   var samples: UInt32?
+  var depth: Float?
+  // Raw linear radiance as OpenEXR, without a denoiser (renderer comparisons).
+  var raw: Bool?
 }
 func waitFor(_ condition: () -> Bool, seconds: Double) -> Bool {
   let deadline = Date().addingTimeInterval(seconds)
@@ -115,13 +119,15 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
   p.options.outputWidth = shot.width
   p.options.outputHeight = shot.height
   p.options.exportSamples = shot.samples ?? 1024
+  if let v = shot.depth { p.options.depth = v }
   try controller.restore(p)
-  controller.exportDenoise = true
-  controller.exportRaw = false
-  let url = outputFolder.appendingPathComponent(shot.name + ".png")
+  let raw = shot.raw ?? false
+  controller.exportDenoise = !raw
+  controller.exportRaw = raw
+  let url = outputFolder.appendingPathComponent(shot.name + (raw ? ".exr" : ".png"))
   try? FileManager.default.removeItem(at: url)
   let start = Date()
-  controller.startExport(url: url, hdr: false)
+  controller.startExport(url: url, hdr: raw)
   guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600),
     FileManager.default.fileExists(atPath: url.path)
   else { fputs("FAIL: \(shot.name) did not export\n", stderr); exit(1) }
