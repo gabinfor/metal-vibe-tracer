@@ -1,6 +1,6 @@
 # Audit remediation — 2026-09-26
 
-This record supersedes `AUDIT.md` (2026-09-07) and `docs/AUDIT_FIX_PLAN_2026-09-11.md` as the current status of known findings. Those files remain as history.
+This record supersedes [`AUDIT_2026-09-07.md`](AUDIT_2026-09-07.md) (formerly `AUDIT.md`) and [`AUDIT_FIX_PLAN_2026-09-11.md`](AUDIT_FIX_PLAN_2026-09-11.md) as the current status of known findings. Those files remain as history.
 
 ## Scope
 

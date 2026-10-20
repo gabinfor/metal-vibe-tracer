@@ -2,6 +2,23 @@
 
 An experimental path tracer for macOS, built with Swift, AppKit, and Metal. Explore lighting and materials in real time, import scenes, and export denoised renders.
 
+![Architectural Pavilion lit by an HDRI environment: mirror, copper and glass spheres and a gold cylinder](docs/images/pavilion-hdri.jpg)
+
+## Overview
+
+Metal Vibe Tracer is a GPU path tracer with an interactive studio UI. It implements recent real-time resampling research (ReSTIR DI, GI and PT, with 2025–2026 papers on reuse and variance reduction) on top of Metal hardware ray tracing, and it supports spectral light transport, OpenPBR materials, MaterialX graphs, and OpenUSD scene import.
+
+- **Built on research papers:** every adopted method is cited, and [REFERENCES.md](REFERENCES.md) records how each one was adapted and which code implements it.
+- **Defaults chosen by measurement:** each new method is compared with the existing one on error, bias and frame time. It becomes the default only where it wins at equal time. The figures are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md).
+- **Tested on the GPU:** the verification suite runs the production shaders and render path on Metal (179 checks passed on 2026-10-04, Apple M4).
+- **Honest about limitations:** open issues and experimental modes are listed under [Known limitations](#known-limitations).
+
+| Caustics and interreflection | OpenUSD import with OpenPBR shading |
+| --- | --- |
+| ![Cornell box with a mirror sphere and a glass sphere casting a caustic](docs/images/cornell-glass-mirror.jpg) | ![ASWF Standard Shader Ball rendered by Metal Vibe Tracer](docs/images/shaderball-studio.jpg) |
+
+These images were rendered with spectral transport and denoised with Open Image Denoise, through the app's own export path (`python3 scripts/render_showcase.py`). The environments are Poly Haven's Art Studio and Studio Small 01 HDRIs (CC0). The Shader Ball render is an adapted work of the [ASWF Standard Shader Ball](https://github.com/usd-wg/assets/tree/3b75c2dad6a494897557dcca0098257bcf42a8c6/full_assets/StandardShaderBall) by the ASWF USD Working Group (geometry and textures by Chris Rydalch), [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). The changes are described in [docs/images/README.md](docs/images/README.md).
+
 ## Features
 
 - **Path tracing:** ReSTIR with Standard MIS, light-only, and BSDF-only comparison modes. Imported scenes use ReSTIR PT, which reuses whole paths, including glossy, mirror and glass paths, with the improvements of ReSTIR PT Enhanced (Lin et al., SIGGRAPH 2022 and I3D 2026; `RESTIRPT2022`, `RESTIRPTE2026` in [REFERENCES.md](REFERENCES.md)). The procedural scenes use ReSTIR direct lighting with first-bounce diffuse ReSTIR GI, which is faster there; its spatial reuse can pick neighbours by compatibility-guided selection (Junkins et al., HPG 2026; `COMPATRESTIR2026`). An opt-in stochastic pairwise MIS spatial reuse (Hedstrom et al., Eurographics 2026; `SPMIS2026`) reuses DI, GI or PT samples from 64-pixel reuse cells without bias. ReSTIR PT shades pixels with spatio-temporal control variates (Shi et al., SIGGRAPH 2026; `RESTCV2026`): colour estimates accumulated over neighbouring pixels and frames, corrected by the reservoirs' own difference estimates, which lowers colour noise without bias.
@@ -69,7 +86,7 @@ See the [user guide](docs/USER_GUIDE.md) for material controls, project behavior
 - [OpenUSD examples and reference scenes](Examples/OpenUSD/README.md)
 - [Poly Haven HDRI test selection](Examples/HDRI/README.md)
 
-To download the optional 4K HDRI selection locally:
+To download the optional 4K HDRI selection locally (needed by `scripts/render_showcase.py`, which renders the README images through the export path):
 
 ```sh
 python3 scripts/fetch_test_hdris.py
@@ -98,8 +115,8 @@ For Metal API validation:
 MTL_DEBUG_LAYER=1 python3 tests/verify.py
 ```
 
-The September 26, 2026 audit remediation and its validation are recorded in
-[docs/AUDIT_REMEDIATION_2026-09-26.md](docs/AUDIT_REMEDIATION_2026-09-26.md).
+The September 2026 audit, its remediation and the 2026-10-04 validation are archived in
+[docs/archive/](docs/archive/README.md).
 The application is currently distributed as an unsigned local build; signing,
 notarization, and clean-machine installation remain release packaging work.
 
@@ -128,3 +145,7 @@ See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, a
 Built with Apple Metal and MetalFX, Adobe OpenPBR, OpenUSD, and Intel Open Image Denoise. Optional HDRI test assets are from Poly Haven under CC0.
 
 Third-party licenses and attribution are retained with the vendored dependencies and bundled resources. Full citations and implementation notes are in [REFERENCES.md](REFERENCES.md).
+
+## License
+
+Metal Vibe Tracer's own code is released under the [MIT License](LICENSE). Vendored and downloaded components, and the generated spectral tables, keep their own licenses. These are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

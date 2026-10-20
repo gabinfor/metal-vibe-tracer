@@ -1,0 +1,10 @@
+[
+  {"name": "pavilion-hdri", "scene": 0, "width": 1920, "height": 1080, "samples": 1024,
+   "hdri": "Examples/HDRI/art_studio_4k.hdr",
+   "yaw": 0.42, "pitch": 0.12, "distance": 4.0, "fov": 34, "target": [0.15, -0.42, 0.7],
+   "aperture": 0.02, "focusDistance": 4.0},
+  {"name": "cornell-glass-mirror", "scene": 3, "width": 1200, "height": 1200, "samples": 1024,
+   "yaw": 0.0, "pitch": 0.05, "distance": 3.0, "fov": 40, "target": [0, -0.2, 0]},
+  {"name": "shaderball-studio", "usd": "build/reference-scenes/ShaderBall-triangulated.usda",
+   "width": 1600, "height": 1200, "samples": 512, "hdri": "Examples/HDRI/studio_small_01_4k.hdr"}
+]
