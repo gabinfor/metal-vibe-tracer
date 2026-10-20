@@ -5,6 +5,6 @@
   {"name": "spectral-fluorescent-fl11", "scene": 3, "width": 1000, "height": 1000, "samples": 1024, "yaw": 0.0, "pitch": 0.05, "distance": 3.0, "fov": 40, "target": [0, -0.2, 0], "lightSpectrum": 3},
   {"name": "spectral-sodium-hp1", "scene": 3, "width": 1000, "height": 1000, "samples": 1024, "yaw": 0.0, "pitch": 0.05, "distance": 3.0, "fov": 40, "target": [0, -0.2, 0], "lightSpectrum": 4},
   {"name": "pavilion-depth-of-field", "scene": 0, "width": 1600, "height": 1200, "samples": 1024, "hdri": "Examples/HDRI/studio_small_01_4k.hdr", "yaw": 0.58, "pitch": 0.2, "distance": 2.3, "fov": 30, "target": [0.65, -0.55, 0.35], "aperture": 0.09, "focusDistance": 3.0},
-  {"name": "pavilion-twilight", "scene": 0, "width": 1920, "height": 1080, "samples": 1024, "sky": 2, "lightSpectrum": 2, "yaw": 0.42, "pitch": 0.12, "distance": 4.0, "fov": 34, "target": [0.15, -0.42, 0.7]},
+  {"name": "pavilion-twilight", "scene": 0, "width": 1920, "height": 1080, "samples": 1024, "sky": 2, "yaw": 1.35, "pitch": -0.22, "distance": 3.6, "fov": 55, "target": [0.15, -0.05, 0.7]},
   {"name": "shaderball-loft", "usd": "build/reference-scenes/ShaderBall-triangulated.usda", "width": 1600, "height": 1200, "samples": 512, "hdri": "Examples/HDRI/photo_studio_loft_hall_4k.hdr", "yaw": 1.9, "pitch": 0.25, "distance": 0.24, "fov": 24, "target": [0.008, 0.05, 0.023]}
 ]

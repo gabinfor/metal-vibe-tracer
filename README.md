@@ -52,11 +52,11 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 <table>
   <tr>
     <td width="50%"><img src="docs/images/pavilion-depth-of-field.jpg" alt="Pavilion close-up focused on the copper sphere, with the foreground cylinder out of focus"></td>
-    <td width="50%"><img src="docs/images/pavilion-twilight.jpg" alt="Pavilion under the twilight sky preset with soft beam shadows"></td>
+    <td width="50%"><img src="docs/images/pavilion-twilight.jpg" alt="Low view of the Pavilion with the roof beams against the purple twilight sky"></td>
   </tr>
   <tr>
     <td align="center"><sub><b>Thin-lens depth of field.</b> Focus on the copper sphere, with the gold cylinder in front out of focus.</sub></td>
-    <td align="center"><sub><b>Procedural sky.</b> The Twilight preset, with soft shadows from the roof beams.</sub></td>
+    <td align="center"><sub><b>Procedural sky.</b> The roof beams against the Twilight preset, casting shadows on the orange wall.</sub></td>
   </tr>
 </table>
 
