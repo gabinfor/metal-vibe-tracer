@@ -87,7 +87,7 @@
   }
   kernel void fix_geometry_emitter(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
       device atomic_uint *out [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
-      MeshTriangle e=images.triangles[0];
+      MeshTriangle e=scene_triangle(0,images);
       uint seed=gid.y*64+gid.x+7;
       float2 q=rand_f2(seed); if(q.x+q.y>1) q=1-q;
       float3 x=(1-q.x-q.y)*e.a.xyz+q.x*e.b.xyz+q.y*e.c.xyz;
@@ -150,7 +150,7 @@
       if(trace_scene(r,6,p,images.objects,u.light.w,u.light.xyz,tMin)) { best=p.t; bestID=p.mat.slot; }
       for(uint i=0;i<count;++i) {
           float t,b1,b2;
-          if(intersect_mesh_triangle(images.triangles[i],r,tMin,best,t,b1,b2)) { best=t; bestID=64+uint(images.triangles[i].uvc.w)-1; }
+          MeshTriangle tri=scene_triangle(i,images); if(intersect_mesh_triangle(tri,r,tMin,best,t,b1,b2)) { best=t; bestID=64+uint(tri.uvc.w)-1; }
       }
       if(hit) atomic_fetch_add_explicit(&out[0],1,memory_order_relaxed);
       bool same=hit==(best<1e19f) && (!hit || (h.objectID==bestID && abs(h.t-best)<=1e-6f*max(1.0f,best)));

@@ -1,6 +1,6 @@
 # Large-scene storage: design proposal
 
-Status: **proposal, 2026-10-20. Phase 0 is done (results below); phases 1–4 are not implemented.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
+Status: **2026-10-20. Phases 0 and 1 are implemented (results below); phases 2–4 are proposals.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
 
 ## Goal
 
@@ -60,7 +60,25 @@ Primary sources were checked where marked ✓. The rest is from a literature sea
    - The 1 M-triangle throughput numbers were too noisy to use: another GPU job was running.
    - Raw output is kept in `build/measure-acceleration.txt` (not committed); summary in `tests/PERFORMANCE.md`.
 
-### Phase 1: indexed geometry (format 4)
+### Phase 1: indexed geometry — done 2026-10-20 (GPU representation)
+
+Implemented for the two-level paths (software and hardware); the flat median-BVH reference path keeps its `MeshTriangle` buffer. The document model, importers and project format still hold `MeshTriangle` arrays (phase 3), and the encoding happens at publish.
+
+- **Streams** (`MeshStreams`): `MeshFace` (three absolute `uint32` vertex indices plus the stored `uvc.z`, 16 B) and `MeshVertex` (position, normal and UV as exact `float`s, 32 B), welded per asset only when all eight attribute bit patterns are equal; BLAS nodes in their own buffer; and, for a graph-less mesh only, a `UInt32` per face carrying its stored `uvc.w` and `na.w` (such a mesh may hold flattened scene-graph triangles). Argument-buffer IDs 394–397.
+- **Exactness:** `face_triangle` / `instance_source` (MSL) and `StoredTriangles` (Swift) rebuild every `MeshTriangle` field the renderer reads, so renders are unchanged: the ASWF Shader Ball, raw EXR, renders byte-identically to `main` with Standard MIS/RGB and with the defaults (ReSTIR PT, spectral).
+- **Hardware BLAS:** built from a transient unwelded input (packed `float3` corners, identity indices, 36 B per triangle plus 12 B per triangle of the largest asset), freed after compaction; `hardwareLeaks` probes the same input.
+- **Measured** (`scripts/measure_mesh_memory.py`, 999,698-triangle welded grid, 0.50 vertices per triangle, Apple M4):
+
+  | Traversal | Before (old layout, derived) | Phase 1 (measured) |
+  | --- | --- | --- |
+  | Software two-level | 160 B/triangle (128 triangle + 32 BLAS) | **64 B** (16 faces + 16 vertices + 32 BLAS) |
+  | Hardware | 246 B/triangle | **150 B** (+ 86 watertight BLAS) |
+
+  Publish (BVH build, welding, buffers, and the hardware build) takes 0.28 s (software) and 0.36 s (hardware) for 1 M triangles.
+- **Remaining saving:** hardware mode still builds the software BLAS (32 B per triangle) beside the hardware one, for asset bounds and the software fallback; skipping it would bring hardware to about 118 B.
+- Full GPU suite: 180 PASS.
+
+#### Original proposal
 
 Per mesh asset, as structure-of-arrays GPU buffers:
 

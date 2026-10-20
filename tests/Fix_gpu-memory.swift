@@ -55,6 +55,10 @@
      offsets(MeshTriangle.self, [\MeshTriangle.a, \MeshTriangle.b, \MeshTriangle.c, \MeshTriangle.na,
       \MeshTriangle.nb, \MeshTriangle.nc, \MeshTriangle.uvab, \MeshTriangle.uvc])),
     ("MeshNode", ["lo", "hi", "links"], offsets(MeshNode.self, [\MeshNode.lo, \MeshNode.hi, \MeshNode.links])),
+    // Two-level stored geometry: SIMD lanes in Swift (faces a, b, c, tag; vertices position,
+    // normal, uv as packed float3, float3, float2).
+    ("MeshFace", ["a", "b", "c", "tag"], [MemoryLayout<MeshFace>.stride, 0, 4, 8, 12]),
+    ("MeshVertex", ["position", "normal", "uv"], [MemoryLayout<MeshVertex>.stride, 0, 12, 24]),
     ("GraphInstruction", ["code", "value", "extra", "auxiliary"],
      offsets(GraphInstruction.self, [\GraphInstruction.code, \GraphInstruction.value, \GraphInstruction.extra,
       \GraphInstruction.auxiliary])),
@@ -217,7 +221,8 @@
   try renderer.materials.restore(mapped)
   let m = renderer.materials
   let bound = Set(m.boundResources.map { ObjectIdentifier($0) })
-  let expected: [MTLResource] = m.residentTextures + [m.triangleBuffer, m.nodeBuffer, m.objectBuffer,
+  let streams = m.meshStreams ?? m.placeholderStreams!
+  let expected: [MTLResource] = m.residentTextures + [m.triangleBuffer, m.nodeBuffer, m.objectBuffer, streams.faces, streams.vertices, streams.nodes,
     m.graphInstructionBuffer, m.graphHeaderBuffer, m.emissionBuffer, m.emitterBuffer, ]
   require(expected.allSatisfy { bound.contains(ObjectIdentifier($0)) }, "useResources covers every bound slot")
   weak let swapped = m.images[4] as AnyObject
@@ -265,9 +270,11 @@
   var quad = try OBJMesh.load("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4")
   quad += quad.map { var t = $0; t.a.x += 3; t.b.x += 3; t.c.x += 3; return t }
   try m.setMesh(quad)
-  require(m.orderedTriangles.count == quad.count
-      && UnsafeRawPointer(m.orderedTriangles.baseAddress!) == UnsafeRawPointer(m.triangleBuffer.contents()),
-    "ordered triangles alias the GPU triangle buffer")
+  let stored = m.orderedTriangles
+  require(stored.count == quad.count
+      && (m.meshStreams.map { stored.faces.map(UnsafeRawPointer.init) == UnsafeRawPointer($0.faces.contents()) }
+        ?? (stored.flat.map(UnsafeRawPointer.init) == UnsafeRawPointer(m.triangleBuffer.contents()))),
+    "ordered triangles read the GPU geometry (two-level faces or the flat triangle buffer)")
   try m.setMesh([])
   print("PASS: single host triangle copy")
 

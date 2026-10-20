@@ -1,3 +1,14 @@
+# Indexed mesh storage — October 20, 2026
+
+`python3 scripts/measure_mesh_memory.py 999698` (production `MaterialLibrary.setMesh` of one 999,698-triangle welded grid asset, 501,264 vertices; Apple M4, macOS 27.0.1). Resident `meshBytes` per triangle:
+
+| Traversal | Faces | Vertices | BLAS nodes | Hardware BLAS | Total | Publish |
+| --- | --- | --- | --- | --- | --- | --- |
+| Software two-level | 16.0 | 16.0 | 32.2 | — | 64.2 B (61 MiB) | 0.28 s |
+| Hardware | 16.0 | 16.0 | 32.2 | 86.1 | 150.3 B (143 MiB) | 0.36 s |
+
+The previous layout stored 128 B per triangle plus the BLAS nodes in the same buffer (about 160 B in software, 246 B with hardware traversal). Renders are byte-identical to the previous layout (Shader Ball raw EXR, MIS/RGB and ReSTIR PT/spectral).
+
 # Hardware acceleration-structure layouts — October 20, 2026
 
 Apple M4, macOS 27.0.1. `xcrun swiftc -O -swift-version 6 scripts/measure_acceleration.swift -o build/measure_acceleration && build/measure_acceleration 1000000 10000000`. The fixture is a welded displaced grid; each case builds and compacts one primitive structure. Throughput is closest-hit rays with random origins and directions inside the grid's box (4 M rays, best of three passes).

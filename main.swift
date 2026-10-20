@@ -542,6 +542,13 @@ struct ObjectSettings {
 };
 struct MeshTriangle { float4 a, b, c, na, nb, nc, uvab, uvc; };
 struct MeshNode { float4 lo, hi; int4 links; };
+// Two-level stored geometry (docs/SCENE_STORAGE_DESIGN.md, phase 1): welded vertices with exact
+// float attributes, and faces of three absolute vertex indices plus the stored uvc.z (the subset
+// of a scene-graph asset, the slot of a graph-less mesh). face_triangle rebuilds the MeshTriangle
+// the host stored, bit for bit in every field the renderer reads.
+struct MeshVertex { packed_float3 position; packed_float3 normal; float2 uv; };
+struct MeshFace { uint a, b, c, tag; };
+struct MeshWideNode { float4 lox, loy, loz, hix, hiy, hiz; int4 child; int4 count; };
 struct GraphInstruction { int4 code; float4 value, extra, auxiliary; };
 struct GraphHeader { int4 roots0, roots1, roots2, info; };
 struct MaterialResources {
@@ -557,6 +564,11 @@ struct MaterialResources {
     device uint *emitters [[id(391)]];
     texture2d<float> environmentRows [[id(392)]];
     texture2d<float> environmentColumns [[id(393)]];
+    device MeshFace *faces [[id(394)]];
+    device MeshVertex *vertices [[id(395)]];
+    device MeshWideNode *blasNodes [[id(396)]];
+    // Graph-less (legacy) mesh only: per face, its stored uvc.w (low 16 bits) and na.w (high 16).
+    device uint *faceExtras [[id(397)]];
 };
 
 // Radiance of the area light of scenes 1, 3, 4 and 5 before the light tint (Uniforms.light).
@@ -1395,13 +1407,21 @@ void mesh_hit_attributes(thread HitRecord &rec, MeshTriangle tri, float b1, floa
 
 // REFERENCES.md: WALD2007, WIDEBVH2008, PBRT2023, WOOP2013. Two-level hierarchy
 // (MeshSceneLayout on the host): a 4-wide TLAS over the visible instances in world space and
-// a 4-wide binned-SAH BLAS per mesh asset in object space. BLAS nodes follow the stored
-// triangles in the triangle buffer; the node buffer holds the header, the instances, the
-// TLAS and the subset-to-slot table. A flat BVH (the reference path) leaves nodes[0].lo.w 0.
-struct MeshWideNode { float4 lox, loy, loz, hix, hiy, hiz; int4 child; int4 count; };
+// a 4-wide binned-SAH BLAS per mesh asset in object space. Stored triangles are the faces
+// and vertices (BLAS order), BLAS nodes have their own buffer, and the node buffer holds the
+// header, the instances, the TLAS and the subset-to-slot table. A flat BVH (the reference path) leaves nodes[0].lo.w 0.
 struct MeshInstance { float4 world[3]; float4 local[3]; uint4 range; uint4 binding; float4 bound; };
 struct MeshSceneHeader { uint4 info; uint4 counts; float4 lo, hi; uint4 accelerator; };
-static_assert(sizeof(MeshWideNode) == 128 && sizeof(MeshInstance) == 144 && sizeof(MeshSceneHeader) == 80, "Swift mesh layouts");
+static_assert(sizeof(MeshWideNode) == 128 && sizeof(MeshInstance) == 144 && sizeof(MeshSceneHeader) == 80
+    && sizeof(MeshVertex) == 32 && sizeof(MeshFace) == 16, "Swift mesh layouts");
+MeshTriangle face_triangle(MeshFace f, device const MeshVertex *v) {
+    MeshVertex a=v[f.a], b=v[f.b], c=v[f.c];
+    MeshTriangle t;
+    t.a=float4(float3(a.position),1); t.b=float4(float3(b.position),1); t.c=float4(float3(c.position),1);
+    t.na=float4(float3(a.normal),0); t.nb=float4(float3(b.normal),0); t.nc=float4(float3(c.normal),0);
+    t.uvab=float4(a.uv,b.uv); t.uvc=float4(c.uv,float(f.tag),0);
+    return t;
+}
 // Hardware traversal (METALRT, header.counts.w = 1): header.accelerator holds the instance
 // acceleration structure's resource ID, read as an argument-buffer member.
 struct MeshAccelerator { raytracing::instance_acceleration_structure scene; };
@@ -1418,6 +1438,13 @@ float3 instance_point(MeshInstance m, float3 p) { return float3(dot(m.world[0].x
 Ray instance_ray(MeshInstance m, Ray r) {
     return {float3(dot(m.local[0].xyz,r.origin)+m.local[0].w,dot(m.local[1].xyz,r.origin)+m.local[1].w,dot(m.local[2].xyz,r.origin)+m.local[2].w),
             float3(dot(m.local[0].xyz,r.direction),dot(m.local[1].xyz,r.direction),dot(m.local[2].xyz,r.direction))};
+}
+// Stored face `face` as an instance sees it: a graph-less (legacy) instance keeps its stored
+// uvc.w and na.w (it may hold flattened scene-graph triangles), which faceExtras carries.
+MeshTriangle instance_source(uint face, MeshInstance m, constant MaterialResources &images) {
+    MeshTriangle t=face_triangle(images.faces[face],images.vertices);
+    if(m.binding.y==0) { uint e=images.faceExtras[face]; t.uvc.w=float(e&0xffffu); t.na.w=float(e>>16); }
+    return t;
 }
 // The world-space triangle an instance renders, as SceneGraph.forEachRenderTriangle flattens it
 // (normals by the inverse transpose; a mirroring transform swaps b and c, and with them the
@@ -1450,7 +1477,11 @@ MeshTriangle scene_triangle(uint id, constant MaterialResources &images) {
     uint low=0, high=max(1u,mesh_header(images).info.x)-1;
     while(low<high) { uint middle=(low+high+1)/2; if(instances[middle].range.z<=id) low=middle; else high=middle-1; }
     MeshInstance m=instances[low]; float b1=0, b2=0;
-    return instance_triangle(images.triangles[m.range.x+(id-m.range.z)],m,images,b1,b2);
+    return instance_triangle(instance_source(m.range.x+(id-m.range.z),m,images),m,images,b1,b2);
+}
+// Stored triangle i (BVH order): the flat buffer's record, or a two-level face decoded.
+MeshTriangle stored_triangle(uint i, constant MaterialResources &images) {
+    return mesh_two_level(images) ? face_triangle(images.faces[i],images.vertices) : images.triangles[i];
 }
 // Position rounding of a hit rebuilt from an instance's world corners: the bound of the
 // corners themselves (mesh_hit_error) and of the transform that produced them.
@@ -1488,7 +1519,7 @@ int wide_order(bool4 hit, float4 nearT, thread int *order, thread float *key) {
 }
 // Closest hit in one asset's BLAS, in object space. The host keeps BLAS depth <= 20, so the
 // stack (at most 3 net pushes per level) never overflows.
-void blas_closest(device const MeshWideNode *nodes, device const MeshTriangle *triangles, Ray local, float rootMax,
+void blas_closest(device const MeshWideNode *nodes, device const MeshFace *faces, device const MeshVertex *vertices, Ray local, float rootMax,
                   float tMin, thread float &closest, thread int &hit, thread float &hb1, thread float &hb2) {
     WatertightRay watertight=watertight_ray(local);
     WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+rootMax));
@@ -1503,7 +1534,7 @@ void blas_closest(device const MeshWideNode *nodes, device const MeshTriangle *t
             int first=-node.child[k]-1;
             for(int q=0;q<node.count[k];++q) {
                 float t,b1,b2;
-                if(!intersect_mesh_triangle(triangles[first+q],watertight,tMin,closest,t,b1,b2)) continue;
+                if(!intersect_mesh_triangle(face_triangle(faces[first+q],vertices),watertight,tMin,closest,t,b1,b2)) continue;
                 closest=t; hit=first+q; hb1=b1; hb2=b2;
             }
         }
@@ -1512,7 +1543,7 @@ void blas_closest(device const MeshWideNode *nodes, device const MeshTriangle *t
 }
 // Any hit in [tMin, tMax - slack) of one asset; slack is the endpoint surface's own bound
 // (see scene_occluded), from the instance transform and the triangle's local corners.
-bool blas_any(device const MeshWideNode *nodes, device const MeshTriangle *triangles, Ray local, MeshInstance instance,
+bool blas_any(device const MeshWideNode *nodes, device const MeshFace *faces, device const MeshVertex *vertices, Ray local, MeshInstance instance,
               float tMin, float tMax, bool slack) {
     WatertightRay watertight=watertight_ray(local);
     WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+instance.bound.z));
@@ -1525,7 +1556,7 @@ bool blas_any(device const MeshWideNode *nodes, device const MeshTriangle *trian
             if(node.child[k]>0) { if(top<64) stack[top++]=node.child[k]; continue; }
             int first=-node.child[k]-1;
             for(int q=0;q<node.count[k];++q) {
-                MeshTriangle tri=triangles[first+q];
+                MeshTriangle tri=face_triangle(faces[first+q],vertices);
                 float t,b1,b2,local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
                 float s=slack ? max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local)) : 0.0f;
                 if(intersect_mesh_triangle(tri,watertight,tMin,tMax-s,t,b1,b2)) return true;
@@ -1552,7 +1583,7 @@ bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &ima
     }
     device const MeshInstance *instances=mesh_instances(images);
     device const MeshWideNode *tlas=(device const MeshWideNode *)((device const char *)images.nodes+16*header.info.y);
-    device const MeshWideNode *blas=(device const MeshWideNode *)images.triangles;
+    device const MeshWideNode *blas=images.blasNodes;
     WideRay w=wide_ray(r,header.lo.w*(max_abs(r.origin)+header.hi.w));
     float closest=tMax; bool found=false;
     int stack[32]; int top=0; stack[top++]=0;
@@ -1566,7 +1597,7 @@ bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &ima
             uint index=uint(-node.child[k]-1);
             MeshInstance instance=instances[index];
             int triangle=-1; float b1=0, b2=0;
-            blas_closest(blas+instance.range.y,images.triangles+instance.range.x,instance_ray(instance,r),instance.bound.z,tMin,closest,triangle,b1,b2);
+            blas_closest(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance.bound.z,tMin,closest,triangle,b1,b2);
             if(triangle>=0) { h.t=closest; h.b1=b1; h.b2=b2; h.triangle=triangle; h.instance=index; found=true; }
         }
         for(int j=m-1;j>=0;--j) { int k=order[j]; if(node.child[k]>0 && key[j]<=closest && top<32) stack[top++]=node.child[k]; }
@@ -1592,14 +1623,14 @@ bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialR
         raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(raytracing::ray(r.origin,r.direction,max(tMin,tMax-S),tMax),scene,params);
         while(query.next()) {
             MeshInstance instance=instances[query.get_candidate_instance_id()];
-            MeshTriangle tri=images.triangles[instance.range.x+query.get_candidate_primitive_id()];
+            MeshTriangle tri=face_triangle(images.faces[instance.range.x+query.get_candidate_primitive_id()],images.vertices);
             float local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
             if(query.get_candidate_triangle_distance()<tMax-max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local))) { query.abort(); return true; }
         }
         return false;
     }
     device const MeshWideNode *tlas=(device const MeshWideNode *)((device const char *)images.nodes+16*header.info.y);
-    device const MeshWideNode *blas=(device const MeshWideNode *)images.triangles;
+    device const MeshWideNode *blas=images.blasNodes;
     WideRay w=wide_ray(r,header.lo.w*(max_abs(r.origin)+header.hi.w));
     int stack[32]; int top=0; stack[top++]=0;
     while(top>0) {
@@ -1609,7 +1640,7 @@ bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialR
             if(!hit[k]) continue;
             if(node.child[k]>0) { if(top<32) stack[top++]=node.child[k]; continue; }
             MeshInstance instance=instances[-node.child[k]-1];
-            if(blas_any(blas+instance.range.y,images.triangles+instance.range.x,instance_ray(instance,r),instance,tMin,tMax,slack)) return true;
+            if(blas_any(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance,tMin,tMax,slack)) return true;
         }
     }
     return false;
@@ -1630,7 +1661,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
         MeshHit m;
         if(!mesh_closest(local,tMin/o.positionScale.w,closest,images,m)) return hit;
         MeshInstance instance=mesh_instances(images)[m.instance];
-        MeshTriangle stored=images.triangles[instance.range.x+uint(m.triangle)];
+        MeshTriangle stored=instance_source(instance.range.x+uint(m.triangle),instance,images);
         float b1=m.b1, b2=m.b2;
         MeshTriangle tri=instance_triangle(stored,instance,images,b1,b2);
         float b0=1-b1-b2;
@@ -7046,10 +7077,15 @@ final class MaterialLibrary {
     // orderedTriangles). meshTriangles is the document's own array of a graph-less
     // (legacy) mesh, shared rather than copied, for snapshots; it is empty for a
     // scene-graph mesh, whose assets remain the only other host copy.
-    // Two-level (MeshSceneLayout): triangleBuffer holds every asset's triangles in object
-    // space, then their BLAS nodes; nodeBuffer the instances and TLAS. Flat (the reference
-    // path): flattened world-space triangles and the median-split nodes.
+    // Two-level (MeshSceneLayout): meshStreams holds every asset's faces and welded vertices in
+    // object space and their BLAS nodes, triangleBuffer is a placeholder, and nodeBuffer holds
+    // the instances and TLAS. Flat (the reference path): flattened world-space triangles in
+    // triangleBuffer and the median-split nodes.
     var triangleBuffer: MTLBuffer! { didSet { emittersDirty = true } }
+    var meshStreams: MeshStreams? { didSet { emittersDirty = true } }
+    // Bound in place of absent geometry: a 128-byte triangle buffer and empty streams.
+    var placeholderTriangles: MTLBuffer!
+    var placeholderStreams: MeshStreams!
     var nodeBuffer: MTLBuffer! { didSet { emittersDirty = true } }
     var meshTriangles: [MeshTriangle] = []
     var triangleCount = 0
@@ -7097,10 +7133,17 @@ final class MaterialLibrary {
     var spectralMaterials: [SIMD4<Float>] {
         (0..<SceneLimits.materials).map { spectralOverrides[$0] ?? materialX[$0]?.spectral ?? MaterialXProgram.noSpectral }
     }
-    var orderedTriangles: UnsafeBufferPointer<MeshTriangle> {
-        UnsafeBufferPointer(start: triangleCount == 0 ? nil
-            : triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: triangleCount),
-            count: triangleCount)
+    var orderedTriangles: StoredTriangles {
+        if let streams = meshStreams, meshLayout != nil {
+            return StoredTriangles(flat: nil,
+                faces: UnsafePointer(streams.faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, triangleCount))),
+                vertices: UnsafePointer(streams.vertices.contents().bindMemory(to: MeshVertex.self, capacity: max(1, streams.vertices.length / 32))),
+                extras: streams.extras.map { UnsafePointer($0.contents().bindMemory(to: UInt32.self, capacity: max(1, triangleCount))) },
+                count: triangleCount)
+        }
+        return StoredTriangles(flat: triangleCount == 0 ? nil
+            : UnsafePointer(triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: triangleCount)),
+            faces: nil, vertices: nil, count: triangleCount)
     }
     // Every resource referenced by the argument buffer. bind() declares exactly
     // this list with useResources, which is what keeps indirectly referenced
@@ -7164,10 +7207,15 @@ final class MaterialLibrary {
         environmentColumns = importance
         defaultEnvironmentSampling = importance
         guard let triangles = device.makeBuffer(length:128,options:.storageModeShared),
-              let nodes = device.makeBuffer(length:48,options:.storageModeShared) else {
+              let nodes = device.makeBuffer(length:48,options:.storageModeShared),
+              let faces = device.makeBuffer(length:16,options:.storageModeShared),
+              let vertices = device.makeBuffer(length:32,options:.storageModeShared),
+              let blas = device.makeBuffer(length:128,options:.storageModeShared) else {
             throw Self.error("Could not allocate imported-scene buffers.")
         }
         triangleBuffer=triangles
+        placeholderTriangles=triangles
+        placeholderStreams=MeshStreams(faces: faces, vertices: vertices, nodes: blas)
         nodeBuffer=nodes
         try prepareMaterialX([:])
     }
@@ -7285,6 +7333,11 @@ final class MaterialLibrary {
         setTexture(environmentColumns,393)
         setBuffer(triangleBuffer,257)
         setBuffer(nodeBuffer,258)
+        let streams = meshStreams ?? placeholderStreams!
+        setBuffer(streams.faces,394)
+        setBuffer(streams.vertices,395)
+        setBuffer(streams.nodes,396)
+        setBuffer(streams.extras ?? placeholderStreams.faces,397)
         // Hardware traversal reaches these through the node buffer's resource ID.
         bound += meshLayout?.structures ?? []
         guard let objectBuffer=objects.withUnsafeBytes({ bindingBuffer(bytes:$0.baseAddress!,length:$0.count) }) else { throw Self.error("Could not allocate object settings.") }

@@ -136,7 +136,7 @@
       float tMin=ray_t_min(r.origin,u), best=1e20f; int index=-1; HitRecord p;
       if(trace_scene(r,6,p,images.objects,u.light.w,u.light.xyz,tMin)) best=p.t;
       WatertightRay w=watertight_ray(r);
-      for(uint i=0;i<triangles;++i) { float t,b1,b2; if(intersect_mesh_triangle(images.triangles[i],w,tMin,best,t,b1,b2)) { best=t; index=int(i); } }
+      for(uint i=0;i<triangles;++i) { float t,b1,b2; if(intersect_mesh_triangle(stored_triangle(i,images),w,tMin,best,t,b1,b2)) { best=t; index=int(i); } }
       out[id]=float4(best<1e19f ? best : -1.0f, float(index), 0, 0);
   }
   """
@@ -483,19 +483,21 @@
       // Hardware traversal builds a primitive acceleration structure beside each software BLAS.
       let perAsset = mode == .hardware ? 2 : 1
       require(l.assetBuildCount == 2 * perAsset && l.sceneBuildCount == 1 && hit.object == 65, "initial publish builds both assets once")
-      let buffer = l.triangleBuffer!, builds = l.assetBuildCount
+      // Two-level geometry lives in the streams (faces, vertices, BLAS nodes); a kept face
+      // buffer means no asset was rebuilt or re-encoded.
+      let streams = l.meshStreams!, buffer = streams.faces, builds = l.assetBuildCount
       var moved = graph
       moved.nodes[1].transform.positionScale.x = 6
       try l.setMesh(moved)
       hit = try probe(6)
       var vacated = try probe(3)
-      require(l.triangleBuffer === buffer && l.assetBuildCount == builds && l.sceneBuildCount == 2
+      require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.sceneBuildCount == 2
         && hit.object == 65 && vacated.object < 64, "a transform edit rebuilds only the top level")
       var hidden = moved
       hidden.nodes[2].transform.rotationHidden.w = 1
       try l.setMesh(hidden)
       vacated = try probe(-3)
-      require(l.triangleBuffer === buffer && l.assetBuildCount == builds && l.renderedTriangleCount == 2 * first.count
+      require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.renderedTriangleCount == 2 * first.count
         && vacated.object < 64, "a visibility edit rebuilds only the top level")
       var rebound = hidden
       rebound.nodes[1].bindings = [m1.id]
@@ -503,21 +505,21 @@
       try l.setMeshBindings(rebound)
       hit = try probe(6)
       let kept = try probe(0)
-      require(l.triangleBuffer === buffer && l.assetBuildCount == builds && l.meshBuildCount == meshBuilds
+      require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.meshBuildCount == meshBuilds
         && hit.slot == m1.slot && kept.slot == m0.slot && l.meshLayout?.scene === instances
         && (mode != .hardware || instances != nil), "a binding edit rewrites only the slot table (no acceleration-structure work)")
       var edited = rebound
       edited.assets[1].triangles = patch(14).triangles
       edited.nodes[2].transform.rotationHidden.w = 0
       let firstRegion = l.meshLayout!.assets[0]
-      let before = Data(bytes: l.triangleBuffer.contents().advanced(by: firstRegion.triangleBase * 128), count: firstRegion.count * 128)
+      let before = (0..<firstRegion.count).map { l.orderedTriangles[firstRegion.triangleBase + $0] }
       try l.setMesh(edited)
       let reused = l.meshLayout!.assets[0]
-      let after = Data(bytes: l.triangleBuffer.contents().advanced(by: reused.triangleBase * 128), count: reused.count * 128)
-      let nodesBefore = Data(bytes: buffer.contents().advanced(by: firstRegion.nodeBase * 128), count: firstRegion.nodeCount * 128)
-      let nodesAfter = Data(bytes: l.triangleBuffer.contents().advanced(by: reused.nodeBase * 128), count: reused.nodeCount * 128)
+      let after = (0..<reused.count).map { l.orderedTriangles[reused.triangleBase + $0] }
+      let nodesBefore = Data(bytes: streams.nodes.contents().advanced(by: firstRegion.nodeBase * 128), count: firstRegion.nodeCount * 128)
+      let nodesAfter = Data(bytes: l.meshStreams!.nodes.contents().advanced(by: reused.nodeBase * 128), count: reused.nodeCount * 128)
       hit = try probe(-3)
-      require(l.triangleBuffer !== buffer && l.assetBuildCount == builds + perAsset && before == after && nodesBefore == nodesAfter
+      require(l.meshStreams?.faces !== buffer && l.assetBuildCount == builds + perAsset && sameBytes(before, after) && nodesBefore == nodesAfter
         && l.triangleCount == first.count + 2 * 14 * 14 && hit.object == 66, "a geometry edit rebuilds only the edited asset")
       // The same paths through the studio controller (undoable edits of the live library), unless
       // the suite runs on the flat reference path (VIBE_ACCELERATION=flat).
@@ -526,7 +528,7 @@
       try controller.restore(document)
       let live = testRenderer.materials
       if live.acceleration != .flat {
-        let liveBuffer = live.triangleBuffer!, liveBuilds = live.assetBuildCount
+        let liveBuffer = live.meshStreams!.faces, liveBuilds = live.assetBuildCount
         let history = controller.history, grouping = history.groupsByEvent
         history.groupsByEvent = false
         defer { history.groupsByEvent = grouping }
@@ -538,12 +540,12 @@
       grouped { controller.editGraph("Move instance") { g in g.nodes[1].transform.positionScale.z = 2 } }
       grouped { controller.editGraph("Hide instance") { g in g.nodes[2].transform.rotationHidden.w = 1 } }
       grouped { controller.editGraph("Rebind", kind: .bindings) { g in g.nodes[0].bindings = [m1.id] } }
-      require(live === testRenderer.materials && live.triangleBuffer === liveBuffer && live.assetBuildCount == liveBuilds
+      require(live === testRenderer.materials && live.meshStreams?.faces === liveBuffer && live.assetBuildCount == liveBuilds
         && live.meshLayout?.instances.count == 2, "studio transform, visibility and binding edits keep every asset hierarchy")
       for _ in 0..<3 { history.undo(); settle() }
       // Undo may publish a prepared candidate library; it adopts the live buffers instead of building.
       let restored = testRenderer.materials
-      require(restored.triangleBuffer === liveBuffer && restored.meshLayout?.instances.count == 3
+      require(restored.meshStreams?.faces === liveBuffer && restored.meshLayout?.instances.count == 3
         && restored.assetBuildCount == (restored === live ? liveBuilds : 0) && controller.project.graph?.nodes[1].transform.positionScale.z == 0,
         "undoing transform, visibility and binding edits rebuilds no asset hierarchy")
       }
@@ -569,20 +571,23 @@
       // Uncompacted sizes of the batch, from an identical publish on another library.
       let sizing = try library(mode)
       try sizing.setMesh(graph)
-      let indices = MaterialLibrary.unweldedIndices(gpu, count: assets.map(\.count).max()!)!
-      let uncompacted = sizing.meshLayout!.assets.map { a in
+      let largest = assets.map(\.count).max()!
+      let indices = MaterialLibrary.identityIndices(gpu, count: largest)!
+      let transient = MaterialLibrary.transientBuildLayout(sizing.meshLayout!.assets.map(\.count))
+      let positions = gpu.makeBuffer(length: transient.bytes, options: .storageModeShared)!
+      let uncompacted = sizing.meshLayout!.assets.enumerated().map { k, a in
         UInt64(gpu.accelerationStructureSizes(descriptor: MaterialLibrary.primitiveDescriptor(
-          vertices: sizing.triangleBuffer, offset: a.triangleBase * MeshSceneLayout.triangleStride, count: a.count,
-          indices: indices)).accelerationStructureSize)
+          vertices: positions, offset: transient.offsets[k], count: a.count, indices: indices)).accelerationStructureSize)
       }
       let l = try library(mode)
-      let priorLayout = l.meshLayout, priorBuffer = l.triangleBuffer, priorCommands = l.accelerationCommandCount
-      // Every asset fits alone, but not the batch beside the new triangle buffer.
-      l.meshBudgetOverride = l.meshBytes + UInt64(sizing.triangleBuffer.length) + uncompacted.reduce(0, +) - 1
+      let priorLayout = l.meshLayout, priorBuffer = l.meshStreams?.faces, priorCommands = l.accelerationCommandCount
+      // Every asset fits alone, but not the batch beside the new streams and the transient build input.
+      l.meshBudgetOverride = l.meshBytes + UInt64(sizing.meshStreams!.bytes) + UInt64(transient.bytes + 12 * largest)
+        + uncompacted.reduce(0, +) - 1
       var refused = false
       do { try l.setMesh(graph) } catch { refused = true }
       require(refused && uncompacted.count == 3 && uncompacted.max()! < uncompacted.reduce(0, +)
-        && l.triangleBuffer === priorBuffer && l.accelerationCommandCount == priorCommands
+        && l.meshStreams?.faces === priorBuffer && l.accelerationCommandCount == priorCommands
         && l.meshLayout?.scene === priorLayout?.scene && l.meshLayout?.assets.count == priorLayout?.assets.count,
         "a batch over the mesh budget fails before any GPU work and publishes nothing")
       l.meshBudgetOverride = nil
@@ -595,14 +600,14 @@
       require(Set(built.map { ObjectIdentifier($0) }).count == 3 && batchCommands <= 3 && l.sceneRefitCount == 0
         && l.meshLayout?.sceneRefits == 0 && objects == [64, 65, 66], "three missing asset structures build in one batch")
       // A transform-only edit refits into a new structure and traces like a fresh build.
-      let buffer = l.triangleBuffer!, scene = l.meshLayout?.scene, builds = l.assetBuildCount
+      let buffer = l.meshStreams!.faces, scene = l.meshLayout?.scene, builds = l.assetBuildCount
       var moved = graph
       moved.nodes[1].transform.positionScale.x = 3.4
       moved.nodes[2].transform.positionScale.z = 0.3
       let commands = l.accelerationCommandCount
       try l.setMesh(moved)
       require(l.sceneRefitCount == 1 && l.meshLayout?.sceneRefits == 1 && l.meshLayout?.scene != nil
-        && l.meshLayout?.scene !== scene && l.triangleBuffer === buffer && l.assetBuildCount == builds
+        && l.meshLayout?.scene !== scene && l.meshStreams?.faces === buffer && l.assetBuildCount == builds
         && l.accelerationCommandCount == commands + 1, "a transform-only edit refits the instance structure into a new one")
       let fresh = try library(mode)
       try fresh.setMesh(moved); fresh.hasSceneGraph = true

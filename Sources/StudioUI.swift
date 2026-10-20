@@ -2105,7 +2105,7 @@ final class StudioController: NSViewController {
         hi = simd_max(hi, p)
       }
     }
-    for t in lo.x <= hi.x || materials.meshLayout != nil ? UnsafeBufferPointer(rebasing: tris[..<0]) : tris {
+    for t in lo.x <= hi.x || materials.meshLayout != nil ? tris[0..<0] : tris[...] {
       if let graph = project.graph, let family, Int(t.uvc.w) > 0,
         !family.contains(graph.nodes[Int(t.uvc.w) - 1].id)
       {

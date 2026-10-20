@@ -640,8 +640,10 @@ struct ReusableResources: @unchecked Sendable {
   var environmentData: Data?
   var environment: (texture: MTLTexture, rows: MTLTexture, columns: MTLTexture)?
   var meshTriangles: [MeshTriangle]
-  // BVH-ordered triangles live only in triangleBuffer (MaterialLibrary.orderedTriangles).
+  // BVH-ordered triangles live only in triangleBuffer (flat) or meshStreams (two-level);
+  // MaterialLibrary.orderedTriangles reads either.
   var triangleBuffer: MTLBuffer
+  var meshStreams: MeshStreams?
   var triangleCount: Int
   var nodeBuffer: MTLBuffer
   var nodeCount: Int
@@ -719,8 +721,8 @@ extension MaterialLibrary {
       environment: environmentData == nil
         ? nil : (environmentTexture, environmentRows, environmentColumns),
       meshTriangles: meshTriangles,
-      triangleBuffer: triangleBuffer, triangleCount: triangleCount, nodeBuffer: nodeBuffer, nodeCount: nodeCount,
-      meshLayout: meshLayout, acceleration: acceleration, hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
+      triangleBuffer: triangleBuffer, meshStreams: meshStreams, triangleCount: triangleCount, nodeBuffer: nodeBuffer,
+      nodeCount: nodeCount, meshLayout: meshLayout, acceleration: acceleration, hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
   }
   // Seed a freshly created candidate. It is published only after restore,
   // setEnvironment and the mesh step have rebuilt its bindings.
@@ -737,6 +739,7 @@ extension MaterialLibrary {
     }
     meshTriangles = r.meshTriangles
     triangleBuffer = r.triangleBuffer
+    meshStreams = r.meshStreams
     triangleCount = r.triangleCount
     nodeBuffer = r.nodeBuffer
     nodeCount = r.nodeCount
@@ -1112,10 +1115,12 @@ extension MaterialLibrary {
     let triangles: [MeshTriangle], triangleBuffer: MTLBuffer, triangleCount: Int
     let nodeBuffer: MTLBuffer, nodeCount: Int
     var layout: MeshSceneLayout? = nil
+    // Two-level: the faces, vertices and BLAS nodes (triangleBuffer is then a placeholder).
+    var streams: MeshStreams? = nil
   }
   var meshResources: MeshResources {
     MeshResources(triangles: meshTriangles, triangleBuffer: triangleBuffer, triangleCount: triangleCount,
-      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: meshLayout)
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: meshLayout, streams: meshStreams)
   }
   func restoreMesh(_ m: MeshResources) throws {
     let old = meshResources, oldArgument = argumentBuffer
@@ -1125,6 +1130,7 @@ extension MaterialLibrary {
   }
   private func apply(_ m: MeshResources) {
     triangleBuffer = m.triangleBuffer; triangleCount = m.triangleCount
+    meshStreams = m.streams
     nodeBuffer = m.nodeBuffer; nodeCount = m.nodeCount
     meshTriangles = m.triangles
     meshLayout = m.layout
@@ -1171,7 +1177,8 @@ extension MaterialLibrary {
         zip(layout.instances, current.instances).allSatisfy({ $0.node == $1.node && $0.asset == $1.asset && $0.world == $1.world })
       else { throw Self.error("Scene binding no longer matches the published geometry.") }
       // Same instances and transforms: the hardware instance structure is kept too.
-      try publishScene(layout, triangleBuffer: triangleBuffer, document: meshTriangles, keepScene: true)
+      guard let streams = meshStreams else { throw Self.error("Scene binding no longer matches the published geometry.") }
+      try publishScene(layout, streams: streams, document: meshTriangles, keepScene: true)
       return
     }
     let slots = Dictionary(uniqueKeysWithValues: graph.materials.map { ($0.id, $0.slot) })
@@ -1186,20 +1193,36 @@ extension MaterialLibrary {
       result.uvc.z = Float(slot)
       return result
     }
-    // Rebind straight from the shared buffer into its replacement; the BVH order is unchanged.
-    // A two-level graph-less mesh of flattened triangles keeps its hierarchy after them.
+    // A two-level graph-less mesh of flattened triangles: new faces with rebound tags; the
+    // vertices, hierarchy, extras and hardware structures are kept.
+    if var layout = meshLayout, let streams = meshStreams {
+      let ordered = orderedTriangles
+      guard let faces = device.makeBuffer(length: streams.faces.length, options: .storageModeShared)
+      else { throw Self.error("Could not allocate imported mesh bindings.") }
+      let source = streams.faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, ordered.count))
+      let target = faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, ordered.count))
+      for (i, triangle) in ordered.enumerated() {
+        var face = source[i]
+        face.w = UInt32(try rebound(triangle).uvc.z)
+        target[i] = face
+      }
+      var rebuilt = streams
+      rebuilt.faces = faces
+      // The rebound triangles no longer equal the document array the layout remembers.
+      layout.assets[0].source = []
+      try restoreMesh(MeshResources(triangles: [], triangleBuffer: placeholderTriangles, triangleCount: ordered.count,
+        nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: layout, streams: rebuilt))
+      return
+    }
+    // Flat: rebind straight from the shared buffer into its replacement; the BVH order is unchanged.
     let ordered = orderedTriangles
-    let length = meshLayout == nil ? ordered.count * MemoryLayout<MeshTriangle>.stride : triangleBuffer.length
+    let length = ordered.count * MemoryLayout<MeshTriangle>.stride
     guard let candidateBuffer = device.makeBuffer(length: max(128, length), options: .storageModeShared)
     else { throw Self.error("Could not allocate imported mesh bindings.") }
-    if meshLayout != nil { candidateBuffer.contents().copyMemory(from: triangleBuffer.contents(), byteCount: length) }
     let target = candidateBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, ordered.count))
     for (i, triangle) in ordered.enumerated() { target[i] = try rebound(triangle) }
-    // The rebound triangles no longer equal the document array the layout remembers.
-    var layout = meshLayout
-    if layout != nil { layout?.assets[0].source = [] }
     // Bindings belong to a scene-graph mesh, which retains no document-order copy.
     try restoreMesh(MeshResources(triangles: [], triangleBuffer: candidateBuffer, triangleCount: ordered.count,
-      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: layout))
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount))
   }
 }

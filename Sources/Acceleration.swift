@@ -17,7 +17,7 @@ import simd
 // Apple, so it is gated by tests/Fix_accel.swift and is not the default.
 enum MeshAcceleration: Equatable, Sendable { case twoLevel, flat, hardware }
 
-// 128 bytes, the MeshTriangle stride, so BLAS nodes share the triangle buffer. Child k is an
+// 128 bytes (MSL MeshWideNode), in MeshStreams.nodes for BLASes. Child k is an
 // inner node (> 0, index relative to the hierarchy's first node), a leaf (< 0: -(first + 1)
 // with count[k] items, relative to the hierarchy's first item) or empty (0).
 struct MeshWideNode {
@@ -33,7 +33,7 @@ struct MeshWideNode {
 struct MeshInstanceRecord {
   var world0, world1, world2: SIMD4<Float>
   var local0, local1, local2: SIMD4<Float>
-  // Asset's first triangle, its first BLAS node (both in the triangle buffer), the first
+  // Asset's first face (MeshStreams.faces), its first BLAS node (MeshStreams.nodes), the first
   // rendered-triangle ID of this instance, the asset's triangle count.
   var range: SIMD4<UInt32>
   // First slot-table entry, graph node index + 1 (0: keep the stored slot and ID), flags
@@ -51,6 +51,56 @@ struct MeshSceneHeader {
   var hi: SIMD4<Float>  // hi.w = max over instances of |translation| + |linear| * |local coordinates|
   var accelerator: SIMD4<UInt32>  // .xy: the instance acceleration structure's MTLResourceID (hardware)
   static let magic: UInt32 = 0x3256_544C
+}
+
+// Two-level stored geometry (docs/SCENE_STORAGE_DESIGN.md, phase 1). MSL MeshVertex: position,
+// normal and uv as exact floats (32 bytes); MSL MeshFace: three absolute vertex indices and the
+// stored uvc.z (16 bytes). Faces and welded vertices take 16 B per triangle plus 32 B per vertex
+// instead of the 128-byte MeshTriangle, and rebuild every MeshTriangle field the renderer reads:
+// corners (w = 1), normals (w = 0), UVs and uvc.z. Stored assets are validated to that shape
+// (SceneGraph.validate); a graph-less mesh's other fields are not read in two-level mode.
+typealias MeshVertex = SIMD8<Float>
+typealias MeshFace = SIMD4<UInt32>
+// The published two-level geometry: faces and vertices in BLAS order, and the BLAS nodes.
+struct MeshStreams: @unchecked Sendable {
+  var faces: MTLBuffer, vertices: MTLBuffer, nodes: MTLBuffer
+  // A graph-less (legacy) mesh may hold flattened scene-graph triangles, whose uvc.w (node + 1)
+  // and na.w (subset) its instance keeps: one UInt32 per face, uvc.w | na.w << 16. Nil otherwise.
+  var extras: MTLBuffer? = nil
+  var bytes: Int { faces.length + vertices.length + nodes.length + (extras?.length ?? 0) }
+  static func extra(_ t: MeshTriangle) -> UInt32 {
+    func half(_ x: Float) -> UInt32 { x.isFinite && x >= 0 && x <= 65535 ? UInt32(x) : 0 }
+    return half(t.uvc.w) | half(t.na.w) << 16
+  }
+}
+extension MeshTriangle {
+  init(face f: MeshFace, vertices v: UnsafePointer<MeshVertex>) {
+    let a = v[Int(f.x)], b = v[Int(f.y)], c = v[Int(f.z)]
+    self.init(
+      a: SIMD4(a[0], a[1], a[2], 1), b: SIMD4(b[0], b[1], b[2], 1), c: SIMD4(c[0], c[1], c[2], 1),
+      na: SIMD4(a[3], a[4], a[5], 0), nb: SIMD4(b[3], b[4], b[5], 0), nc: SIMD4(c[3], c[4], c[5], 0),
+      uvab: SIMD4(a[6], a[7], b[6], b[7]), uvc: SIMD4(c[6], c[7], Float(f.w), 0))
+  }
+}
+// The stored triangles, BVH-ordered: the flat path's MeshTriangle buffer, or the two-level faces
+// decoded on access (MaterialLibrary.orderedTriangles).
+struct StoredTriangles: RandomAccessCollection {
+  let flat: UnsafePointer<MeshTriangle>?
+  let faces: UnsafePointer<MeshFace>?, vertices: UnsafePointer<MeshVertex>?
+  var extras: UnsafePointer<UInt32>? = nil
+  let count: Int
+  var startIndex: Int { 0 }
+  var endIndex: Int { count }
+  subscript(i: Int) -> MeshTriangle {
+    precondition(i >= 0 && i < count, "stored triangle index out of range")
+    if let flat { return flat[i] }
+    var t = MeshTriangle(face: faces![i], vertices: vertices!)
+    if let extras {
+      t.uvc.w = Float(extras[i] & 0xFFFF)
+      t.na.w = Float(extras[i] >> 16)
+    }
+    return t
+  }
 }
 
 // Top-down binned-SAH build of a 4-wide BVH: each node repeatedly splits its child with the
@@ -313,8 +363,10 @@ struct MeshSceneLayout {
     var nodeBase: Int, nodeCount: Int
     var lo: SIMD3<Float>, hi: SIMD3<Float>, maxAbs: Float
     // Hardware traversal: the asset's primitive acceleration structure (self-contained, so it
-    // survives relocations of the triangle buffer).
+    // survives relocations of the streams).
     var structure: MTLAccelerationStructure? = nil
+    // The asset's welded vertices in MeshStreams.vertices; its faces index them absolutely.
+    var vertexBase = 0, vertexCount = 0
   }
   struct Instance {
     var node: Int  // graph node index, -1 for a graph-less mesh
@@ -387,8 +439,6 @@ struct MeshSceneLayout {
 }
 
 extension MeshSceneLayout {
-  static let triangleStride = MemoryLayout<MeshTriangle>.stride
-
   // Local bounds, 6 floats per triangle, for the BLAS build.
   static func bounds(_ triangles: UnsafeBufferPointer<MeshTriangle>) -> [Float] {
     [Float](unsafeUninitializedCapacity: 6 * triangles.count) { b, initialized in
@@ -402,15 +452,30 @@ extension MeshSceneLayout {
     }
   }
 
-  // Builds one asset's hierarchy: BLAS-ordered triangles are written straight to `target`
-  // (the GPU buffer), and the nodes (item and child indices relative to the asset) returned.
-  static func buildAsset(_ source: UnsafeBufferPointer<MeshTriangle>, into target: UnsafeMutablePointer<MeshTriangle>)
-    -> [MeshWideNode]
-  {
-    let b = bounds(source)
-    let result = b.withUnsafeBufferPointer { WideBVH.build(bounds: $0, count: source.count, leafSize: 2) }
-    for (i, k) in result.order.enumerated() { target[i] = source[Int(k)] }
-    return result.nodes
+  // An asset's triangles in BLAS order (`order`) as faces with asset-relative vertex indices
+  // and welded vertices. Vertices weld only when all eight attribute bit patterns are equal, so
+  // decoding is exact (0 and -0 stay distinct).
+  static func encode(_ source: UnsafeBufferPointer<MeshTriangle>, order: [Int32]) -> (faces: [MeshFace], vertices: [MeshVertex]) {
+    var index: [SIMD8<UInt32>: UInt32] = [:]
+    index.reserveCapacity(source.count)
+    var vertices: [MeshVertex] = []
+    vertices.reserveCapacity(source.count)
+    func vertex(_ p: SIMD4<Float>, _ n: SIMD4<Float>, _ u: Float, _ v: Float) -> UInt32 {
+      let value = MeshVertex(p.x, p.y, p.z, n.x, n.y, n.z, u, v)
+      let key = unsafeBitCast(value, to: SIMD8<UInt32>.self)
+      if let i = index[key] { return i }
+      let i = UInt32(vertices.count)
+      vertices.append(value)
+      index[key] = i
+      return i
+    }
+    let faces = order.map { item -> MeshFace in
+      let t = source[Int(item)]
+      let tag = t.uvc.z.isFinite && t.uvc.z >= 0 && t.uvc.z < 4e9 ? UInt32(t.uvc.z) : 0
+      return MeshFace(vertex(t.a, t.na, t.uvab.x, t.uvab.y), vertex(t.b, t.nb, t.uvab.z, t.uvab.w),
+        vertex(t.c, t.nc, t.uvc.x, t.uvc.y), tag)
+    }
+    return (faces, vertices)
   }
 
   static func linear(_ m: simd_float4x4) -> simd_float3x3 {
@@ -558,9 +623,9 @@ extension MeshSceneLayout {
 }
 
 extension MaterialLibrary {
-  // GPU bytes of the published mesh: triangles, hierarchies, instances and emitter list.
+  // GPU bytes of the published mesh: triangles or streams, hierarchies, instances and emitter list.
   var meshBytes: UInt64 {
-    UInt64((triangleBuffer?.length ?? 0) + (nodeBuffer?.length ?? 0) + (emitterBuffer?.length ?? 0))
+    UInt64((triangleBuffer?.length ?? 0) + (meshStreams?.bytes ?? 0) + (nodeBuffer?.length ?? 0) + (emitterBuffer?.length ?? 0))
       + (meshLayout?.structures.reduce(UInt64(0)) { $0 + UInt64($1.allocatedSize) } ?? 0)
   }
   var meshBudget: UInt64 {
@@ -609,15 +674,15 @@ extension MaterialLibrary {
   }
 
   // Publishes a two-level mesh: assets whose ID and triangles match the published layout keep
-  // their hierarchy (and, when nothing else changed, the whole triangle buffer); the others
-  // are built. `instances` then adds the visible instances.
+  // their hierarchy and encoded geometry (and, when nothing else changed, the whole streams);
+  // the others are built and encoded. `instances` then adds the visible instances.
   func publishTwoLevel(
     assets inputs: [(UUID, [MeshTriangle])], document: [MeshTriangle], layout: inout MeshSceneLayout,
     instances: (inout MeshSceneLayout) throws -> Void
   ) throws {
-    let previous = meshLayout
+    let previous = meshLayout, previousStreams = meshStreams
     var reused = [Int?](repeating: nil, count: inputs.count)
-    if let previous {
+    if let previous, previousStreams != nil {
       var byID: [UUID: Int] = [:]
       for (i, asset) in previous.assets.enumerated() { byID[asset.id] = i }
       for (i, input) in inputs.enumerated() {
@@ -628,21 +693,31 @@ extension MaterialLibrary {
     guard stored <= SceneLimits.triangles else {
       throw Self.error("Stored mesh assets exceed the \(SceneLimits.triangles.formatted()) triangle limit.")
     }
-    let stride = MeshSceneLayout.triangleStride
-    let buffer: MTLBuffer
-    if let previous, previous.assets.count == inputs.count, reused.enumerated().allSatisfy({ $0.element == $0.offset }) {
-      // Only instances changed: the triangle buffer and every hierarchy are kept.
+    let streams: MeshStreams
+    var pending: UInt64 = 0
+    if let previous, let previousStreams, previous.assets.count == inputs.count,
+      reused.enumerated().allSatisfy({ $0.element == $0.offset })
+    {
+      // Only instances changed: the streams and every hierarchy are kept.
       layout.assets = previous.assets
       for i in inputs.indices { layout.assets[i].source = inputs[i].1 }
-      buffer = triangleBuffer
+      streams = previousStreams
     } else {
-      var built: [Int: WideBVH.Result] = [:]
+      // New assets: hierarchy, then faces in BLAS order with welded vertices.
+      var built: [Int: (nodes: [MeshWideNode], faces: [MeshFace], vertices: [MeshVertex], extras: [UInt32])] = [:]
+      let legacy = inputs.count == 1 && inputs[0].0 == MeshSceneLayout.legacyAsset
       for (i, input) in inputs.enumerated() where reused[i] == nil && !input.1.isEmpty {
-        let bounds = input.1.withUnsafeBufferPointer { MeshSceneLayout.bounds($0) }
-        built[i] = bounds.withUnsafeBufferPointer { WideBVH.build(bounds: $0, count: input.1.count, leafSize: 2) }
+        let result = input.1.withUnsafeBufferPointer { source in
+          let bounds = MeshSceneLayout.bounds(source)
+          let tree = bounds.withUnsafeBufferPointer { WideBVH.build(bounds: $0, count: source.count, leafSize: 2) }
+          let encoded = MeshSceneLayout.encode(source, order: tree.order)
+          let extras = legacy ? tree.order.map { MeshStreams.extra(source[Int($0)]) } : []
+          return (nodes: tree.nodes, faces: encoded.faces, vertices: encoded.vertices, extras: extras)
+        }
+        built[i] = result
         assetBuildCount += 1
       }
-      var triangleBase = 0, nodeBase = stored
+      var faceBase = 0, vertexBase = 0, nodeBase = 0
       layout.assets = []
       for (i, input) in inputs.enumerated() {
         var asset: MeshSceneLayout.Asset
@@ -661,43 +736,67 @@ extension MaterialLibrary {
           asset = MeshSceneLayout.Asset(
             id: input.0, source: input.1, triangleBase: 0, count: input.1.count, nodeBase: 0, nodeCount: nodes.count,
             lo: lo, hi: hi, maxAbs: nodes.isEmpty ? 0 : max(simd_reduce_max(simd_abs(lo)), simd_reduce_max(simd_abs(hi))))
+          asset.vertexCount = built[i]?.vertices.count ?? 0
         }
-        asset.triangleBase = triangleBase
+        asset.triangleBase = faceBase
+        asset.vertexBase = vertexBase
         asset.nodeBase = nodeBase
-        triangleBase += asset.count
+        faceBase += asset.count
+        vertexBase += asset.vertexCount
         nodeBase += asset.nodeCount
         layout.assets.append(asset)
       }
-      let bytes = nodeBase.multipliedReportingOverflow(by: stride)
-      guard !bytes.overflow,
-        UInt64(bytes.partialValue) + meshBytes <= meshBudget,
-        let b = device.makeBuffer(length: max(128, bytes.partialValue), options: .storageModeShared)
+      let faceBytes = faceBase.multipliedReportingOverflow(by: MemoryLayout<MeshFace>.stride)
+      let vertexBytes = vertexBase.multipliedReportingOverflow(by: MemoryLayout<MeshVertex>.stride)
+      let nodeBytes = nodeBase.multipliedReportingOverflow(by: MemoryLayout<MeshWideNode>.stride)
+      guard !faceBytes.overflow, !vertexBytes.overflow, !nodeBytes.overflow, vertexBase < Int(UInt32.max),
+        UInt64(faceBytes.partialValue + vertexBytes.partialValue + nodeBytes.partialValue) + meshBytes <= meshBudget,
+        let f = device.makeBuffer(length: max(16, faceBytes.partialValue), options: .storageModeShared),
+        let v = device.makeBuffer(length: max(32, vertexBytes.partialValue), options: .storageModeShared),
+        let n = device.makeBuffer(length: max(128, nodeBytes.partialValue), options: .storageModeShared)
       else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
-      let target = b.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, nodeBase))
-      let raw = b.contents()
+      let faces = f.contents().bindMemory(to: MeshFace.self, capacity: max(1, faceBase))
+      let vertices = v.contents().bindMemory(to: MeshVertex.self, capacity: max(1, vertexBase))
+      let nodes = n.contents().bindMemory(to: MeshWideNode.self, capacity: max(1, nodeBase))
       for (i, asset) in layout.assets.enumerated() {
-        if let j = reused[i], let previous {
-          // Hierarchies index relative to their asset, so they move as plain bytes.
-          let old = previous.assets[j], source = triangleBuffer.contents()
-          raw.advanced(by: asset.triangleBase * stride)
-            .copyMemory(from: source.advanced(by: old.triangleBase * stride), byteCount: old.count * stride)
-          raw.advanced(by: asset.nodeBase * stride)
-            .copyMemory(from: source.advanced(by: old.nodeBase * stride), byteCount: old.nodeCount * stride)
-        } else if let result = built[i] {
-          inputs[i].1.withUnsafeBufferPointer { source in
-            for (k, item) in result.order.enumerated() { target[asset.triangleBase + k] = source[Int(item)] }
-          }
-          result.nodes.withUnsafeBytes { raw.advanced(by: asset.nodeBase * stride).copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        let shift = MeshFace(UInt32(asset.vertexBase), UInt32(asset.vertexBase), UInt32(asset.vertexBase), 0)
+        if let j = reused[i], let previous, let previousStreams {
+          // Faces index vertices absolutely, so a moved asset's indices shift with its vertices;
+          // hierarchies index relative to their asset and move as plain bytes.
+          let old = previous.assets[j]
+          let oldFaces = previousStreams.faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, old.triangleBase + old.count))
+          let back = MeshFace(UInt32(old.vertexBase), UInt32(old.vertexBase), UInt32(old.vertexBase), 0)
+          for k in 0..<old.count { faces[asset.triangleBase + k] = oldFaces[old.triangleBase + k] &- back &+ shift }
+          (vertices + asset.vertexBase).update(
+            from: previousStreams.vertices.contents().bindMemory(to: MeshVertex.self, capacity: old.vertexBase + old.vertexCount)
+              + old.vertexBase, count: old.vertexCount)
+          (nodes + asset.nodeBase).update(
+            from: previousStreams.nodes.contents().bindMemory(to: MeshWideNode.self, capacity: old.nodeBase + old.nodeCount)
+              + old.nodeBase, count: old.nodeCount)
+        } else if let encoded = built[i] {
+          for (k, face) in encoded.faces.enumerated() { faces[asset.triangleBase + k] = face &+ shift }
+          encoded.vertices.withUnsafeBufferPointer { (vertices + asset.vertexBase).update(from: $0.baseAddress!, count: $0.count) }
+          encoded.nodes.withUnsafeBufferPointer { (nodes + asset.nodeBase).update(from: $0.baseAddress!, count: $0.count) }
         }
       }
-      buffer = b
+      var s = MeshStreams(faces: f, vertices: v, nodes: n)
+      if legacy {
+        // The only asset: reused (identical bytes) keeps its extras, a new one has them encoded.
+        let extras = built[0]?.extras ?? []
+        if let kept = previousStreams?.extras, reused[0] != nil { s.extras = kept }
+        else if !extras.isEmpty {
+          s.extras = extras.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
+          guard s.extras != nil else { throw Self.error("Could not allocate imported mesh.") }
+        }
+      }
+      streams = s
+      pending = UInt64(streams.bytes)
     }
     layout.storedTriangles = stored
-    var pending = buffer === triangleBuffer ? 0 : UInt64(buffer.length)
-    if hardwareTraversal { try buildAssetStructures(&layout, triangleBuffer: buffer, pending: &pending) }
+    if hardwareTraversal { try buildAssetStructures(&layout, streams: streams, pending: &pending) }
     try instances(&layout)
     meshBuildCount += 1
-    try publishScene(layout, triangleBuffer: buffer, document: document, pending: pending)
+    try publishScene(layout, streams: streams, document: document, pending: pending)
   }
 
   // METALRT: hardware traversal needs a device that supports ray tracing; otherwise the
@@ -842,8 +941,8 @@ extension MaterialLibrary {
   }
 
   // METALRT gate at run time. Apple does not document the intersector's watertightness, and
-  // Fix_accel measured leaks on shared edges with packed or welded vertices but none with the
-  // unwelded MeshTriangle layout used here. Hardware traversal is the default only if, on this
+  // Fix_accel measured leaks on shared edges with welded vertices or an unindexed input but none
+  // with the unwelded indexed input built here. Hardware traversal is the default only if, on this
   // device and OS, the production structures (compacted, unwelded, one identity and one
   // rotated/scaled instance) pass rays aimed at every shared edge and vertex of a curved patch
   // (the WOOP2013 check of tests/Fix_renderer-followups.swift). Otherwise the exact software
@@ -899,8 +998,9 @@ extension MaterialLibrary {
     do {
       let library = try device.makeLibrary(source: source, options: nil)
       guard let function = library.makeFunction(name: "probe"),
-        let vertices = triangles.withUnsafeBytes({ device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
-        let indices = unweldedIndices(device, count: triangles.count),
+        let vertices = triangles.flatMap({ [$0.a.x, $0.a.y, $0.a.z, $0.b.x, $0.b.y, $0.b.z, $0.c.x, $0.c.y, $0.c.z] })
+          .withUnsafeBytes({ device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
+        let indices = identityIndices(device, count: triangles.count),
         let targetBuffer = targets.withUnsafeBytes({ device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
         let leaks = device.makeBuffer(length: 4, options: .storageModeShared)
       else { return nil }
@@ -942,29 +1042,58 @@ extension MaterialLibrary {
       return nil
     }
   }
-  // One primitive acceleration structure per asset lacking one. The vertices are the stored
-  // MeshTriangle records themselves (stride 16, triangle k indexing vertices 8k, 8k + 1 and
-  // 8k + 2): Fix_accel measured this unwelded layout leak-free on shared edges, while packed and
-  // welded vertex layouts leaked through the same intersector.
-  func buildAssetStructures(_ layout: inout MeshSceneLayout, triangleBuffer: MTLBuffer, pending: inout UInt64) throws {
+  // One primitive acceleration structure per asset lacking one, built from a transient
+  // unwelded input that is freed after the batch: packed float3 corners (36 B per triangle, in
+  // BLAS order) and identity uint32 indices. Welded vertices or an unindexed input compact to a
+  // format that leaked at shared edges on Apple M4 / macOS 27, while this input compacts to the
+  // watertight one (86 B per triangle; REFERENCES.md METALRT "Layout measurements").
+  func buildAssetStructures(_ layout: inout MeshSceneLayout, streams: MeshStreams, pending: inout UInt64) throws {
     let missing = layout.assets.indices.filter { layout.assets[$0].structure == nil && layout.assets[$0].count > 0 }
     guard let largest = missing.map({ layout.assets[$0].count }).max() else { return }
-    guard let indexBuffer = MaterialLibrary.unweldedIndices(device, count: largest)
-    else { throw Self.error("Could not allocate the mesh acceleration structure.") }
-    let descriptors = missing.map { i in
-      MaterialLibrary.primitiveDescriptor(
-        vertices: triangleBuffer, offset: layout.assets[i].triangleBase * MeshSceneLayout.triangleStride,
-        count: layout.assets[i].count, indices: indexBuffer)
+    let (offsets, bytes) = Self.transientBuildLayout(missing.map { layout.assets[$0].count })
+    let transient = UInt64(bytes + 12 * largest)
+    guard transient + pending + meshBytes <= meshBudget,
+      let positions = device.makeBuffer(length: max(16, bytes), options: .storageModeShared),
+      let indexBuffer = Self.identityIndices(device, count: largest)
+    else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
+    let faces = streams.faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, layout.storedTriangles))
+    let vertices = streams.vertices.contents().bindMemory(to: MeshVertex.self, capacity: max(1, layout.assets.reduce(0) { $0 + $1.vertexCount }))
+    for (k, i) in missing.enumerated() {
+      let asset = layout.assets[i]
+      let target = (positions.contents() + offsets[k]).bindMemory(to: Float.self, capacity: 9 * asset.count)
+      for t in 0..<asset.count {
+        let f = faces[asset.triangleBase + t]
+        for (c, index) in [f.x, f.y, f.z].enumerated() {
+          let v = vertices[Int(index)]
+          target[9 * t + 3 * c] = v[0]; target[9 * t + 3 * c + 1] = v[1]; target[9 * t + 3 * c + 2] = v[2]
+        }
+      }
+    }
+    let descriptors = missing.enumerated().map { k, i in
+      MaterialLibrary.primitiveDescriptor(vertices: positions, offset: offsets[k], count: layout.assets[i].count, indices: indexBuffer)
     }
     // One batch for every missing asset; the layout changes only once all of them are built.
+    pending += transient
     let structures = try buildStructures(descriptors, compact: true, pending: &pending)
+    pending -= transient
     for (i, structure) in zip(missing, structures) { layout.assets[i].structure = structure }
     assetBuildCount += missing.count
   }
-  // Triangle k of a MeshTriangle array indexes vertices 8k, 8k + 1 and 8k + 2 (its a, b, c).
-  static func unweldedIndices(_ device: MTLDevice, count: Int) -> MTLBuffer? {
+  // Offsets of each asset's packed corners in the transient build input: multiples of the
+  // 12-byte stride and of the buffer offset alignment.
+  static func transientBuildLayout(_ counts: [Int]) -> (offsets: [Int], bytes: Int) {
+    let granule = 768
+    var offsets: [Int] = [], bytes = 0
+    for count in counts {
+      offsets.append(bytes)
+      bytes += (count * 36 + granule - 1) / granule * granule
+    }
+    return (offsets, max(16, bytes))
+  }
+  // Triangle k uses vertices 3k, 3k + 1 and 3k + 2 of a packed unwelded input.
+  static func identityIndices(_ device: MTLDevice, count: Int) -> MTLBuffer? {
     let indices = [UInt32](unsafeUninitializedCapacity: 3 * count) { b, initialized in
-      for k in 0..<count { b[3 * k] = UInt32(8 * k); b[3 * k + 1] = UInt32(8 * k + 1); b[3 * k + 2] = UInt32(8 * k + 2) }
+      for k in 0..<3 * count { b[k] = UInt32(k) }
       initialized = 3 * count
     }
     return indices.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: max(16, $0.count), options: .storageModeShared) }
@@ -975,7 +1104,7 @@ extension MaterialLibrary {
     let geometry = MTLAccelerationStructureTriangleGeometryDescriptor()
     geometry.vertexBuffer = vertices
     geometry.vertexBufferOffset = offset
-    geometry.vertexStride = 16
+    geometry.vertexStride = 12
     geometry.vertexFormat = .float3
     geometry.indexBuffer = indices
     geometry.indexType = .uint32
@@ -1043,8 +1172,8 @@ extension MaterialLibrary {
     layout.sceneIndices = indices
   }
 
-  // Builds the TLAS and instance table of `layout` and publishes it with `triangleBuffer`.
-  func publishScene(_ layout: MeshSceneLayout, triangleBuffer t: MTLBuffer, document: [MeshTriangle], pending: UInt64 = 0,
+  // Builds the TLAS and instance table of `layout` and publishes it with its streams.
+  func publishScene(_ layout: MeshSceneLayout, streams: MeshStreams, document: [MeshTriangle], pending: UInt64 = 0,
                     keepScene: Bool = false) throws {
     var layout = layout, pending = pending
     // Hardware traversal: a new instance structure for every instance change (the per-asset
@@ -1068,7 +1197,7 @@ extension MaterialLibrary {
     else { throw Self.error("The imported meshes exceed the safe GPU memory budget.") }
     sceneBuildCount += 1
     let nodes = layout.instances.isEmpty ? 0 : layout.tlasNodes + layout.assets.reduce(0) { $0 + $1.nodeCount }
-    try restoreMesh(MeshResources(triangles: document, triangleBuffer: t, triangleCount: layout.storedTriangles,
-      nodeBuffer: n, nodeCount: nodes, layout: layout))
+    try restoreMesh(MeshResources(triangles: document, triangleBuffer: placeholderTriangles, triangleCount: layout.storedTriangles,
+      nodeBuffer: n, nodeCount: nodes, layout: layout, streams: streams))
   }
 }
