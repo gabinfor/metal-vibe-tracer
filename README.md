@@ -212,4 +212,4 @@ Built with Apple Metal and MetalFX, Adobe OpenPBR, OpenUSD, and Intel Open Image
 
 ## License
 
-Metal Vibe Tracer's own code is released under the [MIT License](LICENSE). Vendored and downloaded components, and the generated spectral tables, keep their own licenses. These are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Metal Vibe Tracer's own code is released under the [MIT License](LICENSE). Vendored and downloaded components, and the generated spectral tables, keep their own licenses. These are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributions are accepted under the MIT License; see [CONTRIBUTING.md](CONTRIBUTING.md).
