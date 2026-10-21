@@ -327,6 +327,7 @@ struct Material {
     uint usesMaterialX;
     bool inside;
     float3 geometricNormal;
+    float3 specularColor;  // OpenPBR specular_color of a MaterialX material (slot_specular_color)
 };
 
 struct HitRecord {
@@ -573,7 +574,8 @@ struct MaterialResources {
     device MeshWideNode *blasNodes [[id(12)]];
     // Graph-less (legacy) mesh only: per face, its stored uvc.w (low 16 bits) and na.w (high 16).
     device uint *faceExtras [[id(13)]];
-    // Per slot: the spectral OpenPBR parameters (MSL SpectralMaterial, MaterialLibrary.spectralMaterials).
+    // Per slot, two float4 (MaterialLibrary.slotParameters): the spectral OpenPBR parameters
+    // (SpectralMaterial), then the constant specular_color (slot_specular_color).
     device float4 *spectralMaterials [[id(14)]];
     // Alpha cutouts: per slot the register of MaterialX geometry_opacity (-1: opaque), then at
     // MATERIAL_SLOTS the number of cutout slots (MaterialLibrary.rebuildArguments).
@@ -581,6 +583,11 @@ struct MaterialResources {
     array<texture2d<float>, GRAPH_IMAGES> graphImages [[id(16)]];
     array<texture2d<float>, MATERIAL_SLOTS * 4> maps [[id(4112)]];
 };
+// OpenPBR specular_color of a slot (MaterialLibrary.slotParameters; white unless a MaterialX
+// program sets it): a metal's 82-degree edge tint, a dielectric's specular tint.
+float3 slot_specular_color(uint slot, constant MaterialResources &images) {
+    return slot < MATERIAL_SLOTS ? images.spectralMaterials[2 * slot + 1].rgb : float3(1.0f);
+}
 
 // Radiance of the area light of scenes 1, 3, 4 and 5 before the light tint (Uniforms.light).
 float3 procedural_light_emission(uint sceneIndex) {
@@ -601,7 +608,7 @@ float3 procedural_light_emission(uint sceneIndex) {
 // are added, at the wavelengths of the estimator that produced them. In RGB libraries every helper
 // below is the identity and Wavelengths is empty.
 #if VIBE_SPECTRAL
-// Per-slot wavelength-dependent OpenPBR parameters (MaterialLibrary.spectralMaterials).
+// Per-slot wavelength-dependent OpenPBR parameters (MaterialLibrary.slotParameters).
 struct SpectralMaterial {
     float dispersion;        // OpenPBR "dispersion" parameter 20 / V_d (V_d = Abbe number / dispersion scale); 0 = none
     float thinFilmWeight;    // thin_film_weight
@@ -840,7 +847,7 @@ float3 emitter_rgb(float3 e, thread const Wavelengths &wl) { return spectral_emi
 SpectralMaterial spectral_material(Material m, thread const Wavelengths &wl) {
     SpectralMaterial none = { 0.0f, 0.0f, 0.0f, 1.4f };
     if (m.slot >= MATERIAL_SLOTS) return none;
-    float4 p = wl.images->spectralMaterials[m.slot];
+    float4 p = wl.images->spectralMaterials[2 * m.slot];
     SpectralMaterial r = { p.x, p.y, p.z, p.w };
     return r;
 }
@@ -2099,6 +2106,7 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         values[i]=all(isfinite(v))?v:float4(0);densities[i]=d;
     }
     hit.mat.type=OPENPBR;hit.mat.usesMaterialX=1;
+    hit.mat.specularColor=slot_specular_color(hit.mat.slot,images);
     hit.mat.diffuseRoughness=h.info.z>=0 ? clamp(values[h.info.z].x,0.0f,1.0f) : 0.0f;
     hit.mat.albedo=clamp(values[h.roots0.x].rgb,0.0f,1.0f);
     hit.mat.roughness=clamp(values[h.roots0.y].x,0.03f,1.0f);
@@ -2227,6 +2235,7 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
     inputs.specular_weight = mat.usesMaterialX ? mat.specularWeight : (mat.type == DIFFUSE ? 0.0f : 1.0f);
     if(mat.usesMaterialX) { inputs.base_weight=mat.baseWeight; inputs.base_diffuse_roughness=mat.diffuseRoughness; }
     inputs.specular_ior = max(1.01f, mat.ior);
+    inputs.specular_color = mat.usesMaterialX ? mat.specularColor : float3(1.0f);
     inputs.coat_weight = mat.coat;
     inputs.coat_roughness = mat.usesMaterialX ? mat.coatRoughness : 0.12f;
     inputs.specular_roughness_anisotropy = mat.anisotropy;
@@ -2258,6 +2267,7 @@ OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, fl
     inputs.specular_weight = mat.usesMaterialX ? mat.specularWeight : (mat.type == DIFFUSE ? 0.0f : 1.0f);
     if(mat.usesMaterialX) { inputs.base_weight=mat.baseWeight; inputs.base_diffuse_roughness=mat.diffuseRoughness; }
     inputs.specular_ior = max(1.01f, mat.ior);
+    inputs.specular_color = mat.usesMaterialX ? mat.specularColor : float3(1.0f);
     inputs.coat_weight = mat.coat;
     inputs.coat_roughness = mat.usesMaterialX ? mat.coatRoughness : 0.12f;
     inputs.specular_roughness_anisotropy = mat.anisotropy;
@@ -3081,7 +3091,7 @@ PrimarySurface store_primary_surface(HitRecord hit, float3 view = float3(0.0f)) 
     return s;
 }
 
-HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
+HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth, constant MaterialResources &images) {
     HitRecord hit = {};
     hit.t = positionDepth.w; hit.position = positionDepth.xyz;
     hit.normal = s.normal; hit.geometricNormal = s.geometricNormal; hit.tangent = s.tangent;
@@ -3096,6 +3106,7 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
     m.baseWeight = s.baseWeight; m.diffuseRoughness = s.diffuseRoughness;
     m.emission = s.emission;
     m.usesMaterialX = (s.flags & 512u) != 0 ? 1u : 0u;
+    m.specularColor = slot_specular_color(m.slot, images);
     m.inside = !hit.front_face; m.geometricNormal = s.geometricNormal;
     hit.mat = m;
     return hit;
@@ -4373,7 +4384,7 @@ kernel void restir_pt_initial_kernel(
     float firstHit = 0.0f;
     float3 estimate = float3(0.0f), reflectance = float3(0.0f);
     if (position.w > 0.0f && normalMaterial.w != float(EMISSIVE) ) {
-        HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
+        HitRecord x1 = load_primary_surface(primarySurfaces[index], position, images);
         float3 view = float3(primarySurfaces[index].view);
         uint seed = pt_initial_seed(gid, 0u, pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2545f491u), u);
         result = pt_generate(x1, view, seed, pt_footprint_threshold(position.w, x1.geometricNormal, view),
@@ -4499,9 +4510,9 @@ kernel void restir_pt_temporal_kernel(
     PTReservoir t = history[prevIndex];
     if (!sameSurface || !(t.M > 0.0f)) return;
     PTReservoir c = reservoirs[index];
-    HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
+    HitRecord x1 = load_primary_surface(primarySurfaces[index], position, images);
     float3 view = float3(primarySurfaces[index].view);
-    HitRecord y1 = load_primary_surface(historySurfaces[prevIndex], oldPosition);
+    HitRecord y1 = load_primary_surface(historySurfaces[prevIndex], oldPosition, images);
     float3 oldView = float3(historySurfaces[prevIndex].view);
     float cap = PT_CONFIDENCE_CAP;
     if (restir_pt_decorrelates(u)) {
@@ -4547,7 +4558,7 @@ kernel void restir_pt_shift_kernel(
             float4 qNormal = gbufferNormalMat.read(uint2(q));
             if (pt_pair_compatible(position, normalMaterial, qPosition, qNormal)) {
                 uint qIndex = uint(q.y) * u.width + uint(q.x);
-                HitRecord y1 = load_primary_surface(primarySurfaces[qIndex], qPosition);
+                HitRecord y1 = load_primary_surface(primarySurfaces[qIndex], qPosition, images);
                 float3 view = float3(primarySurfaces[qIndex].view);
                 PTShift s = pt_shift(r, y1, view, pt_footprint_threshold(qPosition.w, y1.geometricNormal, view),
                                      cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
@@ -4962,7 +4973,7 @@ kernel void restir_pt_spmis_shift_kernel(
         SPMISPixel cell = spmis_chosen(choices[index], 1u);
         uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ pcg_hash(k * 0x9e3779b9u + 0x61c88647u));
         PTReservoir path = c;
-        HitRecord y1 = load_primary_surface(primarySurfaces[index], position);
+        HitRecord y1 = load_primary_surface(primarySurfaces[index], position, images);
         float3 view = float3(primarySurfaces[index].view);
         float depth = position.w;
         uint z = SPMIS_NO_PIXEL;
@@ -4972,7 +4983,7 @@ kernel void restir_pt_spmis_shift_kernel(
                 z = spmis_uniform_pixel(slots, cell, rand_f(seed));
                 if (z != index) {
                     float4 zPosition = gbufferPosDepth.read(uint2(z % u.width, z / u.width));
-                    y1 = load_primary_surface(primarySurfaces[z], zPosition);
+                    y1 = load_primary_surface(primarySurfaces[z], zPosition, images);
                     view = float3(primarySurfaces[z].view);
                     depth = zPosition.w;
                 }
@@ -5106,7 +5117,7 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
         uint2 zc = uint2(z % u.width, z / u.width);
         float from = pc;
         if (z != index) {
-            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
+            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc), images);
             LightSample y = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, y1.position, canonicalWeights.w);
             from = eval_restir_target_pdf(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat, y,
                                           u.sceneIndex, u.light.w, images, wl);
@@ -5173,7 +5184,7 @@ void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf
         uint2 zc = uint2(z % u.width, z / u.width);
         float from = pc;
         if (z != index) {
-            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
+            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc), images);
             from = restir_gi_accepts_shift(rec.position, y1.position, posPdf.xyz, normal.xyz)
                 ? eval_restir_gi_target(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat,
                                         posPdf.xyz, normal.xyz, radiance, sample_wavelengths(sampleU, wl)) : 0.0f;
@@ -5475,7 +5486,7 @@ kernel void splat_deep_restir_kernel(
     SplatDomain d = domains[tid];
     PrimarySurface s = surfaces[tid];
     bool diffuse = MaterialType(s.flags & 255u) == DIFFUSE;
-    HitRecord rec = load_primary_surface(s, float4(float3(d.position), d.depth));
+    HitRecord rec = load_primary_surface(s, float4(float3(d.position), d.depth), images);
     float3 view = float3(s.view);
     uint seed = splat_seed(d.pixel, d.flags & 255u, 0x7f4a7c15u, u);
     // The deep domain's own wavelengths, from its seed.
@@ -5519,7 +5530,7 @@ kernel void restir_pt_deep_initial_kernel(
     PTReservoir r = pt_empty();
     float3 estimate = float3(0.0f), reflectance = float3(0.0f);
     if (MaterialType(s.flags & 255u) != EMISSIVE) {
-        HitRecord x1 = load_primary_surface(s, float4(float3(d.position), d.depth));
+        HitRecord x1 = load_primary_surface(s, float4(float3(d.position), d.depth), images);
         float3 view = float3(s.view);
         float firstHit = 0.0f;
         uint2 pixel = uint2(d.pixel % u.width, d.pixel / u.width);
@@ -5665,7 +5676,7 @@ kernel void splat_temporal_kernel(
         position = float4(float3(domains[j].position), domains[j].depth);
     }
     if (MaterialType(s.flags & 255u) != DIFFUSE) return;
-    HitRecord rec = load_primary_surface(s, position);
+    HitRecord rec = load_primary_surface(s, position, images);
     float3 view = float3(s.view);
     int2 prevCoord = int2(0);
     bool backup = !deep && sources[tid] == 0xfffffffffffffffful && restir_backproject(rec.position, u, prevCoord) &&
@@ -5782,7 +5793,7 @@ kernel void restir_pt_splat_temporal_kernel(
         uint2 sp = uint2(source % u.width, source / u.width);
         float4 oldPosition = historyPosDepth.read(sp);
         t = history[source];
-        y1 = load_primary_surface(historySurfaces[source], oldPosition);
+        y1 = load_primary_surface(historySurfaces[source], oldPosition, images);
         oldView = float3(historySurfaces[source].view);
         oldDepth = oldPosition.w;
         if (restir_pt_decorrelates(u))
@@ -5790,12 +5801,12 @@ kernel void restir_pt_splat_temporal_kernel(
     } else {
         uint k = source - pixels;
         t = previousPT[k];
-        y1 = load_primary_surface(previousSurfaces[k], float4(float3(previous[k].position), previous[k].depth));
+        y1 = load_primary_surface(previousSurfaces[k], float4(float3(previous[k].position), previous[k].depth), images);
         oldView = float3(previousSurfaces[k].view);
         oldDepth = previous[k].depth;
     }
     if (!(t.M > 0.0f)) return;
-    HitRecord x1 = load_primary_surface(s, position);
+    HitRecord x1 = load_primary_surface(s, position, images);
     uint selectSeed = pcg_hash(tid ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
     float3 difference;
     PTReservoir chosen = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldDepth, cap, selectSeed, u, settings, images,
@@ -5888,7 +5899,7 @@ kernel void shading_kernel(
         }
     } else {
         // Pass 1 traced and resolved this exact ray; reuse its hit.
-        HitRecord primaryHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth);
+        HitRecord primaryHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth, materialImages);
         float coneSpread = 2.0f * fov_scale / float(uniforms.height);
         float pathDistance = primaryHit.t;
         float3 pos = primaryHit.position;
@@ -6243,7 +6254,7 @@ kernel void shading_kernel(
             if (!pathSplit || ++lane >= 4u) break;
             seed = pathSeed;
             currentRay = primaryRay;
-            currentHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth);
+            currentHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth, materialImages);
             throughput = Spectrum(1.0f);
             scatteringDepth = 0;
             emissionOnly = false;
@@ -6430,7 +6441,7 @@ kernel void metalfx_guides_kernel(
             }
         }
         if (int(n.w) == OPENPBR) {
-            Material resolved = load_primary_surface(primarySurfaces[gid.y * u.width + gid.x], p).mat;
+            Material resolved = load_primary_surface(primarySurfaces[gid.y * u.width + gid.x], p, materialImages).mat;
             rough = resolved.roughness;
             diffuseAlbedo = resolved.albedo * (1.0f - resolved.metalness) * (1.0f - resolved.transmission);
             float f0 = pow((resolved.ior - 1.0f) / (resolved.ior + 1.0f), 2.0f);
@@ -7299,8 +7310,13 @@ final class MaterialLibrary {
     // film weight, thickness in micrometres and IOR), from the slots' MaterialX constants;
     // spectralOverrides replaces a slot's (test scenes).
     var spectralOverrides: [Int: SIMD4<Float>] = [:] { didSet { bindingsDirty = true } }
-    var spectralMaterials: [SIMD4<Float>] {
-        (0..<SceneLimits.materials).map { spectralOverrides[$0] ?? materialX[$0]?.spectral ?? MaterialXProgram.noSpectral }
+    // Per slot, two float4: the spectral OpenPBR parameters (MSL SpectralMaterial), then the constant
+    // specular_color (rgb; MSL slot_specular_color).
+    var slotParameters: [SIMD4<Float>] {
+        (0..<SceneLimits.materials).flatMap { slot -> [SIMD4<Float>] in
+            let tint = materialX[slot]?.specularColor ?? SIMD3(repeating: 1)
+            return [spectralOverrides[slot] ?? materialX[slot]?.spectral ?? MaterialXProgram.noSpectral, SIMD4(tint, 0)]
+        }
     }
     var orderedTriangles: StoredTriangles {
         if let streams = meshStreams, meshLayout != nil {
@@ -7536,7 +7552,7 @@ final class MaterialLibrary {
         setBuffer(streams.vertices,Argument.vertices)
         setBuffer(streams.nodes,Argument.blasNodes)
         setBuffer(streams.extras ?? placeholderStreams.faces,Argument.faceExtras)
-        guard let spectral = spectralMaterials.withUnsafeBytes({ bindingBuffer(bytes: $0.baseAddress!, length: $0.count) })
+        guard let spectral = slotParameters.withUnsafeBytes({ bindingBuffer(bytes: $0.baseAddress!, length: $0.count) })
         else { throw Self.error("Could not allocate spectral material parameters.") }
         setBuffer(spectral,Argument.spectralMaterials)
         // Alpha cutouts: per slot the MaterialX register of geometry_opacity (-1: opaque), then the

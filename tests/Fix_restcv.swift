@@ -67,7 +67,7 @@
         PTReservoir c = reservoirs[i];
         float4 p = positions.read(gid);
         if (pt_length(c) == 0u || !(p.w > 0.0f) || !(c.W > 0.0f) || !(pt_luminance(c.F) > 0.0f)) return;
-        HitRecord x1 = load_primary_surface(surfaces[i], p);
+        HitRecord x1 = load_primary_surface(surfaces[i], p, images);
         float3 view = float3(surfaces[i].view);
         PTReservoir t = c;
         t.M = 7.0f;

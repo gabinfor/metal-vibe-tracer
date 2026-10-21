@@ -2,7 +2,7 @@
 @MainActor func fixIntegratorChecks() throws {
     let kernels = """
     kernel void fix_integrator_units(device float4 *out [[buffer(0)]], constant Uniforms &u [[buffer(1)]],
-        constant Uniforms &graph [[buffer(2)]]) {
+        constant MaterialResources &images [[buffer(2)]], constant Uniforms &graph [[buffer(3)]]) {
         // Uniform ABI and the named scene-graph flag.
         uint historyOffset = uint((constant char *)&u.reservoirHistory - (constant char *)&u);
         out[0] = float4(float(sizeof(Uniforms)), float(historyOffset),
@@ -48,7 +48,7 @@
         m.baseWeight = 0.91f; m.diffuseRoughness = 0.13f; m.usesMaterialX = 1; m.inside = true;
         m.geometricNormal = hit.geometricNormal;
         hit.mat = m;
-        HitRecord r = load_primary_surface(store_primary_surface(hit), float4(hit.position, hit.t));
+        HitRecord r = load_primary_surface(store_primary_surface(hit), float4(hit.position, hit.t), images);
         Material q = r.mat;
         bool same = r.t == hit.t && all(r.position == hit.position) && r.front_face == hit.front_face &&
             all(r.normal == hit.normal) && all(r.geometricNormal == hit.geometricNormal) && all(r.tangent == hit.tangent) &&
@@ -60,7 +60,7 @@
             q.usesMaterialX == m.usesMaterialX && q.inside == m.inside && all(q.geometricNormal == m.geometricNormal);
         HitRecord light = hit; light.front_face = true;
         light.mat.type = EMISSIVE; light.mat.emission = float3(18, 15, 9); light.mat.usesMaterialX = 0;
-        HitRecord e = load_primary_surface(store_primary_surface(light), float4(light.position, light.t));
+        HitRecord e = load_primary_surface(store_primary_surface(light), float4(light.position, light.t), images);
         out[5] = float4(same ? 1 : 0, e.mat.type == EMISSIVE && all(e.mat.emission == light.mat.emission) &&
             e.front_face && !e.mat.inside ? 1 : 0, 0, 0);
     }
@@ -91,7 +91,7 @@
         if (hit != (p.w > 0.0f)) { atomic_fetch_add_explicit(&counts[0], 1, memory_order_relaxed); return; }
         if (!hit) return;
         resolve_material(rec, ray, uniforms, surfaceSettings, materialImages, rec.t * 2.0f * fov_scale / float(uniforms.height));
-        HitRecord c = load_primary_surface(primarySurfaces[index], p);
+        HitRecord c = load_primary_surface(primarySurfaces[index], p, materialImages);
         Material a = rec.mat, b = c.mat;
         float3 colorA = a.type == EMISSIVE ? a.emission : a.albedo, colorB = b.type == EMISSIVE ? b.emission : b.albedo;
         float error = max(max(length(rec.normal - c.normal), length(rec.geometricNormal - c.geometricNormal)),
@@ -134,7 +134,8 @@
     run(try pipeline("fix_integrator_units"), width: 1, height: 1) {
         $0.setBuffer(unitOut, offset: 0, index: 0)
         $0.setBytes(&units, length: MemoryLayout<Uniforms>.stride, index: 1)
-        $0.setBytes(&swiftGraph, length: MemoryLayout<Uniforms>.stride, index: 2)
+        testRenderer.materials.bind($0)
+        $0.setBytes(&swiftGraph, length: MemoryLayout<Uniforms>.stride, index: 3)
     }
     let unit = (0..<6).map { unitOut.contents().load(fromByteOffset: $0 * 16, as: SIMD4<Float>.self) }
     print("Integrator unit checks: \(unit)")

@@ -5,10 +5,13 @@ Usage: build/mitsuba-venv/bin/python -I scripts/compare_scene.py SCENE.xml [--na
 
 The USD comes from scripts/mitsuba_to_usd.py (run here). Both renders use the XML's resolution
 (times --scale) and path depth (Mitsuba max_depth = app depth + 1), RGB transport, and linear
-radiance without a denoiser; Mitsuba keeps the scene's own pixel filter. Writes metrics like
+radiance without a denoiser; Mitsuba keeps the scene's own pixel filter and renders with its
+volpath integrator (see the reference render below). A cached reference EXR is reused; delete it
+after changing the integrator or the scene. Writes metrics like
 scripts/compare_mitsuba.py and a side-by-side image (app | Mitsuba | relative block difference).
-Differences come from the material mapping documented in mitsuba_to_usd.py, from dropped bump
-maps, and from noise.
+Differences come from the material mapping documented in mitsuba_to_usd.py (OpenPBR's
+energy-compensated rough lobes, Beckmann as GGX, solid thin glass) and from noise; see
+REFERENCES.md BITTERLI2016 and scripts/mitsuba_probes.py for bisecting a difference.
 """
 import argparse
 import json
@@ -55,7 +58,10 @@ subprocess.run(['python3', str(ROOT / 'scripts/render_showcase.py'), '--shots', 
 reference = out / f'{name}-mitsuba.exr'
 mi.set_variant('metal_ad_rgb')
 if not reference.exists():
-    scene = mi.load_file(str(args.scene), resx=width, resy=height, max_depth=max_depth, integrator='path')
+    # volpath, not path: for surfaces it is the same estimator, but Mitsuba 3.9.1's path integrator
+    # renders a mask's directly lit reflection at opacity^2 (measured with scripts/mitsuba_probes.py;
+    # volpath and the app give opacity x radiance).
+    scene = mi.load_file(str(args.scene), resx=width, resy=height, max_depth=max_depth, integrator='volpath')
     passes, per = max(1, args.mitsuba_samples // 512), min(512, args.mitsuba_samples)
     total = sum(np.array(mi.render(scene, spp=per, seed=s), dtype=np.float64) for s in range(passes)) / passes
     mi.Bitmap(total.astype(np.float32)).write(str(reference))

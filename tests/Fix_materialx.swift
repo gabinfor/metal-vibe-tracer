@@ -386,3 +386,59 @@
   print("PASS: MaterialX rotate2d/USD Transform2d, name resolution, OpenPBR defaults, image decoding, colorspaces, file checks, image sharing and XML diagnostics")
 }
 try fixMaterialXChecks()
+
+// OpenPBR specular_color: a constant colour compiles to MaterialXProgram.specularColor (connected ones
+// are rejected), reaches the GPU per slot (slot_specular_color), and tints a metal's 82-degree Fresnel:
+// at grazing incidence the tinted metal reflects less, at normal incidence alike.
+@MainActor func fixSpecularColorChecks() throws {
+  let folder = testOutputDirectory.appendingPathComponent("specular-color", isDirectory: true)
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  let tinted = try MaterialXImporter.read(Data("""
+    <materialx version="1.39"><open_pbr_surface name="Tint" type="surfaceshader">
+      <input name="base_metalness" type="float" value="1"/><input name="specular_color" type="color3" value="0.4, 0.5, 0.6"/>
+    </open_pbr_surface></materialx>
+    """.utf8), baseURL: folder, source: "Tint.mtlx")
+  require(tinted.materials.first?.specularColor == SIMD3(0.4, 0.5, 0.6), "constant specular_color compiles (\(tinted.report))")
+  let connected = try MaterialXImporter.read(Data("""
+    <materialx version="1.39"><constant name="c" type="color3"><input name="value" type="color3" value="0.5, 0.5, 0.5"/></constant>
+    <open_pbr_surface name="Linked" type="surfaceshader"><input name="specular_color" type="color3" nodename="c"/></open_pbr_surface></materialx>
+    """.utf8), baseURL: folder, source: "Linked.mtlx")
+  require(connected.materials.isEmpty && connected.report.contains { $0.contains("specular_color must be a constant") },
+    "connected specular_color is rejected: \(connected.report)")
+  var state = SceneState()
+  state.materialX = [8: tinted.materials[0]]
+  let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+  try l.restore(state)
+  let kernel = """
+    kernel void tint_probe(constant MaterialResources &images [[buffer(2)]], device float4 *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        if (id != 0) return;
+        out[0] = float4(slot_specular_color(8u, images), slot_specular_color(9u, images).x);
+        Material m = {}; m.type = OPENPBR; m.usesMaterialX = 1u; m.albedo = float3(0.9f); m.roughness = 0.3f; m.metalness = 1.0f;
+        m.ior = 1.5f; m.specularWeight = 1.0f; m.baseWeight = 1.0f; m.slot = 8u;
+        float3 n = float3(0, 0, 1);
+        for (uint k = 0; k < 2; ++k) {
+            float3 wo = k == 0 ? normalize(float3(0.98f, 0, 0.2f)) : float3(0, 0, 1), wi = float3(-wo.x, -wo.y, wo.z);
+            m.specularColor = float3(1.0f);
+            float3 white = openpbr_get_sum_of_diffuse_specular(openpbr_eval(prepare_openpbr(m, n, wo), wi));
+            m.specularColor = float3(0.4f, 0.5f, 0.6f);
+            float3 tint = openpbr_get_sum_of_diffuse_specular(openpbr_eval(prepare_openpbr(m, n, wo), wi));
+            out[1 + k] = float4(tint / max(white, float3(1e-9f)), 0);
+        }
+    }
+    """
+  let library = try gpu.makeLibrary(source: metalSource + kernel, options: shaderCompileOptions())
+  let pipeline = try gpu.makeComputePipelineState(function: library.makeFunction(name: "tint_probe")!)
+  let out = gpu.makeBuffer(length: 48, options: .storageModeShared)!
+  let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+  encoder.setComputePipelineState(pipeline)
+  require(l.bind(encoder), "tint probe binds material resources")
+  encoder.setBuffer(out, offset: 0, index: 3)
+  encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+  encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+  let v = out.contents().bindMemory(to: SIMD4<Float>.self, capacity: 3)
+  require(v[0] == SIMD4(0.4, 0.5, 0.6, 1), "the slot's specular_color reaches the GPU, other slots are white (\(v[0]))")
+  require(v[1].x < 0.95 && v[1].x < v[1].y && v[1].y < v[1].z && abs(v[2].x - 1) < 0.02 && abs(v[2].z - 1) < 0.02,
+    "the edge tint lowers grazing metal reflection per channel and leaves normal incidence (grazing \(v[1]), normal \(v[2]))")
+  print("PASS: OpenPBR specular_color compiles, reaches the GPU per slot and tints the metal edge")
+}
+try fixSpecularColorChecks()

@@ -46,6 +46,9 @@ struct MaterialXProgram: Codable {
   // renderer keeps a hit with that probability (stochastic transparency; docs/SCENE_STORAGE_DESIGN.md,
   // phase 4), so 0 is cut out and partial coverage is unbiased.
   var opacity: Int32?
+  // Constant OpenPBR specular_color (a metal's 82-degree edge tint, a dielectric's specular tint),
+  // or nil for white. Constant only: the renderer stores it per slot (MaterialLibrary.slotParameters).
+  var specularColor: SIMD3<Float>?
   static let noSpectral = SIMD4<Float>(0, 0, 0.5, 1.4)
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
@@ -717,7 +720,6 @@ private final class MXCompiler {
       ("specular_weight", SIMD4(repeating: 1)), ("base_weight", SIMD4(repeating: 1)),
     ]
     let defaults: [String: SIMD4<Float>] = [
-      "specular_color": SIMD4(repeating: 1),
       "transmission_color": SIMD4(repeating: 1), "transmission_depth": .zero,
       "transmission_scatter": .zero, "transmission_scatter_anisotropy": .zero,
       "transmission_dispersion_scale": .zero,
@@ -747,7 +749,8 @@ private final class MXCompiler {
       spectralValues[name] = v
     }
     for i in shader.children
-    where i.category == "input" && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity"].contains(i.name)
+    where i.category == "input"
+      && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity", "specular_color"].contains(i.name)
       && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
     {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
@@ -811,10 +814,21 @@ private final class MXCompiler {
         opacityRoot = try value(input, default: SIMD4(repeating: 1), label: shader.name + "/geometry_opacity")
       }
     }
+    // specular_color: a constant colour (the renderer stores one per slot); white is the default.
+    var specularColor: SIMD3<Float>?
+    if let input = shader.input("specular_color") {
+      guard input.attributes["type"] == "color3", !linked(input) else {
+        try fail("specular_color must be a constant color3; connected specular colours are not supported.")
+      }
+      let c = try numbers(input, fallback: SIMD4(repeating: 1))
+      guard (0..<3).allSatisfy({ c[$0].isFinite && c[$0] >= 0 && c[$0] <= 1 }) else { try fail("specular_color must be within 0-1.") }
+      if (0..<3).contains(where: { abs(c[$0] - 1) > 1e-6 }) { specularColor = SIMD3(c.x, c.y, c.z) }
+    }
     var program = MaterialXProgram(
       name: shader.name, source: source, instructions: nodes, roots: roots, images: images,
       parameters: parameters, diffuseRoughness: diffuseRoot, emission: emissionRoot)
     program.opacity = opacityRoot
+    program.specularColor = specularColor
     let scale = spectralValues["transmission_dispersion_scale"] ?? 0
     let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
     let spectral = SIMD4<Float>(

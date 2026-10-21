@@ -107,7 +107,7 @@
         float4 p = positions.read(gid);
         if (pt_length(r) == 0u || !(p.w > 0.0f) || !(pt_luminance(r.F) > 0.0f)) return;
         float cone = pt_primary_cone(u);
-        HitRecord y = load_primary_surface(surfaces[i], p);
+        HitRecord y = load_primary_surface(surfaces[i], p, images);
         float3 view = float3(surfaces[i].view);
         float threshold = pt_footprint_threshold(p.w, y.geometricNormal, view);
         PTShift s = pt_shift(r, y, view, threshold, cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
@@ -118,7 +118,7 @@
         float4 qp = positions.read(uint2(q));
         if (!pt_pair_compatible(p, normals.read(gid), qp, normals.read(uint2(q)))) return;
         uint qi = uint(q.y) * u.width + uint(q.x);
-        HitRecord z = load_primary_surface(surfaces[qi], qp);
+        HitRecord z = load_primary_surface(surfaces[qi], qp, images);
         float3 zView = float3(surfaces[qi].view);
         PTShift forward = pt_shift(r, z, zView, pt_footprint_threshold(qp.w, z.geometricNormal, zView), cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
         if (!(pt_luminance(forward.FJ) > 0.0f)) { trip[i] = float4(0, 0, 0, float(pt_rc_index(r))); return; }
