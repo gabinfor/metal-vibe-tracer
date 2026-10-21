@@ -2036,7 +2036,7 @@ final class StudioController: NSViewController {
       guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
       var document = document  // The build runs on projectIOQueue with its own copy.
       // Memory-mapped and streamed: files of several GB parse without a text copy.
-      let objData = try self.readBounded(url, maximum: 8 << 30)
+      let objData = try self.readBounded(url, maximum: 1 << 40)
       var skipped = 0
       var report: [String] = []
       let root = try document.appendOBJ(objData, name: url.lastPathComponent, folder: url.deletingLastPathComponent(),

@@ -144,6 +144,19 @@ Bitterli's Mitsuba 3 scenes (`BITTERLI2016` in REFERENCES.md) go through `script
 - Mitsuba comparison unchanged: radiance must match the current results (Cornell within 0.02%).
 - Large-scene tests: Crytek Sponza (262 k triangles) and San Miguel (10 M). Record memory, build time and frame time in `tests/PERFORMANCE.md`.
 
+### Scaling to larger Macs — 2026-10-21
+
+The app was developed on a 16 GB, 10-core M4; on larger Macs nothing fixed should bind before the hardware does.
+
+- **Memory:** the budgets already scale with `recommendedMaxWorkingSetSize` (a quarter each for meshes and textures, 70% for render frames). The static caps no longer bind first: stored triangles rise from 16 M to 2^30 and rendered triangles from 64 M to 2^31 − 1, both addressing bounds (32-bit offsets and IDs). Texture downscaling (`METALTEXTURES`) applies only when the budget is exceeded, so larger Macs show full-resolution images.
+- **Project entries:** a single entry was capped at 256 MiB, so one mesh asset above about 6 M triangles saved but could not be reopened (measured: a 9,005,768-triangle mesh, 274 MiB payload, 369 MiB project, "an asset key or size is out of range"). Entries are now bounded by the largest mesh payload, and the same project reopens.
+- **Viewport:** the view follows the display's refresh rate (120 Hz on ProMotion) instead of a fixed 60, and `PathTracerRenderer.samplesPerFrame` encodes as many samples per frame (`renderFrame(samples:)`) as fit in 80% of a display interval at the measured GPU busy time per sample (the union of command-buffer intervals, since consecutive buffers overlap; decaying over about 16 frames). One sample per frame while the view changes or MetalFX runs. Batched samples accumulate bit-identically to separate frames (`tests/Fix_scaling.swift`).
+- **Export:** two command buffers stay in flight, each holding about 100 ms of samples, so the GPU does not wait for the main thread between samples, and the display passes run once per batch instead of once per sample.
+
+Measured on the 16 GB M4 with `scripts/measure_throughput.py` (raw 1920×1080 export of 32 samples; viewport samples per second at 60 Hz on a 1280×800 drawable): every case is GPU-bound here, so throughput is unchanged within run-to-run noise (about ±15%). Before → after: pavilion, ReSTIR 3.1 → 2.8 export samples/s, 25 → 29 viewport samples/s at 640×400; Cornell, Standard MIS 11.8 → 10.2 and 60 → 60; Sponza 0.8 → 0.7 and 7 → 7; Bistro exterior 0.2 → 0.2. Even 320×200 Cornell frames take 10–16 ms of GPU time (latency-bound paths, not pixel-bound), so this GPU has no idle time for batching to fill; on a 48×32 view (0.36 ms per sample) the batch size reaches 64. The gains apply where a GPU finishes a frame faster than the display or the export loop asks for one, which is the larger-Mac case and cannot be measured on this machine.
+
+Not addressed: scenes with any alpha-cutout material force every triangle non-opaque in hardware traversal (`mesh_closest`/`mesh_occluded`), which likely explains Sponza's and Bistro's cost; per-geometry opacity would keep opaque triangles on the fast path.
+
 ## Not adopted, and why
 
 - **Quantized positions, DGF and meshlet decode at traversal:** crack risk, hardware support Metal lacks, or complexity for about 3 B per triangle of extra saving.

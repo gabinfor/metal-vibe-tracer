@@ -11,14 +11,18 @@ enum SceneLimits {
   static let storedMaterials = 64
   // Object IDs of imported nodes start at `materials` and are 32-bit.
   static let nodes = 65_535
-  // Stored (unique) mesh triangles: document assets and the graph-less mesh. Memory is
-  // governed by MaterialLibrary.meshBudget, which binds first on small GPUs.
-  static let triangles = 16_000_000
+  // Stored (unique) mesh triangles: document assets and the graph-less mesh. This is an
+  // addressing bound (global vertex and face offsets are 32-bit); what a Mac can render is
+  // decided by MaterialLibrary.meshBudget, which scales with its GPU memory (about 16 M
+  // triangles on a 16 GB M4, many times that on larger Macs).
+  static let triangles = 1 << 30
   // The flat reference BVH (128-byte world triangles) and project formats 1-3, which predate
   // the indexed geometry, hold at most this many.
   static let flatTriangles = 1_000_000
-  // Rendered triangles: instances of the stored ones (two-level acceleration only).
-  static let renderedTriangles = 64_000_000
+  // Rendered triangles: instances of the stored ones (two-level acceleration only). Rendered
+  // IDs are 32-bit (HitRecord.triangle, 0xffffffff for analytic hits); instances cost 144 bytes
+  // each, so this is an addressing bound, not a memory one.
+  static let renderedTriangles = Int(Int32.max)
 }
 struct MeshAsset: Codable {
   var id = UUID()

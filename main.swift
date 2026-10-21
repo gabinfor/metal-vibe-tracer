@@ -8159,6 +8159,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var onPausedChange: (() -> Void)?
     var renderElapsed: TimeInterval = 0
     var gpuMilliseconds: Double = 0
+    // GPU busy time per sample over the recent frames (samplesPerFrame). Consecutive command buffers
+    // overlap on the GPU, so each frame adds only the part of its [gpuStartTime, gpuEndTime]
+    // after the previous frame's end; the busy time and samples decay by half every 16 frames.
+    var gpuMillisecondsPerSample: Double { recentSamples > 0 ? recentBusyMilliseconds / recentSamples : 0 }
+    private var recentBusyMilliseconds = 0.0, recentSamples = 0.0, lastGPUEnd: CFTimeInterval = 0
     var framesPerSecond: Double = 0
     var completedSamples: UInt32 = 0
     // Awake seconds (awakeSeconds): the render time limit does not count system sleep.
@@ -8721,9 +8726,28 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // the main thread while in-flight frames hold every drawable.
         guard inFlightFrames.wait(timeout: .now()) == .success else { return }
         guard let drawable=view.currentDrawable else { inFlightFrames.signal(); return }
-        renderFrame(output:drawable.texture,drawable:drawable,reservedFrameSlot:true)
+        // Follow the display's refresh rate (120 Hz on ProMotion screens), not a fixed 60.
+        if let fps = view.window?.screen?.maximumFramesPerSecond, fps > 0, view.preferredFramesPerSecond != fps {
+            view.preferredFramesPerSecond = fps
+        }
+        // About 80% of a display interval per frame keeps the view responsive.
+        let interval = 1 / Double(max(1, view.preferredFramesPerSecond))
+        let remaining = options.maxSamples > 0 ? Int(options.maxSamples) - Int(frameIndex) : Int.max
+        renderFrame(output:drawable.texture,drawable:drawable,reservedFrameSlot:true,
+                    samples:samplesPerFrame(targetMilliseconds: interval * 800, limit: remaining))
     }
-    func renderFrame(output: MTLTexture, drawable: CAMetalDrawable? = nil, reservedFrameSlot: Bool = false) {
+    // Samples to encode in one frame (renderFrame `samples`): as many as fit in `targetMilliseconds`
+    // of GPU time at the measured time per sample, so a GPU faster than the display or the export
+    // loop accumulates more per command buffer instead of idling; at most `limit` and 64. One while
+    // accumulation restarts (the view changes, and the first frames measure) and while MetalFX
+    // runs, whose temporal history takes one jittered sample per frame (encodePresentation).
+    func samplesPerFrame(targetMilliseconds: Double, limit: Int) -> Int {
+        let metalFX = denoiserEnabled && supportsMetalFX && samplingMode == 0 && viewportMode == 0
+        guard frameIndex >= 4, gpuMillisecondsPerSample > 0, !metalFX else { return 1 }
+        return max(1, min(Int(targetMilliseconds / gpuMillisecondsPerSample), limit, 64))
+    }
+    // Encodes `samples` samples into one command buffer and presents once, after the last.
+    func renderFrame(output: MTLTexture, drawable: CAMetalDrawable? = nil, reservedFrameSlot: Bool = false, samples: Int = 1) {
         guard reservedFrameSlot || inFlightFrames.wait(timeout: .now()) == .success else { return }
         var committed = false
         defer { if !committed { inFlightFrames.signal() } }
@@ -8735,8 +8759,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             return
         }
         rejectedRenderSize = nil
+        let samples = max(1, samples)
         // Float32 running means lose unit sample precision after 2^24 samples.
-        if frameIndex >= 16_777_215 { resetAccumulation() }
+        if frameIndex + UInt32(min(samples, 65536)) > 16_777_215 { resetAccumulation() }
         // Light transport of this frame; accumulation restarts when it changes (spectral pipelines
         // becoming ready, or a failure falling back to RGB).
         let spectral = activeLightTransport == .spectral && prepareSpectralShaders()
@@ -8887,6 +8912,58 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        guard let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
+        var encoded: (frame: UInt32, spectralWeights: [Float]?)?
+        for sample in 0..<samples {
+            guard let result = encodeSample(cmdBuffer, output: output, w: w, h: h, needsReSTIR: needsReSTIR,
+                                            indirectReuse: indirectReuse, usesPT: usesPT, present: sample == samples - 1) else {
+                // Earlier samples of this batch already advanced the accumulation state.
+                if sample > 0 { resetAccumulation() }
+                return
+            }
+            encoded = result
+        }
+        guard let (nextFrame, spectralWeights) = encoded else { return }
+        let submittedGeneration = generation
+        let semaphore = inFlightFrames
+        cmdBuffer.addCompletedHandler { [weak self] completedBuffer in
+            semaphore.signal()
+            let errorMessage = completedBuffer.error?.localizedDescription
+            let succeeded = completedBuffer.status == .completed
+            let gpuStart = completedBuffer.gpuStartTime, gpuEnd = completedBuffer.gpuEndTime
+            let gpuMilliseconds = (gpuEnd - gpuStart) * 1000
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if succeeded {
+                    guard self.generation == submittedGeneration else { return }
+                    self.completedSamples=nextFrame
+                    self.gpuMilliseconds=gpuMilliseconds
+                    let busy = max(0, gpuEnd - max(gpuStart, self.lastGPUEnd)) * 1000
+                    self.lastGPUEnd = max(self.lastGPUEnd, gpuEnd)
+                    let decay = pow(0.5, 1.0 / 16)
+                    self.recentBusyMilliseconds = self.recentBusyMilliseconds * decay + busy
+                    self.recentSamples = self.recentSamples * decay + Double(samples)
+                    let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)
+                    self.framesPerSecond=interval>0 ? 1/interval : 0; self.lastCompletion=now
+                    self.onFrameUpdate?(nextFrame)
+                } else {
+                    self.resetAccumulation()
+                    self.onError?(errorMessage ?? "Metal could not render this frame.")
+                }
+            }
+        }
+        if let drawable { cmdBuffer.present(drawable) }
+        if let spectralWeights { spectralSamplingWeights = spectralWeights }
+        cmdBuffer.commit()
+        committed = true
+    }
+
+    // One sample (passes 1-2 and the reuse passes; the display passes when `present`), encoded into
+    // `cmdBuffer`. It advances the accumulation and history state as the GPU will once the buffer
+    // runs, so a frame may encode several samples back to back (renderFrame `samples`).
+    private func encodeSample(_ cmdBuffer: MTLCommandBuffer, output: MTLTexture, w: Int, h: Int, needsReSTIR: Bool,
+                              indirectReuse: IndirectReuse, usesPT: Bool, present: Bool)
+        -> (frame: UInt32, spectralWeights: [Float]?)? {
         guard let accum = accumTexture, let samples = sampleTexture,
               let gPos = gbufferPosDepth,
               let gNorm = gbufferNormalMat,
@@ -8900,8 +8977,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
               let giRadB = giRadianceB, let giWeightB = giWeightsB,
               let ptOut = ptIndirect, let duplication = ptDuplication,
               let oidnAlbedo = oidnAlbedoAccum, let oidnNormal = oidnNormalAccum,
-              let surfaces = primarySurfaceBuffer(width: w, height: h), let placeholder = splatPlaceholder,
-              let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
+              let surfaces = primarySurfaceBuffer(width: w, height: h), let placeholder = splatPlaceholder else { return nil }
 
         let nextFrame = frameIndex + 1
         let nextSample = sampleIndex == UInt32.max ? 1 : sampleIndex + 1
@@ -8963,7 +9039,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var spectralWords = [UInt32]()
         var spectralWeights: [Float]?
         if spectralFrame {
-            guard let weights = encodeSpectralSampling(cmdBuffer) else { return }
+            guard let weights = encodeSpectralSampling(cmdBuffer) else { return nil }
             spectralWeights = weights
             spectralWords = spectralSceneWords()
         }
@@ -8980,7 +9056,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Splat state: this frame's pool starts empty (so a frame that does not splat leaves the next
         // one no deep domains); a splat frame also clears the activation masks and splat sources.
         if let (current, _) = splatState, let mask = splatMask, let sources = splatSources {
-            guard let blit = cmdBuffer.makeBlitCommandEncoder() else { return }
+            guard let blit = cmdBuffer.makeBlitCommandEncoder() else { return nil }
             blit.label = "Splat: clear"
             blit.fill(buffer: current.counters, range: 0..<8, value: 0)
             if splatFrame {
@@ -9002,7 +9078,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 
         // PASS 1: G-Buffer & ReSTIR Temporal Reuse
-        guard let enc1 = cmdBuffer.makeComputeCommandEncoder() else { return }
+        guard let enc1 = cmdBuffer.makeComputeCommandEncoder() else { return nil }
         do {
             enc1.label = "Pass 1: G-Buffer & ReSTIR Temporal"
             enc1.setComputePipelineState(sceneKernels.temporal)
@@ -9028,7 +9104,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             guard materials.bind(enc1) else {
                 enc1.endEncoding()
                 onError?("Could not update material bindings.")
-                return
+                return nil
             }
             enc1.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             enc1.setBuffer(surfaces, offset: 0, index: 3)
@@ -9051,7 +9127,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             passes.append(("Splat: reservoir splats", kernels.reservoirs, pixels + slots))
             if usesDIReservoirs { passes.append(("Splat: DI/GI temporal reuse", kernels.temporal, pixels + slots)) }
             for (label, pipeline, count) in passes {
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return }
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
                 let textures: [MTLTexture] = [gPos, gNorm, hPos, hNorm, duplication, rPosA, rEmitA, rWeightA, rPosB, rEmitB, rWeightB,
@@ -9060,7 +9136,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 guard materials.bind(encoder) else {
                     encoder.endEncoding()
                     onError?("Could not update material bindings.")
-                    return
+                    return nil
                 }
                 encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
                 for (index, buffer) in [surfaces, historyPrimarySurfaces, ptReservoirs, ptHistory].enumerated() {
@@ -9117,7 +9193,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         if usesPT {
             guard let current = ptReservoirs, let history = ptHistory, let shifts = ptShifts,
                   let historySurfaces = historyPrimarySurfaces, let pairing = ptPairing, let controls = ptControls,
-                  let kernels = sceneKernels.pt else { return }
+                  let kernels = sceneKernels.pt else { return nil }
             // A nil pipeline is the reuse-cell pass of stochastic pairwise MIS (encodeSPMISCells).
             var passes: [(String, MTLComputePipelineState?, Bool)] = [("ReSTIR PT: initial paths", kernels.initial, true)]
             // Temporal reuse only while the view changes (MSL restir_pt_temporal); by splatting on splat frames.
@@ -9141,10 +9217,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             if ptDecorrelation { passes.append(("ReSTIR PT: duplication map", kernels.duplication, false)) }
             for (label, step, bindsMaterials) in passes {
                 guard let pipeline = step else {
-                    guard encodeSPMISCells(ptReservoirs: current) else { return }
+                    guard encodeSPMISCells(ptReservoirs: current) else { return nil }
                     continue
                 }
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return }
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
                 for (index, texture) in [gPos, gNorm, hPos, hNorm, duplication, ptOut].enumerated() { encoder.setTexture(texture, index: index) }
@@ -9152,7 +9228,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     guard materials.bind(encoder) else {
                         encoder.endEncoding()
                         onError?("Could not update material bindings.")
-                        return
+                        return nil
                     }
                 }
                 encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -9177,10 +9253,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 
         // ReSTIR GI: the reuse cells of the DI and GI reservoirs.
-        if !usesPT && needsReSTIR { guard encodeSPMISCells(ptReservoirs: nil) else { return } }
+        if !usesPT && needsReSTIR { guard encodeSPMISCells(ptReservoirs: nil) else { return nil } }
 
         // PASS 2: Spatial Resampling & Full Path Tracing
-        guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return }
+        guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return nil }
         do {
             enc2.label = "Pass 2: Spatial Resampling & Shading"
             enc2.setComputePipelineState(sceneKernels.shading)
@@ -9202,7 +9278,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             guard materials.bind(enc2) else {
                 enc2.endEncoding()
                 onError?("Could not update material bindings.")
-                return
+                return nil
             }
             enc2.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             enc2.setBuffer(surfaces, offset: 0, index: 3)
@@ -9214,9 +9290,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc2.endEncoding()
         }
 
-        guard encodePresentation(commandBuffer: cmdBuffer, accumulation: accum, samples: samples,
-            positions: gPos, normals: gNorm, materials: gAlb, output: output,
-            uniforms: uniforms) != nil else { return }
+        if present {
+            guard encodePresentation(commandBuffer: cmdBuffer, accumulation: accum, samples: samples,
+                positions: gPos, normals: gNorm, materials: gAlb, output: output,
+                uniforms: uniforms) != nil else { return nil }
+        }
 
         let tmpPos = resPosDirA; resPosDirA = resPosDirB; resPosDirB = tmpPos
         let tmpEmit = resEmitPdfA; resEmitPdfA = resEmitPdfB; resEmitPdfB = tmpEmit
@@ -9238,32 +9316,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // frameIndex, so frames still in flight across a switch are not misattributed.
         if viewportMode > 0 { debugFrames &+= 1 }
         reservoirHistoryNeedsReset = false
-        let submittedGeneration = generation
-        let semaphore = inFlightFrames
-        cmdBuffer.addCompletedHandler { [weak self] completedBuffer in
-            semaphore.signal()
-            let errorMessage = completedBuffer.error?.localizedDescription
-            let succeeded = completedBuffer.status == .completed
-            let gpuMilliseconds = (completedBuffer.gpuEndTime - completedBuffer.gpuStartTime) * 1000
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if succeeded {
-                    guard self.generation == submittedGeneration else { return }
-                    self.completedSamples=nextFrame
-                    self.gpuMilliseconds=gpuMilliseconds
-                    let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)
-                    self.framesPerSecond=interval>0 ? 1/interval : 0; self.lastCompletion=now
-                    self.onFrameUpdate?(nextFrame)
-                } else {
-                    self.resetAccumulation()
-                    self.onError?(errorMessage ?? "Metal could not render this frame.")
-                }
-            }
-        }
-        if let drawable { cmdBuffer.present(drawable) }
-        if let spectralWeights { spectralSamplingWeights = spectralWeights }
-        cmdBuffer.commit()
-        committed = true
+        return (nextFrame, spectralWeights)
     }
 }
 

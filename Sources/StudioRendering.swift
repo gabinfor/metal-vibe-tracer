@@ -162,6 +162,14 @@ extension StudioController {
         self?.showError("Export failed: \(message)")
       }
       let start = Date()
+      // Two command buffers stay in flight, so the GPU runs the next batch while the main thread
+      // handles the last one; each batch holds about 100 ms of samples (samplesPerFrame).
+      func submit() {
+        guard exportRenderer === r, let out = exportOutput else { return }
+        let remaining = Int(r.options.exportSamples) - Int(r.frameIndex)
+        guard remaining > 0 else { return }
+        r.renderFrame(output: out, samples: r.samplesPerFrame(targetMilliseconds: 100, limit: remaining))
+      }
       r.onFrameUpdate = { [weak self, weak r] count in
         guard let self, let r, self.exportRenderer === r else { return }
         self.status.stringValue =
@@ -169,17 +177,13 @@ extension StudioController {
         if count >= r.options.exportSamples {
           self.finishExport()
         } else {
-          DispatchQueue.main.async { [weak self, weak r] in
-            guard let self, let r, self.exportRenderer === r, let out = self.exportOutput else {
-              return
-            }
-            r.renderFrame(output: out)
-          }
+          submit()
         }
       }
       rebuild()
       show("Rendering \(out.width)×\(out.height) export…")
-      r.renderFrame(output: out)
+      submit()
+      submit()
     } catch { showError("Export failed: \(error.localizedDescription)") }
   }
   func cancelExport() {

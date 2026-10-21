@@ -28,18 +28,23 @@ enum ProjectAssets {
   static let sidecarFolderName = "AutosaveAssets"
   static let referencePrefix = "sha256:"
   static let triangleBytes = MemoryLayout<MeshTriangle>.stride
-  // Bounds checked before any payload is decoded, read or uploaded. An entry holds at most
-  // the environment (256 MiB); images count against ProjectDocument.embeddedAssetLimit and
-  // meshes against the stored (graph) and legacy flat triangle limits.
-  static let maximumEntryBytes = 256 * 1024 * 1024
+  // Bounds checked before any payload is decoded, read or uploaded. An entry holds at most the
+  // largest single payload: the environment (256 MiB) or one mesh asset of the stored-triangle
+  // limit (header and 112 bytes per face). Images count against ProjectDocument.embeddedAssetLimit
+  // and meshes against the stored (graph) and legacy flat triangle limits; validate() checks each
+  // kind's own size, so Save never writes an entry Open rejects.
+  static let maximumEntryBytes = max(256 * 1024 * 1024, 16 + SceneLimits.triangles * 112)
   // Formats 1-3: flat and graph triangles of 128 bytes; format 4 graph meshes at most 112 bytes
   // per face (three unshared vertices and the face).
   static let maximumMeshBytes = 2 * SceneLimits.flatTriangles * triangleBytes + SceneLimits.triangles * 112
   static let maximumTableBytes = ProjectDocument.embeddedAssetLimit + maximumMeshBytes
-  // Seven scenes of maps and MaterialX images, the environment, the flat mesh and at most
-  // one entry per stored triangle for mesh assets.
+  // Seven scenes of maps and MaterialX images, the environment, the flat mesh and the mesh
+  // assets. Mesh entries keep the former bound of one per stored triangle at 16 M triangles: it
+  // no longer follows SceneLimits.triangles (an addressing bound since 2026-10-21), and real
+  // documents hold one asset per object.
+  static let maximumMeshEntries = 16_000_000
   static let maximumEntries =
-    7 * SceneLimits.materials * (4 + SceneLimits.graphImages) + 2 + SceneLimits.triangles
+    7 * SceneLimits.materials * (4 + SceneLimits.graphImages) + 2 + maximumMeshEntries
   // Unreferenced sidecars younger than this are kept, so payloads another writer stored
   // but has not referenced yet survive a collection.
   static let sidecarGracePeriod: TimeInterval = 600
