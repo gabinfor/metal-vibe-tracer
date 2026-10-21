@@ -869,8 +869,9 @@ extension MaterialLibrary {
     let oldGraphTextures = graphTextures, oldGraphInstructions = graphInstructionBuffer
     let oldGraphHeaders = graphHeaderBuffer, oldArgument = argumentBuffer
     let oldObjectBuffer = objectBuffer, oldEmissionBuffer = emissionBuffer, oldEmitterBuffer = emitterBuffer
-    let oldBindingsDirty = bindingsDirty
+    let oldBindingsDirty = bindingsDirty, oldSide = graphTextureSide
     do {
+      graphTextureSide = graph.side
       settings = state.surfaces
         + Array(repeating: SurfaceSettings(), count: SceneLimits.materials - state.surfaces.count)
       objects = state.objects
@@ -891,6 +892,7 @@ extension MaterialLibrary {
       objectBuffer = oldObjectBuffer; emissionBuffer = oldEmissionBuffer; emitterBuffer = oldEmitterBuffer
       // Pending object or emission edits were never uploaded; keep them pending.
       bindingsDirty = oldBindingsDirty
+      graphTextureSide = oldSide
       throw error
     }
   }
@@ -904,7 +906,24 @@ extension MaterialLibrary {
   // files as R/RG, so those become swizzled views (RRR1, RRRG). sRGB cases the formats
   // cannot express (16-bit data; RG8 sRGB, which would also decode alpha) are expanded
   // to RGBA on the CPU.
-  func decodeTexture(_ data: Data, srgb: Bool) throws -> MTLTexture {
+  func decodeTexture(_ data: Data, srgb: Bool, maximumSide: Int? = nil) throws -> MTLTexture {
+    // Budget downscaling (materialXCandidate): an ImageIO thumbnail at most `maximumSide` texels
+    // long, passed on as uncompressed TIFF so every format path below still applies.
+    if let side = maximumSide, let header = Self.imageHeader(data), max(header.width, header.height) > side {
+      let output = NSMutableData()
+      guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+        let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+          kCGImageSourceThumbnailMaxPixelSize: side, kCGImageSourceCreateThumbnailFromImageAlways: true,
+          kCGImageSourceCreateThumbnailWithTransform: false,
+        ] as CFDictionary),
+        let destination = CGImageDestinationCreateWithData(output, "public.tiff" as CFString, 1, nil)
+      else { throw Self.error("Could not downscale a texture.") }
+      CGImageDestinationAddImage(destination, image, [
+        kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFCompression: 1]
+      ] as CFDictionary)
+      guard CGImageDestinationFinalize(destination) else { throw Self.error("Could not downscale a texture.") }
+      return try decodeTexture(output as Data, srgb: srgb)
+    }
     let options: [MTKTextureLoader.Option: Any] = [
       .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
       .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),

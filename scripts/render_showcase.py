@@ -133,6 +133,13 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
   p.options.exportSamples = shot.samples ?? 1024
   if let v = shot.depth { p.options.depth = v }
   try controller.restore(p)
+  if let side = testRenderer.materials.graphTextureSide {
+    let materials = testRenderer.materials
+    let sizes = Dictionary(grouping: materials.graphTextures, by: { max($0.width, $0.height) }).mapValues(\.count).sorted { $0.key > $1.key }
+    print("\(shot.name): large textures decoded at reduced size (down to \(side) px) for the GPU texture budget; "
+      + "\(materials.uniqueTextureBytes(materials.graphTextures) >> 20) MiB of \(materials.textureBudget >> 20) MiB; longer sides "
+      + sizes.map { "\($0.key) x\($0.value)" }.joined(separator: ", "))
+  }
   let raw = shot.raw ?? false
   controller.exportDenoise = !raw
   controller.exportRaw = raw

@@ -1361,6 +1361,9 @@ final class StudioController: NSViewController {
     if let resources {
       r.materials = resources
       resources.external = MaterialLibrary.ResidentTextures()
+      if let side = resources.graphTextureSide {
+        show("Large textures are shown at reduced resolution (down to \(side) px) to fit GPU memory; the project keeps the full-size images.")
+      }
     }
     project = p
     r.sceneIndex = p.scene

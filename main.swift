@@ -7264,6 +7264,9 @@ final class MaterialLibrary {
     var materialX: [Int:MaterialXProgram] = [:] { didSet { emittersDirty = true } }
     var graphInstructionBuffer: MTLBuffer!, graphHeaderBuffer: MTLBuffer!
     var graphTextures: [MTLTexture] = []
+    // The smallest side a graph image was decoded at to fit `textureBudget` (materialXCandidate),
+    // or nil when every image is at full size. The embedded images themselves are never changed.
+    var graphTextureSide: Int?
     private var emittersDirty = true
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
@@ -7399,10 +7402,35 @@ final class MaterialLibrary {
         }
     }
 
-    // `pending` holds candidates decoded earlier in the same batch.
+    // Conservative decoded size with a complete mip chain. MTKTextureLoader yields at most RGBA8
+    // (5.33 B/pixel with mips) for 8-bit files and RGBA16 (10.75 B/pixel measured for half-float
+    // EXR) up to 16 bits; 32-bit float EXR/TIFF yields RGBA32F (21.5 B/pixel measured).
+    static func estimatedTextureBytes(pixels: UInt64, depth: Int) -> (partialValue: UInt64, overflow: Bool) {
+        pixels.multipliedReportingOverflow(by: depth > 16 ? 22 : depth > 8 ? 11 : 6)
+    }
+    // Width, height and bits per channel from an encoded image's header (no decoding).
+    static func imageHeader(_ data: Data) -> (width: Int, height: Int, depth: Int)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else { return nil }
+        let isFloat = properties[kCGImagePropertyIsFloat] as? Bool ?? false
+        return (width, height, properties[kCGImagePropertyDepth] as? Int ?? (isFloat ? 32 : 8))
+    }
+    // An image's size once its longer side is at most `side` (ImageIO thumbnails keep the aspect).
+    static func cappedSize(_ width: Int, _ height: Int, side: Int?) -> (width: Int, height: Int) {
+        guard let side, max(width, height) > side else { return (width, height) }
+        let scale = Double(side) / Double(max(width, height))
+        return (max(1, Int((Double(width) * scale).rounded())), max(1, Int((Double(height) * scale).rounded())))
+    }
+
+    // `pending` holds candidates decoded earlier in the same batch; `maximumSide` is the side the
+    // image will be decoded at (decodeTexture), which the budget estimate uses.
     func validateEncodedImage(_ data: Data, maximumWidth: Int = 16384,
                               maximumHeight: Int = 16384,
                               maximumPixels: UInt64 = 67_108_864,
+                              maximumSide: Int? = nil,
                               pending: [MTLTexture] = []) throws {
         guard data.count <= 128 * 1024 * 1024 else {
             throw Self.error("Texture file exceeds the 128 MiB import limit.")
@@ -7419,13 +7447,10 @@ final class MaterialLibrary {
               pixels.partialValue <= maximumPixels else {
             throw Self.error("Decoded texture exceeds the supported dimensions or pixel count.")
         }
-        // Conservative predecode estimates with a complete mip chain. Up to 16
-        // bits per channel MTKTextureLoader yields at most RGBA16 (10.75 B/pixel
-        // measured for half-float EXR); 32-bit float EXR/TIFF yields RGBA32F
-        // (21.5 B/pixel measured).
         let isFloat = properties[kCGImagePropertyIsFloat] as? Bool ?? false
         let depth = properties[kCGImagePropertyDepth] as? Int ?? (isFloat ? 32 : 8)
-        let estimate = pixels.partialValue.multipliedReportingOverflow(by: depth > 16 ? 22 : 11)
+        let decoded = Self.cappedSize(width, height, side: maximumSide)
+        let estimate = Self.estimatedTextureBytes(pixels: UInt64(decoded.width) * UInt64(decoded.height), depth: depth)
         guard !estimate.overflow,
               uniqueTextureBytes(residentTextures + external.textures + pending) + estimate.partialValue <= textureBudget else {
             throw Self.error("Scene textures exceed the safe GPU memory budget.")

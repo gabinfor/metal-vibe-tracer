@@ -830,7 +830,8 @@ extension MaterialLibrary {
   func prepareMaterialX(_ programs: [Int: MaterialXProgram]) throws {
     let candidate = try materialXCandidate(programs, images: images)
     let old = (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX)
-    let oldArgument = argumentBuffer
+    let oldArgument = argumentBuffer, oldSide = graphTextureSide
+    graphTextureSide = candidate.side
     graphInstructionBuffer = candidate.instructions
     graphHeaderBuffer = candidate.headers
     graphTextures = candidate.textures
@@ -838,13 +839,14 @@ extension MaterialLibrary {
     do { try rebuildArguments(images) } catch {
       (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX) = old
       argumentBuffer = oldArgument
+      graphTextureSide = oldSide
       throw error
     }
   }
   // Builds graph resources without publishing them. Texture checks count
   // `candidateImages` as the map set that will be published alongside.
   func materialXCandidate(_ programs: [Int: MaterialXProgram], images candidateImages: [MTLTexture]) throws
-    -> (instructions: MTLBuffer, headers: MTLBuffer, textures: [MTLTexture])
+    -> (instructions: MTLBuffer, headers: MTLBuffer, textures: [MTLTexture], side: Int?)
   {
     var instructions: [GraphInstruction] = []
     var headers = Array(repeating: GraphHeader(), count: SceneLimits.materials)
@@ -866,6 +868,43 @@ extension MaterialLibrary {
         }
       }
     }
+    // When the decoded images would not fit `textureBudget`, the largest one is halved (its longer
+    // side capped; images of 256 texels or less are never reduced) until the estimate fits, so large textures shrink first and small
+    // ones stay exact. The estimate counts the live and replaced libraries' textures, as the peak
+    // check does; a texture is reused only at its chosen size.
+    func header(_ data: Data) -> (width: Int, height: Int, depth: Int)? { Self.imageHeader(data) }
+    var unique: [(data: Data, srgb: Bool, header: (width: Int, height: Int, depth: Int))] = []
+    var seen: [Set<Data>] = [[], []]
+    for slot in programs.keys.sorted() {
+      for image in programs[slot]?.images ?? [] where seen[image.srgb ? 1 : 0].insert(image.data).inserted {
+        if let h = header(image.data) { unique.append((image.data, image.srgb, h)) }
+      }
+    }
+    func reused(_ data: Data, _ srgb: Bool, _ h: (width: Int, height: Int, depth: Int), side: Int?) -> MTLTexture? {
+      guard let texture = reusable[srgb ? 1 : 0][data] else { return nil }
+      let size = Self.cappedSize(h.width, h.height, side: side)
+      return abs(texture.width - size.width) <= 1 && abs(texture.height - size.height) <= 1 ? texture : nil
+    }
+    func estimate(_ i: Int, _ side: Int?) -> UInt64 {
+      let h = unique[i].header
+      if reused(unique[i].data, unique[i].srgb, h, side: side) != nil { return 0 }  // counted in `fixed`
+      let size = Self.cappedSize(h.width, h.height, side: side)
+      return Self.estimatedTextureBytes(pixels: UInt64(size.width) * UInt64(size.height), depth: h.depth).partialValue
+    }
+    var sides = [Int?](repeating: nil, count: unique.count)
+    var costs = unique.indices.map { estimate($0, nil) }
+    var total = costs.reduce(uniqueTextureBytes(residentTextures + external.textures + candidateImages), &+)
+    while total > textureBudget, let i = costs.indices.max(by: { costs[$0] < costs[$1] }), costs[i] > 0 {
+      let longer = sides[i] ?? max(unique[i].header.width, unique[i].header.height)
+      guard longer > 256 else { break }
+      sides[i] = longer / 2
+      let cost = estimate(i, sides[i])
+      total = total - costs[i] + cost
+      costs[i] = cost
+    }
+    var chosen: [[Data: Int]] = [[:], [:]]
+    for (i, image) in unique.enumerated() { if let side = sides[i] { chosen[image.srgb ? 1 : 0][image.data] = side } }
+    let side = sides.compactMap { $0 }.min()
     bindings = [[:], [:]]
     for slot in programs.keys.sorted() {
       guard (0..<SceneLimits.materials).contains(slot), let program = programs[slot] else {
@@ -883,12 +922,13 @@ extension MaterialLibrary {
         }
         bindings[image.srgb ? 1 : 0][image.data] = textures.count
         imageIndices.append(textures.count)
-        if let texture = reusable[image.srgb ? 1 : 0][image.data] {
+        let imageSide = chosen[image.srgb ? 1 : 0][image.data]
+        if let h = header(image.data), let texture = reused(image.data, image.srgb, h, side: imageSide) {
           textures.append(texture)
           continue
         }
-        try validateEncodedImage(image.data, pending: candidateImages + textures)
-        let texture = try decodeTexture(image.data, srgb: image.srgb)
+        try validateEncodedImage(image.data, maximumSide: imageSide, pending: candidateImages + textures)
+        let texture = try decodeTexture(image.data, srgb: image.srgb, maximumSide: imageSide)
         try validateDecodedTexture(texture, encodedBytes: image.data.count, pending: candidateImages + textures)
         textures.append(texture)
         try validateCandidateTextures(images: candidateImages, graph: textures)
@@ -918,6 +958,6 @@ extension MaterialLibrary {
       })
     else { throw Self.error("Could not allocate MaterialX graph buffers.") }
     try validateCandidateTextures(images: candidateImages, graph: textures)
-    return (instructionBuffer, headerBuffer, textures)
+    return (instructionBuffer, headerBuffer, textures, side)
   }
 }

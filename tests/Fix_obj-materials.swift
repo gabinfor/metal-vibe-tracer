@@ -129,5 +129,36 @@
   require(report.contains { $0.contains("Missing is not defined") } && document.importReport?.first == "scene.obj:"
     && !report.contains { $0.contains("vibe-mtl-") }, "OBJ import report: \(report)")
   print("PASS: OBJ mtllib materials, MTL to OpenPBR MaterialX, bump-to-normal orientation and alpha coverage")
+
+  // Over the texture budget, the largest graph image is halved until the scene fits; small images
+  // stay exact, the embedded bytes are untouched, and an unchanged scene reuses its textures.
+  try png("big.png", 1024, 512, alpha: false) { x, y in SIMD4(UInt8(x % 256), UInt8(y % 256), 64, 255) }
+  try png("small.png", 64, 64, alpha: false) { _, _ in SIMD4(200, 100, 50, 255) }
+  let pair = try MaterialXImporter.read(Data("""
+    <materialx version="1.39">
+     <image name="big" type="color3"><input name="file" type="filename" value="big.png"/></image>
+     <image name="small" type="color3"><input name="file" type="filename" value="small.png"/></image>
+     <open_pbr_surface name="Big" type="surfaceshader"><input name="base_color" type="color3" nodename="big"/></open_pbr_surface>
+     <open_pbr_surface name="Small" type="surfaceshader"><input name="base_color" type="color3" nodename="small"/></open_pbr_surface>
+    </materialx>
+    """.utf8), baseURL: folder, source: "pair.mtlx")
+  var budgetState = SceneState()
+  budgetState.materialX = [8: pair.materials[0], 9: pair.materials[1]]
+  let limited = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+  let estimate = { (w: Int, h: Int) in MaterialLibrary.estimatedTextureBytes(pixels: UInt64(w * h), depth: 8).partialValue }
+  // Room for the big image at 512 x 256 but not at full size.
+  limited.textureBudgetOverride = limited.uniqueTextureBytes(limited.residentTextures) + estimate(512, 256) + estimate(64, 64) + 4096
+  try limited.restore(budgetState)
+  let sizes = limited.graphTextures.map { SIMD2($0.width, $0.height) }
+  require(limited.graphTextureSide == 512 && sizes.contains(SIMD2(512, 256)) && sizes.contains(SIMD2(64, 64))
+    && limited.materialX[8]?.images[0].data == pair.materials[0].images[0].data,
+    "the big image is halved to fit the budget, the small one is exact, embedded bytes unchanged (\(sizes), side \(String(describing: limited.graphTextureSide)))")
+  let first = limited.graphTextures.map { ObjectIdentifier($0 as AnyObject) }
+  try limited.restore(budgetState)
+  require(limited.graphTextures.map { ObjectIdentifier($0 as AnyObject) } == first, "an unchanged budgeted scene reuses its textures")
+  let roomy = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+  try roomy.restore(budgetState)
+  require(roomy.graphTextureSide == nil && roomy.graphTextures.contains { $0.width == 1024 }, "within the budget images keep full size")
+  print("PASS: graph images downscale, largest first, to fit the GPU texture budget")
 }
 try fixOBJMaterialChecks()
