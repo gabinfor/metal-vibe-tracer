@@ -836,7 +836,10 @@ extension MaterialLibrary {
     graphHeaderBuffer = candidate.headers
     graphTextures = candidate.textures
     materialX = programs
-    do { try rebuildArguments(images) } catch {
+    do {
+      try rebuildArguments(images)
+      try refreshInstanceOpacity()
+    } catch {
       (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX) = old
       argumentBuffer = oldArgument
       graphTextureSide = oldSide

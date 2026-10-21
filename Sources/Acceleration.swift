@@ -391,6 +391,8 @@ struct MeshSceneLayout {
   // instance's index into them, and the refits applied since its last full build.
   var sceneReferences: [MTLAccelerationStructure] = []
   var sceneIndices: [UInt32] = []
+  // Per instance, whether the instance structure marks it opaque (instanceOpacity).
+  var sceneOpaque: [Bool] = []
   var sceneRefits = 0
   // Everything the shader reaches through the hardware structures (for residency).
   var structures: [MTLResource] { (scene.map { [$0] } ?? []) + assets.compactMap(\.structure) }
@@ -1109,7 +1111,9 @@ extension MaterialLibrary {
     layout.scene = nil
     layout.sceneReferences = []
     layout.sceneIndices = []
+    layout.sceneOpaque = []
     layout.sceneRefits = 0
+    let opaque = instanceOpacity(layout)
     guard !layout.instances.isEmpty else { return }
     var compact: [Int: Int] = [:], structures: [MTLAccelerationStructure] = []
     for (i, asset) in layout.assets.enumerated() {
@@ -1118,13 +1122,13 @@ extension MaterialLibrary {
       structures.append(structure)
     }
     var descriptors: [MTLAccelerationStructureInstanceDescriptor] = [], indices: [UInt32] = []
-    for instance in layout.instances {
+    for (k, instance) in layout.instances.enumerated() {
       guard let index = compact[instance.asset] else { throw Self.error("A mesh asset has no acceleration structure.") }
       let m = instance.world
       func column(_ c: SIMD4<Float>) -> MTLPackedFloat3 { MTLPackedFloat3Make(c.x, c.y, c.z) }
       var d = MTLAccelerationStructureInstanceDescriptor()
       d.transformationMatrix = MTLPackedFloat4x3(columns: (column(m.columns.0), column(m.columns.1), column(m.columns.2), column(m.columns.3)))
-      d.options = .opaque
+      d.options = opaque[k] ? .opaque : .nonOpaque
       d.mask = 0xFF
       d.intersectionFunctionTableOffset = 0
       d.accelerationStructureIndex = UInt32(index)
@@ -1142,6 +1146,7 @@ extension MaterialLibrary {
     descriptor.instanceCount = descriptors.count
     descriptor.instanceDescriptorBuffer = buffer
     if let previous, let source = previous.scene, previous.sceneRefits < Self.sceneRefitLimit, previous.sceneIndices == indices,
+      previous.sceneOpaque == opaque,
       previous.sceneReferences.count == structures.count, zip(previous.sceneReferences, structures).allSatisfy({ $0 === $1 })
     {
       layout.scene = try refitStructure(source, descriptor: descriptor, pending: &pending)
@@ -1152,6 +1157,27 @@ extension MaterialLibrary {
     }
     layout.sceneReferences = structures
     layout.sceneIndices = indices
+    layout.sceneOpaque = opaque
+  }
+
+  // Alpha cutouts (MaterialXProgram.opacity) in hardware traversal: an instance is opaque unless
+  // one of its bound slots has a cutout, so rays treat it as the fast, opaque path and only cutout
+  // instances return candidates to mesh_closest / mesh_occluded. A graph-less mesh's faces carry
+  // their slots, so it is non-opaque whenever any slot has a cutout.
+  var cutoutSlots: Set<UInt32> {
+    Set(materialX.compactMap { slot, program in program.opacity != nil && slot >= 0 ? UInt32(slot) : nil })
+  }
+  func instanceOpacity(_ layout: MeshSceneLayout) -> [Bool] {
+    let cutouts = cutoutSlots
+    return layout.instances.map { cutouts.isEmpty || (!$0.slots.isEmpty && !$0.slots.contains(where: cutouts.contains)) }
+  }
+  // Material edits change which instances bind cutouts; the instance structure follows them, so
+  // an instance marked opaque never holds a cutout. Called after materials are published.
+  func refreshInstanceOpacity() throws {
+    guard hardwareTraversal, let layout = meshLayout, layout.scene != nil, let streams = meshStreams,
+      layout.sceneOpaque != instanceOpacity(layout)
+    else { return }
+    try publishScene(layout, streams: streams, document: meshTriangles)
   }
 
   // Builds the TLAS and instance table of `layout` and publishes it with its streams.
@@ -1161,7 +1187,8 @@ extension MaterialLibrary {
     // Hardware traversal: a new instance structure for every instance change (the per-asset
     // structures are kept); transform-only edits refit the published one into it, other
     // instance changes rebuild it, and binding edits keep it.
-    if !(keepScene && layout.scene != nil) {
+    // Binding edits keep the instance structure only while every instance's opacity is unchanged.
+    if !(keepScene && layout.scene != nil && layout.sceneOpaque == instanceOpacity(layout)) {
       if hardwareTraversal {
         try buildSceneStructure(&layout, previous: meshLayout, pending: &pending)
       } else {

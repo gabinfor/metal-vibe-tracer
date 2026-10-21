@@ -882,6 +882,7 @@ extension MaterialLibrary {
       graphTextures = graph.textures
       materialX = programs
       try rebuildArguments(replacement)
+      try refreshInstanceOpacity()
       payloads = state.maps + Array(repeating: nil, count: SceneLimits.materials * 4 - state.maps.count)
       fileNames = state.names + Array(repeating: "None", count: SceneLimits.materials * 4 - state.names.count)
     } catch {

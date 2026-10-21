@@ -1661,11 +1661,12 @@ bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &ima
     MeshSceneHeader header=mesh_header(images);
     bool cut=mesh_cutouts(images);
     if(HARDWARE_MESHES && header.counts.w!=0 && cut) {
-        // Cutouts: every triangle is a candidate (forced non-opaque); opaque points are committed,
-        // and the query only reports candidates nearer than the committed hit.
+        // Cutouts: instances without cutout slots are opaque in the instance structure
+        // (MaterialLibrary.instanceOpacity) and commit in hardware; only cutout instances report
+        // candidates, which are committed unless cut. The query reports only candidates nearer
+        // than the committed hit.
         raytracing::intersection_params params;
         params.assume_geometry_type(raytracing::geometry_type::triangle);
-        params.force_opacity(raytracing::forced_opacity::non_opaque);
         raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(
             raytracing::ray(r.origin,r.direction,tMin,tMax),mesh_accelerator(images).scene,params);
         device const MeshInstance *instances=mesh_instances(images);
@@ -1720,13 +1721,33 @@ bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialR
     device const MeshInstance *instances=mesh_instances(images);
     bool cut=mesh_cutouts(images);
     if(HARDWARE_MESHES && header.counts.w!=0 && cut) {
-        // Cutouts: one query over the whole segment; a candidate blocks unless it is the endpoint
-        // surface (within its own slack, as blas_any decides) or a cut-out point.
+        // Cutouts. Before tMax - S (S bounds every triangle's slack) any opaque instance blocks in
+        // hardware (MaterialLibrary.instanceOpacity), and a cutout instance's candidate blocks
+        // unless it is cut out. In [tMax - S, tMax) every candidate is checked as blas_any does:
+        // it blocks unless it is the endpoint surface (within its own slack) or cut out.
+        float S=slack ? max(1e-7f,1.907349e-6f*header.hi.w) : 0.0f;
+        raytracing::instance_acceleration_structure scene=mesh_accelerator(images).scene;
+        if(tMax-S>tMin) {
+            raytracing::intersection_params near;
+            near.assume_geometry_type(raytracing::geometry_type::triangle);
+            near.accept_any_intersection(true);
+            raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> any(
+                raytracing::ray(r.origin,r.direction,tMin,tMax-S),scene,near);
+            while(any.next()) {
+                MeshInstance instance=instances[any.get_candidate_instance_id()];
+                float2 bc=any.get_candidate_triangle_barycentric_coord();
+                if(face_cut(instance,any.get_candidate_primitive_id(),bc.x,bc.y,instance_ray(instance,r),graphSlots,images)) continue;
+                any.abort();
+                return true;
+            }
+            if(any.get_committed_intersection_type()==raytracing::intersection_type::triangle) return true;
+        }
+        if(!slack) return false;
         raytracing::intersection_params params;
         params.assume_geometry_type(raytracing::geometry_type::triangle);
         params.force_opacity(raytracing::forced_opacity::non_opaque);
         raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(
-            raytracing::ray(r.origin,r.direction,tMin,tMax),mesh_accelerator(images).scene,params);
+            raytracing::ray(r.origin,r.direction,max(tMin,tMax-S),tMax),scene,params);
         while(query.next()) {
             MeshInstance instance=instances[query.get_candidate_instance_id()];
             if(slack) {

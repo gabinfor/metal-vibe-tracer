@@ -1083,6 +1083,36 @@ try fixMaterialSlotChecks()
       && abs(v[1].x - 2) < 1e-4 && v[1].y == node && v[1].z == 1
     require(ok, "\(mode): cut-out half passes to the lower quad and casts no shadow, opaque half stops rays (\(v[0]), \(v[1]))")
   }
+  // Hardware: an instance is opaque in the instance structure unless it binds a cutout slot, and a
+  // material edit that adds or removes a cutout updates it, so traversal never skips a cutout.
+  if gpu.supportsRaytracing {
+    let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    l.acceleration = .hardware
+    try l.restore(SceneState())
+    try l.setMesh(graph)
+    l.hasSceneGraph = true
+    func probe() -> (top: Float, opaque: [Bool]) {
+      var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+      u.environment = SIMD4(0, 0, 0, Float(l.nodeCount)); u.lens.z = 1; u.sunParams.w = 0
+      let out = gpu.makeBuffer(length: 32, options: .storageModeShared)!
+      let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+      encoder.setComputePipelineState(pipeline)
+      require(l.bind(encoder), "opacity probe binds scene resources")
+      encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+      encoder.setBuffer(out, offset: 0, index: 3)
+      encoder.dispatchThreads(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 2, height: 1, depth: 1))
+      encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+      return (out.contents().load(as: SIMD4<Float>.self).x, l.meshLayout?.sceneOpaque ?? [])
+    }
+    let before = probe()
+    try l.restore(state)
+    let cut = probe()
+    try l.restore(SceneState())
+    let after = probe()
+    require(before.top == 2 && before.opaque == [true, true] && cut.top == 3 && cut.opaque == [false, true]
+      && after.top == 2 && after.opaque == [true, true],
+      "instance opacity follows material edits (\(before), \(cut), \(after))")
+  }
   // Partial coverage: a constant geometry_opacity of 0.25 stops a quarter of camera and shadow rays.
   let partial = try MaterialXImporter.read(Data("""
     <materialx version="1.39">
