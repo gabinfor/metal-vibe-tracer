@@ -380,13 +380,13 @@
 
   // R-37: saving refuses what open would reject, with an actionable message.
   var oversized = ProjectDocument()
-  oversized.environmentData = Data(count: 200 * 1024 * 1024)
+  oversized.environmentData = Data(count: 200 * 1024 * 1024)  // with seven 128 MiB maps, above the 1 GiB limit
   var heavy = SceneState()
   // Distinct payloads: identical ones are stored once and count once (R-74).
-  for i in 0..<3 { var map = Data(count: 128 * 1024 * 1024); map[0] = UInt8(i + 1); heavy.maps[i] = map }
+  for i in 0..<7 { var map = Data(count: 128 * 1024 * 1024); map[0] = UInt8(i + 1); heavy.maps[i] = map }
   oversized.scenes[0] = heavy
   do { _ = try oversized.encodeForSaving(); require(false, "save rejects embedded assets above the open limit") } catch {
-    require(error.localizedDescription.contains("512 MiB"), "embedded-limit message is actionable")
+    require(error.localizedDescription.contains("\(ProjectDocument.embeddedAssetLimit >> 20) MiB"), "embedded-limit message is actionable")
   }
   do { try controller.requireEmbeddedCapacity(ProjectDocument.embeddedAssetLimit + 1); require(false, "asset loads keep the aggregate limit") } catch {}
   var broken = ProjectDocument(); broken.scenes[0] = SceneState(); broken.scenes[0]!.surfaces = []

@@ -204,7 +204,7 @@ struct ProjectDocument: Codable {
   }
 
   // Aggregate embedded asset bytes (maps, MaterialX images, environment) across all scenes.
-  static let embeddedAssetLimit = 512 * 1024 * 1024
+  static let embeddedAssetLimit = 1024 * 1024 * 1024
   // Open accepts everything validate() accepts: JSON embeds assets as base64 (4/3 size).
   // Formats 1-3 held at most SceneLimits.flatTriangles flat and graph triangles each, at most
   // ~600 bytes per JSON triangle (507 measured with worst-case floats; format 3's 128-byte
