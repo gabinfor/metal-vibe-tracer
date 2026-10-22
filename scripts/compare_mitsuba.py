@@ -7,7 +7,8 @@ Setup (once): python3 -m venv build/mitsuba-venv && build/mitsuba-venv/bin/pip i
 
 Each scene below is the geometry of trace_scene in main.swift, rebuilt as a Mitsuba scene: the same
 camera (CameraState conventions, vertical field of view, box pixel filter), Lambertian DIFFUSE
-materials, smooth glass for DIELECTRIC, and conductors for GLOSSY. Metal Vibe Tracer exports raw
+materials, smooth glass for DIELECTRIC, and conductors for GLOSSY (rough ones with the OpenPBR metal
+multiple-scattering lobe added by a Python BSDF, openpbr_metal_ms). Metal Vibe Tracer exports raw
 linear radiance (OpenEXR, no denoiser) through scripts/render_showcase.py; Mitsuba renders with
 its Metal backend. Each configuration is compared on mean radiance per channel, relative MSE, and
 region means, and a side-by-side image (Vibe | Mitsuba | relative difference) is written.
@@ -116,8 +117,116 @@ def glossy(color, roughness):
     if roughness < 0.02:
         return {'type': 'conductor', **gulbrandsen(color)}
     alpha = max(0.03, roughness) ** 2
-    return {'type': 'twosided', 'bsdf': {'type': 'roughconductor', 'distribution': 'ggx', 'alpha': alpha,
-            **gulbrandsen(color)}}
+    single = {'type': 'roughconductor', 'distribution': 'ggx', 'alpha': alpha, **gulbrandsen(color)}
+    return {'type': 'twosided', 'bsdf': {'type': 'openpbr_metal_ms', 'alpha': alpha, 'nested': single,
+            'scale': rgb((metal_average_fresnel(color) ** 2).tolist())}}
+
+
+# The OpenPBR metal adds Adobe's microfacet multiple-scattering lobe to the single-scattering GGX
+# lobe (ADOBEOPENPBR: OpenPBR_MetalMicrofacetMultipleScatteringLobe, initialised in openpbr_bsdf.h
+# with scale = Favg^2 for metalness 1 and specular weight 1):
+#   f_ms(i, o) = scale min((1 - E(mu_i)) (1 - E(mu_o)) / (1 - E_avg), 1 / mu_o) / pi  (o: light side),
+# active for alpha >= 0.04^2, with 1 - E the ideal-metal energy complement of the GGX lobe. Mitsuba's
+# roughconductor has no such lobe; it lifts the roughness-0.45 Veach plate by 17%. The complement is
+# read from the renderer's own table (Shaders/MetalEnergy.metal) with its lookup's interpolation.
+def metal_average_fresnel(f0):  # openpbr_metal_average_fresnel_with_f82_tint with a white F82 tint
+    r = np.clip(np.array(f0, dtype=float), 0, 1)
+    return np.clip(r + (1 - r) / 21, 0, 1)
+
+
+def metal_energy_tables():
+    import re
+    text = (ROOT / 'Shaders/MetalEnergy.metal').read_text()
+    def array(name, count):
+        body = re.search(r'constant float ' + name + r'\[' + str(count) + r'\] = \{(.*?)\};', text, re.S)[1]
+        values = np.array([float(v.rstrip('f')) for v in body.replace('\n', '').split(',') if v.strip()])
+        assert values.size == count, name
+        return values
+    return array('vibeMetalEnergy', 129 * 129).reshape(129, 129), array('vibeMetalAverageEnergy', 129)
+
+
+METAL_ENERGY, METAL_AVERAGE_ENERGY = metal_energy_tables()
+
+
+def metal_complement(alpha):
+    """vibe_metal_energy at a fixed alpha (129 sqrt-cosine nodes) and vibe_metal_average_energy."""
+    x = min(max(math.sqrt(alpha) * 128, 0), 128)
+    ix = min(int(x), 127)
+    f = x - ix
+    return (METAL_ENERGY[ix] * (1 - f) + METAL_ENERGY[ix + 1] * f,
+            METAL_AVERAGE_ENERGY[ix] * (1 - f) + METAL_AVERAGE_ENERGY[ix + 1] * f)
+
+
+def register_openpbr_metal_ms():
+    """Registers openpbr_metal_ms for the current variant (a Python BSDF subclasses that variant's BSDF)."""
+    class OpenPBRMetalMS(mi.BSDF):
+        """Single-scattering nested BSDF plus the OpenPBR metal multiple-scattering lobe (above)."""
+        MS_PROBABILITY = 0.25
+
+        def __init__(self, props):
+            mi.BSDF.__init__(self, props)
+            self.nested = props['nested']
+            c = props['scale']  # an RGB colour; the srgb texture uplifts it in spectral variants
+            self.scale = mi.load_dict({'type': 'srgb', 'color': [float(c[0]), float(c[1]), float(c[2])]})
+            alpha = props['alpha']
+            complement, average = metal_complement(alpha)
+            self.active_ms = alpha >= 0.04 ** 2
+            self.complement = mi.Float(complement.tolist())
+            self.inv_average = 1.0 / max(average, 1e-12)
+            flags = mi.BSDFFlags.GlossyReflection | mi.BSDFFlags.FrontSide
+            self.m_components = [flags]
+            self.m_flags = flags
+
+        def energy_complement(self, cosine):
+            y = dr.sqrt(dr.clip(cosine, 0, 1)) * 128
+            iy = dr.minimum(mi.UInt32(y), 127)
+            f = y - mi.Float(iy)
+            return dr.lerp(dr.gather(mi.Float, self.complement, iy), dr.gather(mi.Float, self.complement, iy + 1), f)
+
+        def ms_value(self, si, wo, active):
+            cos_i, cos_o = mi.Frame3f.cos_theta(si.wi), mi.Frame3f.cos_theta(wo)
+            valid = active & (cos_i > 0) & (cos_o > 0)
+            factors = self.energy_complement(cos_i) * self.energy_complement(cos_o) * self.inv_average
+            factors = dr.minimum(factors, dr.rcp(dr.maximum(cos_o, 1e-12)))
+            value = self.scale.eval(si, valid) * (factors * dr.inv_pi * cos_o)
+            return dr.select(valid, value, 0.0), dr.select(valid, cos_o * dr.inv_pi, 0.0)
+
+        def eval_pdf(self, ctx, si, wo, active=True):
+            value, pdf = self.nested.eval_pdf(ctx, si, wo, active)
+            if not self.active_ms:
+                return value, pdf
+            ms, ms_pdf = self.ms_value(si, wo, active)
+            q = self.MS_PROBABILITY
+            return value + ms, (1 - q) * pdf + q * ms_pdf
+
+        def eval(self, ctx, si, wo, active=True):
+            return self.eval_pdf(ctx, si, wo, active)[0]
+
+        def pdf(self, ctx, si, wo, active=True):
+            return self.eval_pdf(ctx, si, wo, active)[1]
+
+        def sample(self, ctx, si, sample1, sample2, active=True):
+            if not self.active_ms:
+                return self.nested.sample(ctx, si, sample1, sample2, active)
+            q = self.MS_PROBABILITY
+            bs, _ = self.nested.sample(ctx, si, sample1, sample2, active)
+            diffuse = sample1 < q
+            bs.wo = dr.select(diffuse, mi.warp.square_to_cosine_hemisphere(sample2), bs.wo)
+            bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyReflection)
+            bs.sampled_component = mi.UInt32(0)
+            bs.eta = 1.0
+            value, pdf = self.eval_pdf(ctx, si, bs.wo, active)
+            bs.pdf = pdf
+            ok = active & (pdf > 0) & (mi.Frame3f.cos_theta(bs.wo) > 0)
+            return bs, dr.select(ok, value / dr.maximum(pdf, 1e-12), 0.0)
+
+        def traverse(self, callback):
+            self.nested.traverse(callback)
+
+        def to_string(self):
+            return 'OpenPBRMetalMS[]'
+
+    mi.register_bsdf('openpbr_metal_ms', OpenPBRMetalMS)
 
 
 WHITE, RED, GREEN = diffuse(0.73), diffuse([0.65, 0.05, 0.05]), diffuse([0.12, 0.45, 0.15])
@@ -174,7 +283,7 @@ SCENES = {
     'glass-mirror': (3, scene_glass_mirror, dict(yaw=0.0, pitch=0.05, distance=3.0, fov=40, target=[0, -0.2, 0]),
                      (512, 512), 'Mirror: Schlick F0 0.95 (Vibe) vs Gulbrandsen conductor with F0 0.95 (Mitsuba).'),
     'veach-mis': (2, scene_veach, dict(yaw=0.0, pitch=0.38, distance=5.6, fov=38, target=[0, 0.3, 0.3]),
-                  (768, 432), 'Plates: OpenPBR metal (Vibe) vs GGX Gulbrandsen conductor (Mitsuba); differences in multiple-scattering energy are not modelled here.'),
+                  (768, 432), 'Plates: OpenPBR metal (Vibe) vs GGX Gulbrandsen conductor plus the OpenPBR metal multiple-scattering lobe (Mitsuba); the single-scattering Fresnel is Schlick vs Gulbrandsen. The camera\'s right is world -x: plate 3 (roughness 0.45) is on the image left.'),
 }
 # Metal Vibe Tracer configurations: (label, strategy, light transport, Mitsuba variant)
 MODES = [('mis-rgb', 1, 0, 'metal_ad_rgb'), ('restir-rgb', 0, 0, 'metal_ad_rgb'),
@@ -205,6 +314,7 @@ def render_mitsuba(name, variant):
     if path.exists():
         return np.array(mi.Bitmap(str(path)), dtype=np.float64)[..., :3]
     mi.set_variant(variant)
+    register_openpbr_metal_ms()
     index, build, cam, (w, h), _ = SCENES[name]
     scene = mi.load_dict({'type': 'scene', 'integrator': {'type': 'path', 'max_depth': DEPTH + 1},
                           'camera': camera(**cam, width=w, height=h), **build()}, optimize=False)
