@@ -94,10 +94,11 @@ struct SceneGraph: Codable {
     var libraries: [String] = []
     return try addOBJ(Data(text.utf8), name: name, skipped: &skipped, libraries: &libraries)
   }
-  mutating func addOBJ(_ data: Data, name: String, skipped: inout Int, libraries: inout [String]) throws -> UUID {
+  mutating func addOBJ(_ data: Data, name: String, skipped: inout Int, libraries: inout [String],
+                       progress: OperationProgress? = nil) throws -> UUID {
     // The root node is created below; each object and part adds one more.
     let parts = try OBJMesh.parts(data, skipped: &skipped, nodeBudget: SceneLimits.nodes - nodes.count - 1,
-      libraries: &libraries)
+      libraries: &libraries, progress: progress)
     let root = SceneNode(name: name)
     nodes.append(root)
     var parents: [String: UUID] = [:]
@@ -421,8 +422,8 @@ extension ProjectDocument {
     return try appendOBJ(Data(text.utf8), name: name, folder: nil, skipped: &skipped, report: &report)
   }
   // `folder` resolves the OBJ's mtllib files (OBJMaterials); nil imports without materials.
-  mutating func appendOBJ(_ data: Data, name: String, folder: URL?, skipped: inout Int, report: inout [String]) throws
-    -> UUID
+  mutating func appendOBJ(_ data: Data, name: String, folder: URL?, skipped: inout Int, report: inout [String],
+                          progress: OperationProgress? = nil) throws -> UUID
   {
     var p = self
     var graph = p.graph ?? SceneGraph()
@@ -462,11 +463,12 @@ extension ProjectDocument {
     }
     let existing = graph.materials.count
     var libraries: [String] = []
-    let root = try graph.addOBJ(data, name: name, skipped: &skipped, libraries: &libraries)
+    let root = try graph.addOBJ(data, name: name, skipped: &skipped, libraries: &libraries, progress: progress)
     if let folder, !libraries.isEmpty {
       let added = graph.materials[existing...]
+      progress?.begin("Reading the MTL material libraries")
       let (programs, colors) = try OBJMaterials.programs(
-        libraries: libraries, folder: folder, names: Set(added.map(\.name)), report: &report)
+        libraries: libraries, folder: folder, names: Set(added.map(\.name)), report: &report, progress: progress)
       var state = p.scenes[6] ?? SceneState()
       for material in added {
         if let kd = colors[material.name] {

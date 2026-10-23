@@ -692,7 +692,9 @@ extension MaterialLibrary {
     } else {
       // New assets: a hierarchy, then the document's faces in BLAS order; vertices are copied.
       var built: [Int: (nodes: [MeshWideNode], order: [Int32])] = [:]
+      let building = inputs.indices.filter { reused[$0] == nil && !inputs[$0].1.isEmpty }.count
       for (i, input) in inputs.enumerated() where reused[i] == nil && !input.1.isEmpty {
+        progress?.update("Building mesh hierarchies", completed: built.count, of: building)
         let bounds = MeshSceneLayout.bounds(input.1)
         let tree = bounds.withUnsafeBufferPointer { WideBVH.build(bounds: $0, count: input.1.count, leafSize: 2) }
         built[i] = (tree.nodes, tree.order)
@@ -777,7 +779,10 @@ extension MaterialLibrary {
       pending = UInt64(streams.bytes)
     }
     layout.storedTriangles = stored
-    if hardwareTraversal { try buildAssetStructures(&layout, streams: streams, pending: &pending) }
+    if hardwareTraversal {
+      progress?.begin("Building hardware acceleration structures")
+      try buildAssetStructures(&layout, streams: streams, pending: &pending)
+    }
     try instances(&layout)
     meshBuildCount += 1
     try publishScene(layout, streams: streams, document: document, pending: pending)

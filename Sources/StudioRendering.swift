@@ -83,9 +83,10 @@ extension StudioController {
       let p = snapshot()
       try p.validate()
       let r = try PathTracerRenderer(device: renderer.device, sharing: renderer)
-      // The export library shares identical textures with the live preview and
-      // counts the preview's set once (external), not as a second copy.
-      r.materials.external = renderer.materials.residentSnapshot()
+      // The export library adopts the live preview's textures, mesh, hierarchies and acceleration
+      // structures (nothing is decoded or rebuilt on the main thread) and counts the preview's
+      // texture set once (external), not as a second copy.
+      r.materials = try prepareResources(p, reuse: renderer.materials.reusableResources(graph: project.graph))
       let outputPixels = UInt64(p.options.outputWidth).multipliedReportingOverflow(
         by: UInt64(p.options.outputHeight))
       let outputBytes = outputPixels.overflow
@@ -93,10 +94,6 @@ extension StudioController {
         : outputPixels.partialValue.multipliedReportingOverflow(by: 4).partialValue
       let concurrentTotal = renderer.residentFrameBytes.addingReportingOverflow(outputBytes)
       r.concurrentRenderBytes = concurrentTotal.overflow ? UInt64.max : concurrentTotal.partialValue
-      try r.materials.restore(renderer.materials.state())
-      try r.materials.setEnvironment(p.environmentData)
-      try r.materials.setMesh(p)
-      r.materials.hasSceneGraph = p.graph != nil
       r.sceneIndex = p.scene
       r.samplingMode = p.strategy
       // The project's ReSTIR modes. Temporal reuse acts only while the view changes and an
@@ -162,6 +159,7 @@ extension StudioController {
         self?.showError("Export failed: \(message)")
       }
       let start = Date()
+      let progress = beginActivity("Rendering \(out.width)×\(out.height) export") { [weak self] in self?.cancelExport() }
       // Two command buffers stay in flight, so the GPU runs the next batch while the main thread
       // handles the last one; each batch holds about 100 ms of samples (samplesPerFrame).
       func submit() {
@@ -174,6 +172,7 @@ extension StudioController {
         guard let self, let r, self.exportRenderer === r else { return }
         self.status.stringValue =
           "Export: \(count) / \(r.options.exportSamples) spp · \(Int(Date().timeIntervalSince(start))) s"
+        progress.update("Rendering \(out.width)×\(out.height) export", completed: Int(count), of: Int(r.options.exportSamples))
         if count >= r.options.exportSamples {
           self.finishExport()
         } else {
@@ -231,9 +230,11 @@ extension StudioController {
       DispatchQueue.main.async {
         guard let self, let job, self.exportDenoiseJob === job else { return }
         self.status.stringValue = "OIDN offline denoising: \(Int(fraction * 100))%"
+        self.activity?.update("Denoising the export with OIDN", fraction: fraction)
       }
     }
     status.stringValue = "Preparing OIDN offline denoising…"
+    activity?.begin("Preparing OIDN offline denoising")
     // The worker gets snapshots; renderer state is only read on the main actor.
     let input = OIDNInput(color: color, albedo: albedo, normal: normal)
     let queue = r.commandQueue, options = r.oidnOptions
@@ -337,8 +338,10 @@ extension StudioController {
       DispatchQueue.main.async {
         guard let self, let job, self.previewDenoiseJob === job else { return }
         self.status.stringValue = "OIDN preview: \(Int(fraction * 100))%"
+        self.activity?.update("Denoising the preview with OIDN", fraction: fraction)
       }
     }
+    beginActivity("Preparing OIDN preview of \(samples) spp") { [weak self] in self?.cancelOIDNPreview() }
     rebuild()
     status.stringValue = "Preparing OIDN preview of \(samples) spp…"
     // The worker gets snapshots; renderer state is only read on the main actor.

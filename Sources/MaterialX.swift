@@ -946,6 +946,8 @@ extension MaterialLibrary {
     for (i, image) in unique.enumerated() { if let side = sides[i] { chosen[image.srgb ? 1 : 0][image.data] = side } }
     let side = sides.compactMap { $0 }.min()
     bindings = [[:], [:]]
+    var decoded = 0
+    let phase = side == nil ? "Decoding MaterialX textures" : "Decoding and downscaling MaterialX textures to fit GPU memory"
     for slot in programs.keys.sorted() {
       guard (0..<SceneLimits.materials).contains(slot), let program = programs[slot] else {
         throw Self.error("Invalid graph material slot.")
@@ -968,6 +970,8 @@ extension MaterialLibrary {
           continue
         }
         try validateEncodedImage(image.data, maximumSide: imageSide, pending: candidateImages + textures)
+        progress?.update(phase, completed: decoded, of: unique.count)
+        decoded += 1
         let texture = try decodeTexture(image.data, srgb: image.srgb, maximumSide: imageSide)
         try validateDecodedTexture(texture, encodedBytes: image.data.count, pending: candidateImages + textures)
         textures.append(texture)

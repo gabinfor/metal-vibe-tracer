@@ -271,7 +271,7 @@ extension StudioController {
     let selectedNode = self.selectedNode, selectedSubset = self.selectedSubset
     let selectedSlot = self.selectedSlot
     let useLibrary = scene == 6 && document.graph != nil && selectedNode != nil
-    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { () -> (ProjectDocument, (String, Int?)) in
+    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { _ -> (ProjectDocument, (String, Int?)) in
       var document = document  // The build runs on projectIOQueue with its own copy.
       let imported = try MaterialXImporter.load(url)
       var report = imported.report.joined(separator: "\n")

@@ -493,15 +493,16 @@ extension StudioController {
     bar.maxValue = 1
     sheet.accessoryView = bar
     sheet.addButton(withTitle: "Cancel")
+    importInProgress = true
+    let progress = beginProjectActivity("Downloading \(scene.title)…")
     let job = ExampleSceneDownload { fraction, message in
+      progress.update(message, fraction: fraction)
       DispatchQueue.main.async {
         bar.doubleValue = fraction
         sheet.informativeText = message
       }
     }
-    importInProgress = true
     exampleDownload = job
-    beginProjectActivity("Downloading \(scene.title)…")
     sheet.beginSheetModal(for: window) { _ in job.cancel() }
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let result = Result { try job.install(scene, into: library) }
@@ -540,14 +541,14 @@ extension StudioController {
     }
     let url = exampleLibrary.objURL(scene)
     let record = undoRecord("Open example scene", replacesDocument: true)
-    beginDocumentChange("Importing \(scene.title)…", build: { [weak self] () -> (ProjectDocument, Int) in
+    beginDocumentChange("Importing \(scene.title)…", build: { [weak self] progress -> (ProjectDocument, Int) in
       guard let self else { throw MaterialLibrary.error("Example scene import cancelled.") }
       var document = ProjectDocument()
       let objData = try self.readBounded(url, maximum: 1 << 40)
       var skipped = 0
       var report: [String] = []
       _ = try document.appendOBJ(objData, name: url.lastPathComponent, folder: url.deletingLastPathComponent(),
-        skipped: &skipped, report: &report)
+        skipped: &skipped, report: &report, progress: progress)
       shot.apply(to: &document)
       // The credit travels with the project in its import report.
       document.importReport = [scene.attribution] + (document.importReport ?? [])
