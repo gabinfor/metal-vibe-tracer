@@ -153,6 +153,8 @@ final class StudioController: NSViewController {
   var projectURL: URL? { didSet { updateWindowTitle() } }
   var importInProgress = false { didSet { busyStateChanged() } }
   var usdImportJob: USDImportJob?
+  // File > Open Example Scene's download in progress (ExampleScenes.swift).
+  var exampleDownload: ExampleSceneDownload?
   // Opens (including the launch restore), saves and off-main document preparation.
   private var openInFlight = false { didSet { busyStateChanged() } }
   private var saveInFlight = false { didSet { busyStateChanged() } }
@@ -179,6 +181,8 @@ final class StudioController: NSViewController {
   private var pendingSaveFailure: String?
   // Tests redirect the recovery files; production uses Application Support.
   var autosaveURL = StudioController.defaultAutosaveURL
+  // Downloaded example scenes (ExampleScenes.swift); tests redirect them too.
+  var exampleLibrary = ExampleLibrary()
   private var autosaveSuppressed = false
   // Shared with autosaveQueue: the newest queued snapshot and the revision last written.
   private struct AutosaveState {
@@ -1099,6 +1103,7 @@ final class StudioController: NSViewController {
     text(
       "Projects embed textures, the environment image, and imported geometry. Changes are also autosaved locally and restored at next launch."
     )
+    exampleScenePanel()
     heading("Export")
     number("Output width", Float(renderer.options.outputWidth), 16...8192, 1920, reset: false) {
       [weak self] in self?.renderer.options.outputWidth = Int($0.rounded())
@@ -2185,6 +2190,30 @@ final class StudioController: NSViewController {
         ("Open USD Scene…", "", #selector(importUSDAction)),
         ("Export…", "e", #selector(exportAction)),
       ])
+    // Example scenes: downloaded on request (ExampleScenes.swift); titles show the remaining download size.
+    if let file = main.items.last?.submenu,
+      let index = file.items.firstIndex(where: { $0.action == #selector(importUSDAction) })
+    {
+      let examples = NSMenu(title: "Open Example Scene")
+      for (tag, scene) in ExampleScenes.catalog.enumerated() {
+        let item = NSMenuItem(title: scene.title, action: #selector(exampleSceneAction(_:)), keyEquivalent: "")
+        item.tag = tag
+        item.target = self
+        examples.addItem(item)
+      }
+      examples.addItem(.separator())
+      for (title, selector) in [
+        ("Credits and Licenses…", #selector(exampleCreditsAction)),
+        ("Show Downloaded Scenes in Finder", #selector(revealExampleScenesAction)),
+      ] {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        examples.addItem(item)
+      }
+      let item = NSMenuItem(title: "Open Example Scene", action: nil, keyEquivalent: "")
+      item.submenu = examples
+      file.insertItem(item, at: index + 1)
+    }
     // Standard application and window commands go to NSApp and the key window.
     if let app = main.items.first?.submenu {
       let hide = NSMenuItem(title: "Hide Metal Vibe Tracer", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
@@ -2287,6 +2316,12 @@ extension StudioController: NSMenuItemValidation {
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     if item.action == #selector(quit) { return true }
     if item.action == #selector(inspectorAction) { return true }
+    if item.action == #selector(exampleCreditsAction) || item.action == #selector(revealExampleScenesAction) {
+      return true
+    }
+    if item.action == #selector(exampleSceneAction(_:)), ExampleScenes.catalog.indices.contains(item.tag) {
+      item.title = exampleSceneTitle(ExampleScenes.catalog[item.tag])
+    }
     if item.action == #selector(viewportAction(_:)) {
       item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
     }

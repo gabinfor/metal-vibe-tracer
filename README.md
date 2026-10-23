@@ -46,6 +46,8 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 
 <p align="center"><sub>Imported from Morgan McGuire's Computer Graphics Archive (OBJ with MTL materials translated to OpenPBR MaterialX), 1600×900, 128 spp, denoised with Open Image Denoise, on a 16 GB Apple M4. The daylight Bistro exterior has the scene's lamps and emissive signs switched off; the evening interior brightens its lamps 60×.</sub></p>
 
+To open these scenes in the app, choose **File › Open Example Scene**. They are not bundled. A scene is downloaded once from the archive after you agree to its size and license (Sponza 80 MB, San Miguel 536 MB, Bistro 1.4 GB). The download is checked against a pinned SHA-256 digest, extracted into Application Support and opened with the camera and lighting shown above. **Credits and Licenses…** in the same menu lists the attributions.
+
 ## Gallery
 
 <table>
@@ -193,6 +195,7 @@ Projects embed imported assets and can be reopened without the original files. S
 
 - [MaterialX examples](Examples/MaterialX/README.md)
 - [OpenUSD examples and reference scenes](Examples/OpenUSD/README.md)
+- McGuire's Sponza, San Miguel and Bistro: **File › Open Example Scene** downloads them on request (see [Production scenes](#production-scenes)).
 - [Poly Haven HDRI test selection](Examples/HDRI/README.md). Download it with `python3 scripts/fetch_test_hdris.py`. `scripts/render_showcase.py` needs it to render the README images.
 
 ## Development
