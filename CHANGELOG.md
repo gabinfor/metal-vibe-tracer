@@ -2,7 +2,9 @@
 
 Metal Vibe Tracer is in early development: releases are validated builds, not stable APIs or file formats. Every method below is cited, with its adaptations, in [REFERENCES.md](REFERENCES.md); measurements are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md).
 
-## Unreleased
+## 0.2.1 — 2026-10-23
+
+The app now opens instantly and shows progress for everything it loads, and the README's production scenes open from inside the app. Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (192 checks).
 
 ### Launch and progress
 
