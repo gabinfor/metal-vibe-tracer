@@ -2309,6 +2309,15 @@ final class StudioController: NSViewController {
       let index = file.items.firstIndex(where: { $0.action == #selector(importUSDAction) })
     {
       let examples = NSMenu(title: "Open Example Scene")
+      // Bundled spectral examples first, then the McGuire archive scenes downloaded on request.
+      for (tag, example) in SpectralExamples.catalog.enumerated() {
+        let item = NSMenuItem(title: example.title, action: #selector(spectralExampleAction(_:)), keyEquivalent: "")
+        item.tag = tag
+        item.target = self
+        item.toolTip = example.summary
+        examples.addItem(item)
+      }
+      examples.addItem(.separator())
       for (tag, scene) in ExampleScenes.catalog.enumerated() {
         let item = NSMenuItem(title: scene.title, action: #selector(exampleSceneAction(_:)), keyEquivalent: "")
         item.tag = tag
@@ -2532,8 +2541,8 @@ extension StudioController: NSMenuItemValidation {
     if isBusy { return false }
     // The start screen has no document to save, edit, render or export.
     if startScreen != nil {
-      return [#selector(openAction), #selector(importOBJAction), #selector(importUSDAction), #selector(exampleSceneAction(_:))]
-        .contains(item.action)
+      return [#selector(openAction), #selector(importOBJAction), #selector(importUSDAction), #selector(exampleSceneAction(_:)),
+        #selector(spectralExampleAction(_:))].contains(item.action)
     }
     if item.action == #selector(undoAction) {
       item.title = history.undoMenuItemTitle

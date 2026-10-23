@@ -47,6 +47,14 @@
     && Array(exterior.archives.dropFirst()) == Array(interior.archives.dropFirst())
     && exterior.archives.dropFirst().map(\.name) == ["BuildingTextures.zip", "OtherTextures.zip", "PropTextures.zip"],
     "the Bistro exterior and interior share one folder and its three texture archives")
+  // Bundled spectral examples: a showcase shot each, whose stage is under Examples/Spectral and resolves.
+  require(SpectralExamples.catalog.map(\.shot) == ["spectral-newton-series", "spectral-abbe-row"],
+    "spectral examples list Newton's colour series and the Abbe row")
+  for example in SpectralExamples.catalog {
+    let stage = try shot(example.shot).usd
+    require(stage?.hasPrefix("Examples/Spectral/") == true && stage.flatMap(SpectralExamples.url) != nil,
+      "\(example.shot) opens a bundled stage (\(stage ?? "none"))")
+  }
   require(ExampleScenes.megabytes(80_113_441) == "80 MB" && ExampleScenes.megabytes(1_438_403_029) == "1.4 GB",
     "download sizes read in MB and GB")
 

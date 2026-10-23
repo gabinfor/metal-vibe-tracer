@@ -78,6 +78,19 @@ To open these scenes in the app, choose **File › Open Example Scene**. They ar
 
 <table>
   <tr>
+    <td width="50%"><img src="docs/images/spectral-newton-series.jpg" alt="Two rows of glossy spheres: soap-film colours on black spheres behind, anodized-titanium colours on metal spheres in front"></td>
+    <td width="50%"><img src="docs/images/spectral-abbe-row.jpg" alt="Four glass prisms on a black mirror floor, each showing a white slit spread into a spectrum of a different width"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Thin-film interference.</b> Soap films 100–800 nm thick (back) and titanium oxide films 30–150 nm thick (front).</sub></td>
+    <td align="center"><sub><b>Dispersion.</b> A white slit seen through N-SF11, F2, N-BK7 and N-FK51A prisms: lower Abbe numbers spread it wider.</sub></td>
+  </tr>
+</table>
+
+<p align="center"><sub><b>Spectral examples</b>, included with the app (<b>File › Open Example Scene</b>). Both effects need spectral transport.</sub></p>
+
+<table>
+  <tr>
     <td width="50%"><img src="docs/images/pavilion-depth-of-field.jpg" alt="Pavilion close-up focused on the copper sphere, with the foreground cylinder out of focus"></td>
     <td width="50%"><img src="docs/images/pavilion-twilight.jpg" alt="Low view of the Pavilion with the roof beams against the purple twilight sky"></td>
   </tr>
@@ -117,7 +130,7 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 | **Path tracing** | ReSTIR DI with first-bounce ReSTIR GI on procedural scenes, and ReSTIR PT for imported scenes. Standard MIS, light-only and BSDF-only modes for comparison. |
 | **Light transport** | Spectral (default) or RGB. CIE illuminant presets, dispersion, and thin film. |
 | **Materials** | OpenPBR surfaces, image textures with anisotropic filtering, normal and bump maps, alpha cutouts, thin-walled glass, and a subset of MaterialX graphs. |
-| **Scenes** | Six procedural test scenes, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Scene size is limited by the Mac's GPU memory, not fixed caps. |
+| **Scenes** | Six procedural test scenes, two bundled spectral examples, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Scene size is limited by the Mac's GPU memory, not fixed caps. |
 | **Acceleration** | Two-level instancing on Metal hardware ray tracing, with an exact software 4-wide BVH as a fallback. |
 | **Camera and lighting** | Thin-lens depth of field, procedural skies, HDRI environments, and editable area lights. |
 | **Denoising** | MetalFX for the interactive preview, and Open Image Denoise for snapshots and exports. |
@@ -195,6 +208,7 @@ Projects embed imported assets and can be reopened without the original files. S
 
 - [MaterialX examples](Examples/MaterialX/README.md)
 - [OpenUSD examples and reference scenes](Examples/OpenUSD/README.md)
+- [Spectral example scenes](Examples/Spectral/README.md): thin-film interference (Newton's colour series) and dispersion (the Abbe row), included with the app under **File › Open Example Scene**.
 - McGuire's Sponza, San Miguel and Bistro: **File › Open Example Scene** downloads them on request (see [Production scenes](#production-scenes)).
 - [Poly Haven HDRI test selection](Examples/HDRI/README.md). Download it with `python3 scripts/fetch_test_hdris.py`. `scripts/render_showcase.py` needs it to render the README images.
 

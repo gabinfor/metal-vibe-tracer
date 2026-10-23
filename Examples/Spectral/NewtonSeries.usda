@@ -1,0 +1,484 @@
+#usda 1.0
+(
+    doc = """Newton's colour series. Back row: soap films (n 1.33) 100-800 nm thick, first- to fourth-order interference colours. Front row: anodized titanium, oxide films (n 2.4) 30-150 nm. Thin film renders in spectral light transport only."""
+    defaultPrim = "Scene"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "Scene"
+{
+    def Scope "Looks"
+    {
+        def Material "Floor"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Floor/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.15, 0.15, 0.16)
+                float inputs:specular_roughness = 0.35
+                token outputs:out
+            }
+        }
+
+        # Soap film (n = 1.33) 100 nm thick over an index-matched black base: the film alone reflects.
+        def Material "Soap_100nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_100nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.1
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        def Material "Soap_200nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_200nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.2
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        def Material "Soap_300nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_300nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.3
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        def Material "Soap_400nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_400nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.4
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        def Material "Soap_500nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_500nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.5
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        def Material "Soap_600nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_600nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.6
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        def Material "Soap_700nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_700nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.7
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        def Material "Soap_800nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Soap_800nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                float inputs:specular_ior = 1
+                float inputs:specular_roughness = 0.03
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.8
+                float inputs:thin_film_ior = 1.33
+                token outputs:out
+            }
+        }
+
+        # Anodized titanium: an oxide film (n = 2.4) 30 nm thick over the metal.
+        def Material "Titanium_30nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_30nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.03
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+
+        def Material "Titanium_45nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_45nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.045
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+
+        def Material "Titanium_60nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_60nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.06
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+
+        def Material "Titanium_75nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_75nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.075
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+
+        def Material "Titanium_90nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_90nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.09
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+
+        def Material "Titanium_110nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_110nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.11
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+
+        def Material "Titanium_130nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_130nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.13
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+
+        def Material "Titanium_150nm"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Titanium_150nm/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.55, 0.52, 0.48)
+                float inputs:base_metalness = 1
+                float inputs:specular_roughness = 0.08
+                float inputs:thin_film_weight = 1
+                float inputs:thin_film_thickness = 0.15
+                float inputs:thin_film_ior = 2.4
+                token outputs:out
+            }
+        }
+    }
+
+    def Camera "Camera"
+    {
+        double3 xformOp:translate = (0, 1, 3.5)
+        float3 xformOp:rotateXYZ = (-13.9223, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        float focalLength = 36
+        float horizontalAperture = 36
+        float verticalAperture = 20.25
+        float2 clippingRange = (0.01, 100)
+    }
+
+    def Mesh "Cyclorama" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 5, 4, 4, 5, 7, 6, 6, 7, 9, 8, 8, 9, 11, 10, 10, 11, 13, 12, 12, 13, 15, 14, 14, 15, 17, 16, 16, 17, 19, 18, 18, 19, 21, 20, 20, 21, 23, 22, 22, 23, 25, 24, 24, 25, 27, 26, 26, 27, 29, 28, 28, 29, 31, 30, 30, 31, 33, 32, 32, 33, 35, 34, 34, 35, 37, 36]
+        point3f[] points = [(-100, 0, 100), (100, 0, 100), (-100, 0, -1), (100, 0, -1), (-100, 0.0072229, -1.147), (100, 0.0072229, -1.147), (-100, 0.028822, -1.2926), (100, 0.028822, -1.2926), (-100, 0.064589, -1.4354), (100, 0.064589, -1.4354), (-100, 0.11418, -1.574), (100, 0.11418, -1.574), (-100, 0.17712, -1.7071), (100, 0.17712, -1.7071), (-100, 0.2528, -1.8334), (100, 0.2528, -1.8334), (-100, 0.34048, -1.9516), (100, 0.34048, -1.9516), (-100, 0.43934, -2.0607), (100, 0.43934, -2.0607), (-100, 0.54841, -2.1595), (100, 0.54841, -2.1595), (-100, 0.66664, -2.2472), (100, 0.66664, -2.2472), (-100, 0.7929, -2.3229), (100, 0.7929, -2.3229), (-100, 0.92597, -2.3858), (100, 0.92597, -2.3858), (-100, 1.0646, -2.4354), (100, 1.0646, -2.4354), (-100, 1.2074, -2.4712), (100, 1.2074, -2.4712), (-100, 1.353, -2.4928), (100, 1.353, -2.4928), (-100, 1.5, -2.5), (100, 1.5, -2.5), (-100, 8, -2.5), (100, 8, -2.5)]
+        normal3f[] normals = [(0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 0.99518, 0.098017), (0, 0.99518, 0.098017), (0, 0.98079, 0.19509), (0, 0.98079, 0.19509), (0, 0.95694, 0.29028), (0, 0.95694, 0.29028), (0, 0.92388, 0.38268), (0, 0.92388, 0.38268), (0, 0.88192, 0.4714), (0, 0.88192, 0.4714), (0, 0.83147, 0.55557), (0, 0.83147, 0.55557), (0, 0.77301, 0.63439), (0, 0.77301, 0.63439), (0, 0.70711, 0.70711), (0, 0.70711, 0.70711), (0, 0.63439, 0.77301), (0, 0.63439, 0.77301), (0, 0.55557, 0.83147), (0, 0.55557, 0.83147), (0, 0.4714, 0.88192), (0, 0.4714, 0.88192), (0, 0.38268, 0.92388), (0, 0.38268, 0.92388), (0, 0.29028, 0.95694), (0, 0.29028, 0.95694), (0, 0.19509, 0.98079), (0, 0.19509, 0.98079), (0, 0.098017, 0.99518), (0, 0.098017, 0.99518), (0, 6.1232e-17, 1), (0, 6.1232e-17, 1), (0, 0, 1), (0, 0, 1)] (
+            interpolation = "vertex"
+        )
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </Scene/Looks/Floor>
+    }
+
+    def Sphere "Soap_100nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-1.4, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_100nm>
+    }
+
+    def Sphere "Soap_200nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-1, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_200nm>
+    }
+
+    def Sphere "Soap_300nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-0.6, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_300nm>
+    }
+
+    def Sphere "Soap_400nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-0.2, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_400nm>
+    }
+
+    def Sphere "Soap_500nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (0.2, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_500nm>
+    }
+
+    def Sphere "Soap_600nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (0.6, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_600nm>
+    }
+
+    def Sphere "Soap_700nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (1, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_700nm>
+    }
+
+    def Sphere "Soap_800nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (1.4, 0.17, -0.35)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Soap_800nm>
+    }
+
+    def Sphere "Titanium_30nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-1.4, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_30nm>
+    }
+
+    def Sphere "Titanium_45nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-1, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_45nm>
+    }
+
+    def Sphere "Titanium_60nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-0.6, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_60nm>
+    }
+
+    def Sphere "Titanium_75nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (-0.2, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_75nm>
+    }
+
+    def Sphere "Titanium_90nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (0.2, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_90nm>
+    }
+
+    def Sphere "Titanium_110nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (0.6, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_110nm>
+    }
+
+    def Sphere "Titanium_130nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (1, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_130nm>
+    }
+
+    def Sphere "Titanium_150nm" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.17
+        double3 xformOp:translate = (1.4, 0.17, 0.25)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/Titanium_150nm>
+    }
+
+    def DomeLight "Tent"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 0.6
+    }
+
+    def RectLight "Softbox"
+    {
+        double3 xformOp:translate = (0, 3, 1.2)
+        float3 xformOp:rotateXYZ = (-70, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        float inputs:width = 5
+        float inputs:height = 2.5
+        float inputs:intensity = 2.5
+    }
+}

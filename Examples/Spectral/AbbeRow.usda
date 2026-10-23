@@ -1,0 +1,256 @@
+#usda 1.0
+(
+    doc = """Abbe row: 60-degree prisms of SCHOTT N-SF11, F2, N-BK7 and N-FK51A (Abbe numbers 25.7 to 84.5) each turned to minimum deviation towards a thin white slit, as in a spectroscope. Through each prism its slit spreads into a spectrum, wider as the Abbe number falls. Dispersion renders in spectral light transport only."""
+    defaultPrim = "Scene"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "Scene"
+{
+    def Scope "Looks"
+    {
+        def Material "Floor"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/Floor/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.2, 0.2, 0.2)
+                float inputs:specular_roughness = 0.3
+                token outputs:out
+            }
+        }
+
+        def Material "LightBar"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/LightBar/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0, 0, 0)
+                color3f inputs:emission_color = (1, 1, 1)
+                float inputs:emission_luminance = 60
+                token outputs:out
+            }
+        }
+
+        # SCHOTT N-SF11: n_d = 1.78472, V_d = 25.68 (REFERENCES.md SCHOTTGLASS).
+        def Material "N_SF11"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/N_SF11/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:specular_ior = 1.78472
+                float inputs:specular_roughness = 0
+                float inputs:transmission_weight = 1
+                float inputs:transmission_dispersion_scale = 1
+                float inputs:transmission_dispersion_abbe_number = 25.68
+                token outputs:out
+            }
+        }
+
+        # SCHOTT F2: n_d = 1.62004, V_d = 36.37 (REFERENCES.md SCHOTTGLASS).
+        def Material "F2"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/F2/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:specular_ior = 1.62004
+                float inputs:specular_roughness = 0
+                float inputs:transmission_weight = 1
+                float inputs:transmission_dispersion_scale = 1
+                float inputs:transmission_dispersion_abbe_number = 36.37
+                token outputs:out
+            }
+        }
+
+        # SCHOTT N-BK7: n_d = 1.5168, V_d = 64.17 (REFERENCES.md SCHOTTGLASS).
+        def Material "N_BK7"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/N_BK7/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:specular_ior = 1.5168
+                float inputs:specular_roughness = 0
+                float inputs:transmission_weight = 1
+                float inputs:transmission_dispersion_scale = 1
+                float inputs:transmission_dispersion_abbe_number = 64.17
+                token outputs:out
+            }
+        }
+
+        # SCHOTT N-FK51A: n_d = 1.48656, V_d = 84.47 (REFERENCES.md SCHOTTGLASS).
+        def Material "N_FK51A"
+        {
+            token outputs:mtlx:surface.connect = </Scene/Looks/N_FK51A/Surface.outputs:out>
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:specular_ior = 1.48656
+                float inputs:specular_roughness = 0
+                float inputs:transmission_weight = 1
+                float inputs:transmission_dispersion_scale = 1
+                float inputs:transmission_dispersion_abbe_number = 84.47
+                token outputs:out
+            }
+        }
+    }
+
+    def Camera "Camera"
+    {
+        double3 xformOp:translate = (0, 0.42, 2.7)
+        float3 xformOp:rotateXYZ = (-2.5448, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        float focalLength = 30
+        float horizontalAperture = 36
+        float verticalAperture = 20.25
+        float2 clippingRange = (0.01, 100)
+    }
+
+    def Camera "Overview"
+    {
+        double3 xformOp:translate = (1.2, 4, 3.2)
+        float3 xformOp:rotateXYZ = (-42.0835, 28.3008, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        float focalLength = 24
+        float horizontalAperture = 36
+        float verticalAperture = 20.25
+        float2 clippingRange = (0.01, 100)
+    }
+
+    def Mesh "Cyclorama" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 5, 4, 4, 5, 7, 6, 6, 7, 9, 8, 8, 9, 11, 10, 10, 11, 13, 12, 12, 13, 15, 14, 14, 15, 17, 16, 16, 17, 19, 18, 18, 19, 21, 20, 20, 21, 23, 22, 22, 23, 25, 24, 24, 25, 27, 26, 26, 27, 29, 28, 28, 29, 31, 30, 30, 31, 33, 32, 32, 33, 35, 34, 34, 35, 37, 36]
+        point3f[] points = [(-100, 0, 100), (100, 0, 100), (-100, 0, -2.6), (100, 0, -2.6), (-100, 0.0072229, -2.747), (100, 0.0072229, -2.747), (-100, 0.028822, -2.8926), (100, 0.028822, -2.8926), (-100, 0.064589, -3.0354), (100, 0.064589, -3.0354), (-100, 0.11418, -3.174), (100, 0.11418, -3.174), (-100, 0.17712, -3.3071), (100, 0.17712, -3.3071), (-100, 0.2528, -3.4334), (100, 0.2528, -3.4334), (-100, 0.34048, -3.5516), (100, 0.34048, -3.5516), (-100, 0.43934, -3.6607), (100, 0.43934, -3.6607), (-100, 0.54841, -3.7595), (100, 0.54841, -3.7595), (-100, 0.66664, -3.8472), (100, 0.66664, -3.8472), (-100, 0.7929, -3.9229), (100, 0.7929, -3.9229), (-100, 0.92597, -3.9858), (100, 0.92597, -3.9858), (-100, 1.0646, -4.0354), (100, 1.0646, -4.0354), (-100, 1.2074, -4.0712), (100, 1.2074, -4.0712), (-100, 1.353, -4.0928), (100, 1.353, -4.0928), (-100, 1.5, -4.1), (100, 1.5, -4.1), (-100, 8, -4.1), (100, 8, -4.1)]
+        normal3f[] normals = [(0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 0.99518, 0.098017), (0, 0.99518, 0.098017), (0, 0.98079, 0.19509), (0, 0.98079, 0.19509), (0, 0.95694, 0.29028), (0, 0.95694, 0.29028), (0, 0.92388, 0.38268), (0, 0.92388, 0.38268), (0, 0.88192, 0.4714), (0, 0.88192, 0.4714), (0, 0.83147, 0.55557), (0, 0.83147, 0.55557), (0, 0.77301, 0.63439), (0, 0.77301, 0.63439), (0, 0.70711, 0.70711), (0, 0.70711, 0.70711), (0, 0.63439, 0.77301), (0, 0.63439, 0.77301), (0, 0.55557, 0.83147), (0, 0.55557, 0.83147), (0, 0.4714, 0.88192), (0, 0.4714, 0.88192), (0, 0.38268, 0.92388), (0, 0.38268, 0.92388), (0, 0.29028, 0.95694), (0, 0.29028, 0.95694), (0, 0.19509, 0.98079), (0, 0.19509, 0.98079), (0, 0.098017, 0.99518), (0, 0.098017, 0.99518), (0, 6.1232e-17, 1), (0, 6.1232e-17, 1), (0, 0, 1), (0, 0, 1)] (
+            interpolation = "vertex"
+        )
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </Scene/Looks/Floor>
+    }
+
+    def Mesh "Prism_N_SF11" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Rotated to minimum deviation (67.2 degrees at the d line) for the camera ray through its centre.
+        int[] faceVertexCounts = [3, 3, 4, 4, 4]
+        int[] faceVertexIndices = [0, 2, 1, 3, 4, 5, 0, 1, 4, 3, 1, 2, 5, 4, 2, 0, 3, 5]
+        point3f[] points = [(-0.20450, 0, -0.03716), (0.07006, 0, 0.19568), (0.13443, 0, -0.15852), (-0.20450, 0.55, -0.03716), (0.07006, 0.55, 0.19568), (0.13443, 0.55, -0.15852)]
+        uniform token subdivisionScheme = "none"
+        double3 xformOp:translate = (-1.05, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/N_SF11>
+    }
+
+    def Mesh "Prism_F2" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Rotated to minimum deviation (48.2 degrees at the d line) for the camera ray through its centre.
+        int[] faceVertexCounts = [3, 3, 4, 4, 4]
+        int[] faceVertexIndices = [0, 2, 1, 3, 4, 5, 0, 1, 4, 3, 1, 2, 5, 4, 2, 0, 3, 5]
+        point3f[] points = [(0.17722, 0, -0.10860), (-0.18266, 0, -0.09918), (0.00544, 0, 0.20777), (0.17722, 0.55, -0.10860), (-0.18266, 0.55, -0.09918), (0.00544, 0.55, 0.20777)]
+        uniform token subdivisionScheme = "none"
+        double3 xformOp:translate = (-0.35, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/F2>
+    }
+
+    def Mesh "Prism_N_BK7" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Rotated to minimum deviation (38.6 degrees at the d line) for the camera ray through its centre.
+        int[] faceVertexCounts = [3, 3, 4, 4, 4]
+        int[] faceVertexIndices = [0, 2, 1, 3, 4, 5, 0, 1, 4, 3, 1, 2, 5, 4, 2, 0, 3, 5]
+        point3f[] points = [(-0.06457, 0, 0.19756), (0.20338, 0, -0.04286), (-0.13881, 0, -0.15470), (-0.06457, 0.55, 0.19756), (0.20338, 0.55, -0.04286), (-0.13881, 0.55, -0.15470)]
+        uniform token subdivisionScheme = "none"
+        double3 xformOp:translate = (0.35, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/N_BK7>
+    }
+
+    def Mesh "Prism_N_FK51A" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Rotated to minimum deviation (36.0 degrees at the d line) for the camera ray through its centre.
+        int[] faceVertexCounts = [3, 3, 4, 4, 4]
+        int[] faceVertexIndices = [0, 2, 1, 3, 4, 5, 0, 1, 4, 3, 1, 2, 5, 4, 2, 0, 3, 5]
+        point3f[] points = [(0.20752, 0, 0.01160), (-0.09371, 0, -0.18552), (-0.11381, 0, 0.17392), (0.20752, 0.55, 0.01160), (-0.09371, 0.55, -0.18552), (-0.11381, 0.55, 0.17392)]
+        uniform token subdivisionScheme = "none"
+        double3 xformOp:translate = (1.05, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/N_FK51A>
+    }
+
+    def Cylinder "Slit_N_SF11" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Where the d-line ray leaving N-SF11 meets a slit 2 m away.
+        uniform token axis = "Y"
+        double radius = 0.004
+        double height = 1.2
+        double3 xformOp:translate = (-3.2536, 0.6, -0.0917)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/LightBar>
+    }
+
+    def Cylinder "Slit_F2" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Where the d-line ray leaving F2 meets a slit 2 m away.
+        uniform token axis = "Y"
+        double radius = 0.004
+        double height = 1.2
+        double3 xformOp:translate = (-2.1461, 0.6, -1.2306)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/LightBar>
+    }
+
+    def Cylinder "Slit_N_BK7" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Where the d-line ray leaving N-BK7 meets a slit 2 m away.
+        uniform token axis = "Y"
+        double radius = 0.004
+        double height = 1.2
+        double3 xformOp:translate = (-0.7705, 0.6, -1.846)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/LightBar>
+    }
+
+    def Cylinder "Slit_N_FK51A" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Where the d-line ray leaving N-FK51A meets a slit 2 m away.
+        uniform token axis = "Y"
+        double radius = 0.004
+        double height = 1.2
+        double3 xformOp:translate = (0.5003, 0.6, -2.0841)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </Scene/Looks/LightBar>
+    }
+
+    def DomeLight "Ambient"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 0.25
+    }
+}

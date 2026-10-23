@@ -80,6 +80,28 @@
   require(job.isCancelled && !job.isHelperRunning, "quit terminates the USD helper")
   require(scratch().subtracting(before).isEmpty, "quit removes the USD scratch folder")
   controller.usdImportJob = nil
-  print("PASS: USD robust import, orbit/focus separation, constant dome, emission clamp, image color space, sphere proxy, quit cancellation")
+
+  // Bundled spectral examples (SpectralExamples): implicit spheres and cylinders are tessellated and instanced,
+  // and the OpenPBR thin-film and dispersion constants reach MaterialXProgram.spectral.
+  func example(_ shot: String) throws -> ProjectDocument {
+    guard let path = try ShowcaseShot.bundled().first(where: { $0.name == shot })?.usd, let url = SpectralExamples.url(path)
+    else { throw MaterialLibrary.error("no stage for \(shot)") }
+    return try USDImporter.load(url, into: ProjectDocument()).document
+  }
+  let newton = try example("spectral-newton-series")
+  let films = (newton.scenes[6]!.materialX ?? [:]).values.compactMap(\.spectral).filter { $0.y == 1 }
+  let soap = films.filter { $0.w == 1.33 }.map(\.z).sorted(), oxide = films.filter { $0.w == 2.4 }.map(\.z).sorted()
+  require(soap.count == 8 && close(soap[0], 0.1) && close(soap[7], 0.8) && oxide.count == 8 && close(oxide[0], 0.03)
+    && close(oxide[7], 0.15), "Newton's colour series keeps its film thicknesses: \(soap) \(oxide)")
+  require(newton.graph!.assets.count == 3 && newton.graph!.nodes.filter { $0.mesh != nil }.count == 16 + 1 + 1,
+    "the 16 spheres share one tessellated asset (\(newton.graph!.assets.count) assets)")
+  require(newton.environmentData != nil && newton.camera.fov > 20, "Newton's colour series has its tent dome and camera")
+  let abbe = try example("spectral-abbe-row")
+  let dispersion = (abbe.scenes[6]!.materialX ?? [:]).values.compactMap(\.spectral).map(\.x).filter { $0 > 0 }.sorted()
+  require(dispersion.count == 4 && close(dispersion[0], 20 / 84.47) && close(dispersion[3], 20 / 25.68),
+    "Abbe row prisms carry OpenPBR dispersion 20 / V_d: \(dispersion)")
+  require((abbe.scenes[6]!.emissions ?? [:]).isEmpty == false || abbe.scenes[6]!.materialX!.values.contains { $0.emission != nil },
+    "Abbe row slits emit")
+  print("PASS: USD robust import, orbit/focus separation, constant dome, emission clamp, image color space, sphere proxy, quit cancellation, spectral examples")
 }
 try fixUSDChecks()

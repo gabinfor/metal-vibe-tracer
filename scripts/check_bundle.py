@@ -30,6 +30,20 @@ for path in [executable, contents / "Info.plist", resources / "OpenPBR.metal", r
     if not path.is_file():
         problems.append(f"missing {path.relative_to(app)}")
 
+# Bundled spectral examples (SpectralExamples): every showcase stage under Examples/ is in the bundle at the
+# same path, unchanged.
+try:
+    for shot in json.loads((resources / "showcase.json").read_text()):
+        stage = shot.get("usd", "")
+        if stage.startswith("Examples/"):
+            bundled = resources / stage
+            if not bundled.is_file():
+                problems.append(f"missing bundled example {stage}")
+            elif sha256_file(bundled) != sha256_file(app.parents[1] / stage):
+                problems.append(f"bundled example {stage} differs from the repository")
+except (OSError, ValueError) as error:
+    problems.append(f"showcase.json unreadable: {error}")
+
 # Spectral transport's tables: exactly the generator's outputs (their manifest's SHA-256), the
 # licences that cover them, and not the opt-in 96 MiB test table.
 try:

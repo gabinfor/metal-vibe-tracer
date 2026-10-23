@@ -221,3 +221,28 @@ check(fast==slow,'bulk Vt conversion changes the bridge snapshot')
 print('USD bridge conversion (%d triangles): %.3f s bulk, %.3f s per corner'%(2*(n*n-2)+6,fastTime,slowTime))
 check(fastTime*3<slowTime,'bulk Vt conversion is not faster than per-corner Gf conversion (%.3f s against %.3f s)'%(fastTime,slowTime))
 print('PASS: USD bridge bulk vector conversion is byte-identical to per-corner Gf conversion (float/half primvars, all interpolations)')
+# Implicit Sphere, Cube and Cylinder prims are tessellated from their schema attributes: outward winding that
+# agrees with the smooth normals, surface areas close to the analytic ones, transforms and bindings kept.
+shapes=Usd.Stage.CreateNew(str(out/'shapes.usda'));UsdGeom.SetStageMetersPerUnit(shapes,1)
+ball=UsdGeom.Sphere.Define(shapes,'/Ball');ball.CreateRadiusAttr(0.5)
+box=UsdGeom.Cube.Define(shapes,'/Box');box.CreateSizeAttr(2);box.AddTranslateOp().Set((3,0,0))
+can=UsdGeom.Cylinder.Define(shapes,'/Can');can.CreateAxisAttr('X');can.CreateRadiusAttr(0.3);can.CreateHeightAttr(1)
+UsdGeom.Sphere.Define(shapes,'/Flat').CreateRadiusAttr(0)
+shapes.GetRootLayer().Save()
+for path,area in [('/Ball',math.pi),('/Box',24),('/Can',2*math.pi*0.3+2*math.pi*0.09)]:
+ points,counts,indices,normals,st=bridge.implicit_mesh(shapes.GetPrimAtPath(path),Usd.TimeCode.Default());total=0;offset=0
+ for count in counts:
+  for t in bridge.triangulate(points,indices[offset:offset+count])[0]:
+   a,b,c=[points[indices[offset+i]] for i in t];w=bridge.cross(bridge.sub(b,a),bridge.sub(c,a));total+=math.sqrt(sum(x*x for x in w))/2
+   check(sum(x*sum(normals[offset+i][k] for i in t) for k,x in enumerate(w))>0,path+' winds outward')
+  offset+=count
+ check(abs(total-area)<0.002*area,path+' tessellated area %.5f, analytic %.5f'%(total,area))
+check(max(abs(p[0]) for p in bridge.implicit_mesh(shapes.GetPrimAtPath('/Can'),Usd.TimeCode.Default())[0])==0.5,'cylinder follows its axis')
+implicit=bridge.import_stage(str(out/'shapes.usda'),out)
+check(len(implicit['assets'])==3 and any('/Flat: degenerate Sphere skipped' in line for line in implicit['report']),implicit['report'])
+check(next(n for n in implicit['nodes'] if n['name']=='Box')['matrix'][12]==3,'implicit prim keeps its transform')
+# The bundled spectral examples import with every material translated.
+for name in ['NewtonSeries.usda','AbbeRow.usda']:
+ example=bridge.import_stage(str(ROOT/'Examples/Spectral'/name),out)
+ check(all(m.get('mtlx') or m.get('emission') for m in example['materials']) and len(example['cameras'])==(2 if name=='AbbeRow.usda' else 1),name+': '+str(example['report']))
+print('PASS: USD implicit Sphere, Cube and Cylinder tessellation; bundled spectral examples')

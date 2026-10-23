@@ -421,7 +421,10 @@ extension StudioController {
       }
     }
   }
-  func beginImportUSD(from url: URL) {
+  // `adjust` edits the imported document before its resources are prepared; with `opened`, that status
+  // message replaces the import report sheet (the bundled spectral examples).
+  func beginImportUSD(from url: URL, opened: String? = nil,
+                      adjust: (@Sendable (inout ProjectDocument) -> Void)? = nil) {
     guard !isBusy else { return }
     let record = undoRecord("Open USD scene", replacesDocument: true)
     let source = snapshot()
@@ -439,7 +442,8 @@ extension StudioController {
     DispatchQueue.global(qos: .userInitiated).async {
       // Resources are prepared off the main thread, reusing unchanged live resources.
       let result = Result { () -> (USDImportResult, MaterialLibrary) in
-        let imported = try USDImporter.load(url, into: source, job: job, progress: progress)
+        var imported = try USDImporter.load(url, into: source, job: job, progress: progress)
+        adjust?(&imported.document)
         return (imported, try self.prepareResources(imported.document, reuse: reuse, progress: progress))
       }
       DispatchQueue.main.async {
@@ -455,7 +459,7 @@ extension StudioController {
         switch result {
         case .success(let (imported, resources)):
           self.publishImportedUSD(imported, resources: resources, record: record)
-          self.showUSDReport()
+          if let opened { self.show(opened) } else { self.showUSDReport() }
         case .failure(let error):
           self.showError(error.localizedDescription)
           self.rebuild()
