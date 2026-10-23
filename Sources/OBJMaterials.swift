@@ -134,7 +134,8 @@ enum OBJMaterials {
 
   // Compiles the materials named `names` from the `mtllib` files (resolved against `folder`).
   // Returns programs by material name and the base colours (for slots whose program fails).
-  static func programs(libraries: [String], folder: URL, names: Set<String>, report: inout [String]) throws
+  static func programs(libraries: [String], folder: URL, names: Set<String>, report: inout [String],
+                       progress: OperationProgress? = nil) throws
     -> (programs: [String: MaterialXProgram], colors: [String: SIMD3<Float>])
   {
     var materials: [String: MTLMaterial] = [:]
@@ -164,9 +165,11 @@ enum OBJMaterials {
     var document = MaterialXWriter()
     var shaders: [String: String] = [:]
     for (index, m) in used.enumerated() {
+      progress?.update("Translating MTL materials", completed: index, of: used.count)
       shaders["m\(index)"] = m.name
       document.material(m, prefix: "m\(index)", folder: folder, scratch: scratch, report: &report)
     }
+    progress?.begin("Reading material textures")
     let imported = try MaterialXImporter.read(Data(document.text.utf8), baseURL: folder, source: "MTL")
     var programs: [String: MaterialXProgram] = [:]
     for var program in imported.materials {

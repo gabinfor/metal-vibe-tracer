@@ -395,15 +395,16 @@ enum OBJMesh {
   // are (numerically) collinear. `nodeBudget` bounds the scene nodes the parts create (one per
   // object, one per object/group part) so oversized hierarchies fail before the whole file is
   // parsed. `libraries` receives each `mtllib` statement's argument text.
-  static func parts(_ data: Data, skipped: inout Int, nodeBudget: Int = Int.max, libraries: inout [String]) throws
-    -> [OBJPart]
+  static func parts(_ data: Data, skipped: inout Int, nodeBudget: Int = Int.max, libraries: inout [String],
+                    progress: OperationProgress? = nil) throws -> [OBJPart]
   {
     try data.withUnsafeBytes { raw in
-      try parts(raw.bindMemory(to: UInt8.self), skipped: &skipped, nodeBudget: nodeBudget, libraries: &libraries)
+      try parts(raw.bindMemory(to: UInt8.self), skipped: &skipped, nodeBudget: nodeBudget, libraries: &libraries,
+                progress: progress)
     }
   }
   private static func parts(_ bytes: UnsafeBufferPointer<UInt8>, skipped: inout Int, nodeBudget: Int,
-                            libraries: inout [String]) throws -> [OBJPart] {
+                            libraries: inout [String], progress: OperationProgress?) throws -> [OBJPart] {
     var positions: [SIMD3<Float>] = []
     var normals: [SIMD3<Float>] = []
     var uvs: [SIMD2<Float>] = []
@@ -577,8 +578,13 @@ enum OBJMesh {
     // Physical lines end at LF, CR, CR LF, VT or FF (Swift's newline characters in ASCII). A
     // trailing backslash outside a comment continues the statement on the next line.
     var pending: [UInt8] = []
-    var physical = 0, start = 0
+    var physical = 0, start = 0, reported = 0
     while start <= bytes.count {
+      // The parse reports its byte position every 4 MB.
+      if let progress, start - reported >= 1 << 22 {
+        reported = start
+        progress.update("Parsing OBJ geometry", fraction: Double(start) / Double(bytes.count))
+      }
       var end = start
       while end < bytes.count, bytes[end] != 0x0A, bytes[end] != 0x0D, bytes[end] != 0x0B, bytes[end] != 0x0C { end += 1 }
       physical += 1
@@ -852,6 +858,8 @@ extension MaterialLibrary {
     // Build all textures (maps and MaterialX images) before publishing a restored
     // scene, and budget them together as one candidate set.
     var replacement = (0..<(SceneLimits.materials * 4)).map { defaultTexture(channel: $0 % 4) }
+    let maps = state.maps.compactMap { $0 }.count
+    var decoded = 0
     for i in state.maps.indices {
       guard let bytes = state.maps[i] else { continue }
       if payloads.indices.contains(i), payloads[i] == bytes {
@@ -859,11 +867,14 @@ extension MaterialLibrary {
       } else if external.payloads.indices.contains(i), external.payloads[i] == bytes {
         replacement[i] = external.images[i]
       } else {
+        progress?.update("Decoding material textures", completed: decoded, of: maps)
+        decoded += 1
         replacement[i] = try texture(data: bytes, channel: i % 4, pending: replacement)
       }
       try validateCandidateTextures(images: replacement)
     }
     let programs = state.materialX ?? [:]
+    if !programs.isEmpty { progress?.begin("Preparing \(programs.count) MaterialX materials") }
     let graph = try materialXCandidate(programs, images: replacement)
     try validateCandidateTextures(images: replacement, graph: graph.textures)
     let oldSettings = settings, oldObjects = objects, oldPayloads = payloads, oldNames = fileNames
@@ -1193,6 +1204,7 @@ extension MaterialLibrary {
         throw Self.error("The mesh exceeds the \(SceneLimits.triangles.formatted()) triangle limit.")
       }
       var layout = MeshSceneLayout()
+      progress?.begin("Building the mesh hierarchy")
       try publishTwoLevel(
         assets: [(MeshSceneLayout.legacyAsset, MeshGeometry(triangles: triangles))], document: triangles,
         legacyExtras: triangles.map(MeshStreams.extra), layout: &layout
@@ -1201,6 +1213,7 @@ extension MaterialLibrary {
       }
       return
     }
+    progress?.begin("Building the mesh hierarchy")
     let t = try triangleStorage(triangles.count)
     if !triangles.isEmpty {
       triangles.withUnsafeBytes { t.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
@@ -1218,6 +1231,7 @@ extension MaterialLibrary {
       }
       return
     }
+    progress?.begin("Building the mesh hierarchy")
     let count = try graph.renderTriangleCount()
     guard count <= SceneLimits.flatTriangles else {
       throw Self.error("The flat BVH renders at most \(SceneLimits.flatTriangles.formatted()) triangles.")

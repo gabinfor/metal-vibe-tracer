@@ -146,6 +146,19 @@ final class StudioController: NSViewController {
   weak var hostWindow: NSWindow?
   let viewport: InteractiveMTKView
   let sidebar = NSScrollView(), stack = TopAlignedStackView(), status = NSTextField(labelWithString: "")
+  // The activity strip left of the status line: a progress bar, its phase and, for operations that
+  // support it, a Cancel button (beginActivity). Background shader compilation shows there too.
+  let activityStrip = NSStackView(), activityBar = NSProgressIndicator()
+  let activityLabel = NSTextField(labelWithString: "")
+  private(set) lazy var activityCancel = ActionButton("Cancel") { [weak self] in self?.activityCancelHandler?() }
+  private(set) var activity: OperationProgress?
+  private var activityCancelHandler: (() -> Void)?
+  private var activityTimer: Timer?
+  private var statusAtEdge: NSLayoutConstraint!, statusAfterActivity: NSLayoutConstraint!
+  // The empty start state shown at launch (StartScreenView); nil once a document is loaded.
+  fileprivate(set) var startScreen: StartScreenView?
+  // Set while the start screen restores the last session, which keeps its autosave file.
+  fileprivate var restoringSession = false
   private(set) var errorMessage: String?
   private(set) lazy var errorButton = ActionButton("") { [weak self] in self?.showErrorDetails() }
   let history = UndoManager()
@@ -154,7 +167,7 @@ final class StudioController: NSViewController {
   var importInProgress = false { didSet { busyStateChanged() } }
   var usdImportJob: USDImportJob?
   // Opens (including the launch restore), saves and off-main document preparation.
-  private var openInFlight = false { didSet { busyStateChanged() } }
+  private(set) var openInFlight = false { didSet { busyStateChanged() } }
   private var saveInFlight = false { didSet { busyStateChanged() } }
   private var preparationInFlight: UInt64? { didSet { busyStateChanged() } }
   var projectOperationInProgress: Bool { openInFlight || saveInFlight || preparationInFlight != nil }
@@ -164,7 +177,7 @@ final class StudioController: NSViewController {
   var pauseButton: NSButton?
   private var busyButtons: [NSButton] = []
   private var projectActivity = ""
-  private let autosaveQueue = DispatchQueue(label: "VibeTracer.autosave", qos: .utility)
+  let autosaveQueue = DispatchQueue(label: "VibeTracer.autosave", qos: .utility)
   private let projectIOQueue = DispatchQueue(label: "VibeTracer.project-io", qos: .userInitiated)
   private var documentRevision: UInt64 = 0
   var openGeneration: UInt64 = 0, saveGeneration: UInt64 = 0, prepareGeneration: UInt64 = 0
@@ -179,7 +192,7 @@ final class StudioController: NSViewController {
   private var pendingSaveFailure: String?
   // Tests redirect the recovery files; production uses Application Support.
   var autosaveURL = StudioController.defaultAutosaveURL
-  private var autosaveSuppressed = false
+  private(set) var autosaveSuppressed = false
   // Shared with autosaveQueue: the newest queued snapshot and the revision last written.
   private struct AutosaveState {
     var queued: PendingAutosave?
@@ -278,13 +291,20 @@ final class StudioController: NSViewController {
     renderer.onFrameUpdate = { [weak self] _ in self?.updateStatus() }
     renderer.onError = { [weak self] text in self?.showError(text) }
     renderer.onPausedChange = { [weak self] in self?.busyStateChanged() }
-    renderer.onSpectralShadersReady = { [weak self] in self?.rebuild() }
+    renderer.onSpectralShadersReady = { [weak self] in self?.rebuild(); self?.refreshActivity() }
+    renderer.onKernelsReady = { [weak self] in self?.rebuild(); self?.refreshActivity() }
     installMenus()
     updateWindowTitle()
     rebuild()
   }
   // The window names the project file (with its proxy icon); the app name is the subtitle.
   func updateWindowTitle() {
+    if startScreen != nil {
+      hostWindow?.representedURL = nil
+      hostWindow?.title = "Metal Vibe Tracer"
+      hostWindow?.subtitle = ""
+      return
+    }
     hostWindow?.representedURL = projectURL
     hostWindow?.title = projectURL?.lastPathComponent ?? "Untitled"
     hostWindow?.subtitle = "Metal Vibe Tracer"
@@ -333,7 +353,21 @@ final class StudioController: NSViewController {
     errorButton.lineBreakMode = .byTruncatingTail
     errorButton.isHidden = true
     errorButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-    for v in [bar, viewport, sidebar, status, errorButton] {
+    activityStrip.orientation = .horizontal
+    activityStrip.spacing = 6
+    activityBar.style = .bar
+    activityBar.controlSize = .small
+    activityBar.minValue = 0
+    activityBar.maxValue = 1
+    activityBar.widthAnchor.constraint(equalToConstant: 120).isActive = true
+    activityLabel.font = .systemFont(ofSize: 11)
+    activityLabel.lineBreakMode = .byTruncatingTail
+    activityLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    activityCancel.controlSize = .small
+    activityCancel.font = .systemFont(ofSize: 11)
+    for v in [activityBar, activityLabel, activityCancel] { activityStrip.addArrangedSubview(v) }
+    activityStrip.isHidden = true
+    for v in [bar, viewport, sidebar, activityStrip, status, errorButton] {
       v.translatesAutoresizingMaskIntoConstraints = false
       root.addSubview(v)
     }
@@ -345,7 +379,9 @@ final class StudioController: NSViewController {
       bar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
       bar.heightAnchor.constraint(equalToConstant: 30),
       status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
-      status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+      activityStrip.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+      activityStrip.centerYAnchor.constraint(equalTo: status.centerYAnchor),
+      activityStrip.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.5),
       status.trailingAnchor.constraint(equalTo: errorButton.leadingAnchor, constant: -8),
       errorButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
       errorButton.centerYAnchor.constraint(equalTo: status.centerYAnchor),
@@ -362,6 +398,9 @@ final class StudioController: NSViewController {
       stack.trailingAnchor.constraint(equalTo: sidebar.contentView.trailingAnchor),
       stack.topAnchor.constraint(equalTo: sidebar.contentView.topAnchor),
     ])
+    statusAtEdge = status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12)
+    statusAfterActivity = status.leadingAnchor.constraint(equalTo: activityStrip.trailingAnchor, constant: 10)
+    statusAtEdge.isActive = true
   }
   func add(_ v: NSView) {
     if let control = v as? NumberControl, control.onReject == nil {
@@ -462,7 +501,8 @@ final class StudioController: NSViewController {
     }
     if projectOperationInProgress || importInProgress {
       heading(projectActivity.isEmpty ? "Working…" : projectActivity)
-      text("Editing resumes when the project operation finishes.")
+      text("Editing resumes when the project operation finishes. The progress bar below the viewport shows each step.")
+      if let job = usdImportJob { button("Cancel Import") { [weak self] in job.cancel(); self?.show("Cancelling the USD import…") } }
       return
     }
     switch page {
@@ -574,6 +614,10 @@ final class StudioController: NSViewController {
       text(failure)
     } else if r.activeLightTransport == .spectral && r.spectralShaders.compiling {
       text("Compiling the spectral shaders; the view renders in RGB until they are ready.")
+    }
+    let compiling = PathTracerRenderer.KernelGroup.allCases.filter { r.sceneShaders.compiling.contains($0) }
+    if !compiling.isEmpty {
+      text("Compiling the \(compiling.map(\.title).joined(separator: ", ")) shaders; until they are ready the view renders with ReSTIR GI, reprojection and automatic neighbours.")
     }
     choice(
       "Indirect reuse", Self.indirectReuseChoices, current: r.indirectReuse,
@@ -1097,7 +1141,7 @@ final class StudioController: NSViewController {
     button("Save project") { [weak self] in self?.saveProject() }
     button("Save project as…") { [weak self] in self?.saveProject(asNew: true) }
     text(
-      "Projects embed textures, the environment image, and imported geometry. Changes are also autosaved locally and restored at next launch."
+      "Projects embed textures, the environment image, and imported geometry. Changes are also autosaved locally; the start screen offers to restore them at the next launch."
     )
     heading("Export")
     number("Output width", Float(renderer.options.outputWidth), 16...8192, 1920, reset: false) {
@@ -1166,6 +1210,7 @@ final class StudioController: NSViewController {
   func updateStatus() {
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
     busyStateChanged()
+    if activityTimer == nil, backgroundShaderProgress != nil { refreshActivity() }
     guard Date() >= messageUntil, exportRenderer == nil else { return }
     let r = renderer
     let state = r.paused ? "Paused" : r.reachedLimit ? "Complete" : "Rendering"
@@ -1288,14 +1333,71 @@ final class StudioController: NSViewController {
   }
   private func busyStateChanged() {
     let enabled = !isBusy
+    if enabled, activity != nil {
+      activity = nil
+      activityCancelHandler = nil
+      refreshActivity()
+    }
+    startScreen?.setActionsEnabled(enabled)
     for button in busyButtons { button.isEnabled = enabled }
     pauseButton?.isEnabled = enabled
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
   }
-  func beginProjectActivity(_ activity: String) {
+  @discardableResult func beginProjectActivity(_ activity: String, cancel: (() -> Void)? = nil) -> OperationProgress {
     projectActivity = activity
     show(activity)
+    let progress = beginActivity(activity.hasSuffix("…") ? String(activity.dropLast()) : activity, cancel: cancel)
     rebuild()
+    return progress
+  }
+  // Shows a new operation's progress in the activity strip (and on the start screen) until the
+  // controller is no longer busy; `cancel` adds a Cancel button. Call it once the operation is busy.
+  @discardableResult func beginActivity(_ phase: String, cancel: (() -> Void)? = nil) -> OperationProgress {
+    let progress = OperationProgress(phase)
+    activity = progress
+    activityCancelHandler = cancel
+    refreshActivity()
+    return progress
+  }
+  // Background compilation of optional kernel groups or spectral pipelines.
+  var backgroundShaderProgress: OperationProgress? {
+    renderer.sceneShaders.progress ?? renderer.spectralShaders.progress
+  }
+  // Updates the activity strip from the current progress; polls at 10 Hz while one is shown.
+  func refreshActivity() {
+    let progress = activity ?? backgroundShaderProgress
+    let visible = progress != nil
+    if activityStrip.isHidden == visible {
+      activityStrip.isHidden = !visible
+      statusAtEdge.isActive = !visible
+      statusAfterActivity.isActive = visible
+    }
+    activityCancel.isHidden = activity == nil || activityCancelHandler == nil
+    if let snapshot = progress?.snapshot {
+      activityLabel.stringValue = snapshot.text
+      activityStrip.toolTip = snapshot.text
+      if let fraction = snapshot.fraction {
+        activityBar.isIndeterminate = false
+        activityBar.doubleValue = fraction
+      } else {
+        activityBar.isIndeterminate = true
+      }
+      activityBar.startAnimation(nil)
+    } else {
+      activityBar.stopAnimation(nil)
+    }
+    // A load started from the start screen shows its progress there too.
+    startScreen?.setProgress(activity?.snapshot)
+    if visible, activityTimer == nil {
+      let timer = Timer(timeInterval: 0.1, repeats: true) { _ in
+        MainActor.assumeIsolated { [weak self] in self?.refreshActivity() }
+      }
+      RunLoop.main.add(timer, forMode: .common)
+      activityTimer = timer
+    } else if !visible {
+      activityTimer?.invalidate()
+      activityTimer = nil
+    }
   }
   // Runs quit continuations once no project I/O remains.
   private func finishProjectOperation() {
@@ -1319,11 +1421,13 @@ final class StudioController: NSViewController {
   // set, taken on the main thread. It stays live until applyProject, so the candidate
   // budgets and shares against it.
   nonisolated func prepareResources(
-    _ p: ProjectDocument, reuse: ReusableResources? = nil, resident: MaterialLibrary.ResidentTextures? = nil
+    _ p: ProjectDocument, reuse: ReusableResources? = nil, resident: MaterialLibrary.ResidentTextures? = nil,
+    progress: OperationProgress? = nil
   ) throws -> MaterialLibrary {
     try p.validate()
     let resources = try MaterialLibrary(
       device: renderer.device, function: renderer.materialFunction)
+    resources.progress = progress
     resources.external = resident ?? reuse?.resident ?? MaterialLibrary.ResidentTextures()
     if let reuse { resources.adopt(reuse) }
     try resources.restore(p.scenes[Int(p.scene)] ?? SceneState())
@@ -1340,12 +1444,14 @@ final class StudioController: NSViewController {
       try resources.setMesh(p)
     }
     resources.hasSceneGraph = p.graph != nil
+    resources.progress = nil
     return resources
   }
   // Only radiance-affecting differences restart accumulation. Display-only state
   // (exposure, white balance, tone map, divider, MetalFX, viewport mode, limits,
   // export settings, saved views) keeps the accumulated samples and OIDN preview.
   func applyProject(_ p: ProjectDocument, resources: MaterialLibrary?, resourcesChanged: Bool = true) {
+    if startScreen != nil { dismissStartScreen() }
     isRestoring = true
     defer { isRestoring = false }
     let r = renderer
@@ -1447,7 +1553,7 @@ final class StudioController: NSViewController {
         completion(nil)
       } catch { completion(error) }
     case .prepare:
-      beginDocumentChange(activity, build: { (p, ()) }) { result in
+      beginDocumentChange(activity, build: { _ in (p, ()) }) { result in
         if case .failure(let error) = result { completion(error) } else { completion(nil) }
       }
     }
@@ -1455,19 +1561,19 @@ final class StudioController: NSViewController {
   // Builds a candidate document (parsing imports) and prepares its resources on
   // projectIOQueue, then publishes it unless a newer replacement superseded it.
   func beginDocumentChange<Extra: Sendable>(
-    _ activity: String, build: @escaping @Sendable () throws -> (ProjectDocument, Extra),
+    _ activity: String, build: @escaping @Sendable (OperationProgress) throws -> (ProjectDocument, Extra),
     completion: @escaping @MainActor (Result<Extra, Error>) -> Void
   ) {
     prepareGeneration &+= 1
     let generation = prepareGeneration
     let reuse = renderer.materials.reusableResources(graph: project.graph)
     preparationInFlight = generation
-    beginProjectActivity(activity)
+    let progress = beginProjectActivity(activity)
     projectIOQueue.async { [weak self] in
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, Extra, MaterialLibrary) in
-        let (document, extra) = try build()
-        return (document, extra, try self.prepareResources(document, reuse: reuse))
+        let (document, extra) = try build(progress)
+        return (document, extra, try self.prepareResources(document, reuse: reuse, progress: progress))
       }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
@@ -1604,7 +1710,7 @@ final class StudioController: NSViewController {
     autosaveState.withLock { $0.written = written }
   }
   func autosave() {
-    guard !isRestoring, !autosaveSuppressed else { return }
+    guard !isRestoring, !autosaveSuppressed, startScreen == nil else { return }
     let item = PendingAutosave(
       document: autosaveSnapshot(), revision: documentRevision, url: autosaveURL)
     let scheduled = autosaveState.withLock { state -> Bool in
@@ -1624,7 +1730,8 @@ final class StudioController: NSViewController {
   // older snapshot can never replace the final state during application shutdown.
   // Nothing is rewritten when the current revision is already on disk.
   func flushAutosave(to destination: URL? = nil) throws {
-    guard !isRestoring, !autosaveSuppressed else { return }
+    // Quitting from the start screen keeps the last session's autosave for the next launch.
+    guard !isRestoring, !autosaveSuppressed, startScreen == nil || destination != nil else { return }
     saveTimer?.invalidate()
     saveTimer = nil
     let item = PendingAutosave(
@@ -1679,13 +1786,14 @@ final class StudioController: NSViewController {
     let generation = openGeneration
     let reuse = renderer.materials.reusableResources(graph: project.graph)
     openInFlight = true
-    beginProjectActivity("Restoring autosaved project…")
+    let progress = beginProjectActivity("Restoring autosaved project…")
     projectIOQueue.async { [weak self] in
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, MaterialLibrary) in
         let data = try self.readBounded(url, maximum: ProjectDocument.maximumFileBytes)
+        progress.begin("Decoding the autosaved project")
         let document = try ProjectDocument.decodeProject(data, near: url)
-        return (document, try self.prepareResources(document, reuse: reuse))
+        return (document, try self.prepareResources(document, reuse: reuse, progress: progress))
       }
       var preserved: Result<URL, Error>?
       if case .failure = result { preserved = Result { try Self.preserveUnrestorableAutosave(url) } }
@@ -1715,6 +1823,8 @@ final class StudioController: NSViewController {
         }
         // The file on disk (or its preserved copy) already holds this state.
         self.markAutosaved()
+        self.restoringSession = false
+        self.startScreen?.setRestore(Self.autosaveDate(at: url))
         self.rebuild()
         self.finishProjectOperation()
       }
@@ -1761,13 +1871,14 @@ final class StudioController: NSViewController {
     let generation = openGeneration
     let reuse = renderer.materials.reusableResources(graph: project.graph)
     openInFlight = true
-    beginProjectActivity("Opening \(url.lastPathComponent)…")
+    let progress = beginProjectActivity("Opening \(url.lastPathComponent)…")
     projectIOQueue.async { [weak self] in
       guard let self else { return }
       let result = Result { () -> (ProjectDocument, MaterialLibrary) in
         let data = try self.readBounded(url, maximum: ProjectDocument.maximumFileBytes)
+        progress.begin("Decoding \(url.lastPathComponent)")
         let document = try ProjectDocument.decodeProject(data, near: url)
-        return (document, try self.prepareResources(document, reuse: reuse))
+        return (document, try self.prepareResources(document, reuse: reuse, progress: progress))
       }
       DispatchQueue.main.async { [weak self] in
         guard let self, generation == self.openGeneration else { return }
@@ -1825,10 +1936,13 @@ final class StudioController: NSViewController {
     saveGeneration &+= 1
     let generation = saveGeneration
     saveInFlight = true
-    beginProjectActivity("Saving \(url.lastPathComponent)…")
+    let progress = beginProjectActivity("Saving \(url.lastPathComponent)…")
     projectIOQueue.async { [weak self] in
       let result = Result {
-        try document.encodeForSaving().write(to: url, options: .atomic)
+        progress.begin("Encoding \(url.lastPathComponent)")
+        let data = try document.encodeForSaving()
+        progress.begin("Writing \(url.lastPathComponent) (\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)))")
+        try data.write(to: url, options: .atomic)
       }
       DispatchQueue.main.async { [weak self] in
         guard let self, generation == self.saveGeneration else { return }
@@ -1953,7 +2067,7 @@ final class StudioController: NSViewController {
     let record = undoRecord("Load material")
     let document = snapshot()
     let scene = Int(renderer.sceneIndex)
-    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, Void) in
+    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] _ -> (ProjectDocument, Void) in
       guard let self else { throw MaterialLibrary.error("Material preset load cancelled.") }
       var document = document  // The build runs on projectIOQueue with its own copy.
       let p = try ProjectDocument.decodeProject(
@@ -1997,7 +2111,7 @@ final class StudioController: NSViewController {
     guard !isBusy else { return }
     let record = undoRecord("Environment image")
     let document = snapshot()
-    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, Void) in
+    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] _ -> (ProjectDocument, Void) in
       guard let self else { throw MaterialLibrary.error("Environment load cancelled.") }
       var document = document  // The build runs on projectIOQueue with its own copy.
       document.environmentData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
@@ -2032,7 +2146,7 @@ final class StudioController: NSViewController {
     guard !isBusy else { return }
     let record = undoRecord("Import OBJ")
     let document = snapshot()
-    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, (UUID, Int, Int, [String])) in
+    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] progress -> (ProjectDocument, (UUID, Int, Int, [String])) in
       guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
       var document = document  // The build runs on projectIOQueue with its own copy.
       // Memory-mapped and streamed: files of several GB parse without a text copy.
@@ -2040,7 +2154,7 @@ final class StudioController: NSViewController {
       var skipped = 0
       var report: [String] = []
       let root = try document.appendOBJ(objData, name: url.lastPathComponent, folder: url.deletingLastPathComponent(),
-        skipped: &skipped, report: &report)
+        skipped: &skipped, report: &report, progress: progress)
       return (document, (root, document.graph?.materials.last?.slot ?? 1, skipped, report))
     }) { [weak self] result in
       guard let self else { return }
@@ -2283,6 +2397,96 @@ final class StudioController: NSViewController {
   @objc func restartAction() { restart() }
 }
 
+// The start screen (StartScreenView): the empty state at launch.
+extension StudioController {
+  // Covers the viewport and inspector with `view` (the launch screen, reused) until a document loads.
+  // Nothing renders meanwhile, and no autosave is written, so the last session stays restorable.
+  func showStartScreen(_ view: StartScreenView = StartScreenView()) {
+    view.setRestore(Self.autosaveDate(at: autosaveURL))
+    view.onAction = { [weak self] action in self?.performStartAction(action) }
+    view.onCancelPending = nil
+    view.setPending(nil)
+    view.setActionsEnabled(!isBusy)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.removeFromSuperview()
+    self.view.addSubview(view)
+    NSLayoutConstraint.activate([
+      view.topAnchor.constraint(equalTo: self.view.topAnchor),
+      view.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
+      view.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
+      view.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
+    ])
+    startScreen = view
+    viewport.isPaused = true
+    viewport.isHidden = true
+    updateWindowTitle()
+    refreshActivity()
+  }
+  // A loaded document (applyProject) replaces the start screen. Unless the last session was
+  // restored, its autosave becomes the recovery copy (Autosave-previous.vtrace) before this
+  // session's first autosave can replace it.
+  func dismissStartScreen() {
+    guard let view = startScreen else { return }
+    view.removeFromSuperview()
+    startScreen = nil
+    if !restoringSession { retireLastSessionAutosave() }
+    viewport.isHidden = false
+    viewport.isPaused = false
+    renderer.lastTick = awakeSeconds()
+    updateWindowTitle()
+    refreshActivity()
+  }
+  private func retireLastSessionAutosave() {
+    let current = autosaveURL, previous = previousAutosaveURL
+    guard !autosaveSuppressed else { return }
+    autosaveQueue.async {
+      let files = FileManager.default
+      guard files.fileExists(atPath: current.path) else { return }
+      try? files.removeItem(at: previous)
+      try? files.moveItem(at: current, to: previous)
+    }
+  }
+  nonisolated static func autosaveDate(at url: URL) -> Date? {
+    (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+  }
+  func performStartAction(_ action: StartAction) {
+    guard !isBusy else { return }
+    switch action {
+    case .openProject(let url?): beginOpenProject(url)
+    case .importOBJ(let url?): beginImportOBJ(from: url)
+    case .importUSD(let url?): beginImportUSD(from: url)
+    case .builtInScene(let index): startBuiltInScene(index)
+    case .restoreSession:
+      restoringSession = true
+      restoreAutosave()
+      if !openInFlight { restoringSession = false }
+    case .openProject(nil), .importOBJ(nil), .importUSD(nil):
+      guard let window = hostWindow else { return }
+      StartScreenView.chooseFile(for: action, window: window) { [weak self] chosen in self?.performStartAction(chosen) }
+    }
+  }
+  // A new untitled project of built-in scene `index`, with that scene's default camera.
+  func startBuiltInScene(_ index: Int) {
+    var p = ProjectDocument()
+    p.scene = UInt32(index)
+    let oldCamera = CameraState(renderer), oldScene = renderer.sceneIndex
+    renderer.sceneIndex = UInt32(index)
+    p.camera = CameraState(renderer)
+    renderer.sceneIndex = oldScene
+    oldCamera.apply(renderer)
+    replaceDocument(p, activity: "Loading \(Self.sceneNames[index])…") { [weak self] error in
+      guard let self else { return }
+      if let error {
+        self.showError(error.localizedDescription)
+        return
+      }
+      self.history.removeAllActions()
+      self.associate(nil, edited: false, replaced: true)
+      self.rebuild()
+    }
+  }
+}
+
 extension StudioController: NSMenuItemValidation {
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     if item.action == #selector(quit) { return true }
@@ -2291,6 +2495,10 @@ extension StudioController: NSMenuItemValidation {
       item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
     }
     if isBusy { return false }
+    // The start screen has no document to save, edit, render or export.
+    if startScreen != nil {
+      return [#selector(openAction), #selector(importOBJAction), #selector(importUSDAction)].contains(item.action)
+    }
     if item.action == #selector(undoAction) {
       item.title = history.undoMenuItemTitle
       return history.canUndo

@@ -7163,6 +7163,30 @@ func makePairingTexture(side: Int, sigma: Double, seed: UInt64) -> [SIMD2<Int8>]
     // Whether refineSpectralGrid ran, and how many cells it refined.
     var refined = false
     var refinedCells = 0
+    // Pipelines compiled so far while compiling (shown by the UI's activity strip).
+    var progress: OperationProgress?
+}
+
+// Scene kernels of one device, shared by its renderers like SpectralShaderCache: the core pipelines
+// compiled at launch (PathTracerRenderer.compileShaders) and the optional ReSTIR PT, reservoir
+// splatting and stochastic pairwise MIS groups, compiled in the background when a mode first needs
+// them (PathTracerRenderer.requestKernels); until then their modes resolve to the fallbacks.
+@MainActor final class SceneShaderCache {
+    var procedural: PathTracerRenderer.SceneKernels
+    var mesh: PathTracerRenderer.SceneKernels
+    let proceduralLibrary: MTLLibrary
+    var compiling: Set<PathTracerRenderer.KernelGroup> = []
+    // Groups requested so far, compiled or compiling; a library without a group's functions keeps it nil.
+    var attempted: Set<PathTracerRenderer.KernelGroup> = []
+    var failure: String?
+    var progress: OperationProgress?
+    init(_ shaders: PathTracerRenderer.CompiledShaders) {
+        procedural = shaders.procedural
+        mesh = shaders.mesh
+        proceduralLibrary = shaders.proceduralLibrary
+        attempted = Set(PathTracerRenderer.KernelGroup.allCases.filter { procedural.has($0) && mesh.has($0) })
+    }
+    func has(_ group: PathTracerRenderer.KernelGroup) -> Bool { procedural.has(group) && mesh.has(group) }
 }
 
 // The three pairing textures ReSTIR PT's spatial reuse reads (MSL PT_PAIRING_SIDES: 254, 230 and
@@ -7382,6 +7406,9 @@ final class MaterialLibrary {
     var sceneRefitCount = 0, accelerationCommandCount = 0
     // Builds hardware acceleration structures (created on first use).
     var accelerationQueue: MTLCommandQueue?
+    // The operation preparing this library, if any (StudioController.prepareResources): texture
+    // decoding, MaterialX images and hierarchy builds report their phase to it.
+    var progress: OperationProgress?
     static var defaultAcceleration: MeshAcceleration {
 #if VIBE_TESTING
         // Test builds can run the whole suite on the reference or the hardware path.
@@ -7878,6 +7905,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     let commandQueue: MTLCommandQueue
 
     let shaderLibrary: MTLLibrary
+    // The pipelines this renderer was created with, for renderers that share them (`sharing:`).
+    let compiledShaders: CompiledShaders
     let materialFunction: MTLFunction
     let pickPipeline: MTLComputePipelineState
     let restirTemporalPipeline: MTLComputePipelineState
@@ -7888,12 +7917,28 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // traversal is dead code there, but its registers slowed them by 13-17% (tests/PERFORMANCE.md).
     struct SceneKernels {
         let temporal, shading, guides, pick: MTLComputePipelineState
-        // Nil for a library without them (tests/benchmark.py baselines), which then renders ReSTIR GI.
-        let pt: ReSTIRPTKernels?
-        // Nil for a library without them, which then reuses temporally by reprojection.
-        let splat: SplatKernels?
-        // Nil for a library without them, which then selects spatial neighbours as .automatic does.
-        let spmis: SPMISKernels?
+        // Nil for a library without them (tests/benchmark.py baselines) or until they are compiled
+        // (SceneShaderCache); the scene then renders ReSTIR GI.
+        var pt: ReSTIRPTKernels?
+        // Nil for a library without them or until compiled; the scene then reuses temporally by reprojection.
+        var splat: SplatKernels?
+        // Nil for a library without them or until compiled; the scene then selects spatial neighbours as
+        // .automatic does.
+        var spmis: SPMISKernels?
+        func has(_ group: KernelGroup) -> Bool {
+            switch group {
+            case .pt: return pt != nil
+            case .splat: return splat != nil
+            case .spmis: return spmis != nil
+            }
+        }
+        func adding(_ k: OptionalKernels) -> SceneKernels {
+            var result = self
+            result.pt = pt ?? k.pt
+            result.splat = splat ?? k.splat
+            result.spmis = spmis ?? k.spmis
+            return result
+        }
     }
     // ReSTIR PT passes: initial paths, temporal reuse, paired shifts, spatial reuse, duplication map.
     struct ReSTIRPTKernels { let initial, temporal, shift, spatial, duplication: MTLComputePipelineState }
@@ -7902,39 +7947,142 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     struct SplatKernels { let activate, layers, deepReSTIR, deepPT, reservoirs, temporal, ptTemporal: MTLComputePipelineState }
     // Stochastic pairwise MIS (SPMIS2026): reuse-cell construction and ReSTIR PT spatial reuse.
     struct SPMISKernels { let cells, select, ptShift, pt: MTLComputePipelineState }
+    // Scene kernel groups that compile after the core set (SceneShaderCache): the core pipelines
+    // render GI, reprojection and the automatic neighbour selection until their group is ready.
+    enum KernelGroup: CaseIterable, Sendable {
+        case pt, splat, spmis
+        var names: [String] {
+            switch self {
+            case .pt: return ["restir_pt_initial_kernel", "restir_pt_temporal_kernel", "restir_pt_shift_kernel",
+                              "restir_pt_spatial_kernel", "restir_pt_duplication_kernel"]
+            case .splat: return ["splat_activate_kernel", "splat_layers_kernel", "splat_deep_restir_kernel",
+                                 "restir_pt_deep_initial_kernel", "splat_reservoirs_kernel", "splat_temporal_kernel",
+                                 "restir_pt_splat_temporal_kernel"]
+            case .spmis: return ["spmis_cells_kernel", "spmis_select_kernel", "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
+            }
+        }
+        var title: String {
+            switch self {
+            case .pt: return "ReSTIR PT"
+            case .splat: return "reservoir splatting"
+            case .spmis: return "stochastic pairwise MIS"
+            }
+        }
+    }
+    // The optional groups of one library; nil for a group the library lacks (tests/benchmark.py baselines).
+    struct OptionalKernels: Sendable {
+        var pt: ReSTIRPTKernels?
+        var splat: SplatKernels?
+        var spmis: SPMISKernels?
+    }
     nonisolated static func pipeline(_ device: MTLDevice, _ library: MTLLibrary, _ name: String) throws -> MTLComputePipelineState {
         guard let function = library.makeFunction(name: name) else {
             throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
         }
         return try device.makeComputePipelineState(function: function)
     }
-    nonisolated static func ptKernels(_ device: MTLDevice, _ library: MTLLibrary) throws -> ReSTIRPTKernels? {
-        let names = ["restir_pt_initial_kernel", "restir_pt_temporal_kernel", "restir_pt_shift_kernel",
-                     "restir_pt_spatial_kernel", "restir_pt_duplication_kernel"]
-        guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
-        let p = try names.map { try pipeline(device, library, $0) }
-        return ReSTIRPTKernels(initial: p[0], temporal: p[1], shift: p[2], spatial: p[3], duplication: p[4])
+    // Compiles `jobs` concurrently (the compiler service runs them in parallel), counting each finished
+    // pipeline in `progress`. Blocks the calling thread; never call it on the main thread in the app.
+    nonisolated static func pipelines(_ device: MTLDevice, _ jobs: [(MTLLibrary, String)], progress: OperationProgress? = nil,
+                                      phase: String = "Compiling GPU pipelines") throws -> [MTLComputePipelineState] {
+        final class Results: @unchecked Sendable {
+            let lock = NSLock()
+            var states: [MTLComputePipelineState?]
+            var failure: Error?
+            init(_ count: Int) { states = Array(repeating: nil, count: count) }
+        }
+        let results = Results(jobs.count)
+        progress?.update(phase, completed: 0, of: jobs.count)
+        DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
+            do {
+                let state = try pipeline(device, jobs[i].0, jobs[i].1)
+                results.lock.lock(); results.states[i] = state; results.lock.unlock()
+                progress?.advance(phase, total: jobs.count)
+            } catch {
+                results.lock.lock(); results.failure = error; results.lock.unlock()
+            }
+        }
+        if let failure = results.failure { throw failure }
+        return results.states.map { $0! }
     }
-    nonisolated static func splatKernels(_ device: MTLDevice, _ library: MTLLibrary) throws -> SplatKernels? {
-        let names = ["splat_activate_kernel", "splat_layers_kernel", "splat_deep_restir_kernel", "restir_pt_deep_initial_kernel",
-                     "splat_reservoirs_kernel", "splat_temporal_kernel", "restir_pt_splat_temporal_kernel"]
-        guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
-        let p = try names.map { try pipeline(device, library, $0) }
-        return SplatKernels(activate: p[0], layers: p[1], deepReSTIR: p[2], deepPT: p[3], reservoirs: p[4],
-                            temporal: p[5], ptTemporal: p[6])
+    // The optional groups of each library in `libraries`, compiled in one concurrent batch.
+    nonisolated static func compileKernelGroups(_ groups: Set<KernelGroup>, device: MTLDevice, libraries: [MTLLibrary],
+                                                progress: OperationProgress? = nil, phase: String = "Compiling GPU pipelines")
+        throws -> [OptionalKernels] {
+        let ordered = KernelGroup.allCases.filter { groups.contains($0) }
+        // A library without every function of a group keeps that group nil.
+        let present = libraries.map { library in
+            ordered.filter { group in group.names.allSatisfy { library.functionNames.contains($0) } }
+        }
+        let jobs = zip(libraries, present).flatMap { library, groups in groups.flatMap { $0.names.map { (library, $0) } } }
+        var states = try pipelines(device, jobs, progress: progress, phase: phase)[...]
+        return present.map { groups in
+            var kernels = OptionalKernels()
+            for group in groups {
+                let p = Array(states.prefix(group.names.count)); states = states.dropFirst(group.names.count)
+                switch group {
+                case .pt: kernels.pt = ReSTIRPTKernels(initial: p[0], temporal: p[1], shift: p[2], spatial: p[3], duplication: p[4])
+                case .splat: kernels.splat = SplatKernels(activate: p[0], layers: p[1], deepReSTIR: p[2], deepPT: p[3],
+                                                          reservoirs: p[4], temporal: p[5], ptTemporal: p[6])
+                case .spmis: kernels.spmis = SPMISKernels(cells: p[0], select: p[1], ptShift: p[2], pt: p[3])
+                }
+            }
+            return kernels
+        }
     }
-    nonisolated static func spmisKernels(_ device: MTLDevice, _ library: MTLLibrary) throws -> SPMISKernels? {
-        let names = ["spmis_cells_kernel", "spmis_select_kernel", "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
-        guard names.allSatisfy({ library.functionNames.contains($0) }) else { return nil }
-        let p = try names.map { try pipeline(device, library, $0) }
-        return SPMISKernels(cells: p[0], select: p[1], ptShift: p[2], pt: p[3])
+    // The renderer's libraries and core pipelines, plus the optional `groups`: compiled off the main
+    // thread at launch (AppDelegate), synchronously by `init(device:sharing:)` (tests, tools). The two
+    // libraries, then the core pipelines, then the groups' pipelines compile concurrently. `source` and `mathMode` are read on the
+    // main actor (metalSource, shaderCompileOptions).
+    struct CompiledShaders: Sendable {
+        let library, proceduralLibrary: MTLLibrary
+        let present: MTLComputePipelineState
+        let mesh, procedural: SceneKernels
+    }
+    nonisolated static func compileShaders(device: MTLDevice, source: String, mathMode: MTLMathMode,
+                                           groups: Set<KernelGroup> = Set(KernelGroup.allCases),
+                                           progress: OperationProgress? = nil) throws -> CompiledShaders {
+        progress?.begin("Compiling the shader library")
+        final class Libraries: @unchecked Sendable {
+            let lock = NSLock()
+            var libraries: [MTLLibrary?] = [nil, nil]
+            var failure: Error?
+        }
+        let built = Libraries()
+        // Scenes 0-5 use a library compiled with VIBE_MESHES=0 (see SceneKernels).
+        DispatchQueue.concurrentPerform(iterations: 2) { i in
+            let options = MTLCompileOptions()
+            options.mathMode = mathMode
+            if i == 1 { options.preprocessorMacros = ["VIBE_MESHES": NSNumber(value: 0)] }
+            do {
+                let library = try device.makeLibrary(source: source, options: options)
+                built.lock.lock(); built.libraries[i] = library; built.lock.unlock()
+            } catch {
+                built.lock.lock(); built.failure = error; built.lock.unlock()
+            }
+        }
+        if let failure = built.failure { throw failure }
+        let lib = built.libraries[0]!, procedural = built.libraries[1]!
+        let core: [(MTLLibrary, String)] = ["pick_kernel", "restir_temporal_kernel", "shading_kernel", "metalfx_guides_kernel",
+            "present_kernel"].map { (lib, $0) } + ["restir_temporal_kernel", "shading_kernel", "metalfx_guides_kernel",
+            "pick_kernel"].map { (procedural, $0) }
+        let states = try pipelines(device, core, progress: progress)
+        let optional = groups.isEmpty ? [OptionalKernels(), OptionalKernels()]
+            : try compileKernelGroups(groups, device: device, libraries: [lib, procedural], progress: progress)
+        return CompiledShaders(
+            library: lib, proceduralLibrary: procedural, present: states[4],
+            mesh: SceneKernels(temporal: states[1], shading: states[2], guides: states[3], pick: states[0],
+                               pt: optional[0].pt, splat: optional[0].splat, spmis: optional[0].spmis),
+            procedural: SceneKernels(temporal: states[5], shading: states[6], guides: states[7], pick: states[8],
+                                     pt: optional[1].pt, splat: optional[1].splat, spmis: optional[1].spmis))
     }
     // Spectral transport's scene kernels (VIBE_SPECTRAL=1 libraries, after the generated tables), and
     // the inverse-CDF kernel. The MetalFX guide and picking kernels have no colour transport and are
     // the RGB libraries'. The pipelines compile concurrently (the compiler service runs them in parallel).
     struct SpectralKernels: Sendable { let procedural, mesh: SceneKernels; let icdf, refineFlags, refineSolve: MTLComputePipelineState }
     nonisolated static func buildSpectralKernels(device: MTLDevice, source: String, relaxedMath: Bool,
-                                                 procedural rgbProcedural: SceneKernels, mesh rgbMesh: SceneKernels) throws -> SpectralKernels {
+                                                 procedural rgbProcedural: SceneKernels, mesh rgbMesh: SceneKernels,
+                                                 progress: OperationProgress? = nil) throws -> SpectralKernels {
         let source = try loadSpectralTablesSource() + source
         func library(meshes: Bool) throws -> MTLLibrary {
             let options = MTLCompileOptions()
@@ -7943,6 +8091,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 : ["VIBE_SPECTRAL": NSNumber(value: 1), "VIBE_MESHES": NSNumber(value: 0)]
             return try device.makeLibrary(source: source, options: options)
         }
+        progress?.begin("Compiling the spectral shader library")
         let libraries = [try library(meshes: true), try library(meshes: false)]
         let names = ["restir_temporal_kernel", "shading_kernel", "restir_pt_initial_kernel", "restir_pt_temporal_kernel",
                      "restir_pt_shift_kernel", "restir_pt_spatial_kernel", "restir_pt_duplication_kernel", "splat_activate_kernel",
@@ -7951,23 +8100,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                      "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
         let jobs = libraries.flatMap { library in names.map { (library, $0) } }
             + ["spectral_icdf_kernel", "spectral_refine_flags_kernel", "spectral_refine_solve_kernel"].map { (libraries[0], $0) }
-        final class Results: @unchecked Sendable {
-            let lock = NSLock()
-            var states: [MTLComputePipelineState?]
-            var failure: Error?
-            init(_ count: Int) { states = Array(repeating: nil, count: count) }
-        }
-        let results = Results(jobs.count)
-        DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
-            do {
-                let state = try pipeline(device, jobs[i].0, jobs[i].1)
-                results.lock.lock(); results.states[i] = state; results.lock.unlock()
-            } catch {
-                results.lock.lock(); results.failure = error; results.lock.unlock()
-            }
-        }
-        if let failure = results.failure { throw failure }
-        let states = results.states.map { $0! }
+        let states = try pipelines(device, jobs, progress: progress, phase: "Compiling spectral shaders")
         func kernels(_ k: Int, rgb: SceneKernels) -> SceneKernels {
             let p = Array(states[(k * names.count)..<((k + 1) * names.count)])
             return SceneKernels(temporal: p[0], shading: p[1], guides: rgb.guides, pick: rgb.pick,
@@ -7980,8 +8113,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return SpectralKernels(procedural: kernels(1, rgb: rgbProcedural), mesh: kernels(0, rgb: rgbMesh), icdf: extra[0],
                                refineFlags: extra[1], refineSolve: extra[2])
     }
-    let proceduralKernels: SceneKernels
-    let meshKernels: SceneKernels
+    // Shared with renderers created with `sharing:`; optional groups are added as they compile.
+    let sceneShaders: SceneShaderCache
+    var proceduralKernels: SceneKernels { sceneShaders.procedural }
+    var meshKernels: SceneKernels { sceneShaders.mesh }
     var sceneKernels: SceneKernels {
         if spectralFrame, let spectral = spectralShaders.kernels { return sceneIndex == 6 ? spectral.mesh : spectral.procedural }
         return sceneIndex == 6 ? meshKernels : proceduralKernels
@@ -7996,6 +8131,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var spectralSamplingWeights: [Float]?
     // Called on the main queue when background-compiled spectral pipelines become ready.
     var onSpectralShadersReady: (() -> Void)?
+    // Called on the main queue when background-compiled scene kernel groups become ready (requestKernels).
+    var onKernelsReady: (() -> Void)?
     let supportsMetalFX: Bool
     var materials: MaterialLibrary
     private(set) var metalFX: MetalFXDenoiser?
@@ -8365,6 +8502,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return resolved == .stochasticPairwise && sceneKernels.spmis == nil
             ? SpatialNeighborSelection.automatic.resolved(importedSceneGraph: imported) : resolved
     }
+    // The reuse modes the last frame resolved to (renderFrame).
+    struct ResolvedModes: Equatable { let indirect: IndirectReuse, temporal: TemporalReuse, spatial: SpatialNeighborSelection }
+    private var lastResolvedModes: ResolvedModes?
     // Set when only the reservoirs were reallocated; the next frame skips temporal reuse.
     private(set) var reservoirHistoryNeedsReset = false
     var concurrentRenderBytes: UInt64 = 0
@@ -8460,7 +8600,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return nil
     }
 
-    init(device: MTLDevice, sharing other: PathTracerRenderer? = nil) throws {
+    // Compiles every pipeline synchronously (tests and tools), or shares `other`'s on the same device.
+    convenience init(device: MTLDevice, sharing other: PathTracerRenderer? = nil) throws {
+        if let other, other.device.registryID == device.registryID {
+            try self.init(device: device, shaders: other.compiledShaders, sharing: other)
+        } else {
+            try self.init(device: device, shaders: Self.compileShaders(
+                device: device, source: metalSource, mathMode: shaderCompileOptions().mathMode))
+        }
+    }
+    // A renderer of pipelines compiled beforehand (compileShaders, off the main thread at launch).
+    // With `sharing`, a renderer on the same device shares its kernel and spectral caches.
+    init(device: MTLDevice, shaders: CompiledShaders, sharing other: PathTracerRenderer? = nil) throws {
         self.device = device
         var metalFXSupported = MTLFXTemporalDenoisedScalerDescriptor.supportsDevice(device)
 #if VIBE_TESTING
@@ -8471,52 +8622,21 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             throw NSError(domain: "PathTracer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not create a Metal command queue."])
         }
         self.commandQueue = queue
-        self.spectralShaders = other.flatMap { $0.device.registryID == device.registryID ? $0.spectralShaders : nil }
-            ?? SpectralShaderCache()
-
-        do {
-            let shared = other.flatMap { $0.device.registryID == device.registryID ? $0 : nil }
-            let lib = try shared?.shaderLibrary ?? device.makeLibrary(source: metalSource, options: shaderCompileOptions())
-            self.shaderLibrary = lib
-            guard let fnPick = lib.makeFunction(name: "pick_kernel"),
-                  let fnTemporal = lib.makeFunction(name: "restir_temporal_kernel"),
-                  let fnShading = lib.makeFunction(name: "shading_kernel"),
-                  let fnGuides = lib.makeFunction(name: "metalfx_guides_kernel"),
-                  let fnPresent = lib.makeFunction(name: "present_kernel") else {
-                throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
-            }
-
-            self.materialFunction = fnTemporal
-            self.pickPipeline = try shared?.pickPipeline ?? device.makeComputePipelineState(function: fnPick)
-            self.materials = try MaterialLibrary(device: device, function: fnTemporal)
-            self.restirTemporalPipeline = try shared?.restirTemporalPipeline ?? device.makeComputePipelineState(function: fnTemporal)
-            self.shadingPipeline = try shared?.shadingPipeline ?? device.makeComputePipelineState(function: fnShading)
-            self.metalFXGuidePipeline = try shared?.metalFXGuidePipeline ?? device.makeComputePipelineState(function: fnGuides)
-            self.presentPipeline = try shared?.presentPipeline ?? device.makeComputePipelineState(function: fnPresent)
-            func pipeline(_ library: MTLLibrary, _ name: String) throws -> MTLComputePipelineState {
-                try Self.pipeline(device, library, name)
-            }
-            func ptKernels(_ library: MTLLibrary) throws -> ReSTIRPTKernels? { try Self.ptKernels(device, library) }
-            func splatKernels(_ library: MTLLibrary) throws -> SplatKernels? { try Self.splatKernels(device, library) }
-            func spmisKernels(_ library: MTLLibrary) throws -> SPMISKernels? { try Self.spmisKernels(device, library) }
-            if let shared {
-                self.proceduralKernels = shared.proceduralKernels
-                self.meshKernels = shared.meshKernels
-            } else {
-                let options = shaderCompileOptions()
-                options.preprocessorMacros = ["VIBE_MESHES": NSNumber(value: 0)]
-                let procedural = try device.makeLibrary(source: metalSource, options: options)
-                self.proceduralKernels = SceneKernels(temporal: try pipeline(procedural, "restir_temporal_kernel"),
-                    shading: try pipeline(procedural, "shading_kernel"), guides: try pipeline(procedural, "metalfx_guides_kernel"),
-                    pick: try pipeline(procedural, "pick_kernel"), pt: try ptKernels(procedural), splat: try splatKernels(procedural),
-                    spmis: try spmisKernels(procedural))
-                self.meshKernels = SceneKernels(temporal: restirTemporalPipeline, shading: shadingPipeline,
-                    guides: metalFXGuidePipeline, pick: pickPipeline, pt: try ptKernels(lib), splat: try splatKernels(lib),
-                    spmis: try spmisKernels(lib))
-            }
-        } catch {
-            throw error
+        let shared = other.flatMap { $0.device.registryID == device.registryID ? $0 : nil }
+        self.spectralShaders = shared?.spectralShaders ?? SpectralShaderCache()
+        self.sceneShaders = shared?.sceneShaders ?? SceneShaderCache(shaders)
+        self.compiledShaders = shaders
+        self.shaderLibrary = shaders.library
+        guard let fnTemporal = shaders.library.makeFunction(name: "restir_temporal_kernel") else {
+            throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
         }
+        self.materialFunction = fnTemporal
+        self.pickPipeline = shaders.mesh.pick
+        self.materials = try MaterialLibrary(device: device, function: fnTemporal)
+        self.restirTemporalPipeline = shaders.mesh.temporal
+        self.shadingPipeline = shaders.mesh.shading
+        self.metalFXGuidePipeline = shaders.mesh.guides
+        self.presentPipeline = shaders.present
         super.init()
         measuredMetalFXScalerBytesPerPixel = other.flatMap {
             $0.device.registryID == device.registryID ? $0.measuredMetalFXScalerBytesPerPixel : nil
@@ -8561,12 +8681,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
         }
         cache.compiling = true
+        let progress = OperationProgress("Compiling spectral shaders")
+        cache.progress = progress
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
                 Result { try PathTracerRenderer.buildSpectralKernels(device: device, source: source, relaxedMath: true,
-                                                                     procedural: procedural, mesh: mesh) }
+                                                                     procedural: procedural, mesh: mesh, progress: progress) }
             }.value
             cache.compiling = false
+            cache.progress = nil
             switch result {
             case .success(let kernels): cache.kernels = kernels
             case .failure(let error): cache.failure = "Spectral shaders failed to compile: \(error.localizedDescription)"
@@ -8578,6 +8701,48 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             self.onSpectralShadersReady?()
         }
         return false
+    }
+    // Starts compiling, off the main thread, the optional kernel groups (KernelGroup) that the current
+    // modes or `extra` need. Until a group is ready its modes resolve to the core fallbacks; renderFrame
+    // restarts accumulation once the resolved modes change. Each group is attempted once per device.
+    func requestKernels(_ extra: Set<KernelGroup> = []) {
+        let cache = sceneShaders
+        var wanted = extra
+        let imported = sceneIndex == 6
+        let indirect = indirectReuse.resolved(importedScene: imported)
+        if indirect != .restirGI { wanted.insert(.pt) }
+        if temporalReuse.resolved(indirectReuse: indirect) == .splatting { wanted.insert(.splat) }
+        if spatialNeighbors.resolved(importedSceneGraph: imported && materials.hasSceneGraph) == .stochasticPairwise {
+            wanted.insert(.spmis)
+        }
+        let missing = wanted.subtracting(cache.attempted)
+        guard !missing.isEmpty else { return }
+        cache.attempted.formUnion(missing)
+        cache.compiling.formUnion(missing)
+        let titles = KernelGroup.allCases.filter { cache.compiling.contains($0) }.map(\.title)
+        let progress = OperationProgress("Compiling \(titles.joined(separator: ", ")) shaders")
+        cache.progress = progress
+        let device = self.device, libraries = [shaderLibrary, cache.proceduralLibrary]
+        let phase = progress.snapshot.phase
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result {
+                try PathTracerRenderer.compileKernelGroups(missing, device: device, libraries: libraries,
+                                                            progress: progress, phase: phase)
+            }
+            DispatchQueue.main.async { [weak self] in
+                cache.compiling.subtract(missing)
+                if cache.progress === progress { cache.progress = nil }
+                switch result {
+                case .success(let kernels):
+                    cache.mesh = cache.mesh.adding(kernels[0])
+                    cache.procedural = cache.procedural.adding(kernels[1])
+                case .failure(let error):
+                    cache.failure = "Shaders failed to compile: \(error.localizedDescription)"
+                    self?.onError?(cache.failure!)
+                }
+                self?.onKernelsReady?()
+            }
+        }
     }
     // Refines the grid's cells whose codes the trilinear interpolation reproduces worse than 0.35 8-bit
     // steps (MSL spectral_moments): flags them on the GPU over every 8-bit code, assigns their blocks and
@@ -8918,6 +9083,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let spectral = activeLightTransport == .spectral && prepareSpectralShaders()
         if spectral != spectralFrame && frameIndex > 0 { resetAccumulation() }
         spectralFrame = spectral
+        // Background-compiled kernel groups (requestKernels) change the resolved modes; accumulation
+        // restarts then, so every accumulated sample uses the same reuse.
+        requestKernels()
+        let modes = ResolvedModes(indirect: activeIndirectReuse, temporal: activeTemporalReuse, spatial: activeSpatialNeighbors)
+        if let previous = lastResolvedModes, previous != modes, frameIndex > 0 { resetAccumulation() }
+        lastResolvedModes = modes
 
         let needsReSTIR = samplingMode == 0 && viewportMode == 0
         let indirectReuse = activeIndirectReuse

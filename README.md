@@ -161,7 +161,7 @@ If the checkout is inside iCloud Drive (for example `~/Documents`), the build ma
 
 ## Usage
 
-Choose a scene in the inspector, then adjust its camera, lighting, materials, and objects. Use **Render** to change the sampling strategy, the ReSTIR reuse modes (indirect reuse, spatial neighbours, temporal reuse) or the viewport mode. **Settings…** is available in the top toolbar and the macOS application menu.
+The app opens instantly on an empty start screen: open a project, import an OBJ or USD scene, pick a built-in scene, or restore the last autosaved session. Shaders compile in the background with a progress bar (about half a minute on the first launch of a new build on an Apple M4, well under a second afterwards), and long operations (imports, opens, saves, acceleration-structure builds, exports, OIDN) show their progress at the bottom of the window. Then choose a scene in the inspector and adjust its camera, lighting, materials, and objects. Use **Render** to change the sampling strategy, the ReSTIR reuse modes (indirect reuse, spatial neighbours, temporal reuse) or the viewport mode. **Settings…** is available in the top toolbar and the macOS application menu.
 
 | Action | Control |
 | --- | --- |
@@ -185,7 +185,7 @@ The **Window** menu provides Minimize, Zoom and Bring All to Front. ⌘E and **S
 
 Use **OIDN Preview Current Frame** to denoise the current accumulation inside the app. PNG includes display adjustments and is sRGB-encoded. OpenEXR stores linear HDR radiance as 32-bit float RGB without an alpha channel, so values above 65504 are kept. MetalFX output, in the preview or in an export, is a display estimate, not radiometric data. The suite measured MetalFX/raw region-mean ratios of 1.03 on diffuse Cornell surfaces, 0.87 on diffuse Pavilion surfaces, 0.69 on reflective regions and 0.77 on the grazing gold cylinder. For linear radiance, export the raw or OIDN source as OpenEXR.
 
-Projects embed imported assets and can be reopened without the original files. Since project format 3, each distinct image, environment or mesh is stored once per file, and autosaves write only assets that changed, as separate sidecar files. Older projects open and are saved as format 3; builds from before this change cannot open format-3 projects. Open, New and Open USD Scene ask Save / Don't Save / Cancel when the document has unsaved changes; a replaced unsaved document is also kept as `Autosave-previous.vtrace`. The app restores its latest autosave on startup, together with its project file association and edited state. An autosave that cannot be restored is moved aside as `Autosave-unrestorable-<date>.vtrace` and never overwritten. Quit waits for pending saves.
+Projects embed imported assets and can be reopened without the original files. Since project format 3, each distinct image, environment or mesh is stored once per file, and autosaves write only assets that changed, as separate sidecar files. Older projects open and are saved as format 3; builds from before this change cannot open format-3 projects. Open, New and Open USD Scene ask Save / Don't Save / Cancel when the document has unsaved changes; a replaced unsaved document is also kept as `Autosave-previous.vtrace`. The start screen offers to restore the latest autosave, together with its project file association and edited state; choosing anything else keeps it as `Autosave-previous.vtrace`. An autosave that cannot be restored is moved aside as `Autosave-unrestorable-<date>.vtrace` and never overwritten. Quit waits for pending saves.
 
 </details>
 

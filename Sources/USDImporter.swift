@@ -143,7 +143,7 @@ enum USDImporter {
   }
   static func load(
     _ url: URL, into source: ProjectDocument, frame: Double? = nil,
-    job: USDImportJob = USDImportJob()
+    job: USDImportJob = USDImportJob(), progress: OperationProgress? = nil
   ) throws -> USDImportResult {
     defer { job.finish() }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -168,6 +168,7 @@ enum USDImporter {
     process.environment = [
       "PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory(), "PYTHONNOUSERSITE": "1",
     ]
+    progress?.begin("Composing the USD stage in OpenUSD")
     try job.run(process)
     let deadline = job.clock() + job.limit
     while process.isRunning {
@@ -196,7 +197,9 @@ enum USDImporter {
     var p = source
     // USD opens as a complete scene; it does not merge lighting or IDs into an existing import.
     var stored = 0
-    let assets = try snapshot.assets.map { asset -> MeshAsset in
+    let assetCount = snapshot.assets.count
+    let assets = try snapshot.assets.enumerated().map { index, asset -> MeshAsset in
+      progress?.update("Loading USD meshes", completed: index, of: assetCount)
       let geometry = try MeshGeometry(payload: Data(contentsOf: URL(fileURLWithPath: asset.mesh.file)),
         maximumFaces: SceneLimits.triangles - stored)
       guard geometry.count == asset.mesh.faces, geometry.vertices.count == asset.mesh.vertices else {
@@ -419,31 +422,28 @@ extension StudioController {
     }
   }
   func beginImportUSD(from url: URL) {
-    guard !isBusy, let window = hostWindow else { return }
+    guard !isBusy else { return }
     let record = undoRecord("Open USD scene", replacesDocument: true)
     let source = snapshot()
     let reuse = renderer.materials.reusableResources(graph: project.graph)
     let job = USDImportJob()
     let wasPaused = renderer.paused
-    let sheet = NSAlert()
-    sheet.messageText = "Importing OpenUSD scene"
-    sheet.informativeText =
-      "Composing layers, resolving materials, and building the scene. This can take a few minutes."
-    sheet.addButton(withTitle: "Cancel")
     importInProgress = true
     usdImportJob = job
     renderer.paused = true
-    beginProjectActivity("Importing \(url.lastPathComponent)…")
-    sheet.beginSheetModal(for: window) { _ in job.cancel() }
+    // The activity strip shows the phase (OpenUSD composition can take minutes) and a Cancel button.
+    let progress = beginProjectActivity("Importing \(url.lastPathComponent)…") { [weak self] in
+      job.cancel()
+      self?.show("Cancelling the USD import…")
+    }
     DispatchQueue.global(qos: .userInitiated).async {
       // Resources are prepared off the main thread, reusing unchanged live resources.
       let result = Result { () -> (USDImportResult, MaterialLibrary) in
-        let imported = try USDImporter.load(url, into: source, job: job)
-        return (imported, try self.prepareResources(imported.document, reuse: reuse))
+        let imported = try USDImporter.load(url, into: source, job: job, progress: progress)
+        return (imported, try self.prepareResources(imported.document, reuse: reuse, progress: progress))
       }
       DispatchQueue.main.async {
         let cancelled = job.isCancelled
-        window.endSheet(sheet.window)
         self.importInProgress = false
         self.usdImportJob = nil
         self.renderer.paused = wasPaused

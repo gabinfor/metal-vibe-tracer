@@ -2,6 +2,12 @@
 
 Metal Vibe Tracer is in early development: releases are validated builds, not stable APIs or file formats. Every method below is cited, with its adaptations, in [REFERENCES.md](REFERENCES.md); measurements are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md).
 
+## Unreleased
+
+- **Instant launch:** the window opens at once on an empty start screen (open project, import OBJ/USD, built-in scenes, Restore Last Session) instead of compiling every GPU pipeline on the main thread and restoring the autosave. The core pipelines compile concurrently in the background with a progress bar; ReSTIR PT, reservoir splatting and stochastic pairwise MIS compile on demand (`METALSHADERCOMPILE`). First launch of a new build: window 293 s → 0.97 s, renderer ready after 37 s; cached: 0.21 s → 0.19 s to the window (`tests/PERFORMANCE.md`, "Launch time").
+- **Progress everywhere:** a progress bar with the current step (and Cancel where supported) for shader compilation, project open/save/restore, OBJ/MTL import with texture decoding and downscaling and MaterialX preparation, USD import, mesh hierarchy and acceleration-structure builds, exports and OIDN. USD imports no longer block the window with a sheet.
+- Exports reuse the preview's hierarchies and acceleration structures instead of rebuilding them on the main thread.
+
 ## 0.2.0 — 2026-10-23
 
 121 commits since 0.1.0. Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (189 checks).

@@ -1,3 +1,16 @@
+# Launch time — October 23, 2026
+
+`xcrun swiftc -O -swift-version 6 scripts/measure_launch.swift -o build/measure_launch && build/measure_launch build/MetalVibeTracer.app [--cold]` (Apple M4, 16 GB, macOS 27.0.1). *Window* is the time from process launch until the app's window is on screen (CGWindowList); *ready* is when the renderer exists and a scene can be chosen (the `VIBE_LAUNCH shaders-ready` trace; 0.2.0 has no trace, its window appears only after every pipeline is compiled). *Cold* runs a bundle copy under a new bundle identifier, so the Metal compiler service has no cached library or pipeline (the first launch of a new build); the copy and its caches are deleted afterwards.
+
+| Build | Caches | Window | Ready | Main thread while compiling |
+| --- | --- | --- | --- | --- |
+| 0.2.0 (`0293ffa`) | cold | 174 s, 293 s (two runs) | same | blocked ("not responding") |
+| 0.2.0 | warm | 0.21–0.22 s (runs 2–3) | same | — |
+| this change | cold | 0.97 s | 36.8 s | responsive, progress bar |
+| this change | warm | 0.17–0.32 s (three runs) | 0.20–0.40 s | — |
+
+0.2.0 compiled both scene libraries and all 41 pipelines one after another on the main thread before creating the window, then restored the autosave. This change opens the window on the empty start screen at once, compiles the two libraries and then the nine core pipelines concurrently on a background queue, and compiles the 32 optional ReSTIR PT, reservoir-splatting and stochastic-pairwise-MIS pipelines only when a mode needs them (ReSTIR PT is requested right after launch, in the background). The 0.2.0 cold runs varied with concurrent GPU and compiler load from other processes; the comment-only `OpenPBR.metal` change that misses only the library cache took 3.8 s to the window on 0.2.0. Raw output: `build/launch-baseline-cold.txt`, `build/launch-new-cold.txt` (not committed).
+
 # Indexed documents and 10 M-triangle publishes — October 20, 2026
 
 `python3 scripts/measure_mesh_memory.py 999698 9999392` (one welded grid asset built as `MeshGeometry`, 0.50 vertices per triangle; Apple M4, macOS 27.0.1):
