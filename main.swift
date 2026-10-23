@@ -327,6 +327,10 @@ struct Material {
     uint usesMaterialX;
     bool inside;
     float3 geometricNormal;
+    float3 specularColor;  // OpenPBR specular_color of a MaterialX material (slot_specular_color)
+    // OpenPBR transmission_color (rgb) and geometry_thin_walled (w > 0) of a MaterialX material
+    // (slot_transmission).
+    float4 transmissionTint;
 };
 
 struct HitRecord {
@@ -361,7 +365,7 @@ struct LightSample {
 struct Uniforms {
     float4 cameraPos;      // xyz = pos, w = fov
     float4 cameraTarget;   // xyz = target, w = maximum path depth (1 = direct lighting only); see scattering_limit
-    float4 cameraUp;       // xyz = up, w = 0
+    float4 cameraUp;       // xyz = up, w = texture footprint scale (texture_footprint_scale; 0 reads as 1)
     float4 sunParams;      // xyz = sun direction, w = sun intensity
     float4x4 currentViewProj;
     float4x4 prevViewProj;
@@ -384,6 +388,16 @@ struct Uniforms {
     float4 lens; // aperture radius, focus distance, scene-graph mode (see uses_scene_graph), independent sun 1 - cos(half angle)
     float4 light; // RGB multiplier, size multiplier
 };
+
+// PBRT2023 (RayIntegrator): the camera's ray differentials, here its texture ray cone, are scaled by
+// max(1/8, 1/sqrt(samples per pixel)), because accumulated jittered samples already filter the
+// pixel (PathTracerRenderer.textureFootprintScale). Only primary hits use the scaled cone
+// (primary_texture_footprint); bounces keep the unscaled camera cone and widen it.
+float texture_footprint_scale(constant Uniforms &u) { return u.cameraUp.w > 0.0f ? u.cameraUp.w : 1.0f; }
+// Texture footprint width of a primary hit at distance t: the camera's pixel cone, scaled.
+float primary_texture_footprint(float t, constant Uniforms &u) {
+    return t * 2.0f * tan(u.cameraPos.w * PI / 360.0f) / float(u.height) * texture_footprint_scale(u);
+}
 
 // lens.z = 1 renders scene 6 from the imported scene graph: per-triangle material
 // slots and emission, an identity root transform, and float-scaled ray offsets.
@@ -542,22 +556,57 @@ struct ObjectSettings {
 };
 struct MeshTriangle { float4 a, b, c, na, nb, nc, uvab, uvc; };
 struct MeshNode { float4 lo, hi; int4 links; };
+// Two-level stored geometry (docs/SCENE_STORAGE_DESIGN.md, phase 1): welded vertices with exact
+// float attributes, and faces of three absolute vertex indices plus the stored uvc.z (the subset
+// of a scene-graph asset, the slot of a graph-less mesh). face_triangle rebuilds the MeshTriangle
+// the host stored, bit for bit in every field the renderer reads.
+struct MeshVertex { packed_float3 position; packed_float3 normal; float2 uv; };
+struct MeshFace { uint a, b, c, tag; };
+struct MeshWideNode { float4 lox, loy, loz, hix, hiy, hiz; int4 child; int4 count; };
 struct GraphInstruction { int4 code; float4 value, extra, auxiliary; };
 struct GraphHeader { int4 roots0, roots1, roots2, info; };
+// Material slots (SceneLimits.materials) and MaterialX graph images (SceneLimits.graphImages).
+// Slots 0-7 are the procedural scenes' surfaces; imported materials take 8 and up. Object IDs
+// of imported scene-graph nodes start after the slots (MATERIAL_SLOTS + node index).
+#define MATERIAL_SLOTS 1024u
+#define GRAPH_IMAGES 4096u
+// Argument-buffer IDs: small members first, then the two texture arrays (MaterialLibrary.Argument).
 struct MaterialResources {
-    array<texture2d<float>, 256> maps [[id(0)]];
-    texture2d<float> environmentMap [[id(256)]];
-    device MeshTriangle *triangles [[id(257)]];
-    device MeshNode *nodes [[id(258)]];
-    device ObjectSettings *objects [[id(259)]];
-    array<texture2d<float>,128> graphImages [[id(260)]];
-    device GraphInstruction *graphInstructions [[id(388)]];
-    device GraphHeader *graphHeaders [[id(389)]];
-    device float4 *emissions [[id(390)]];
-    device uint *emitters [[id(391)]];
-    texture2d<float> environmentRows [[id(392)]];
-    texture2d<float> environmentColumns [[id(393)]];
+    texture2d<float> environmentMap [[id(0)]];
+    device MeshTriangle *triangles [[id(1)]];
+    device MeshNode *nodes [[id(2)]];
+    device ObjectSettings *objects [[id(3)]];
+    device GraphInstruction *graphInstructions [[id(4)]];
+    device GraphHeader *graphHeaders [[id(5)]];
+    device float4 *emissions [[id(6)]];
+    device uint *emitters [[id(7)]];
+    texture2d<float> environmentRows [[id(8)]];
+    texture2d<float> environmentColumns [[id(9)]];
+    device MeshFace *faces [[id(10)]];
+    device MeshVertex *vertices [[id(11)]];
+    device MeshWideNode *blasNodes [[id(12)]];
+    // Graph-less (legacy) mesh only: per face, its stored uvc.w (low 16 bits) and na.w (high 16).
+    device uint *faceExtras [[id(13)]];
+    // Per slot, three float4 (MaterialLibrary.slotParameters): the spectral OpenPBR parameters
+    // (SpectralMaterial), the constant specular_color (slot_specular_color), and the constant
+    // transmission_color and geometry_thin_walled (slot_transmission).
+    device float4 *spectralMaterials [[id(14)]];
+    // Alpha cutouts: per slot the register of MaterialX geometry_opacity (-1: opaque), then at
+    // MATERIAL_SLOTS the number of cutout slots (MaterialLibrary.rebuildArguments).
+    device int *opacityRoots [[id(15)]];
+    array<texture2d<float>, GRAPH_IMAGES> graphImages [[id(16)]];
+    array<texture2d<float>, MATERIAL_SLOTS * 4> maps [[id(4112)]];
 };
+// OpenPBR specular_color of a slot (MaterialLibrary.slotParameters; white unless a MaterialX
+// program sets it): a metal's 82-degree edge tint, a dielectric's specular tint.
+float3 slot_specular_color(uint slot, constant MaterialResources &images) {
+    return slot < MATERIAL_SLOTS ? images.spectralMaterials[3 * slot + 1].rgb : float3(1.0f);
+}
+// OpenPBR transmission_color (rgb) and geometry_thin_walled (w: 1 or 0) of a slot; white and solid
+// unless a MaterialX program sets them.
+float4 slot_transmission(uint slot, constant MaterialResources &images) {
+    return slot < MATERIAL_SLOTS ? images.spectralMaterials[3 * slot + 2] : float4(1.0f, 1.0f, 1.0f, 0.0f);
+}
 
 // Radiance of the area light of scenes 1, 3, 4 and 5 before the light tint (Uniforms.light).
 float3 procedural_light_emission(uint sceneIndex) {
@@ -578,7 +627,7 @@ float3 procedural_light_emission(uint sceneIndex) {
 // are added, at the wavelengths of the estimator that produced them. In RGB libraries every helper
 // below is the identity and Wavelengths is empty.
 #if VIBE_SPECTRAL
-// Per-slot wavelength-dependent OpenPBR parameters (MaterialLibrary.spectralMaterials).
+// Per-slot wavelength-dependent OpenPBR parameters (MaterialLibrary.slotParameters).
 struct SpectralMaterial {
     float dispersion;        // OpenPBR "dispersion" parameter 20 / V_d (V_d = Abbe number / dispersion scale); 0 = none
     float thinFilmWeight;    // thin_film_weight
@@ -592,9 +641,8 @@ struct SpectralScene {
     uint dispersionSampling; // DispersionSampling bits: 1 spectral MIS at rough dispersive lobes, 2 lane splitting at delta ones
     uint padding1;
     float nodes[88];          // linear sRGB of the coarse grid's nodes, codes 0, 3, ..., 255 (86 used)
-    SpectralMaterial materials[64];
 };
-static_assert(sizeof(SpectralScene) == 1392, "Swift writes a 1392-byte SpectralScene");
+static_assert(sizeof(SpectralScene) == 368, "Swift writes a 368-byte SpectralScene");
 // Buffer 28 (SpectralShaderCache.grid): the exactly solved 86^3 grid of FourierSRGB86.bin as float4
 // (c0, c1, c2, 0), indexed (r * 86 + g) * 86 + b. Buffer 29 (PathTracerRenderer.spectralSampling),
 // written by spectral_icdf_kernel: the scene's 1025-node wavelength inverse CDF, then at float4 257
@@ -817,7 +865,10 @@ float3 emitter_rgb(float3 e, thread const Wavelengths &wl) { return spectral_emi
 
 SpectralMaterial spectral_material(Material m, thread const Wavelengths &wl) {
     SpectralMaterial none = { 0.0f, 0.0f, 0.0f, 1.4f };
-    return m.slot < 64u ? wl.scene->materials[m.slot] : none;
+    if (m.slot >= MATERIAL_SLOTS) return none;
+    float4 p = wl.images->spectralMaterials[3 * m.slot];
+    SpectralMaterial r = { p.x, p.y, p.z, p.w };
+    return r;
 }
 // Whether the material's index of refraction depends on wavelength (OpenPBR "Dispersion").
 bool spectral_dispersive(Material m, thread const Wavelengths &wl) {
@@ -1395,13 +1446,21 @@ void mesh_hit_attributes(thread HitRecord &rec, MeshTriangle tri, float b1, floa
 
 // REFERENCES.md: WALD2007, WIDEBVH2008, PBRT2023, WOOP2013. Two-level hierarchy
 // (MeshSceneLayout on the host): a 4-wide TLAS over the visible instances in world space and
-// a 4-wide binned-SAH BLAS per mesh asset in object space. BLAS nodes follow the stored
-// triangles in the triangle buffer; the node buffer holds the header, the instances, the
-// TLAS and the subset-to-slot table. A flat BVH (the reference path) leaves nodes[0].lo.w 0.
-struct MeshWideNode { float4 lox, loy, loz, hix, hiy, hiz; int4 child; int4 count; };
+// a 4-wide binned-SAH BLAS per mesh asset in object space. Stored triangles are the faces
+// and vertices (BLAS order), BLAS nodes have their own buffer, and the node buffer holds the
+// header, the instances, the TLAS and the subset-to-slot table. A flat BVH (the reference path) leaves nodes[0].lo.w 0.
 struct MeshInstance { float4 world[3]; float4 local[3]; uint4 range; uint4 binding; float4 bound; };
 struct MeshSceneHeader { uint4 info; uint4 counts; float4 lo, hi; uint4 accelerator; };
-static_assert(sizeof(MeshWideNode) == 128 && sizeof(MeshInstance) == 144 && sizeof(MeshSceneHeader) == 80, "Swift mesh layouts");
+static_assert(sizeof(MeshWideNode) == 128 && sizeof(MeshInstance) == 144 && sizeof(MeshSceneHeader) == 80
+    && sizeof(MeshVertex) == 32 && sizeof(MeshFace) == 16, "Swift mesh layouts");
+MeshTriangle face_triangle(MeshFace f, device const MeshVertex *v) {
+    MeshVertex a=v[f.a], b=v[f.b], c=v[f.c];
+    MeshTriangle t;
+    t.a=float4(float3(a.position),1); t.b=float4(float3(b.position),1); t.c=float4(float3(c.position),1);
+    t.na=float4(float3(a.normal),0); t.nb=float4(float3(b.normal),0); t.nc=float4(float3(c.normal),0);
+    t.uvab=float4(a.uv,b.uv); t.uvc=float4(c.uv,float(f.tag),0);
+    return t;
+}
 // Hardware traversal (METALRT, header.counts.w = 1): header.accelerator holds the instance
 // acceleration structure's resource ID, read as an argument-buffer member.
 struct MeshAccelerator { raytracing::instance_acceleration_structure scene; };
@@ -1418,6 +1477,13 @@ float3 instance_point(MeshInstance m, float3 p) { return float3(dot(m.world[0].x
 Ray instance_ray(MeshInstance m, Ray r) {
     return {float3(dot(m.local[0].xyz,r.origin)+m.local[0].w,dot(m.local[1].xyz,r.origin)+m.local[1].w,dot(m.local[2].xyz,r.origin)+m.local[2].w),
             float3(dot(m.local[0].xyz,r.direction),dot(m.local[1].xyz,r.direction),dot(m.local[2].xyz,r.direction))};
+}
+// Stored face `face` as an instance sees it: a graph-less (legacy) instance keeps its stored
+// uvc.w and na.w (it may hold flattened scene-graph triangles), which faceExtras carries.
+MeshTriangle instance_source(uint face, MeshInstance m, constant MaterialResources &images) {
+    MeshTriangle t=face_triangle(images.faces[face],images.vertices);
+    if(m.binding.y==0) { uint e=images.faceExtras[face]; t.uvc.w=float(e&0xffffu); t.na.w=float(e>>16); }
+    return t;
 }
 // The world-space triangle an instance renders, as SceneGraph.forEachRenderTriangle flattens it
 // (normals by the inverse transpose; a mirroring transform swaps b and c, and with them the
@@ -1450,7 +1516,81 @@ MeshTriangle scene_triangle(uint id, constant MaterialResources &images) {
     uint low=0, high=max(1u,mesh_header(images).info.x)-1;
     while(low<high) { uint middle=(low+high+1)/2; if(instances[middle].range.z<=id) low=middle; else high=middle-1; }
     MeshInstance m=instances[low]; float b1=0, b2=0;
-    return instance_triangle(images.triangles[m.range.x+(id-m.range.z)],m,images,b1,b2);
+    return instance_triangle(instance_source(m.range.x+(id-m.range.z),m,images),m,images,b1,b2);
+}
+// Opacity (MaterialXProgram.opacity; docs/SCENE_STORAGE_DESIGN.md phase 4): OpenPBR geometry_opacity is
+// coverage, so a candidate hit is kept with probability equal to it (stochastic transparency): 0 is
+// cut out, 1 always kept, and a value in between is unbiased over the rays that test it. The random
+// number hashes the ray and the triangle, so a ray decides the same way wherever it is traced. The
+// slot's MaterialX instructions are evaluated up to the opacity register at the hit's UV, sampling
+// images at mip 0 (traversal has no ray footprint); normal-map instructions evaluate to 0. Scenes
+// without opacity skip every check.
+bool mesh_cutouts(constant MaterialResources &images) { return images.opacityRoots[MATERIAL_SLOTS] > 0; }
+float2 mesh_uv(MeshTriangle t, float b1, float b2) { return (1.0f-b1-b2)*t.uvab.xy+b1*t.uvab.zw+b2*t.uvc.xy; }
+float cutout_random(Ray r, uint a, uint b) {
+    uint h=pcg_hash(b^0x2545f491u);
+    h=pcg_hash(h^a); h=pcg_hash(h^as_type<uint>(r.origin.x)); h=pcg_hash(h^as_type<uint>(r.origin.y));
+    h=pcg_hash(h^as_type<uint>(r.origin.z)); h=pcg_hash(h^as_type<uint>(r.direction.x));
+    h=pcg_hash(h^as_type<uint>(r.direction.y)); h=pcg_hash(h^as_type<uint>(r.direction.z));
+    return float(h>>8)*(1.0f/16777216.0f);
+}
+// Not inlined, so its register file is not copied into every traversal loop.
+__attribute__((noinline)) bool material_cut(uint slot, float2 uv, constant MaterialResources &images, float random) {
+    if(slot>=MATERIAL_SLOTS) return false;
+    int root=images.opacityRoots[slot]; if(root<0) return false;
+    GraphHeader h=images.graphHeaders[slot];
+    float4 values[64];
+    for(int i=0;i<=root && i<64;++i) {
+        GraphInstruction n=images.graphInstructions[h.info.x+i];
+        float4 a=i>0?values[n.code.y]:float4(0),b=i>0?values[n.code.z]:float4(0),c=i>0?values[n.code.w]:float4(0);
+        float4 v=n.value;
+        switch(n.code.x) {
+        case 0:break;
+        case 1:v=float4(uv.x,1.0f-uv.y,0,0);break;
+        case 2:{
+            constexpr sampler periodic(coord::normalized,address::repeat,filter::linear);
+            constexpr sampler clampU(coord::normalized,s_address::clamp_to_edge,t_address::repeat,filter::linear);
+            constexpr sampler clampV(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear);
+            constexpr sampler clampUV(coord::normalized,address::clamp_to_edge,filter::linear);
+            uint index=uint(n.value.x); float2 st=float2(a.x,1.0f-a.y);
+            v=n.value.z>0 ? images.graphImages[index].sample(n.value.w>0?clampUV:clampU,st,level(0))
+                : images.graphImages[index].sample(n.value.w>0?clampV:periodic,st,level(0));
+            if(n.value.y>0) v=float4(v.x); break;
+        }
+        case 3:v=a*b;break;
+        case 4:v=a+b;break;
+        case 5:v=mix(a,b,c);break;
+        case 6:v=float4(a[uint(n.value.x)]);break;
+        case 7:v=clamp(a,b,c);break;
+        case 8:v=float4(0);break;
+        case 9:v=a-b;break;
+        case 10:{float angle=n.value.x;v=float4(cos(angle)*a.x+sin(angle)*a.y,-sin(angle)*a.x+cos(angle)*a.y,0,0);break;}
+        case 11:v=a;break;
+        }
+        values[i]=all(isfinite(v))?v:float4(0);
+    }
+    return random>=values[root].x;
+}
+// The material slot of stored face `tag` (its uvc.z) as instance `m` renders it: the scene-graph
+// binding, or for a graph-less mesh its stored slot (scene-graph scenes) or the imported-mesh slot 7.
+uint instance_face_slot(MeshInstance m, uint tag, bool graphSlots, constant MaterialResources &images) {
+    if(m.binding.y!=0) {
+        const device uint *slots=(const device uint *)((device const char *)images.nodes+16*mesh_header(images).info.z);
+        return slots[m.binding.x+tag];
+    }
+    return graphSlots ? tag : 7u;
+}
+// Whether instance m's face `primitive` (relative to m.range.x) is cut out at barycentrics (b1, b2)
+// for the object-space ray `local`. Shared by the two-level and hardware traversals, out of line.
+__attribute__((noinline)) bool face_cut(MeshInstance m, uint primitive, float b1, float b2, Ray local, bool graphSlots,
+                                        constant MaterialResources &images) {
+    MeshFace face=images.faces[m.range.x+primitive];
+    return material_cut(instance_face_slot(m,face.tag,graphSlots,images),mesh_uv(face_triangle(face,images.vertices),b1,b2),images,
+        cutout_random(local,m.range.z,primitive));
+}
+// Stored triangle i (BVH order): the flat buffer's record, or a two-level face decoded.
+MeshTriangle stored_triangle(uint i, constant MaterialResources &images) {
+    return mesh_two_level(images) ? face_triangle(images.faces[i],images.vertices) : images.triangles[i];
 }
 // Position rounding of a hit rebuilt from an instance's world corners: the bound of the
 // corners themselves (mesh_hit_error) and of the transform that produced them.
@@ -1488,8 +1628,9 @@ int wide_order(bool4 hit, float4 nearT, thread int *order, thread float *key) {
 }
 // Closest hit in one asset's BLAS, in object space. The host keeps BLAS depth <= 20, so the
 // stack (at most 3 net pushes per level) never overflows.
-void blas_closest(device const MeshWideNode *nodes, device const MeshTriangle *triangles, Ray local, float rootMax,
-                  float tMin, thread float &closest, thread int &hit, thread float &hb1, thread float &hb2) {
+void blas_closest(device const MeshWideNode *nodes, device const MeshFace *faces, device const MeshVertex *vertices, Ray local, float rootMax,
+                  float tMin, thread float &closest, thread int &hit, thread float &hb1, thread float &hb2,
+                  MeshInstance instance, bool cut, bool graphSlots, constant MaterialResources &images) {
     WatertightRay watertight=watertight_ray(local);
     WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+rootMax));
     int stack[64]; int top=0; stack[top++]=0;
@@ -1503,7 +1644,9 @@ void blas_closest(device const MeshWideNode *nodes, device const MeshTriangle *t
             int first=-node.child[k]-1;
             for(int q=0;q<node.count[k];++q) {
                 float t,b1,b2;
-                if(!intersect_mesh_triangle(triangles[first+q],watertight,tMin,closest,t,b1,b2)) continue;
+                MeshTriangle tri=face_triangle(faces[first+q],vertices);
+                if(!intersect_mesh_triangle(tri,watertight,tMin,closest,t,b1,b2)) continue;
+                if(cut && face_cut(instance,uint(first+q),b1,b2,local,graphSlots,images)) continue;
                 closest=t; hit=first+q; hb1=b1; hb2=b2;
             }
         }
@@ -1512,8 +1655,8 @@ void blas_closest(device const MeshWideNode *nodes, device const MeshTriangle *t
 }
 // Any hit in [tMin, tMax - slack) of one asset; slack is the endpoint surface's own bound
 // (see scene_occluded), from the instance transform and the triangle's local corners.
-bool blas_any(device const MeshWideNode *nodes, device const MeshTriangle *triangles, Ray local, MeshInstance instance,
-              float tMin, float tMax, bool slack) {
+bool blas_any(device const MeshWideNode *nodes, device const MeshFace *faces, device const MeshVertex *vertices, Ray local, MeshInstance instance,
+              float tMin, float tMax, bool slack, bool cut, bool graphSlots, constant MaterialResources &images) {
     WatertightRay watertight=watertight_ray(local);
     WideRay w=wide_ray(local,1.1920929e-6f*(max_abs(local.origin)+instance.bound.z));
     int stack[64]; int top=0; stack[top++]=0;
@@ -1525,10 +1668,12 @@ bool blas_any(device const MeshWideNode *nodes, device const MeshTriangle *trian
             if(node.child[k]>0) { if(top<64) stack[top++]=node.child[k]; continue; }
             int first=-node.child[k]-1;
             for(int q=0;q<node.count[k];++q) {
-                MeshTriangle tri=triangles[first+q];
-                float t,b1,b2,local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
-                float s=slack ? max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local)) : 0.0f;
-                if(intersect_mesh_triangle(tri,watertight,tMin,tMax-s,t,b1,b2)) return true;
+                MeshTriangle tri=face_triangle(faces[first+q],vertices);
+                float t,b1,b2,extent=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
+                float s=slack ? max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*extent)) : 0.0f;
+                if(!intersect_mesh_triangle(tri,watertight,tMin,tMax-s,t,b1,b2)) continue;
+                if(cut && face_cut(instance,uint(first+q),b1,b2,local,graphSlots,images)) continue;
+                return true;
             }
         }
     }
@@ -1538,8 +1683,31 @@ struct MeshHit { float t, b1, b2; int triangle; uint instance; };
 // TLAS traversal. Its boxes are world bounds of transformed object bounds, grown per ray by
 // lo.w * (|origin| + hi.w): the rounding of the object-space ray, amplified by the largest
 // transform condition number, never culls an instance whose object-space traversal hits.
-bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &images, thread MeshHit &h) {
+bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &images, thread MeshHit &h, bool graphSlots) {
     MeshSceneHeader header=mesh_header(images);
+    bool cut=mesh_cutouts(images);
+    if(HARDWARE_MESHES && header.counts.w!=0 && cut) {
+        // Cutouts: instances without cutout slots are opaque in the instance structure
+        // (MaterialLibrary.instanceOpacity) and commit in hardware; only cutout instances report
+        // candidates, which are committed unless cut. The query reports only candidates nearer
+        // than the committed hit.
+        raytracing::intersection_params params;
+        params.assume_geometry_type(raytracing::geometry_type::triangle);
+        raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(
+            raytracing::ray(r.origin,r.direction,tMin,tMax),mesh_accelerator(images).scene,params);
+        device const MeshInstance *instances=mesh_instances(images);
+        while(query.next()) {
+            MeshInstance instance=instances[query.get_candidate_instance_id()];
+            float2 bc=query.get_candidate_triangle_barycentric_coord();
+            if(!face_cut(instance,query.get_candidate_primitive_id(),bc.x,bc.y,instance_ray(instance,r),graphSlots,images))
+                query.commit_triangle_intersection();
+        }
+        if(query.get_committed_intersection_type()!=raytracing::intersection_type::triangle) return false;
+        float2 bc=query.get_committed_triangle_barycentric_coord();
+        h.t=query.get_committed_distance(); h.b1=bc.x; h.b2=bc.y;
+        h.triangle=int(query.get_committed_primitive_id()); h.instance=query.get_committed_instance_id();
+        return true;
+    }
     if(HARDWARE_MESHES && header.counts.w!=0) {
         // Same instances and primitive order as the software hierarchy, so the hit resolves alike.
         raytracing::intersector<raytracing::triangle_data,raytracing::instancing> closest;
@@ -1552,7 +1720,7 @@ bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &ima
     }
     device const MeshInstance *instances=mesh_instances(images);
     device const MeshWideNode *tlas=(device const MeshWideNode *)((device const char *)images.nodes+16*header.info.y);
-    device const MeshWideNode *blas=(device const MeshWideNode *)images.triangles;
+    device const MeshWideNode *blas=images.blasNodes;
     WideRay w=wide_ray(r,header.lo.w*(max_abs(r.origin)+header.hi.w));
     float closest=tMax; bool found=false;
     int stack[32]; int top=0; stack[top++]=0;
@@ -1566,16 +1734,60 @@ bool mesh_closest(Ray r, float tMin, float tMax, constant MaterialResources &ima
             uint index=uint(-node.child[k]-1);
             MeshInstance instance=instances[index];
             int triangle=-1; float b1=0, b2=0;
-            blas_closest(blas+instance.range.y,images.triangles+instance.range.x,instance_ray(instance,r),instance.bound.z,tMin,closest,triangle,b1,b2);
+            blas_closest(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance.bound.z,tMin,closest,triangle,b1,b2,
+                instance,cut,graphSlots,images);
             if(triangle>=0) { h.t=closest; h.b1=b1; h.b2=b2; h.triangle=triangle; h.instance=index; found=true; }
         }
         for(int j=m-1;j>=0;--j) { int k=order[j]; if(node.child[k]>0 && key[j]<=closest && top<32) stack[top++]=node.child[k]; }
     }
     return found;
 }
-bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialResources &images) {
+bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialResources &images, bool graphSlots) {
     MeshSceneHeader header=mesh_header(images);
     device const MeshInstance *instances=mesh_instances(images);
+    bool cut=mesh_cutouts(images);
+    if(HARDWARE_MESHES && header.counts.w!=0 && cut) {
+        // Cutouts. Before tMax - S (S bounds every triangle's slack) any opaque instance blocks in
+        // hardware (MaterialLibrary.instanceOpacity), and a cutout instance's candidate blocks
+        // unless it is cut out. In [tMax - S, tMax) every candidate is checked as blas_any does:
+        // it blocks unless it is the endpoint surface (within its own slack) or cut out.
+        float S=slack ? max(1e-7f,1.907349e-6f*header.hi.w) : 0.0f;
+        raytracing::instance_acceleration_structure scene=mesh_accelerator(images).scene;
+        if(tMax-S>tMin) {
+            raytracing::intersection_params near;
+            near.assume_geometry_type(raytracing::geometry_type::triangle);
+            near.accept_any_intersection(true);
+            raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> any(
+                raytracing::ray(r.origin,r.direction,tMin,tMax-S),scene,near);
+            while(any.next()) {
+                MeshInstance instance=instances[any.get_candidate_instance_id()];
+                float2 bc=any.get_candidate_triangle_barycentric_coord();
+                if(face_cut(instance,any.get_candidate_primitive_id(),bc.x,bc.y,instance_ray(instance,r),graphSlots,images)) continue;
+                any.abort();
+                return true;
+            }
+            if(any.get_committed_intersection_type()==raytracing::intersection_type::triangle) return true;
+        }
+        if(!slack) return false;
+        raytracing::intersection_params params;
+        params.assume_geometry_type(raytracing::geometry_type::triangle);
+        params.force_opacity(raytracing::forced_opacity::non_opaque);
+        raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(
+            raytracing::ray(r.origin,r.direction,max(tMin,tMax-S),tMax),scene,params);
+        while(query.next()) {
+            MeshInstance instance=instances[query.get_candidate_instance_id()];
+            if(slack) {
+                MeshTriangle tri=face_triangle(images.faces[instance.range.x+query.get_candidate_primitive_id()],images.vertices);
+                float local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
+                if(query.get_candidate_triangle_distance()>=tMax-max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local))) continue;
+            }
+            float2 bc=query.get_candidate_triangle_barycentric_coord();
+            if(face_cut(instance,query.get_candidate_primitive_id(),bc.x,bc.y,instance_ray(instance,r),graphSlots,images)) continue;
+            query.abort();
+            return true;
+        }
+        return false;
+    }
     if(HARDWARE_MESHES && header.counts.w!=0) {
         // Any opaque hit before tMax - S (S bounds every triangle's slack), then the candidates
         // in [tMax - S, tMax) against their own slack, exactly as blas_any decides.
@@ -1592,14 +1804,14 @@ bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialR
         raytracing::intersection_query<raytracing::instancing,raytracing::triangle_data> query(raytracing::ray(r.origin,r.direction,max(tMin,tMax-S),tMax),scene,params);
         while(query.next()) {
             MeshInstance instance=instances[query.get_candidate_instance_id()];
-            MeshTriangle tri=images.triangles[instance.range.x+query.get_candidate_primitive_id()];
+            MeshTriangle tri=face_triangle(images.faces[instance.range.x+query.get_candidate_primitive_id()],images.vertices);
             float local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
             if(query.get_candidate_triangle_distance()<tMax-max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local))) { query.abort(); return true; }
         }
         return false;
     }
     device const MeshWideNode *tlas=(device const MeshWideNode *)((device const char *)images.nodes+16*header.info.y);
-    device const MeshWideNode *blas=(device const MeshWideNode *)images.triangles;
+    device const MeshWideNode *blas=images.blasNodes;
     WideRay w=wide_ray(r,header.lo.w*(max_abs(r.origin)+header.hi.w));
     int stack[32]; int top=0; stack[top++]=0;
     while(top>0) {
@@ -1609,7 +1821,8 @@ bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialR
             if(!hit[k]) continue;
             if(node.child[k]>0) { if(top<32) stack[top++]=node.child[k]; continue; }
             MeshInstance instance=instances[-node.child[k]-1];
-            if(blas_any(blas+instance.range.y,images.triangles+instance.range.x,instance_ray(instance,r),instance,tMin,tMax,slack)) return true;
+            if(blas_any(blas+instance.range.y,images.faces+instance.range.x,images.vertices,instance_ray(instance,r),instance,tMin,tMax,slack,
+                cut,graphSlots,images)) return true;
         }
     }
     return false;
@@ -1628,9 +1841,9 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
     float closest=hit ? rec.t/o.positionScale.w : 1e20f;
     if(mesh_two_level(images)) {
         MeshHit m;
-        if(!mesh_closest(local,tMin/o.positionScale.w,closest,images,m)) return hit;
+        if(!mesh_closest(local,tMin/o.positionScale.w,closest,images,m,uses_scene_graph(u))) return hit;
         MeshInstance instance=mesh_instances(images)[m.instance];
-        MeshTriangle stored=images.triangles[instance.range.x+uint(m.triangle)];
+        MeshTriangle stored=instance_source(instance.range.x+uint(m.triangle),instance,images);
         float b1=m.b1, b2=m.b2;
         MeshTriangle tri=instance_triangle(stored,instance,images,b1,b2);
         float b0=1-b1-b2;
@@ -1640,12 +1853,13 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
         mesh_hit_attributes(rec,tri,b1,b2,local.direction);
         rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=uses_scene_graph(u) ? uint(tri.uvc.z) : 7;
         if(uses_scene_graph(u) && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
-        rec.objectID=uses_scene_graph(u) ? 64+uint(tri.uvc.w)-1 : 7;
+        rec.objectID=uses_scene_graph(u) ? MATERIAL_SLOTS+uint(tri.uvc.w)-1 : 7;
         rec.triangle=instance.range.z+uint(m.triangle);
         world_hit(rec,o);
         return true;
     }
     WatertightRay watertight=watertight_ray(local);
+    bool cut=mesh_cutouts(images);
     MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
     while(top>0) {
@@ -1656,6 +1870,8 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             MeshTriangle tri=images.triangles[node.links.z+k];
             float t,b1,b2;
             if(!intersect_mesh_triangle(tri,watertight,tMin/o.positionScale.w,closest,t,b1,b2)) continue;
+            if(cut && material_cut(uses_scene_graph(u) ? uint(tri.uvc.z) : 7u,mesh_uv(tri,b1,b2),images,
+                cutout_random(local,0u,uint(node.links.z+k)))) continue;
             closest=t; hit=true; float b0=1-b1-b2;
             // Rebuild the point from barycentrics: it then lies on the triangle
             // within vertex-magnitude rounding, independent of the ray length.
@@ -1664,7 +1880,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, constant Materia
             mesh_hit_attributes(rec,tri,b1,b2,local.direction);
             rec.mat={DIFFUSE,float3(0.7f),float3(0),0,1}; rec.mat.slot=uses_scene_graph(u) ? uint(tri.uvc.z) : 7;
             if(uses_scene_graph(u) && any(images.emissions[rec.mat.slot].rgb>0)) {rec.mat.type=EMISSIVE;rec.mat.emission=rec.front_face?images.emissions[rec.mat.slot].rgb:float3(0);}
-            rec.objectID=uses_scene_graph(u) ? 64+uint(tri.uvc.w)-1 : 7;
+            rec.objectID=uses_scene_graph(u) ? MATERIAL_SLOTS+uint(tri.uvc.w)-1 : 7;
             rec.triangle=uint(node.links.z+k);
             world_hit(rec,o);
         }
@@ -1683,8 +1899,9 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
     if(uses_scene_graph(u)) { o.positionScale=float4(0,0,0,1);o.rotationHidden=float4(0); }
     Ray local=object_ray(r,o);
     float nearT=tMin/o.positionScale.w, farT=tMax/o.positionScale.w;
-    if(mesh_two_level(images)) return mesh_occluded(local,nearT,farT,uses_scene_graph(u),images);
+    if(mesh_two_level(images)) return mesh_occluded(local,nearT,farT,uses_scene_graph(u),images,uses_scene_graph(u));
     WatertightRay watertight=watertight_ray(local);
+    bool cut=mesh_cutouts(images);
     MeshBoxRay box=mesh_box_ray(local,images.nodes[0]);
     int stack[64]; int top=0; stack[top++]=0;
     while(top>0) {
@@ -1694,7 +1911,10 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
         for(int k=0;k<node.links.w;++k) {
             MeshTriangle tri=images.triangles[node.links.z+k];
             float t,b1,b2,slack=uses_scene_graph(u) ? mesh_hit_error(tri,float3(0),u) : 0.0f;
-            if(intersect_mesh_triangle(tri,watertight,nearT,farT-slack,t,b1,b2)) return true;
+            if(!intersect_mesh_triangle(tri,watertight,nearT,farT-slack,t,b1,b2)) continue;
+            if(cut && material_cut(uses_scene_graph(u) ? uint(tri.uvc.z) : 7u,mesh_uv(tri,b1,b2),images,
+                cutout_random(local,0u,uint(node.links.z+k)))) continue;
+            return true;
         }
     }
     return false;
@@ -1844,17 +2064,35 @@ struct SurfaceSettings {
     float normalStrength;
     uint padding;
 };
-// All 64 slots are uploaded with setBytes, whose payload limit is 4 KB.
-static_assert(sizeof(SurfaceSettings) * 64 <= 4096, "SurfaceSettings payload exceeds setBytes");
+// All MATERIAL_SLOTS slots live in one buffer (MaterialLibrary.settingsBuffer), bound at index 1.
+static_assert(sizeof(SurfaceSettings) == 64, "Swift SurfaceSettings layout");
 
 
+// REFERENCES.md: RAYCONES2021, PBRT2023, METALTEXTURES. A texture footprint: the two axes of the
+// ray cone's ellipse on the surface, as texture-coordinate offsets (the gradients of an explicit-
+// gradient sample, filtered anisotropically by the hardware).
+struct TextureFootprint { float2 dx, dy; };
+TextureFootprint scaled_footprint(TextureFootprint f, float2 scale) { f.dx *= scale; f.dy *= scale; return f; }
+// The cone of width `width` (world units) cut by the surface at `hit`: the minor axis is the width,
+// across the ray's projection onto the surface; the major axis is width / |cos|, along it. Both map
+// to UV through the tangent frame (dP/du, dP/dv directions) and the UV density per world unit.
+TextureFootprint surface_footprint(thread const HitRecord &hit, Ray ray, float width) {
+    float3 n = hit.geometricNormal;
+    float c = abs(dot(ray.direction, n));
+    float3 along = ray.direction - n * dot(ray.direction, n);
+    float3 major = dot(along, along) > 1e-12f ? normalize(along) : hit.tangent;
+    float3 minor = cross(n, major);
+    float3 b = dot(hit.bitangent, hit.bitangent) > 0.25f ? hit.bitangent : cross(hit.normal, hit.tangent);
+    TextureFootprint f;
+    f.dx = hit.uvDensity * float2(dot(major, hit.tangent), dot(major, b)) * (width / max(c, 0.05f));
+    f.dy = hit.uvDensity * float2(dot(minor, hit.tangent), dot(minor, b)) * width;
+    return f;
+}
 float4 sample_material_map(constant MaterialResources &images, uint slot, uint channel,
-                          float2 uv, float2 density, float footprint) {
-    constexpr sampler filter(coord::normalized, address::repeat, filter::linear, mip_filter::linear);
+                          float2 uv, TextureFootprint f) {
+    constexpr sampler filter(coord::normalized, address::repeat, filter::linear, mip_filter::linear, max_anisotropy(16));
     uint index = slot * 4 + channel;
-    float2 size = float2(images.maps[index].get_width(), images.maps[index].get_height());
-    float lod = max(0.0f, log2(max(1e-6f, max(size.x * density.x, size.y * density.y) * footprint)));
-    return images.maps[index].sample(filter, uv, level(lod));
+    return images.maps[index].sample(filter, uv, gradient2d(f.dx, f.dy));
 }
 
 
@@ -1866,7 +2104,9 @@ float3 tangent_space_normal(thread const HitRecord &hit, float3 m) {
 }
 
 // REFERENCES.md: MATERIALX. Bounded, topologically sorted graph expressions.
-void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, float footprint) {
+// `footprint` is the hit's texture footprint in its base UV coordinates; graph densities track how
+// each register's coordinates scale with them (1 at texcoord).
+void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, TextureFootprint footprint) {
     GraphHeader h=images.graphHeaders[hit.mat.slot]; if(h.info.y==0) return;
     float4 values[64]; float2 densities[64];
     for(int i=0;i<h.info.y;++i) {
@@ -1876,18 +2116,19 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         float4 v=n.value;float2 d=float2(0);
         switch(n.code.x) {
         case 0:break;
-        case 1:v=float4(hit.uv.x,1.0f-hit.uv.y,0,0);d=hit.uvDensity;break;
+        case 1:v=float4(hit.uv.x,1.0f-hit.uv.y,0,0);d=float2(1.0f);break;
         case 2:{
             // value.z/w select MaterialX clamp (clamp-to-edge) addressing per axis.
-            constexpr sampler periodic(coord::normalized,address::repeat,filter::linear,mip_filter::linear);
-            constexpr sampler clampU(coord::normalized,s_address::clamp_to_edge,t_address::repeat,filter::linear,mip_filter::linear);
-            constexpr sampler clampV(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear);
-            constexpr sampler clampUV(coord::normalized,address::clamp_to_edge,filter::linear,mip_filter::linear);
-            uint index=uint(n.value.x);float2 size=float2(images.graphImages[index].get_width(),images.graphImages[index].get_height());
-            float lod=max(0.0f,log2(max(1e-6f,max(size.x*da.x,size.y*da.y)*footprint)));
+            constexpr sampler periodic(coord::normalized,address::repeat,filter::linear,mip_filter::linear,max_anisotropy(16));
+            constexpr sampler clampU(coord::normalized,s_address::clamp_to_edge,t_address::repeat,filter::linear,mip_filter::linear,max_anisotropy(16));
+            constexpr sampler clampV(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear,max_anisotropy(16));
+            constexpr sampler clampUV(coord::normalized,address::clamp_to_edge,filter::linear,mip_filter::linear,max_anisotropy(16));
+            uint index=uint(n.value.x);
+            // MaterialX coordinates are bottom-left: the image's t runs against v.
+            float2 flip=float2(1.0f,-1.0f),gx=footprint.dx*da*flip,gy=footprint.dy*da*flip;
             float2 st=float2(a.x,1.0f-a.y);
-            v=n.value.z>0 ? images.graphImages[index].sample(n.value.w>0?clampUV:clampU,st,level(lod))
-                : images.graphImages[index].sample(n.value.w>0?clampV:periodic,st,level(lod));
+            v=n.value.z>0 ? images.graphImages[index].sample(n.value.w>0?clampUV:clampU,st,gradient2d(gx,gy))
+                : images.graphImages[index].sample(n.value.w>0?clampV:periodic,st,gradient2d(gx,gy));
             if(n.value.y>0) v=float4(v.x); break;
         }
         case 3:v=a*b;d=abs(a.xy)*db+abs(b.xy)*da;break;
@@ -1905,6 +2146,8 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         values[i]=all(isfinite(v))?v:float4(0);densities[i]=d;
     }
     hit.mat.type=OPENPBR;hit.mat.usesMaterialX=1;
+    hit.mat.specularColor=slot_specular_color(hit.mat.slot,images);
+    hit.mat.transmissionTint=slot_transmission(hit.mat.slot,images);
     hit.mat.diffuseRoughness=h.info.z>=0 ? clamp(values[h.info.z].x,0.0f,1.0f) : 0.0f;
     hit.mat.albedo=clamp(values[h.roots0.x].rgb,0.0f,1.0f);
     hit.mat.roughness=clamp(values[h.roots0.y].x,0.03f,1.0f);
@@ -1918,7 +2161,7 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
     hit.mat.specularWeight=clamp(values[h.roots2.z].x,0.0f,1.0f);
     hit.mat.baseWeight=clamp(values[h.roots2.w].x,0.0f,1.0f);
     // OpenPBR emission (nits, before coat/fuzz attenuation) leaves the exterior side only;
-    // geometry_thin_walled is fixed at false. See openpbr_emission.
+    // thin-walled materials emit from the front face only as well. See openpbr_emission.
     hit.mat.emission=h.info.w>=0 && hit.front_face ? clamp(values[h.info.w].rgb,0.0f,1e8f) : float3(0);
     if(h.roots2.x>=0) {
         float3 normal=values[h.roots2.x].xyz;
@@ -1934,7 +2177,7 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
     hit.mat.inside = !hit.front_face;
     hit.mat.tangent = hit.tangent;
     hit.mat.geometricNormal = hit.geometricNormal;
-    if (hit.mat.type == EMISSIVE || hit.mat.slot >= 64) return;
+    if (hit.mat.type == EMISSIVE || hit.mat.slot >= MATERIAL_SLOTS) return;
     uint slot = hit.mat.slot;
     SurfaceSettings config = settings[slot];
     if (config.enabled != 0) {
@@ -1948,18 +2191,20 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
         hit.mat.ior = config.detail.y;
         hit.mat.transmission = config.detail.z;
     }
+    TextureFootprint fp = surface_footprint(hit, ray, footprint);
     if(images.graphHeaders[slot].info.y>0) {
-        resolve_materialx(hit,ray,images,footprint/max(0.05f,abs(dot(ray.direction,hit.geometricNormal))));return;
+        resolve_materialx(hit,ray,images,fp);return;
     }
     if (config.mapMask == 0) return;
     float repeat = max(0.01f, config.detail.w);
-    float2 uv = hit.uv * repeat, density = hit.uvDensity * repeat;
+    float2 uv = hit.uv * repeat;
     ObjectSettings object=images.objects[slot];
     float angle=object.uvTransform.z;
-    uv=float2(cos(angle)*uv.x-sin(angle)*uv.y,sin(angle)*uv.x+cos(angle)*uv.y)+object.uvTransform.xy;
-    // Isotropic ray-cone footprint, enlarged at grazing incidence. Rough
+    float2x2 rotation=float2x2(float2(cos(angle),sin(angle)),float2(-sin(angle),cos(angle)));
+    uv=rotation*uv+object.uvTransform.xy;
+    // Anisotropic ray-cone footprint, in the rotated and repeated map coordinates. Rough
     // secondary rays expand the cone in shading_kernel; mirror chains preserve it.
-    footprint /= max(0.05f, abs(dot(ray.direction, hit.geometricNormal)));
+    fp.dx=rotation*(fp.dx*repeat); fp.dy=rotation*(fp.dy*repeat);
     // Roughness and metalness maps promote an original scene material to OpenPBR.
     // Keep its metal or glass lobe; a matte surface takes the inspector roughness.
     if ((config.mapMask & 6) && hit.mat.type != OPENPBR && (hit.mat.type != GLOSSY || (config.mapMask & 4))) {
@@ -1969,11 +2214,11 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
         if (hit.mat.type == DIFFUSE) hit.mat.roughness = config.surface.x;
         hit.mat.type = OPENPBR;
     }
-    if (config.mapMask & 1) hit.mat.albedo *= sample_material_map(images, slot, 0, uv, density, footprint).rgb;
-    if (config.mapMask & 2) hit.mat.roughness = clamp(sample_material_map(images, slot, 1, uv, density, footprint)[min(object.channels.x,3u)], 0.03f, 1.0f);
-    if (config.mapMask & 4) hit.mat.metalness = clamp(sample_material_map(images, slot, 2, uv, density, footprint)[min(object.channels.y,3u)], 0.0f, 1.0f);
+    if (config.mapMask & 1) hit.mat.albedo *= sample_material_map(images, slot, 0, uv, fp).rgb;
+    if (config.mapMask & 2) hit.mat.roughness = clamp(sample_material_map(images, slot, 1, uv, fp)[min(object.channels.x,3u)], 0.03f, 1.0f);
+    if (config.mapMask & 4) hit.mat.metalness = clamp(sample_material_map(images, slot, 2, uv, fp)[min(object.channels.y,3u)], 0.0f, 1.0f);
     if (config.mapMask & 8) {
-        float3 map = sample_material_map(images, slot, 3, uv, density, footprint).xyz * 2.0f - 1.0f;
+        float3 map = sample_material_map(images, slot, 3, uv, fp).xyz * 2.0f - 1.0f;
         map.xy *= config.normalStrength;
         float3 mapped = tangent_space_normal(hit, float3(map.xy, max(0.05f, map.z)));
         // Keep the shading frame facing the ray and within the geometric surface.
@@ -2033,12 +2278,17 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
     inputs.specular_weight = mat.usesMaterialX ? mat.specularWeight : (mat.type == DIFFUSE ? 0.0f : 1.0f);
     if(mat.usesMaterialX) { inputs.base_weight=mat.baseWeight; inputs.base_diffuse_roughness=mat.diffuseRoughness; }
     inputs.specular_ior = max(1.01f, mat.ior);
+    inputs.specular_color = mat.usesMaterialX ? mat.specularColor : float3(1.0f);
     inputs.coat_weight = mat.coat;
     inputs.coat_roughness = mat.usesMaterialX ? mat.coatRoughness : 0.12f;
     inputs.specular_roughness_anisotropy = mat.anisotropy;
     inputs.fuzz_weight = mat.fuzz;
     inputs.transmission_weight = mat.transmission;
-    float3 outward = mat.transmission > 0.0f && mat.inside ? -n : n;
+    inputs.transmission_color = mat.usesMaterialX ? mat.transmissionTint.rgb : float3(1.0f);
+    // A thin-walled surface is always entered from the side the ray arrives on (upstream
+    // openpbr_bsdf.h: inside = back_facing && !geometry_thin_walled).
+    inputs.geometry_thin_walled = mat.usesMaterialX && mat.transmissionTint.w > 0.0f;
+    float3 outward = mat.transmission > 0.0f && mat.inside && !inputs.geometry_thin_walled ? -n : n;
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
     inputs.geometry_coat_basis = inputs.geometry_basis;
@@ -2056,7 +2306,7 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
 #if VIBE_SPECTRAL
 struct PreparedBsdf { OpenPBR_PreparedBsdf a, b; uint hero; bool flat; };
 OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, float3 baseColor, float3 lambda,
-                                           SpectralMaterial sm) {
+                                           SpectralMaterial sm, float3 transmissionColor) {
     OpenPBR_ResolvedInputs inputs = openpbr_make_default_resolved_inputs();
     inputs.base_color = baseColor;
     inputs.specular_roughness = max(0.03f, mat.roughness);
@@ -2064,6 +2314,7 @@ OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, fl
     inputs.specular_weight = mat.usesMaterialX ? mat.specularWeight : (mat.type == DIFFUSE ? 0.0f : 1.0f);
     if(mat.usesMaterialX) { inputs.base_weight=mat.baseWeight; inputs.base_diffuse_roughness=mat.diffuseRoughness; }
     inputs.specular_ior = max(1.01f, mat.ior);
+    inputs.specular_color = mat.usesMaterialX ? mat.specularColor : float3(1.0f);
     inputs.coat_weight = mat.coat;
     inputs.coat_roughness = mat.usesMaterialX ? mat.coatRoughness : 0.12f;
     inputs.specular_roughness_anisotropy = mat.anisotropy;
@@ -2075,29 +2326,39 @@ OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, fl
     inputs.thin_film_weight = sm.thinFilmWeight;
     inputs.thin_film_thickness = sm.thinFilmThickness;
     inputs.thin_film_ior = sm.thinFilmIOR;
-    float3 outward = mat.transmission > 0.0f && mat.inside ? -n : n;
+    inputs.transmission_color = transmissionColor;
+    inputs.geometry_thin_walled = mat.usesMaterialX && mat.transmissionTint.w > 0.0f;
+    float3 outward = mat.transmission > 0.0f && mat.inside && !inputs.geometry_thin_walled ? -n : n;
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
     inputs.geometry_coat_basis = inputs.geometry_basis;
     return openpbr_prepare(inputs, float3(1), lambda, 1.0f, wo);
 }
+// OpenPBR transmission_color at the path's wavelengths: uplifted like a reflectance (white for
+// materials without a MaterialX transmission colour).
+Spectrum spectral_transmission(Material mat, thread const Wavelengths &wl) {
+    float3 t = mat.usesMaterialX ? clamp(mat.transmissionTint.rgb, 0.0f, 1.0f) : float3(1.0f);
+    return t.x == t.y && t.y == t.z ? Spectrum(t.x) : spectral_reflectance(t, wl);
+}
 PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavelengths &wl) {
     SpectralMaterial sm = spectral_material(mat, wl);
     float3 albedo = clamp(mat.albedo, 0.0f, 1.0f);
     Spectrum rho = spectral_albedo(mat, albedo, wl);
+    Spectrum tau = spectral_transmission(mat, wl);
     PreparedBsdf p;
     p.hero = 4u;
     if (wl.heroOnly && spectral_dispersive(mat, wl)) {
         p.hero = spectral_hero(wl); p.flat = true;
-        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[p.hero]), float3(spectral_lambda(wl, p.hero)), sm);
+        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[p.hero]), float3(spectral_lambda(wl, p.hero)), sm, float3(tau[p.hero]));
         return p;
     }
-    p.flat = albedo.x == albedo.y && albedo.y == albedo.z && !(sm.thinFilmWeight > 0.0f) && !spectral_dispersive(mat, wl);
+    p.flat = albedo.x == albedo.y && albedo.y == albedo.z && all(tau == tau.x)
+        && !(sm.thinFilmWeight > 0.0f) && !spectral_dispersive(mat, wl);
     // The upstream BSDF reads wavelengths only for dispersion and thin film.
     float4 lambda = sm.thinFilmWeight > 0.0f || sm.dispersion > 0.0f ? spectral_lambdas(wl)
         : float4(OpenPBR_BaseRgbWavelengths_nm, OpenPBR_BaseRgbWavelengths_nm.x);
-    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm);
-    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm);
+    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm, tau.xyz);
+    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm, float3(tau.w));
     return p;
 }
 Spectrum prepared_lanes(thread const PreparedBsdf &p, float3 a, float b) {
@@ -2220,20 +2481,20 @@ float imported_emitter_area_pdf(uint index,constant MaterialResources &images) {
     uint count=images.emitters[0];
     if(count==0) return 0.0f;
     float total=as_type<float>(images.emitters[2*count+1]);uint slot=uint(scene_triangle(index,images).uvc.z);
-    if(slot<8 || slot>=64 || !(total>0)) return 0.0f;
+    if(slot<8 || slot>=MATERIAL_SLOTS || !(total>0)) return 0.0f;
     return images.emissions[slot].w/total;
 }
 // Radiance a MaterialX emitter sends from a sampled point (barycentrics b1, b2) toward p,
 // evaluated with the graph exactly as at a BSDF hit on that point (finest image level).
 float3 imported_graph_emission(uint index,float b1,float b2,float3 p,float3 position,float3 wi,constant MaterialResources &images) {
     MeshTriangle t=scene_triangle(index,images);uint slot=uint(t.uvc.z);
-    if(slot>=64 || images.graphHeaders[slot].info.y==0 || images.graphHeaders[slot].info.w<0) return float3(0);
+    if(slot>=MATERIAL_SLOTS || images.graphHeaders[slot].info.y==0 || images.graphHeaders[slot].info.w<0) return float3(0);
     HitRecord h={};Ray ray={p,wi};
     h.t=length(position-p);h.position=position;h.triangle=index;
     mesh_hit_attributes(h,t,b1,b2,wi);
     h.mat={DIFFUSE,float3(0.7f),float3(0),0,1};h.mat.slot=slot;
     h.mat.inside=!h.front_face;h.mat.tangent=h.tangent;h.mat.geometricNormal=h.geometricNormal;
-    resolve_materialx(h,ray,images,0.0f);
+    resolve_materialx(h,ray,images,TextureFootprint{});
     return openpbr_emission(h.mat,h.normal,-wi);
 }
 float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant MaterialResources &images) {
@@ -2711,7 +2972,8 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
 // BSDF power heuristic of the hero technique uses (the per-hero partition of HERO2014 Sec. 3.3).
 #if VIBE_SPECTRAL
 OpenPBR_PreparedBsdf spectral_mis_lane(Material mat, float3 n, float3 wo, float rho, uint k, thread const Wavelengths &wl) {
-    return prepare_openpbr_lanes(mat, n, wo, float3(rho), float3(spectral_lambda(wl, k)), spectral_material(mat, wl));
+    return prepare_openpbr_lanes(mat, n, wo, float3(rho), float3(spectral_lambda(wl, k)), spectral_material(mat, wl),
+                                 float3(spectral_transmission(mat, wl)[k]));
 }
 // f (without cosine) of every lane at wi, scaled as above; pdf = the hero lane's.
 Spectrum spectral_mis_eval(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf, thread const Wavelengths &wl,
@@ -2887,7 +3149,7 @@ PrimarySurface store_primary_surface(HitRecord hit, float3 view = float3(0.0f)) 
     return s;
 }
 
-HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
+HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth, constant MaterialResources &images) {
     HitRecord hit = {};
     hit.t = positionDepth.w; hit.position = positionDepth.xyz;
     hit.normal = s.normal; hit.geometricNormal = s.geometricNormal; hit.tangent = s.tangent;
@@ -2902,6 +3164,8 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth) {
     m.baseWeight = s.baseWeight; m.diffuseRoughness = s.diffuseRoughness;
     m.emission = s.emission;
     m.usesMaterialX = (s.flags & 512u) != 0 ? 1u : 0u;
+    m.specularColor = slot_specular_color(m.slot, images);
+    m.transmissionTint = slot_transmission(m.slot, images);
     m.inside = !hit.front_face; m.geometricNormal = s.geometricNormal;
     hit.mat = m;
     return hit;
@@ -2956,12 +3220,19 @@ DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, 
     return r;
 }
 
+// The light ID of a stored DI sample (LightSample.isDirectional: 0 finite light, 1 sun, imported
+// triangle + 2) in posDir.w. Its bits are stored, offset into the normal floats so that no ID is a
+// denormal a store could flush; 0 stays +0.0, which is what empty reservoirs write. float(id) was
+// exact only below 2^24 rendered triangles.
+float restir_di_pack_light(uint id) { return id == 0u ? 0.0f : as_type<float>(id + 0x00800000u); }
+uint restir_di_unpack_light(float w) { uint bits = as_type<uint>(w); return bits == 0u ? 0u : bits - 0x00800000u; }
+
 // A stored DI sample (the reservoir texture layout) seen from the shading point p; u is the
 // reservoir's weights.w.
 LightSample restir_di_stored_sample(float4 posDir, float4 emitPdf, float3 p, float u) {
     LightSample s = {};
     s.position = posDir.xyz;
-    s.isDirectional = uint(posDir.w);
+    s.isDirectional = restir_di_unpack_light(posDir.w);
     s.wi = (s.isDirectional == 1) ? s.position : normalize(s.position - p);
     s.emission = emitPdf.xyz;
     s.pdf = emitPdf.w;
@@ -2992,7 +3263,7 @@ void restir_di_encode(DIReservoir r, HitRecord rec, float3 view, constant Unifor
     float current_p_hat = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, r.sample, u.sceneIndex, u.light.w, images, wl);
     float W = (r.M > 0.0f && current_p_hat > 0.0f) ? (r.weightSum / (r.M * current_p_hat)) : 0.0f;
     float3 storeDirPos = (r.sample.isDirectional == 1) ? r.sample.wi : r.sample.position;
-    posDir = float4(storeDirPos, float(r.sample.isDirectional));
+    posDir = float4(storeDirPos, restir_di_pack_light(r.sample.isDirectional));
     emitPdf = float4(r.sample.emission, r.sample.pdf);
     weights = float4(r.weightSum, r.M, W, r.sample.u);
 }
@@ -3201,7 +3472,7 @@ kernel void restir_temporal_kernel(
         return;
     }
 
-    resolve_material(rec, ray, uniforms, surfaceSettings, materialImages, rec.t * 2.0f * fov_scale / float(uniforms.height));
+    resolve_material(rec, ray, uniforms, surfaceSettings, materialImages, primary_texture_footprint(rec.t, uniforms));
     primarySurfaces[gid.y * uniforms.width + gid.x] = store_primary_surface(rec, ray.direction);
     gbufferPosDepth.write(float4(rec.position, rec.t), gid);
     gbufferNormalMat.write(float4(rec.normal, float(rec.mat.type)), gid);
@@ -4172,7 +4443,7 @@ kernel void restir_pt_initial_kernel(
     float firstHit = 0.0f;
     float3 estimate = float3(0.0f), reflectance = float3(0.0f);
     if (position.w > 0.0f && normalMaterial.w != float(EMISSIVE) ) {
-        HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
+        HitRecord x1 = load_primary_surface(primarySurfaces[index], position, images);
         float3 view = float3(primarySurfaces[index].view);
         uint seed = pt_initial_seed(gid, 0u, pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ 0x2545f491u), u);
         result = pt_generate(x1, view, seed, pt_footprint_threshold(position.w, x1.geometricNormal, view),
@@ -4298,9 +4569,9 @@ kernel void restir_pt_temporal_kernel(
     PTReservoir t = history[prevIndex];
     if (!sameSurface || !(t.M > 0.0f)) return;
     PTReservoir c = reservoirs[index];
-    HitRecord x1 = load_primary_surface(primarySurfaces[index], position);
+    HitRecord x1 = load_primary_surface(primarySurfaces[index], position, images);
     float3 view = float3(primarySurfaces[index].view);
-    HitRecord y1 = load_primary_surface(historySurfaces[prevIndex], oldPosition);
+    HitRecord y1 = load_primary_surface(historySurfaces[prevIndex], oldPosition, images);
     float3 oldView = float3(historySurfaces[prevIndex].view);
     float cap = PT_CONFIDENCE_CAP;
     if (restir_pt_decorrelates(u)) {
@@ -4346,7 +4617,7 @@ kernel void restir_pt_shift_kernel(
             float4 qNormal = gbufferNormalMat.read(uint2(q));
             if (pt_pair_compatible(position, normalMaterial, qPosition, qNormal)) {
                 uint qIndex = uint(q.y) * u.width + uint(q.x);
-                HitRecord y1 = load_primary_surface(primarySurfaces[qIndex], qPosition);
+                HitRecord y1 = load_primary_surface(primarySurfaces[qIndex], qPosition, images);
                 float3 view = float3(primarySurfaces[qIndex].view);
                 PTShift s = pt_shift(r, y1, view, pt_footprint_threshold(qPosition.w, y1.geometricNormal, view),
                                      cone, u, settings, images, SPECTRAL_CONTEXT(u, images));
@@ -4761,7 +5032,7 @@ kernel void restir_pt_spmis_shift_kernel(
         SPMISPixel cell = spmis_chosen(choices[index], 1u);
         uint seed = pcg_hash(index ^ (u.sampleIndex * 1999999973u) ^ pcg_hash(k * 0x9e3779b9u + 0x61c88647u));
         PTReservoir path = c;
-        HitRecord y1 = load_primary_surface(primarySurfaces[index], position);
+        HitRecord y1 = load_primary_surface(primarySurfaces[index], position, images);
         float3 view = float3(primarySurfaces[index].view);
         float depth = position.w;
         uint z = SPMIS_NO_PIXEL;
@@ -4771,7 +5042,7 @@ kernel void restir_pt_spmis_shift_kernel(
                 z = spmis_uniform_pixel(slots, cell, rand_f(seed));
                 if (z != index) {
                     float4 zPosition = gbufferPosDepth.read(uint2(z % u.width, z / u.width));
-                    y1 = load_primary_surface(primarySurfaces[z], zPosition);
+                    y1 = load_primary_surface(primarySurfaces[z], zPosition, images);
                     view = float3(primarySurfaces[z].view);
                     depth = zPosition.w;
                 }
@@ -4905,7 +5176,7 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
         uint2 zc = uint2(z % u.width, z / u.width);
         float from = pc;
         if (z != index) {
-            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
+            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc), images);
             LightSample y = restir_di_stored_sample(canonicalPosDir, canonicalEmitPdf, y1.position, canonicalWeights.w);
             from = eval_restir_target_pdf(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat, y,
                                           u.sceneIndex, u.light.w, images, wl);
@@ -4972,7 +5243,7 @@ void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf
         uint2 zc = uint2(z % u.width, z / u.width);
         float from = pc;
         if (z != index) {
-            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc));
+            HitRecord y1 = load_primary_surface(primarySurfaces[z], gbufferPosDepth.read(zc), images);
             from = restir_gi_accepts_shift(rec.position, y1.position, posPdf.xyz, normal.xyz)
                 ? eval_restir_gi_target(y1.position, y1.normal, float3(primarySurfaces[z].view), y1.mat,
                                         posPdf.xyz, normal.xyz, radiance, sample_wavelengths(sampleU, wl)) : 0.0f;
@@ -5241,7 +5512,7 @@ kernel void splat_layers_kernel(
         primary.origin = eye;
         primary.direction = direction;
         hit.t = t;
-        resolve_material(hit, primary, u, settings, images, t * cone);
+        resolve_material(hit, primary, u, settings, images, primary_texture_footprint(t, u));
         if (!splat_domain_useful(hit.mat.type, u)) continue;
         uint slot = atomic_fetch_add_explicit(&counters[0], 1u, memory_order_relaxed);
         if (slot >= capacity) { atomic_fetch_add_explicit(&counters[1], 1u, memory_order_relaxed); continue; }
@@ -5274,7 +5545,7 @@ kernel void splat_deep_restir_kernel(
     SplatDomain d = domains[tid];
     PrimarySurface s = surfaces[tid];
     bool diffuse = MaterialType(s.flags & 255u) == DIFFUSE;
-    HitRecord rec = load_primary_surface(s, float4(float3(d.position), d.depth));
+    HitRecord rec = load_primary_surface(s, float4(float3(d.position), d.depth), images);
     float3 view = float3(s.view);
     uint seed = splat_seed(d.pixel, d.flags & 255u, 0x7f4a7c15u, u);
     // The deep domain's own wavelengths, from its seed.
@@ -5318,7 +5589,7 @@ kernel void restir_pt_deep_initial_kernel(
     PTReservoir r = pt_empty();
     float3 estimate = float3(0.0f), reflectance = float3(0.0f);
     if (MaterialType(s.flags & 255u) != EMISSIVE) {
-        HitRecord x1 = load_primary_surface(s, float4(float3(d.position), d.depth));
+        HitRecord x1 = load_primary_surface(s, float4(float3(d.position), d.depth), images);
         float3 view = float3(s.view);
         float firstHit = 0.0f;
         uint2 pixel = uint2(d.pixel % u.width, d.pixel / u.width);
@@ -5464,7 +5735,7 @@ kernel void splat_temporal_kernel(
         position = float4(float3(domains[j].position), domains[j].depth);
     }
     if (MaterialType(s.flags & 255u) != DIFFUSE) return;
-    HitRecord rec = load_primary_surface(s, position);
+    HitRecord rec = load_primary_surface(s, position, images);
     float3 view = float3(s.view);
     int2 prevCoord = int2(0);
     bool backup = !deep && sources[tid] == 0xfffffffffffffffful && restir_backproject(rec.position, u, prevCoord) &&
@@ -5581,7 +5852,7 @@ kernel void restir_pt_splat_temporal_kernel(
         uint2 sp = uint2(source % u.width, source / u.width);
         float4 oldPosition = historyPosDepth.read(sp);
         t = history[source];
-        y1 = load_primary_surface(historySurfaces[source], oldPosition);
+        y1 = load_primary_surface(historySurfaces[source], oldPosition, images);
         oldView = float3(historySurfaces[source].view);
         oldDepth = oldPosition.w;
         if (restir_pt_decorrelates(u))
@@ -5589,12 +5860,12 @@ kernel void restir_pt_splat_temporal_kernel(
     } else {
         uint k = source - pixels;
         t = previousPT[k];
-        y1 = load_primary_surface(previousSurfaces[k], float4(float3(previous[k].position), previous[k].depth));
+        y1 = load_primary_surface(previousSurfaces[k], float4(float3(previous[k].position), previous[k].depth), images);
         oldView = float3(previousSurfaces[k].view);
         oldDepth = previous[k].depth;
     }
     if (!(t.M > 0.0f)) return;
-    HitRecord x1 = load_primary_surface(s, position);
+    HitRecord x1 = load_primary_surface(s, position, images);
     uint selectSeed = pcg_hash(tid ^ (u.sampleIndex * 1999999973u) ^ 0x1b873593u);
     float3 difference;
     PTReservoir chosen = pt_temporal_merge(c, x1, view, position.w, t, y1, oldView, oldDepth, cap, selectSeed, u, settings, images,
@@ -5606,6 +5877,43 @@ kernel void restir_pt_splat_temporal_kernel(
                                                   : float3(previousControls[source - pixels].estimate);
         pt_cv_temporal(deep ? deepControls[j] : controls[tid], c.M, min(t.M, cap), previousEstimate, difference);
     }
+}
+
+// REFERENCES.md: OIDN250. Open Image Denoise's auxiliary features of a perfect-specular transparent
+// surface may be stored for a subsequent hit. Smooth OpenPBR glass (transmission, roughness at most
+// 0.1; MTL glass is smooth) is followed straight through when thin-walled, else refracted, across up
+// to eight glass surfaces, and the albedo and normal of the surface behind it are returned, tinted by
+// transmission_color. Otherwise the denoiser sees the glass's own colour and flat normal and blurs
+// what shows through it. False when `hit` is not such glass.
+bool glass_feature_hit(HitRecord hit, float3 direction, constant Uniforms &u, constant SurfaceSettings *settings,
+                       constant MaterialResources &images, thread float3 &albedo, thread float3 &normal) {
+    float3 tint = float3(1.0f);
+    bool through = false;
+    float pathLength = hit.t;
+    for (int k = 0; k < 8; ++k) {
+        Material m = hit.mat;
+        if (!(m.type == OPENPBR && m.transmission > 0.5f && m.metalness < 0.5f && m.roughness <= 0.1f)) break;
+        through = true;
+        bool thin = m.usesMaterialX && m.transmissionTint.w > 0.0f;
+        if (m.usesMaterialX) tint *= clamp(m.transmissionTint.rgb, 0.0f, 1.0f);
+        float3 next = direction;
+        if (!thin) {
+            next = refract(direction, hit.normal, hit.front_face ? 1.0f / max(m.ior, 1.01f) : max(m.ior, 1.01f));
+            if (dot(next, next) < 1e-8f) next = reflect(direction, hit.normal);
+        }
+        Ray r;
+        r.origin = ray_origin(hit.position, hit.geometricNormal, next, u, hit.error);
+        r.direction = normalize(next);
+        HitRecord h;
+        if (!trace_scene(r, u.sceneIndex, h, images, u)) { albedo = tint; normal = -r.direction; return true; }
+        pathLength += h.t;
+        resolve_material(h, r, u, settings, images, primary_texture_footprint(pathLength, u));
+        hit = h; direction = r.direction;
+    }
+    if (!through) return false;
+    albedo = tint * clamp(hit.mat.type == EMISSIVE ? hit.mat.emission : hit.mat.albedo, 0.0f, 1.0f);
+    normal = hit.normal;
+    return true;
 }
 
 // ============================================================================
@@ -5687,7 +5995,7 @@ kernel void shading_kernel(
         }
     } else {
         // Pass 1 traced and resolved this exact ray; reuse its hit.
-        HitRecord primaryHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth);
+        HitRecord primaryHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth, materialImages);
         float coneSpread = 2.0f * fov_scale / float(uniforms.height);
         float pathDistance = primaryHit.t;
         float3 pos = primaryHit.position;
@@ -5721,7 +6029,7 @@ kernel void shading_kernel(
 
                 LightSample selectedSample = {};
                 selectedSample.position = cPosDir.xyz;
-                selectedSample.isDirectional = uint(cPosDir.w);
+                selectedSample.isDirectional = restir_di_unpack_light(cPosDir.w);
                 selectedSample.wi = (selectedSample.isDirectional == 1) ? selectedSample.position : normalize(selectedSample.position - pos);
                 selectedSample.emission = cEmitPdf.xyz;
                 selectedSample.pdf = cEmitPdf.w;
@@ -5761,7 +6069,7 @@ kernel void shading_kernel(
 
                                 LightSample nSample = {};
                                 nSample.position = nPosDir.xyz;
-                                nSample.isDirectional = uint(nPosDir.w);
+                                nSample.isDirectional = restir_di_unpack_light(nPosDir.w);
                                 nSample.wi = (nSample.isDirectional == 1) ? nSample.position : normalize(nSample.position - pos);
                                 nSample.emission = nEmitPdf.xyz;
                                 nSample.pdf = nEmitPdf.w;
@@ -6042,7 +6350,7 @@ kernel void shading_kernel(
             if (!pathSplit || ++lane >= 4u) break;
             seed = pathSeed;
             currentRay = primaryRay;
-            currentHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth);
+            currentHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth, materialImages);
             throughput = Spectrum(1.0f);
             scatteringDepth = 0;
             emissionOnly = false;
@@ -6080,6 +6388,14 @@ kernel void shading_kernel(
     // passing the final stochastic G-buffer sample.
     float4 albedoGuide = gbufferAlbedoRough.read(gid);
     float4 normalGuide = gbufferNormalMat.read(gid);
+    if (posDepth.w > 0.0f) {
+        HitRecord guideHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth, materialImages);
+        float3 behindAlbedo, behindNormal;
+        if (glass_feature_hit(guideHit, primaryRay.direction, uniforms, surfaceSettings, materialImages, behindAlbedo, behindNormal)) {
+            albedoGuide.xyz = behindAlbedo;
+            normalGuide.xyz = behindNormal;
+        }
+    }
     if (uniforms.frameIndex > 1) {
         float3 previousAlbedo = oidnAlbedoAccum.read(gid).xyz;
         float3 previousNormal = oidnNormalAccum.read(gid).xyz;
@@ -6139,7 +6455,7 @@ DenoiserMaterialGuide trace_denoiser_material(Ray ray, constant Uniforms &u,
             guide.diffuse = tint * sky / max(1.0f, max(sky.x, max(sky.y, sky.z)));
             return guide;
         }
-        resolve_material(hit, ray, u, surfaceSettings, materialImages, hit.t * 2.0f * tan(u.cameraPos.w * PI / 360.0f) / float(u.height));
+        resolve_material(hit, ray, u, surfaceSettings, materialImages, primary_texture_footprint(hit.t, u));
         if (hit.mat.type == OPENPBR) {
             guide.diffuse = tint * hit.mat.albedo * (1.0f - hit.mat.metalness) * (1.0f - hit.mat.transmission);
             guide.specular = tint * mix(float3(0.04f), hit.mat.albedo, hit.mat.metalness);
@@ -6229,7 +6545,7 @@ kernel void metalfx_guides_kernel(
             }
         }
         if (int(n.w) == OPENPBR) {
-            Material resolved = load_primary_surface(primarySurfaces[gid.y * u.width + gid.x], p).mat;
+            Material resolved = load_primary_surface(primarySurfaces[gid.y * u.width + gid.x], p, materialImages).mat;
             rough = resolved.roughness;
             diffuseAlbedo = resolved.albedo * (1.0f - resolved.metalness) * (1.0f - resolved.transmission);
             float f0 = pow((resolved.ior - 1.0f) / (resolved.ior + 1.0f), 2.0f);
@@ -6296,7 +6612,7 @@ kernel void pick_kernel(constant Uniforms &u [[buffer(0)]],
     float scale=tan(u.cameraPos.w*PI/360.0f);
     Ray ray={u.cameraPos.xyz,normalize(f+right*uv.x*(float(u.width)/u.height)*scale-up*uv.y*scale)};
     HitRecord hit;
-    result[0]=trace_scene(ray,u.sceneIndex,hit,images,u) && (hit.mat.type!=EMISSIVE || hit.objectID>=64) ? hit.objectID : 0xffffffffu;
+    result[0]=trace_scene(ray,u.sceneIndex,hit,images,u) && (hit.mat.type!=EMISSIVE || hit.objectID>=MATERIAL_SLOTS) ? hit.objectID : 0xffffffffu;
 }
 
 #if VIBE_SPECTRAL
@@ -7020,7 +7336,10 @@ struct SurfaceSettings: Codable {
 final class MaterialLibrary {
     static let names = ["Unassigned", "Floor", "Copper sphere", "Gold ring", "Chrome sphere", "Glass sphere", "Plinth", "Imported mesh"]
     static let mapNames = ["Base color (sRGB)", "Roughness (linear R)", "Metalness (linear R)", "Normal (+Y, linear)"]
-    var settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
+    // Every slot's surface settings, bound as a buffer at index 1 (rebuilt on the next bind after
+    // any edit; frames already encoded keep the buffer they bound).
+    var settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials) { didSet { settingsBuffer = nil } }
+    private var settingsBuffer: MTLBuffer?
     var images: [MTLTexture] = []
     private var defaultTextures: [MTLTexture] = []
     var fileNames = Array(repeating: "None", count: SceneLimits.materials * 4)
@@ -7039,10 +7358,15 @@ final class MaterialLibrary {
     // orderedTriangles). meshTriangles is the document's own array of a graph-less
     // (legacy) mesh, shared rather than copied, for snapshots; it is empty for a
     // scene-graph mesh, whose assets remain the only other host copy.
-    // Two-level (MeshSceneLayout): triangleBuffer holds every asset's triangles in object
-    // space, then their BLAS nodes; nodeBuffer the instances and TLAS. Flat (the reference
-    // path): flattened world-space triangles and the median-split nodes.
+    // Two-level (MeshSceneLayout): meshStreams holds every asset's faces and welded vertices in
+    // object space and their BLAS nodes, triangleBuffer is a placeholder, and nodeBuffer holds
+    // the instances and TLAS. Flat (the reference path): flattened world-space triangles in
+    // triangleBuffer and the median-split nodes.
     var triangleBuffer: MTLBuffer! { didSet { emittersDirty = true } }
+    var meshStreams: MeshStreams? { didSet { emittersDirty = true } }
+    // Bound in place of absent geometry: a 128-byte triangle buffer and empty streams.
+    var placeholderTriangles: MTLBuffer!
+    var placeholderStreams: MeshStreams!
     var nodeBuffer: MTLBuffer! { didSet { emittersDirty = true } }
     var meshTriangles: [MeshTriangle] = []
     var triangleCount = 0
@@ -7076,6 +7400,9 @@ final class MaterialLibrary {
     var materialX: [Int:MaterialXProgram] = [:] { didSet { emittersDirty = true } }
     var graphInstructionBuffer: MTLBuffer!, graphHeaderBuffer: MTLBuffer!
     var graphTextures: [MTLTexture] = []
+    // The smallest side a graph image was decoded at to fit `textureBudget` (materialXCandidate),
+    // or nil when every image is at full size. The embedded images themselves are never changed.
+    var graphTextureSide: Int?
     private var emittersDirty = true
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
@@ -7086,14 +7413,29 @@ final class MaterialLibrary {
     // Spectral transport's per-slot OpenPBR parameters (MSL SpectralMaterial: dispersion 20 / V_d, thin
     // film weight, thickness in micrometres and IOR), from the slots' MaterialX constants;
     // spectralOverrides replaces a slot's (test scenes).
-    var spectralOverrides: [Int: SIMD4<Float>] = [:]
-    var spectralMaterials: [SIMD4<Float>] {
-        (0..<SceneLimits.materials).map { spectralOverrides[$0] ?? materialX[$0]?.spectral ?? MaterialXProgram.noSpectral }
+    var spectralOverrides: [Int: SIMD4<Float>] = [:] { didSet { bindingsDirty = true } }
+    // Per slot, three float4: the spectral OpenPBR parameters (MSL SpectralMaterial), the constant
+    // specular_color (rgb; MSL slot_specular_color), and the constant transmission_color (rgb) and
+    // geometry_thin_walled (w; MSL slot_transmission).
+    var slotParameters: [SIMD4<Float>] {
+        (0..<SceneLimits.materials).flatMap { slot -> [SIMD4<Float>] in
+            let program = materialX[slot]
+            let tint = program?.specularColor ?? SIMD3(repeating: 1)
+            let transmission = SIMD4(program?.transmissionColor ?? SIMD3(repeating: 1), program?.thinWalled == true ? 1 : 0)
+            return [spectralOverrides[slot] ?? program?.spectral ?? MaterialXProgram.noSpectral, SIMD4(tint, 0), transmission]
+        }
     }
-    var orderedTriangles: UnsafeBufferPointer<MeshTriangle> {
-        UnsafeBufferPointer(start: triangleCount == 0 ? nil
-            : triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: triangleCount),
-            count: triangleCount)
+    var orderedTriangles: StoredTriangles {
+        if let streams = meshStreams, meshLayout != nil {
+            return StoredTriangles(flat: nil,
+                faces: UnsafePointer(streams.faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, triangleCount))),
+                vertices: UnsafePointer(streams.vertices.contents().bindMemory(to: MeshVertex.self, capacity: max(1, streams.vertices.length / 32))),
+                extras: streams.extras.map { UnsafePointer($0.contents().bindMemory(to: UInt32.self, capacity: max(1, triangleCount))) },
+                count: triangleCount)
+        }
+        return StoredTriangles(flat: triangleCount == 0 ? nil
+            : UnsafePointer(triangleBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: triangleCount)),
+            faces: nil, vertices: nil, count: triangleCount)
     }
     // Every resource referenced by the argument buffer. bind() declares exactly
     // this list with useResources, which is what keeps indirectly referenced
@@ -7157,10 +7499,15 @@ final class MaterialLibrary {
         environmentColumns = importance
         defaultEnvironmentSampling = importance
         guard let triangles = device.makeBuffer(length:128,options:.storageModeShared),
-              let nodes = device.makeBuffer(length:48,options:.storageModeShared) else {
+              let nodes = device.makeBuffer(length:48,options:.storageModeShared),
+              let faces = device.makeBuffer(length:16,options:.storageModeShared),
+              let vertices = device.makeBuffer(length:32,options:.storageModeShared),
+              let blas = device.makeBuffer(length:128,options:.storageModeShared) else {
             throw Self.error("Could not allocate imported-scene buffers.")
         }
         triangleBuffer=triangles
+        placeholderTriangles=triangles
+        placeholderStreams=MeshStreams(faces: faces, vertices: vertices, nodes: blas)
         nodeBuffer=nodes
         try prepareMaterialX([:])
     }
@@ -7199,10 +7546,35 @@ final class MaterialLibrary {
         }
     }
 
-    // `pending` holds candidates decoded earlier in the same batch.
+    // Conservative decoded size with a complete mip chain. MTKTextureLoader yields at most RGBA8
+    // (5.33 B/pixel with mips) for 8-bit files and RGBA16 (10.75 B/pixel measured for half-float
+    // EXR) up to 16 bits; 32-bit float EXR/TIFF yields RGBA32F (21.5 B/pixel measured).
+    static func estimatedTextureBytes(pixels: UInt64, depth: Int) -> (partialValue: UInt64, overflow: Bool) {
+        pixels.multipliedReportingOverflow(by: depth > 16 ? 22 : depth > 8 ? 11 : 6)
+    }
+    // Width, height and bits per channel from an encoded image's header (no decoding).
+    static func imageHeader(_ data: Data) -> (width: Int, height: Int, depth: Int)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else { return nil }
+        let isFloat = properties[kCGImagePropertyIsFloat] as? Bool ?? false
+        return (width, height, properties[kCGImagePropertyDepth] as? Int ?? (isFloat ? 32 : 8))
+    }
+    // An image's size once its longer side is at most `side` (ImageIO thumbnails keep the aspect).
+    static func cappedSize(_ width: Int, _ height: Int, side: Int?) -> (width: Int, height: Int) {
+        guard let side, max(width, height) > side else { return (width, height) }
+        let scale = Double(side) / Double(max(width, height))
+        return (max(1, Int((Double(width) * scale).rounded())), max(1, Int((Double(height) * scale).rounded())))
+    }
+
+    // `pending` holds candidates decoded earlier in the same batch; `maximumSide` is the side the
+    // image will be decoded at (decodeTexture), which the budget estimate uses.
     func validateEncodedImage(_ data: Data, maximumWidth: Int = 16384,
                               maximumHeight: Int = 16384,
                               maximumPixels: UInt64 = 67_108_864,
+                              maximumSide: Int? = nil,
                               pending: [MTLTexture] = []) throws {
         guard data.count <= 128 * 1024 * 1024 else {
             throw Self.error("Texture file exceeds the 128 MiB import limit.")
@@ -7219,13 +7591,10 @@ final class MaterialLibrary {
               pixels.partialValue <= maximumPixels else {
             throw Self.error("Decoded texture exceeds the supported dimensions or pixel count.")
         }
-        // Conservative predecode estimates with a complete mip chain. Up to 16
-        // bits per channel MTKTextureLoader yields at most RGBA16 (10.75 B/pixel
-        // measured for half-float EXR); 32-bit float EXR/TIFF yields RGBA32F
-        // (21.5 B/pixel measured).
         let isFloat = properties[kCGImagePropertyIsFloat] as? Bool ?? false
         let depth = properties[kCGImagePropertyDepth] as? Int ?? (isFloat ? 32 : 8)
-        let estimate = pixels.partialValue.multipliedReportingOverflow(by: depth > 16 ? 22 : 11)
+        let decoded = Self.cappedSize(width, height, side: maximumSide)
+        let estimate = Self.estimatedTextureBytes(pixels: UInt64(decoded.width) * UInt64(decoded.height), depth: depth)
         guard !estimate.overflow,
               uniqueTextureBytes(residentTextures + external.textures + pending) + estimate.partialValue <= textureBudget else {
             throw Self.error("Scene textures exceed the safe GPU memory budget.")
@@ -7262,6 +7631,13 @@ final class MaterialLibrary {
         }
     }
 
+    // MSL MaterialResources IDs: small members, then the graph images and the material maps.
+    enum Argument {
+        static let environment = 0, triangles = 1, nodes = 2, objects = 3, graphInstructions = 4, graphHeaders = 5
+        static let emissions = 6, emitters = 7, environmentRows = 8, environmentColumns = 9
+        static let faces = 10, vertices = 11, blasNodes = 12, faceExtras = 13, spectralMaterials = 14, opacityRoots = 15
+        static let graphImages = 16, maps = graphImages + SceneLimits.graphImages
+    }
     func rebuildArguments(_ replacement: [MTLTexture]) throws {
         guard let buffer = bindingBuffer(length: argumentEncoder.encodedLength) else {
             throw Self.error("Could not allocate material bindings.")
@@ -7272,19 +7648,38 @@ final class MaterialLibrary {
         var bound: [MTLResource] = []
         func setTexture(_ texture: MTLTexture, _ index: Int) { argumentEncoder.setTexture(texture, index: index); bound.append(texture) }
         func setBuffer(_ buffer: MTLBuffer, _ index: Int) { argumentEncoder.setBuffer(buffer, offset: 0, index: index); bound.append(buffer) }
-        for (i, texture) in replacement.enumerated() { setTexture(texture, i) }
-        setTexture(environmentTexture,256)
-        setTexture(environmentRows,392)
-        setTexture(environmentColumns,393)
-        setBuffer(triangleBuffer,257)
-        setBuffer(nodeBuffer,258)
+        for (i, texture) in replacement.enumerated() { setTexture(texture, Argument.maps + i) }
+        setTexture(environmentTexture,Argument.environment)
+        setTexture(environmentRows,Argument.environmentRows)
+        setTexture(environmentColumns,Argument.environmentColumns)
+        setBuffer(triangleBuffer,Argument.triangles)
+        setBuffer(nodeBuffer,Argument.nodes)
+        let streams = meshStreams ?? placeholderStreams!
+        setBuffer(streams.faces,Argument.faces)
+        setBuffer(streams.vertices,Argument.vertices)
+        setBuffer(streams.nodes,Argument.blasNodes)
+        setBuffer(streams.extras ?? placeholderStreams.faces,Argument.faceExtras)
+        guard let spectral = slotParameters.withUnsafeBytes({ bindingBuffer(bytes: $0.baseAddress!, length: $0.count) })
+        else { throw Self.error("Could not allocate spectral material parameters.") }
+        setBuffer(spectral,Argument.spectralMaterials)
+        // Alpha cutouts: per slot the MaterialX register of geometry_opacity (-1: opaque), then the
+        // number of cutout slots, which lets traversal skip every check in scenes without any.
+        var opacityRoots = [Int32](repeating: -1, count: SceneLimits.materials + 1)
+        var cutouts: Int32 = 0
+        for (slot, program) in materialX where (0..<SceneLimits.materials).contains(slot) {
+            if let root = program.opacity { opacityRoots[slot] = root; cutouts += 1 }
+        }
+        opacityRoots[SceneLimits.materials] = cutouts
+        guard let opacity = opacityRoots.withUnsafeBytes({ bindingBuffer(bytes: $0.baseAddress!, length: $0.count) })
+        else { throw Self.error("Could not allocate material opacity roots.") }
+        setBuffer(opacity,Argument.opacityRoots)
         // Hardware traversal reaches these through the node buffer's resource ID.
         bound += meshLayout?.structures ?? []
         guard let objectBuffer=objects.withUnsafeBytes({ bindingBuffer(bytes:$0.baseAddress!,length:$0.count) }) else { throw Self.error("Could not allocate object settings.") }
-        setBuffer(objectBuffer,259)
-        for i in 0..<SceneLimits.graphImages { setTexture(i < graphTextures.count ? graphTextures[i] : replacement[0],260+i) }
-        setBuffer(graphInstructionBuffer,388)
-        setBuffer(graphHeaderBuffer,389)
+        setBuffer(objectBuffer,Argument.objects)
+        for i in 0..<SceneLimits.graphImages { setTexture(i < graphTextures.count ? graphTextures[i] : replacement[0],Argument.graphImages+i) }
+        setBuffer(graphInstructionBuffer,Argument.graphInstructions)
+        setBuffer(graphHeaderBuffer,Argument.graphHeaders)
         var emissionValues=Array(repeating:SIMD4<Float>(repeating:0),count:SceneLimits.materials)
         for (slot,value) in emissions {if emissionValues.indices.contains(slot){emissionValues[slot]=SIMD4(value,0)}}
         // .w is each emitting slot's light-selection weight (imported_emitter_area_pdf):
@@ -7323,7 +7718,7 @@ final class MaterialLibrary {
             guard let buffer=emitterValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}) else{throw Self.error("Could not allocate scene emitters.")}
             ib = buffer
         }
-        setBuffer(eb,390);setBuffer(ib,391)
+        setBuffer(eb,Argument.emissions);setBuffer(ib,Argument.emitters)
         var seen = Set<ObjectIdentifier>()
         bound = bound.filter { seen.insert(ObjectIdentifier($0)).inserted }
         // Replace atomically; previously encoded frames retain their original
@@ -7377,9 +7772,11 @@ final class MaterialLibrary {
         // buffer and useResources retains every resource it points to, so
         // later swaps cannot free resources that encoded frames still read.
         encoder.useResources(boundResources, usage: .read)
-        settings.withUnsafeBytes { bytes in
-            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 1)
+        if settingsBuffer == nil {
+            settingsBuffer = settings.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
         }
+        guard let settingsBuffer else { return false }
+        encoder.setBuffer(settingsBuffer, offset: 0, index: 1)
         encoder.setBuffer(argumentBuffer, offset: 0, index: 2)
         return true
     }
@@ -7906,6 +8303,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var onPausedChange: (() -> Void)?
     var renderElapsed: TimeInterval = 0
     var gpuMilliseconds: Double = 0
+    // GPU busy time per sample over the recent frames (samplesPerFrame). Consecutive command buffers
+    // overlap on the GPU, so each frame adds only the part of its [gpuStartTime, gpuEndTime]
+    // after the previous frame's end; the busy time and samples decay by half every 16 frames.
+    var gpuMillisecondsPerSample: Double { recentSamples > 0 ? recentBusyMilliseconds / recentSamples : 0 }
+    private var recentBusyMilliseconds = 0.0, recentSamples = 0.0, lastGPUEnd: CFTimeInterval = 0
     var framesPerSecond: Double = 0
     var completedSamples: UInt32 = 0
     // Awake seconds (awakeSeconds): the render time limit does not count system sleep.
@@ -8216,21 +8618,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         solver.endEncoding(); solve.commit(); solve.waitUntilCompleted()
         if solve.status != .completed { onError?("The spectral grid refinement failed: \(String(describing: solve.error))") }
     }
-    // SpectralScene (MSL, 1392 bytes): light and sun illuminants, the coarse grid's node values and
-    // the slots' spectral material parameters.
+    // SpectralScene (MSL, 368 bytes): light and sun illuminants, dispersion sampling and the coarse
+    // grid's node values. The slots' spectral material parameters are in the material argument buffer.
     static let spectralGridNodes: [Float] = (0..<86).map { i in
         let v = Double(3 * i) / 255
         return Float(v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4))
     }
     func spectralSceneWords() -> [UInt32] {
-        var words = [UInt32](repeating: 0, count: 348)
+        var words = [UInt32](repeating: 0, count: 92)
         words[0] = Illuminant.resolved(options.lightSpectrum).rawValue
         words[1] = Illuminant.resolved(options.sunSpectrum).rawValue
         words[2] = dispersionSampling.resolved().rawValue
         for (i, v) in Self.spectralGridNodes.enumerated() { words[4 + i] = v.bitPattern }
-        for (slot, m) in materials.spectralMaterials.enumerated() {
-            for c in 0..<4 { words[92 + slot * 4 + c] = m[c].bitPattern }
-        }
         return words
     }
     // Spectral transport's device memory: the 86^3 float4 moment grid (shared by renderers of one device)
@@ -8471,9 +8870,35 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // the main thread while in-flight frames hold every drawable.
         guard inFlightFrames.wait(timeout: .now()) == .success else { return }
         guard let drawable=view.currentDrawable else { inFlightFrames.signal(); return }
-        renderFrame(output:drawable.texture,drawable:drawable,reservedFrameSlot:true)
+        // Follow the display's refresh rate (120 Hz on ProMotion screens), not a fixed 60.
+        if let fps = view.window?.screen?.maximumFramesPerSecond, fps > 0, view.preferredFramesPerSecond != fps {
+            view.preferredFramesPerSecond = fps
+        }
+        // About 80% of a display interval per frame keeps the view responsive.
+        let interval = 1 / Double(max(1, view.preferredFramesPerSecond))
+        let remaining = options.maxSamples > 0 ? Int(options.maxSamples) - Int(frameIndex) : Int.max
+        renderFrame(output:drawable.texture,drawable:drawable,reservedFrameSlot:true,
+                    samples:samplesPerFrame(targetMilliseconds: interval * 800, limit: remaining))
     }
-    func renderFrame(output: MTLTexture, drawable: CAMetalDrawable? = nil, reservedFrameSlot: Bool = false) {
+    // REFERENCES.md: PBRT2023, RAYCONES2021. The camera's texture ray cone is scaled like pbrt-v4's
+    // ray differentials, by max(1/8, 1/sqrt(samples per pixel)): the accumulated, jittered samples
+    // already filter each pixel. The samples are the accumulation's limit (the export's sample
+    // count), or 64 when the viewport accumulates without one (MSL texture_footprint_scale).
+    var textureFootprintScale: Float {
+        max(0.125, 1 / Float(options.maxSamples > 0 ? options.maxSamples : 64).squareRoot())
+    }
+    // Samples to encode in one frame (renderFrame `samples`): as many as fit in `targetMilliseconds`
+    // of GPU time at the measured time per sample, so a GPU faster than the display or the export
+    // loop accumulates more per command buffer instead of idling; at most `limit` and 64. One while
+    // accumulation restarts (the view changes, and the first frames measure) and while MetalFX
+    // runs, whose temporal history takes one jittered sample per frame (encodePresentation).
+    func samplesPerFrame(targetMilliseconds: Double, limit: Int) -> Int {
+        let metalFX = denoiserEnabled && supportsMetalFX && samplingMode == 0 && viewportMode == 0
+        guard frameIndex >= 4, gpuMillisecondsPerSample > 0, !metalFX else { return 1 }
+        return max(1, min(Int(targetMilliseconds / gpuMillisecondsPerSample), limit, 64))
+    }
+    // Encodes `samples` samples into one command buffer and presents once, after the last.
+    func renderFrame(output: MTLTexture, drawable: CAMetalDrawable? = nil, reservedFrameSlot: Bool = false, samples: Int = 1) {
         guard reservedFrameSlot || inFlightFrames.wait(timeout: .now()) == .success else { return }
         var committed = false
         defer { if !committed { inFlightFrames.signal() } }
@@ -8485,8 +8910,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             return
         }
         rejectedRenderSize = nil
+        let samples = max(1, samples)
         // Float32 running means lose unit sample precision after 2^24 samples.
-        if frameIndex >= 16_777_215 { resetAccumulation() }
+        if frameIndex + UInt32(min(samples, 65536)) > 16_777_215 { resetAccumulation() }
         // Light transport of this frame; accumulation restarts when it changes (spectral pipelines
         // becoming ready, or a failure falling back to RGB).
         let spectral = activeLightTransport == .spectral && prepareSpectralShaders()
@@ -8637,6 +9063,58 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        guard let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
+        var encoded: (frame: UInt32, spectralWeights: [Float]?)?
+        for sample in 0..<samples {
+            guard let result = encodeSample(cmdBuffer, output: output, w: w, h: h, needsReSTIR: needsReSTIR,
+                                            indirectReuse: indirectReuse, usesPT: usesPT, present: sample == samples - 1) else {
+                // Earlier samples of this batch already advanced the accumulation state.
+                if sample > 0 { resetAccumulation() }
+                return
+            }
+            encoded = result
+        }
+        guard let (nextFrame, spectralWeights) = encoded else { return }
+        let submittedGeneration = generation
+        let semaphore = inFlightFrames
+        cmdBuffer.addCompletedHandler { [weak self] completedBuffer in
+            semaphore.signal()
+            let errorMessage = completedBuffer.error?.localizedDescription
+            let succeeded = completedBuffer.status == .completed
+            let gpuStart = completedBuffer.gpuStartTime, gpuEnd = completedBuffer.gpuEndTime
+            let gpuMilliseconds = (gpuEnd - gpuStart) * 1000
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if succeeded {
+                    guard self.generation == submittedGeneration else { return }
+                    self.completedSamples=nextFrame
+                    self.gpuMilliseconds=gpuMilliseconds
+                    let busy = max(0, gpuEnd - max(gpuStart, self.lastGPUEnd)) * 1000
+                    self.lastGPUEnd = max(self.lastGPUEnd, gpuEnd)
+                    let decay = pow(0.5, 1.0 / 16)
+                    self.recentBusyMilliseconds = self.recentBusyMilliseconds * decay + busy
+                    self.recentSamples = self.recentSamples * decay + Double(samples)
+                    let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)
+                    self.framesPerSecond=interval>0 ? 1/interval : 0; self.lastCompletion=now
+                    self.onFrameUpdate?(nextFrame)
+                } else {
+                    self.resetAccumulation()
+                    self.onError?(errorMessage ?? "Metal could not render this frame.")
+                }
+            }
+        }
+        if let drawable { cmdBuffer.present(drawable) }
+        if let spectralWeights { spectralSamplingWeights = spectralWeights }
+        cmdBuffer.commit()
+        committed = true
+    }
+
+    // One sample (passes 1-2 and the reuse passes; the display passes when `present`), encoded into
+    // `cmdBuffer`. It advances the accumulation and history state as the GPU will once the buffer
+    // runs, so a frame may encode several samples back to back (renderFrame `samples`).
+    private func encodeSample(_ cmdBuffer: MTLCommandBuffer, output: MTLTexture, w: Int, h: Int, needsReSTIR: Bool,
+                              indirectReuse: IndirectReuse, usesPT: Bool, present: Bool)
+        -> (frame: UInt32, spectralWeights: [Float]?)? {
         guard let accum = accumTexture, let samples = sampleTexture,
               let gPos = gbufferPosDepth,
               let gNorm = gbufferNormalMat,
@@ -8650,8 +9128,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
               let giRadB = giRadianceB, let giWeightB = giWeightsB,
               let ptOut = ptIndirect, let duplication = ptDuplication,
               let oidnAlbedo = oidnAlbedoAccum, let oidnNormal = oidnNormalAccum,
-              let surfaces = primarySurfaceBuffer(width: w, height: h), let placeholder = splatPlaceholder,
-              let cmdBuffer = commandQueue.makeCommandBuffer() else { return }
+              let surfaces = primarySurfaceBuffer(width: w, height: h), let placeholder = splatPlaceholder else { return nil }
 
         let nextFrame = frameIndex + 1
         let nextSample = sampleIndex == UInt32.max ? 1 : sampleIndex + 1
@@ -8682,7 +9159,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var uniforms = Uniforms(
             cameraPos: SIMD4<Float>(camX, camY, camZ, fov),
             cameraTarget: SIMD4<Float>(target.x, target.y, target.z, options.depth),
-            cameraUp: SIMD4<Float>(0, 1, 0, 0),
+            cameraUp: SIMD4<Float>(0, 1, 0, textureFootprintScale),
             sunParams: SIMD4<Float>(sunDir.x, sunDir.y, sunDir.z, sunIntensity),
             currentViewProj: currViewProj,
             prevViewProj: prevViewProj,
@@ -8713,7 +9190,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var spectralWords = [UInt32]()
         var spectralWeights: [Float]?
         if spectralFrame {
-            guard let weights = encodeSpectralSampling(cmdBuffer) else { return }
+            guard let weights = encodeSpectralSampling(cmdBuffer) else { return nil }
             spectralWeights = weights
             spectralWords = spectralSceneWords()
         }
@@ -8730,7 +9207,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Splat state: this frame's pool starts empty (so a frame that does not splat leaves the next
         // one no deep domains); a splat frame also clears the activation masks and splat sources.
         if let (current, _) = splatState, let mask = splatMask, let sources = splatSources {
-            guard let blit = cmdBuffer.makeBlitCommandEncoder() else { return }
+            guard let blit = cmdBuffer.makeBlitCommandEncoder() else { return nil }
             blit.label = "Splat: clear"
             blit.fill(buffer: current.counters, range: 0..<8, value: 0)
             if splatFrame {
@@ -8752,7 +9229,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 
         // PASS 1: G-Buffer & ReSTIR Temporal Reuse
-        guard let enc1 = cmdBuffer.makeComputeCommandEncoder() else { return }
+        guard let enc1 = cmdBuffer.makeComputeCommandEncoder() else { return nil }
         do {
             enc1.label = "Pass 1: G-Buffer & ReSTIR Temporal"
             enc1.setComputePipelineState(sceneKernels.temporal)
@@ -8778,7 +9255,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             guard materials.bind(enc1) else {
                 enc1.endEncoding()
                 onError?("Could not update material bindings.")
-                return
+                return nil
             }
             enc1.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             enc1.setBuffer(surfaces, offset: 0, index: 3)
@@ -8801,7 +9278,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             passes.append(("Splat: reservoir splats", kernels.reservoirs, pixels + slots))
             if usesDIReservoirs { passes.append(("Splat: DI/GI temporal reuse", kernels.temporal, pixels + slots)) }
             for (label, pipeline, count) in passes {
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return }
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
                 let textures: [MTLTexture] = [gPos, gNorm, hPos, hNorm, duplication, rPosA, rEmitA, rWeightA, rPosB, rEmitB, rWeightB,
@@ -8810,7 +9287,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 guard materials.bind(encoder) else {
                     encoder.endEncoding()
                     onError?("Could not update material bindings.")
-                    return
+                    return nil
                 }
                 encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
                 for (index, buffer) in [surfaces, historyPrimarySurfaces, ptReservoirs, ptHistory].enumerated() {
@@ -8867,7 +9344,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         if usesPT {
             guard let current = ptReservoirs, let history = ptHistory, let shifts = ptShifts,
                   let historySurfaces = historyPrimarySurfaces, let pairing = ptPairing, let controls = ptControls,
-                  let kernels = sceneKernels.pt else { return }
+                  let kernels = sceneKernels.pt else { return nil }
             // A nil pipeline is the reuse-cell pass of stochastic pairwise MIS (encodeSPMISCells).
             var passes: [(String, MTLComputePipelineState?, Bool)] = [("ReSTIR PT: initial paths", kernels.initial, true)]
             // Temporal reuse only while the view changes (MSL restir_pt_temporal); by splatting on splat frames.
@@ -8891,10 +9368,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             if ptDecorrelation { passes.append(("ReSTIR PT: duplication map", kernels.duplication, false)) }
             for (label, step, bindsMaterials) in passes {
                 guard let pipeline = step else {
-                    guard encodeSPMISCells(ptReservoirs: current) else { return }
+                    guard encodeSPMISCells(ptReservoirs: current) else { return nil }
                     continue
                 }
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return }
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
                 for (index, texture) in [gPos, gNorm, hPos, hNorm, duplication, ptOut].enumerated() { encoder.setTexture(texture, index: index) }
@@ -8902,7 +9379,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     guard materials.bind(encoder) else {
                         encoder.endEncoding()
                         onError?("Could not update material bindings.")
-                        return
+                        return nil
                     }
                 }
                 encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -8927,10 +9404,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 
         // ReSTIR GI: the reuse cells of the DI and GI reservoirs.
-        if !usesPT && needsReSTIR { guard encodeSPMISCells(ptReservoirs: nil) else { return } }
+        if !usesPT && needsReSTIR { guard encodeSPMISCells(ptReservoirs: nil) else { return nil } }
 
         // PASS 2: Spatial Resampling & Full Path Tracing
-        guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return }
+        guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return nil }
         do {
             enc2.label = "Pass 2: Spatial Resampling & Shading"
             enc2.setComputePipelineState(sceneKernels.shading)
@@ -8952,7 +9429,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             guard materials.bind(enc2) else {
                 enc2.endEncoding()
                 onError?("Could not update material bindings.")
-                return
+                return nil
             }
             enc2.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             enc2.setBuffer(surfaces, offset: 0, index: 3)
@@ -8964,9 +9441,11 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc2.endEncoding()
         }
 
-        guard encodePresentation(commandBuffer: cmdBuffer, accumulation: accum, samples: samples,
-            positions: gPos, normals: gNorm, materials: gAlb, output: output,
-            uniforms: uniforms) != nil else { return }
+        if present {
+            guard encodePresentation(commandBuffer: cmdBuffer, accumulation: accum, samples: samples,
+                positions: gPos, normals: gNorm, materials: gAlb, output: output,
+                uniforms: uniforms) != nil else { return nil }
+        }
 
         let tmpPos = resPosDirA; resPosDirA = resPosDirB; resPosDirB = tmpPos
         let tmpEmit = resEmitPdfA; resEmitPdfA = resEmitPdfB; resEmitPdfB = tmpEmit
@@ -8988,32 +9467,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // frameIndex, so frames still in flight across a switch are not misattributed.
         if viewportMode > 0 { debugFrames &+= 1 }
         reservoirHistoryNeedsReset = false
-        let submittedGeneration = generation
-        let semaphore = inFlightFrames
-        cmdBuffer.addCompletedHandler { [weak self] completedBuffer in
-            semaphore.signal()
-            let errorMessage = completedBuffer.error?.localizedDescription
-            let succeeded = completedBuffer.status == .completed
-            let gpuMilliseconds = (completedBuffer.gpuEndTime - completedBuffer.gpuStartTime) * 1000
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if succeeded {
-                    guard self.generation == submittedGeneration else { return }
-                    self.completedSamples=nextFrame
-                    self.gpuMilliseconds=gpuMilliseconds
-                    let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)
-                    self.framesPerSecond=interval>0 ? 1/interval : 0; self.lastCompletion=now
-                    self.onFrameUpdate?(nextFrame)
-                } else {
-                    self.resetAccumulation()
-                    self.onError?(errorMessage ?? "Metal could not render this frame.")
-                }
-            }
-        }
-        if let drawable { cmdBuffer.present(drawable) }
-        if let spectralWeights { spectralSamplingWeights = spectralWeights }
-        cmdBuffer.commit()
-        committed = true
+        return (nextFrame, spectralWeights)
     }
 }
 

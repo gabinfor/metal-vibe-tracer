@@ -204,16 +204,18 @@ struct ProjectDocument: Codable {
   }
 
   // Aggregate embedded asset bytes (maps, MaterialX images, environment) across all scenes.
-  static let embeddedAssetLimit = 512 * 1024 * 1024
-  // Open accepts everything validate() accepts: JSON embeds assets as base64
-  // (4/3 size), each of up to SceneLimits.triangles flat and graph triangles encodes in
-  // at most ~600 bytes (507 measured with worst-case floats), and 64 MiB covers
-  // settings, graphs and names. Saving refuses anything larger, so every saved
-  // project reopens. Format 3 (ProjectAssets) stores each distinct payload once and
-  // triangles as 128-byte binary records (171 bytes as base64), so the version 1/2
-  // bound also covers it; an autosave's JSON is smaller still.
+  static let embeddedAssetLimit = 1024 * 1024 * 1024
+  // Open accepts everything validate() accepts: JSON embeds assets as base64 (4/3 size).
+  // Formats 1-3 held at most SceneLimits.flatTriangles flat and graph triangles each, at most
+  // ~600 bytes per JSON triangle (507 measured with worst-case floats; format 3's 128-byte
+  // records are 171 as base64). Format 4 stores graph meshes as MeshGeometry payloads, at most
+  // 112 bytes per face (three unshared 32-byte vertices and the face; 150 as base64), and its
+  // legacy flat mesh as format 3 does. 64 MiB covers settings, graphs and names. Saving
+  // refuses anything larger, so every saved project reopens.
+  static let perFormat4Face = 160
   static let maximumFileBytes =
-    embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.triangles * 600 + 64 * 1024 * 1024
+    embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.flatTriangles * 600 + SceneLimits.triangles * perFormat4Face
+    + 64 * 1024 * 1024
 
   // Identical payloads (a map or image shared by several slots, programs or scenes) are
   // stored once in the asset table and count once.
@@ -299,7 +301,8 @@ struct ProjectDocument: Codable {
     }
     guard (environmentData?.count ?? 0) <= 256 * 1024 * 1024 else { try bad(); return }
     for (index, state) in scenes {
-      guard (0...6).contains(index), [8, SceneLimits.materials].contains(state.surfaces.count),
+      guard (0...6).contains(index),
+        state.surfaces.count == 8 || (SceneLimits.storedMaterials...SceneLimits.materials).contains(state.surfaces.count),
         state.objects.count == state.surfaces.count,
         state.maps.count == state.surfaces.count * 4, state.names.count == state.maps.count
       else {
@@ -376,16 +379,31 @@ struct ProjectDocument: Codable {
 }
 
 // REFERENCES.md: OBJ2026, PBRT2023. Independent OBJ reader; no external importer.
+private extension CChar { var isWhitespaceByte: Bool { self == 0x20 || (self >= 0x09 && self <= 0x0D) } }
 enum OBJMesh {
   static func load(_ text: String) throws -> [MeshTriangle] { try parts(text).flatMap(\.triangles) }
   static func parts(_ text: String) throws -> [OBJPart] {
     var skipped = 0
     return try parts(text, skipped: &skipped)
   }
-  // skipped counts faces left out because their edges are (numerically) collinear.
-  // `nodeBudget` bounds the scene nodes the parts create (one per object, one per
-  // object/group part) so oversized hierarchies fail before the whole file is parsed.
   static func parts(_ text: String, skipped: inout Int, nodeBudget: Int = Int.max) throws -> [OBJPart] {
+    var libraries: [String] = []
+    return try parts(Data(text.utf8), skipped: &skipped, nodeBudget: nodeBudget, libraries: &libraries)
+  }
+  // Streams the file's bytes (a memory-mapped file is never copied into a String), so files of
+  // several GB parse within the triangle limit. skipped counts faces left out because their edges
+  // are (numerically) collinear. `nodeBudget` bounds the scene nodes the parts create (one per
+  // object, one per object/group part) so oversized hierarchies fail before the whole file is
+  // parsed. `libraries` receives each `mtllib` statement's argument text.
+  static func parts(_ data: Data, skipped: inout Int, nodeBudget: Int = Int.max, libraries: inout [String]) throws
+    -> [OBJPart]
+  {
+    try data.withUnsafeBytes { raw in
+      try parts(raw.bindMemory(to: UInt8.self), skipped: &skipped, nodeBudget: nodeBudget, libraries: &libraries)
+    }
+  }
+  private static func parts(_ bytes: UnsafeBufferPointer<UInt8>, skipped: inout Int, nodeBudget: Int,
+                            libraries: inout [String]) throws -> [OBJPart] {
     var positions: [SIMD3<Float>] = []
     var normals: [SIMD3<Float>] = []
     var uvs: [SIMD2<Float>] = []
@@ -394,7 +412,7 @@ enum OBJMesh {
     var group = "Mesh"
     var material = "Default"
     var total = 0
-    var lineNumber = 0, physicalLine = 0, pending = ""
+    var lineNumber = 0
     func failure(_ message: String) -> Error {
       MaterialLibrary.error("\(message.dropLast()) on line \(lineNumber).")
     }
@@ -403,87 +421,107 @@ enum OBJMesh {
     var subsetIndices: [[String: Int]] = []
     var objects = Set<String>()
     var current: (part: Int, subset: Int)?
-    func number(_ s: Substring) throws -> Float {
-      guard let n = Float(s), n.isFinite, abs(n) < 1e8 else {
-        throw failure("OBJ contains an invalid number.")
+    var builders: [MeshGeometry.Builder] = []
+    var scratch = [CChar](repeating: 0, count: 64)
+    var fields: [Range<Int>] = []
+    var corners: [(SIMD3<Float>, SIMD2<Float>, SIMD3<Float>?)] = []
+    func number(_ line: UnsafeBufferPointer<UInt8>, _ r: Range<Int>) throws -> Float {
+      var value: Float?
+      if r.count < scratch.count {
+        value = scratch.withUnsafeMutableBufferPointer { s -> Float? in
+          for (k, i) in r.enumerated() { s[k] = CChar(bitPattern: line[i]) }
+          s[r.count] = 0
+          var end: UnsafeMutablePointer<CChar>?
+          let n = strtof(s.baseAddress!, &end)
+          return end == s.baseAddress! + r.count && !s[0].isWhitespaceByte ? n : nil
+        }
       }
+      guard let n = value, n.isFinite, abs(n) < 1e8 else { throw failure("OBJ contains an invalid number.") }
       return n
     }
-    func index(_ s: Substring, count: Int) throws -> Int {
-      guard let n = Int(s), n != 0, n != Int.min else {
-        throw failure("Invalid OBJ index.")
+    func index(_ line: UnsafeBufferPointer<UInt8>, _ r: Range<Int>, count: Int) throws -> Int {
+      var i = r.lowerBound, negative = false, n = 0
+      if i < r.upperBound, line[i] == 0x2B || line[i] == 0x2D { negative = line[i] == 0x2D; i += 1 }
+      guard i < r.upperBound, r.upperBound - i <= 18 else { throw failure("Invalid OBJ index.") }
+      while i < r.upperBound {
+        let d = Int(line[i]) - 0x30
+        guard d >= 0 && d <= 9 else { throw failure("Invalid OBJ index.") }
+        n = n * 10 + d
+        i += 1
       }
-      let i = n > 0 ? n - 1 : count + n
-      guard i >= 0 && i < count else { throw failure("OBJ index is out of bounds.") }
-      return i
+      guard n != 0 else { throw failure("Invalid OBJ index.") }
+      let k = negative ? count - n : n - 1
+      guard k >= 0 && k < count else { throw failure("OBJ index is out of bounds.") }
+      return k
     }
-    // The empty tail flushes a continuation on the file's last line.
-    let physicalLines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
-    for raw in [physicalLines, [""]].joined() {
-      physicalLine += 1
-      if pending.isEmpty { lineNumber = physicalLine }
-      // A trailing backslash outside a comment continues the statement.
-      if let last = raw.lastIndex(where: { !$0.isWhitespace }), raw[last] == "\\",
-        !raw[..<last].contains("#")
-      {
-        pending += raw[..<last] + " "
-        continue
+    func rest(_ line: UnsafeBufferPointer<UInt8>) -> String {
+      fields.dropFirst().map { String(decoding: UnsafeBufferPointer(rebasing: line[$0]), as: UTF8.self) }
+        .joined(separator: " ")
+    }
+    func keyword(_ line: UnsafeBufferPointer<UInt8>, _ word: StaticString) -> Bool {
+      let r = fields[0]
+      guard r.count == word.utf8CodeUnitCount else { return false }
+      for k in 0..<r.count where line[r.lowerBound + k] != word.utf8Start[k] { return false }
+      return true
+    }
+    func statement(_ line: UnsafeBufferPointer<UInt8>) throws {
+      // Fields are whitespace-separated, up to a comment.
+      fields.removeAll(keepingCapacity: true)
+      var i = 0
+      while i < line.count, line[i] != 0x23 {
+        if line[i] == 0x20 || line[i] == 0x09 { i += 1; continue }
+        let start = i
+        while i < line.count, line[i] != 0x20, line[i] != 0x09, line[i] != 0x23 { i += 1 }
+        fields.append(start..<i)
       }
-      let line = pending.isEmpty ? raw : Substring(pending + raw)
-      pending = ""
-      let fields = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
-        .split(whereSeparator: \.isWhitespace)
-      guard let kind = fields.first else { continue }
-      if kind == "o" {
-        object = fields.dropFirst().joined(separator: " ")
+      guard !fields.isEmpty else { return }
+      if keyword(line, "o") {
+        object = rest(line)
         group = "Mesh"
         current = nil
-        continue
-      }
-      if kind == "g" {
-        group = fields.dropFirst().joined(separator: " ")
+      } else if keyword(line, "g") {
+        group = rest(line)
         current = nil
-        continue
-      }
-      if kind == "usemtl" {
-        material = fields.dropFirst().joined(separator: " ")
+      } else if keyword(line, "usemtl") {
+        material = rest(line)
         current = nil
-        continue
-      }
-      if kind == "v" || kind == "vn" {
+      } else if keyword(line, "mtllib") {
+        if fields.count > 1 { libraries.append(rest(line)) }
+      } else if keyword(line, "v") || keyword(line, "vn") {
         guard fields.count >= 4 else { throw failure("Incomplete OBJ vertex.") }
-        let v = try SIMD3<Float>(number(fields[1]), number(fields[2]), number(fields[3]))
-        if kind == "v" {
+        let v = try SIMD3<Float>(number(line, fields[1]), number(line, fields[2]), number(line, fields[3]))
+        if fields[0].count == 1 {
           positions.append(v)
         } else {
           normals.append(simd_length_squared(v) > 1e-12 ? simd_normalize(v) : SIMD3<Float>(0, 1, 0))
         }
-      } else if kind == "vt" {
+      } else if keyword(line, "vt") {
         // "vt u" is valid OBJ; v defaults to 0.
         guard fields.count >= 2 else { throw failure("Incomplete OBJ UV.") }
-        uvs.append(try SIMD2<Float>(number(fields[1]), 1 - (fields.count >= 3 ? number(fields[2]) : 0)))
-      } else if kind == "f" {
+        uvs.append(try SIMD2<Float>(number(line, fields[1]), 1 - (fields.count >= 3 ? number(line, fields[2]) : 0)))
+      } else if keyword(line, "f") {
         guard fields.count >= 4, fields.count <= 4097 else {
           throw failure("OBJ face must contain 3–4096 vertices.")
         }
-        var vertices: [(SIMD3<Float>, SIMD2<Float>, SIMD3<Float>?)] = []
+        corners.removeAll(keepingCapacity: true)
         for f in fields.dropFirst() {
-          let parts = f.split(separator: "/", omittingEmptySubsequences: false)
-          guard parts.count <= 3 else { throw failure("Invalid OBJ face.") }
-          let p = positions[try index(parts[0], count: positions.count)]
-          let uv =
-            parts.count > 1 && !parts[1].isEmpty
-            ? uvs[try index(parts[1], count: uvs.count)] : .zero
-          let n =
-            parts.count > 2 && !parts[2].isEmpty
-            ? normals[try index(parts[2], count: normals.count)] : nil
-          vertices.append((p, uv, n))
+          // v, v/vt, v//vn or v/vt/vn.
+          var slashes: [Int] = []
+          for k in f where line[k] == 0x2F { slashes.append(k) }
+          guard slashes.count <= 2 else { throw failure("Invalid OBJ face.") }
+          let ends = slashes + [f.upperBound]
+          let p = positions[try index(line, f.lowerBound..<ends[0], count: positions.count)]
+          let uvRange = slashes.count >= 1 ? slashes[0] + 1..<ends[1] : 0..<0
+          let uv = uvRange.isEmpty ? SIMD2<Float>.zero : uvs[try index(line, uvRange, count: uvs.count)]
+          let nRange = slashes.count == 2 ? slashes[1] + 1..<ends[2] : 0..<0
+          let n = nRange.isEmpty ? nil : normals[try index(line, nRange, count: normals.count)]
+          corners.append((p, uv, n))
         }
         // Convex polygons use fan triangulation; triangulate concave faces before import.
-        for i in 1..<(vertices.count - 1) {
-          let a = vertices[0]
-          let b = vertices[i]
-          let c = vertices[i + 1]
+        for i in 1..<(corners.count - 1) {
+          let a = corners[0]
+          let b = corners[i]
+          let c = corners[i + 1]
           let e1 = b.0 - a.0, e2 = c.0 - a.0
           let cross = simd_cross(e1, e2)
           // Relative test: sub-millimetre faces in meter units stay; only collinear
@@ -510,6 +548,7 @@ enum OBJMesh {
               objects.insert(object)
               part = result.count
               result.append(OBJPart(object: object, group: group))
+              builders.append(MeshGeometry.Builder())
               subsetIndices.append([:])
               partIndices[object, default: [:]][group] = part
             }
@@ -522,7 +561,8 @@ enum OBJMesh {
             }
             current = (part, subset)
           }
-          result[part].triangles.append(
+          // Corners with the same position, UV and normal (OBJ's shared v/vt/vn) weld.
+          builders[part].add(
             MeshTriangle(
               a: SIMD4(a.0, 1), b: SIMD4(b.0, 1), c: SIMD4(c.0, 1), na: SIMD4(a.2 ?? n, 0),
               nb: SIMD4(b.2 ?? n, 0), nc: SIMD4(c.2 ?? n, 0),
@@ -534,10 +574,38 @@ enum OBJMesh {
         }
       }
     }
+    // Physical lines end at LF, CR, CR LF, VT or FF (Swift's newline characters in ASCII). A
+    // trailing backslash outside a comment continues the statement on the next line.
+    var pending: [UInt8] = []
+    var physical = 0, start = 0
+    while start <= bytes.count {
+      var end = start
+      while end < bytes.count, bytes[end] != 0x0A, bytes[end] != 0x0D, bytes[end] != 0x0B, bytes[end] != 0x0C { end += 1 }
+      physical += 1
+      if pending.isEmpty { lineNumber = physical }
+      let raw = UnsafeBufferPointer(rebasing: bytes[start..<end])
+      var last = raw.count - 1
+      while last >= 0, raw[last] == 0x20 || raw[last] == 0x09 { last -= 1 }
+      if last >= 0, raw[last] == 0x5C, !raw[..<last].contains(0x23) {
+        pending += raw[..<last]
+        pending.append(0x20)
+      } else if pending.isEmpty {
+        try statement(raw)
+      } else {
+        pending += raw
+        try pending.withUnsafeBufferPointer { try statement($0) }
+        pending.removeAll(keepingCapacity: true)
+      }
+      if end == bytes.count { break }
+      start = end + (bytes[end] == 0x0D && end + 1 < bytes.count && bytes[end + 1] == 0x0A ? 2 : 1)
+    }
+    // A continuation on the file's last line still ends its statement.
+    if !pending.isEmpty { try pending.withUnsafeBufferPointer { try statement($0) } }
     guard !result.isEmpty else {
       throw MaterialLibrary.error(
         skipped > 0 ? "OBJ contains no usable faces (\(skipped) degenerate faces skipped)." : "OBJ contains no usable faces.")
     }
+    for i in result.indices { result[i].geometry = builders[i].geometry }
     return result
   }
   static func build(_ input: [MeshTriangle]) -> ([MeshTriangle], [MeshNode]) {
@@ -640,8 +708,10 @@ struct ReusableResources: @unchecked Sendable {
   var environmentData: Data?
   var environment: (texture: MTLTexture, rows: MTLTexture, columns: MTLTexture)?
   var meshTriangles: [MeshTriangle]
-  // BVH-ordered triangles live only in triangleBuffer (MaterialLibrary.orderedTriangles).
+  // BVH-ordered triangles live only in triangleBuffer (flat) or meshStreams (two-level);
+  // MaterialLibrary.orderedTriangles reads either.
   var triangleBuffer: MTLBuffer
+  var meshStreams: MeshStreams?
   var triangleCount: Int
   var nodeBuffer: MTLBuffer
   var nodeCount: Int
@@ -663,7 +733,28 @@ func sameBytes<T>(_ a: [T], _ b: [T]) -> Bool {
   }
 }
 extension SceneState {
-  // Legacy eight-slot states compare and restore as full-capacity states.
+  // The slots up to the last one in use, and at least SceneLimits.storedMaterials: what a
+  // project file stores (decoding pads it back with `padded`).
+  var trimmed: SceneState {
+    let defaultSurface = SurfaceSettings(), defaultObject = ObjectSettings()
+    var used = -1
+    for i in surfaces.indices where !sameBytes([surfaces[i]], [defaultSurface]) { used = max(used, i) }
+    for i in objects.indices where !sameBytes([objects[i]], [defaultObject]) { used = max(used, i) }
+    for i in maps.indices where maps[i] != nil || (names.indices.contains(i) && names[i] != "None") { used = max(used, i / 4) }
+    for slot in (emissions ?? [:]).keys { used = max(used, slot) }
+    for slot in (materialX ?? [:]).keys { used = max(used, slot) }
+    let count = min(surfaces.count, max(SceneLimits.storedMaterials, used + 1))
+    guard count < surfaces.count, objects.count == surfaces.count, maps.count == 4 * surfaces.count,
+      names.count == maps.count
+    else { return self }
+    var s = self
+    s.surfaces.removeLast(surfaces.count - count)
+    s.objects.removeLast(objects.count - count)
+    s.maps.removeLast(maps.count - 4 * count)
+    s.names.removeLast(names.count - 4 * count)
+    return s
+  }
+  // Legacy eight-slot and trimmed states compare and restore as full-capacity states.
   var padded: SceneState {
     var s = self
     s.surfaces += Array(repeating: SurfaceSettings(), count: max(0, SceneLimits.materials - s.surfaces.count))
@@ -699,7 +790,9 @@ extension SceneState {
 extension MaterialXProgram {
   func sameProgram(as other: MaterialXProgram) -> Bool {
     guard name == other.name, source == other.source, roots == other.roots,
-      diffuseRoughness == other.diffuseRoughness, emission == other.emission,
+      diffuseRoughness == other.diffuseRoughness, emission == other.emission, opacity == other.opacity,
+      specularColor == other.specularColor, transmissionColor == other.transmissionColor,
+      thinWalled == other.thinWalled,
       sameBytes(instructions, other.instructions),
       images.count == other.images.count, parameters.count == other.parameters.count,
       zip(images, other.images).allSatisfy({ $0.name == $1.name && $0.srgb == $1.srgb && $0.data == $1.data })
@@ -719,8 +812,8 @@ extension MaterialLibrary {
       environment: environmentData == nil
         ? nil : (environmentTexture, environmentRows, environmentColumns),
       meshTriangles: meshTriangles,
-      triangleBuffer: triangleBuffer, triangleCount: triangleCount, nodeBuffer: nodeBuffer, nodeCount: nodeCount,
-      meshLayout: meshLayout, acceleration: acceleration, hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
+      triangleBuffer: triangleBuffer, meshStreams: meshStreams, triangleCount: triangleCount, nodeBuffer: nodeBuffer,
+      nodeCount: nodeCount, meshLayout: meshLayout, acceleration: acceleration, hasSceneGraph: hasSceneGraph, graph: graph, resident: residentSnapshot())
   }
   // Seed a freshly created candidate. It is published only after restore,
   // setEnvironment and the mesh step have rebuilt its bindings.
@@ -737,6 +830,7 @@ extension MaterialLibrary {
     }
     meshTriangles = r.meshTriangles
     triangleBuffer = r.triangleBuffer
+    meshStreams = r.meshStreams
     triangleCount = r.triangleCount
     nodeBuffer = r.nodeBuffer
     nodeCount = r.nodeCount
@@ -777,8 +871,9 @@ extension MaterialLibrary {
     let oldGraphTextures = graphTextures, oldGraphInstructions = graphInstructionBuffer
     let oldGraphHeaders = graphHeaderBuffer, oldArgument = argumentBuffer
     let oldObjectBuffer = objectBuffer, oldEmissionBuffer = emissionBuffer, oldEmitterBuffer = emitterBuffer
-    let oldBindingsDirty = bindingsDirty
+    let oldBindingsDirty = bindingsDirty, oldSide = graphTextureSide
     do {
+      graphTextureSide = graph.side
       settings = state.surfaces
         + Array(repeating: SurfaceSettings(), count: SceneLimits.materials - state.surfaces.count)
       objects = state.objects
@@ -789,6 +884,7 @@ extension MaterialLibrary {
       graphTextures = graph.textures
       materialX = programs
       try rebuildArguments(replacement)
+      try refreshInstanceOpacity()
       payloads = state.maps + Array(repeating: nil, count: SceneLimits.materials * 4 - state.maps.count)
       fileNames = state.names + Array(repeating: "None", count: SceneLimits.materials * 4 - state.names.count)
     } catch {
@@ -799,6 +895,7 @@ extension MaterialLibrary {
       objectBuffer = oldObjectBuffer; emissionBuffer = oldEmissionBuffer; emitterBuffer = oldEmitterBuffer
       // Pending object or emission edits were never uploaded; keep them pending.
       bindingsDirty = oldBindingsDirty
+      graphTextureSide = oldSide
       throw error
     }
   }
@@ -812,14 +909,45 @@ extension MaterialLibrary {
   // files as R/RG, so those become swizzled views (RRR1, RRRG). sRGB cases the formats
   // cannot express (16-bit data; RG8 sRGB, which would also decode alpha) are expanded
   // to RGBA on the CPU.
-  func decodeTexture(_ data: Data, srgb: Bool) throws -> MTLTexture {
-    let texture = try loader.newTexture(
-      data: data,
-      options: [
-        .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
-        .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-        .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
-      ])
+  func decodeTexture(_ data: Data, srgb: Bool, maximumSide: Int? = nil) throws -> MTLTexture {
+    // Budget downscaling (materialXCandidate): an ImageIO thumbnail at most `maximumSide` texels
+    // long, passed on as uncompressed TIFF so every format path below still applies.
+    if let side = maximumSide, let header = Self.imageHeader(data), max(header.width, header.height) > side {
+      let output = NSMutableData()
+      guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+        let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+          kCGImageSourceThumbnailMaxPixelSize: side, kCGImageSourceCreateThumbnailFromImageAlways: true,
+          kCGImageSourceCreateThumbnailWithTransform: false,
+        ] as CFDictionary),
+        let destination = CGImageDestinationCreateWithData(output, "public.tiff" as CFString, 1, nil)
+      else { throw Self.error("Could not downscale a texture.") }
+      CGImageDestinationAddImage(destination, image, [
+        kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFCompression: 1]
+      ] as CFDictionary)
+      guard CGImageDestinationFinalize(destination) else { throw Self.error("Could not downscale a texture.") }
+      return try decodeTexture(output as Data, srgb: srgb)
+    }
+    let options: [MTKTextureLoader.Option: Any] = [
+      .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
+      .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+      .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
+    ]
+    let texture: MTLTexture
+    do {
+      texture = try loader.newTexture(data: data, options: options)
+    } catch {
+      // MTKTextureLoader rejects some PNG layouts (8-bit palette images, as in Bistro's MTL
+      // textures); Core Graphics decodes them to RGBA8 with their stored values.
+      guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+        let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8,
+          bytesPerRow: 4 * image.width, space: CGColorSpaceCreateDeviceRGB(),
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+      else { throw error }
+      context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+      guard let rgba = context.makeImage() else { throw error }
+      return try loader.newTexture(cgImage: rgba, options: options)
+    }
     let format = texture.pixelFormat
     if srgb, [.r8Unorm, .r16Unorm, .rg16Unorm, .rgba16Unorm, .rg8Unorm, .rg8Unorm_srgb].contains(format) {
       return try expandedSRGB(data)
@@ -1066,7 +1194,8 @@ extension MaterialLibrary {
       }
       var layout = MeshSceneLayout()
       try publishTwoLevel(
-        assets: [(MeshSceneLayout.legacyAsset, triangles)], document: triangles, layout: &layout
+        assets: [(MeshSceneLayout.legacyAsset, MeshGeometry(triangles: triangles))], document: triangles,
+        legacyExtras: triangles.map(MeshStreams.extra), layout: &layout
       ) { layout in
         if !triangles.isEmpty { try layout.addInstance(node: -1, asset: 0, world: matrix_identity_float4x4, slots: []) }
       }
@@ -1084,14 +1213,14 @@ extension MaterialLibrary {
     if acceleration != .flat {
       try graph.validate()
       var layout = MeshSceneLayout()
-      try publishTwoLevel(assets: graph.assets.map { ($0.id, $0.triangles) }, document: [], layout: &layout) { layout in
+      try publishTwoLevel(assets: graph.assets.map { ($0.id, $0.geometry) }, document: [], layout: &layout) { layout in
         try layout.addInstances(graph)
       }
       return
     }
     let count = try graph.renderTriangleCount()
-    guard count <= SceneLimits.triangles else {
-      throw Self.error("The flat BVH renders at most \(SceneLimits.triangles.formatted()) triangles.")
+    guard count <= SceneLimits.flatTriangles else {
+      throw Self.error("The flat BVH renders at most \(SceneLimits.flatTriangles.formatted()) triangles.")
     }
     let t = try triangleStorage(count)
     let target = t.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, count))
@@ -1112,10 +1241,12 @@ extension MaterialLibrary {
     let triangles: [MeshTriangle], triangleBuffer: MTLBuffer, triangleCount: Int
     let nodeBuffer: MTLBuffer, nodeCount: Int
     var layout: MeshSceneLayout? = nil
+    // Two-level: the faces, vertices and BLAS nodes (triangleBuffer is then a placeholder).
+    var streams: MeshStreams? = nil
   }
   var meshResources: MeshResources {
     MeshResources(triangles: meshTriangles, triangleBuffer: triangleBuffer, triangleCount: triangleCount,
-      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: meshLayout)
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: meshLayout, streams: meshStreams)
   }
   func restoreMesh(_ m: MeshResources) throws {
     let old = meshResources, oldArgument = argumentBuffer
@@ -1125,6 +1256,7 @@ extension MaterialLibrary {
   }
   private func apply(_ m: MeshResources) {
     triangleBuffer = m.triangleBuffer; triangleCount = m.triangleCount
+    meshStreams = m.streams
     nodeBuffer = m.nodeBuffer; nodeCount = m.nodeCount
     meshTriangles = m.triangles
     meshLayout = m.layout
@@ -1171,7 +1303,8 @@ extension MaterialLibrary {
         zip(layout.instances, current.instances).allSatisfy({ $0.node == $1.node && $0.asset == $1.asset && $0.world == $1.world })
       else { throw Self.error("Scene binding no longer matches the published geometry.") }
       // Same instances and transforms: the hardware instance structure is kept too.
-      try publishScene(layout, triangleBuffer: triangleBuffer, document: meshTriangles, keepScene: true)
+      guard let streams = meshStreams else { throw Self.error("Scene binding no longer matches the published geometry.") }
+      try publishScene(layout, streams: streams, document: meshTriangles, keepScene: true)
       return
     }
     let slots = Dictionary(uniqueKeysWithValues: graph.materials.map { ($0.id, $0.slot) })
@@ -1186,20 +1319,36 @@ extension MaterialLibrary {
       result.uvc.z = Float(slot)
       return result
     }
-    // Rebind straight from the shared buffer into its replacement; the BVH order is unchanged.
-    // A two-level graph-less mesh of flattened triangles keeps its hierarchy after them.
+    // A two-level graph-less mesh of flattened triangles: new faces with rebound tags; the
+    // vertices, hierarchy, extras and hardware structures are kept.
+    if var layout = meshLayout, let streams = meshStreams {
+      let ordered = orderedTriangles
+      guard let faces = device.makeBuffer(length: streams.faces.length, options: .storageModeShared)
+      else { throw Self.error("Could not allocate imported mesh bindings.") }
+      let source = streams.faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, ordered.count))
+      let target = faces.contents().bindMemory(to: MeshFace.self, capacity: max(1, ordered.count))
+      for (i, triangle) in ordered.enumerated() {
+        var face = source[i]
+        face.w = UInt32(try rebound(triangle).uvc.z)
+        target[i] = face
+      }
+      var rebuilt = streams
+      rebuilt.faces = faces
+      // The rebound triangles no longer equal the document array the layout remembers.
+      layout.assets[0].source = MeshGeometry()
+      try restoreMesh(MeshResources(triangles: [], triangleBuffer: placeholderTriangles, triangleCount: ordered.count,
+        nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: layout, streams: rebuilt))
+      return
+    }
+    // Flat: rebind straight from the shared buffer into its replacement; the BVH order is unchanged.
     let ordered = orderedTriangles
-    let length = meshLayout == nil ? ordered.count * MemoryLayout<MeshTriangle>.stride : triangleBuffer.length
+    let length = ordered.count * MemoryLayout<MeshTriangle>.stride
     guard let candidateBuffer = device.makeBuffer(length: max(128, length), options: .storageModeShared)
     else { throw Self.error("Could not allocate imported mesh bindings.") }
-    if meshLayout != nil { candidateBuffer.contents().copyMemory(from: triangleBuffer.contents(), byteCount: length) }
     let target = candidateBuffer.contents().bindMemory(to: MeshTriangle.self, capacity: max(1, ordered.count))
     for (i, triangle) in ordered.enumerated() { target[i] = try rebound(triangle) }
-    // The rebound triangles no longer equal the document array the layout remembers.
-    var layout = meshLayout
-    if layout != nil { layout?.assets[0].source = [] }
     // Bindings belong to a scene-graph mesh, which retains no document-order copy.
     try restoreMesh(MeshResources(triangles: [], triangleBuffer: candidateBuffer, triangleCount: ordered.count,
-      nodeBuffer: nodeBuffer, nodeCount: nodeCount, layout: layout))
+      nodeBuffer: nodeBuffer, nodeCount: nodeCount))
   }
 }

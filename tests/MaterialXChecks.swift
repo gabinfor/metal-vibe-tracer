@@ -193,13 +193,13 @@ let mxPipeline = try gpu.makeComputePipelineState(
 let mxResult = evaluateMX()
 print("MaterialX GPU: \(mxResult)")
 require(
-  mxResult[0].x == 8 && mxResult[0].y == 66 && abs(mxResult[0].z - 2) < 1e-5,
+  mxResult[0].x == 8 && mxResult[0].y == Float(SceneLimits.materials + 2) && abs(mxResult[0].z - 2) < 1e-5,
   "scene graph face material and pick ID")
 require(
   simd_length(mxResult[1] - SIMD4(0.65, 0.25, 0.3, 0.4)) < 0.002,
   "Metal graph arithmetic and OpenPBR input mapping")
 require(simd_length(mxResult[2] - SIMD4(0.3, 0.2, 1, 1)) < 0.002, "coat roughness and weights")
-require(mxResult[3].x == 9 && mxResult[3].y == 66, "two materials on one mesh")
+require(mxResult[3].x == 9 && mxResult[3].y == Float(SceneLimits.materials + 2), "two materials on one mesh")
 require(
   abs(mxResult[4].x - 0.21586) < 0.004 && abs(mxResult[4].y - 0.05127) < 0.004
     && abs(mxResult[4].z - 0.01444) < 0.004, "sRGB image conversion and UV orientation")

@@ -9,6 +9,7 @@
       uvab: .zero, uvc: SIMD4(0, 0, slot, id))
   }
   func bytes<T>(_ values: UnsafeBufferPointer<T>) -> Data { Data(buffer: values) }
+  func bytes(_ values: StoredTriangles) -> Data { Data(buffer: UnsafeBufferPointer(start: values.flat, count: values.count)) }
   // A curved N x N patch whose quads alternate their diagonal; every vertex is shared exactly.
   func patch(_ cells: Int, slot: Float = 0, id: Float = 1) -> (vertices: [[SIMD3<Float>]], triangles: [MeshTriangle]) {
     var vertices: [[SIMD3<Float>]] = []
@@ -151,12 +152,12 @@
       float3 eye=eyes[gid.y], target=targets[gid.x].xyz;
       Ray r={eye,normalize(target-eye)}; HitRecord h;
       atomic_fetch_add_explicit(&out[0],1,memory_order_relaxed);
-      bool hit=trace_scene(r,6,h,images,u) && h.objectID>=64;
+      bool hit=trace_scene(r,6,h,images,u) && h.objectID>=MATERIAL_SLOTS;
       if(!hit) atomic_fetch_add_explicit(&out[1],1,memory_order_relaxed);
       if(!scene_occluded(r,6,length(target-eye)*1.001f+1e-3f,images,u)) atomic_fetch_add_explicit(&out[2],1,memory_order_relaxed);
       float tMin=ray_t_min(eye,u), best=1e20f; bool mesh=false; HitRecord p;
       if(trace_scene(r,6,p,images.objects,u.light.w,u.light.xyz,tMin)) best=p.t;
-      for(uint i=0;i<count;++i) { float t,b1,b2; if(intersect_mesh_triangle(images.triangles[i],r,tMin,best,t,b1,b2)) { best=t; mesh=true; } }
+      for(uint i=0;i<count;++i) { float t,b1,b2; if(intersect_mesh_triangle(stored_triangle(i,images),r,tMin,best,t,b1,b2)) { best=t; mesh=true; } }
       if(hit!=mesh || (hit && abs(h.t-best)>1e-6f*max(1.0f,best))) atomic_fetch_add_explicit(&out[3],1,memory_order_relaxed);
   }
   // Edge functions are exact negatives for the two orientations of an edge, including

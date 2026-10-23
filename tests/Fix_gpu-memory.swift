@@ -55,6 +55,10 @@
      offsets(MeshTriangle.self, [\MeshTriangle.a, \MeshTriangle.b, \MeshTriangle.c, \MeshTriangle.na,
       \MeshTriangle.nb, \MeshTriangle.nc, \MeshTriangle.uvab, \MeshTriangle.uvc])),
     ("MeshNode", ["lo", "hi", "links"], offsets(MeshNode.self, [\MeshNode.lo, \MeshNode.hi, \MeshNode.links])),
+    // Two-level stored geometry: SIMD lanes in Swift (faces a, b, c, tag; vertices position,
+    // normal, uv as packed float3, float3, float2).
+    ("MeshFace", ["a", "b", "c", "tag"], [MemoryLayout<MeshFace>.stride, 0, 4, 8, 12]),
+    ("MeshVertex", ["position", "normal", "uv"], [MemoryLayout<MeshVertex>.stride, 0, 12, 24]),
     ("GraphInstruction", ["code", "value", "extra", "auxiliary"],
      offsets(GraphInstruction.self, [\GraphInstruction.code, \GraphInstruction.value, \GraphInstruction.extra,
       \GraphInstruction.auxiliary])),
@@ -98,8 +102,22 @@
       index += 1
     }
   }
-  require(MemoryLayout<SurfaceSettings>.stride * SceneLimits.materials <= 4096
-      && renderer.materials.settings.count == SceneLimits.materials, "SurfaceSettings fit setBytes")
+  // Every slot's SurfaceSettings is bound as one buffer (index 1), so the slot count is no longer
+  // bound by setBytes' 4 KB; MSL MATERIAL_SLOTS and GRAPH_IMAGES match SceneLimits.
+  require(renderer.materials.settings.count == SceneLimits.materials, "one SurfaceSettings per material slot")
+  do {
+    let probe = try gpu.makeLibrary(source: metalSource + "\nkernel void slot_counts(device uint *out [[buffer(0)]]) { out[0] = MATERIAL_SLOTS; out[1] = GRAPH_IMAGES; }",
+      options: shaderCompileOptions())
+    let out = gpu.makeBuffer(length: 8, options: .storageModeShared)!
+    let command = renderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(try gpu.makeComputePipelineState(function: probe.makeFunction(name: "slot_counts")!))
+    encoder.setBuffer(out, offset: 0, index: 0)
+    encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    require(out.contents().load(as: UInt32.self) == UInt32(SceneLimits.materials)
+      && out.contents().load(fromByteOffset: 4, as: UInt32.self) == UInt32(SceneLimits.graphImages),
+      "MSL MATERIAL_SLOTS and GRAPH_IMAGES equal SceneLimits")
+  }
   print("PASS: shared struct sizes and offsets match between Swift and Metal")
 
   // R-21: with full-size sentinel reservoirs bound, the temporal kernel writes no
@@ -217,7 +235,8 @@
   try renderer.materials.restore(mapped)
   let m = renderer.materials
   let bound = Set(m.boundResources.map { ObjectIdentifier($0) })
-  let expected: [MTLResource] = m.residentTextures + [m.triangleBuffer, m.nodeBuffer, m.objectBuffer,
+  let streams = m.meshStreams ?? m.placeholderStreams!
+  let expected: [MTLResource] = m.residentTextures + [m.triangleBuffer, m.nodeBuffer, m.objectBuffer, streams.faces, streams.vertices, streams.nodes,
     m.graphInstructionBuffer, m.graphHeaderBuffer, m.emissionBuffer, m.emitterBuffer, ]
   require(expected.allSatisfy { bound.contains(ObjectIdentifier($0)) }, "useResources covers every bound slot")
   weak let swapped = m.images[4] as AnyObject
@@ -265,9 +284,11 @@
   var quad = try OBJMesh.load("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4")
   quad += quad.map { var t = $0; t.a.x += 3; t.b.x += 3; t.c.x += 3; return t }
   try m.setMesh(quad)
-  require(m.orderedTriangles.count == quad.count
-      && UnsafeRawPointer(m.orderedTriangles.baseAddress!) == UnsafeRawPointer(m.triangleBuffer.contents()),
-    "ordered triangles alias the GPU triangle buffer")
+  let stored = m.orderedTriangles
+  require(stored.count == quad.count
+      && (m.meshStreams.map { stored.faces.map(UnsafeRawPointer.init) == UnsafeRawPointer($0.faces.contents()) }
+        ?? (stored.flat.map(UnsafeRawPointer.init) == UnsafeRawPointer(m.triangleBuffer.contents()))),
+    "ordered triangles read the GPU geometry (two-level faces or the flat triangle buffer)")
   try m.setMesh([])
   print("PASS: single host triangle copy")
 
@@ -359,13 +380,13 @@
 
   // R-37: saving refuses what open would reject, with an actionable message.
   var oversized = ProjectDocument()
-  oversized.environmentData = Data(count: 200 * 1024 * 1024)
+  oversized.environmentData = Data(count: 200 * 1024 * 1024)  // with seven 128 MiB maps, above the 1 GiB limit
   var heavy = SceneState()
   // Distinct payloads: identical ones are stored once and count once (R-74).
-  for i in 0..<3 { var map = Data(count: 128 * 1024 * 1024); map[0] = UInt8(i + 1); heavy.maps[i] = map }
+  for i in 0..<7 { var map = Data(count: 128 * 1024 * 1024); map[0] = UInt8(i + 1); heavy.maps[i] = map }
   oversized.scenes[0] = heavy
   do { _ = try oversized.encodeForSaving(); require(false, "save rejects embedded assets above the open limit") } catch {
-    require(error.localizedDescription.contains("512 MiB"), "embedded-limit message is actionable")
+    require(error.localizedDescription.contains("\(ProjectDocument.embeddedAssetLimit >> 20) MiB"), "embedded-limit message is actionable")
   }
   do { try controller.requireEmbeddedCapacity(ProjectDocument.embeddedAssetLimit + 1); require(false, "asset loads keep the aggregate limit") } catch {}
   var broken = ProjectDocument(); broken.scenes[0] = SceneState(); broken.scenes[0]!.surfaces = []
@@ -376,8 +397,14 @@
   let worst = MeshTriangle(a: v, b: v, c: v, na: v, nb: v, nc: v, uvab: v, uvc: v)
   let perTriangle = try JSONEncoder().encode(Array(repeating: worst, count: 1000)).count / 1000
   require(perTriangle <= 600, "triangle JSON bound holds (\(perTriangle) B)")
-  require(ProjectDocument.maximumFileBytes >= ProjectDocument.embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.triangles * perTriangle,
-    "open limit covers base64 assets and both triangle stores")
+  // Format 4: a face with three unshared vertices is the worst case for MeshGeometry payloads.
+  var unshared = MeshGeometry.Builder()
+  for k in 0..<1000 { var t = worst; t.a.x = Float(k); t.b.x = Float(k) + 0.5; t.c.x = Float(k) + 0.25; t.uvc.z = 0; unshared.add(t) }
+  let perFace = (unshared.geometry.payload.base64EncodedString().utf8.count + 999) / 1000
+  require(perFace <= ProjectDocument.perFormat4Face, "format 4 mesh payload bound holds (\(perFace) B per face)")
+  require(ProjectDocument.maximumFileBytes >= ProjectDocument.embeddedAssetLimit / 3 * 4 + 2 * SceneLimits.flatTriangles * perTriangle
+      + SceneLimits.triangles * perFace,
+    "open limit covers base64 assets, both triangle stores of formats 1-3, and format 4 mesh payloads")
   print("PASS: save and autosave only write projects the open path accepts")
 }
 try fixGPUMemoryChecks()

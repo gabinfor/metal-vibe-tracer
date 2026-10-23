@@ -260,7 +260,7 @@
         PTReservoir r = reservoirs[i];
         float4 p = positions.read(gid);
         if (pt_length(r) == 0u || !(p.w > 0.0f) || !(pt_luminance(r.F) > 0.0f)) return;
-        HitRecord y = load_primary_surface(surfaces[i], p);
+        HitRecord y = load_primary_surface(surfaces[i], p, images);
         float3 view = float3(surfaces[i].view);
         PTShift s = pt_shift(r, y, view, pt_footprint_threshold(p.w, y.geometricNormal, view), pt_primary_cone(u), u, settings,
                              images, SPECTRAL_CONTEXT(u, images));

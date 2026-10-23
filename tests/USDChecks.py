@@ -34,7 +34,7 @@ sun=UsdLux.DistantLight.Define(stage,'/Sun');sun.CreateIntensityAttr(2)
 stage.GetRootLayer().Save()
 result=bridge.import_stage(str(out/'scene.usda'),out)
 check(len(result['assets'])==1 and sum(bool(n.get('mesh')) for n in result['nodes'])==2,result['report'])
-check(len(result['assets'][0]['triangles'])==3,'concave face triangulation')
+check(result['assets'][0]['mesh']['faces']==3,'concave face triangulation')
 check(len(result['cameras'])==1 and result['sun'] is not None,"len(result['cameras'])==1 and result['sun'] is not None")
 check(all(m.get('mtlx') for m in result['materials']),"all(m.get('mtlx') for m in result['materials'])")
 (out/'snapshot.json').write_text(json.dumps(result))
@@ -47,7 +47,7 @@ check(bridge.import_stage(str(out/'scene.usdz'),out)['assets'],"bridge.import_st
 plain=Usd.Stage.CreateNew(str(out/'details.usda'));UsdGeom.SetStageMetersPerUnit(plain,1)
 m=UsdGeom.Mesh.Define(plain,'/M');m.CreatePointsAttr([(0,0,0),(1,0,0),(1,1,0),(0,1,0)]);m.CreateFaceVertexCountsAttr([3,3]);m.CreateFaceVertexIndicesAttr([0,1,2,0,2,3]);m.CreateSubdivisionSchemeAttr('none');m.CreateHoleIndicesAttr([1]);st=UsdGeom.PrimvarsAPI(m).CreatePrimvar('st',Sdf.ValueTypeNames.TexCoord2fArray,'faceVarying');st.Set([(0,0),(1,0),(1,1),(0,1)]);st.SetIndices([0,1,2,0,2,3]);m.CreateVisibilityAttr('invisible')
 plain.GetRootLayer().Save();detail=bridge.import_stage(str(out/'details.usda'),out)
-check(len(detail['assets'][0]['triangles'])==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1,"len(detail['assets'][0]['triangles'])==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1")
+check(detail['assets'][0]['mesh']['faces']==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1,"detail['assets'][0]['mesh']['faces']==1 and detail['nodes'][1]['transform']['rotationHidden'][3]==1")
 print('PASS: USD composition, instances, units/up-axis matrices, concave triangulation, primvars/holes, bindings, camera/sun, USDC and USDZ')
 # A small authored area-lit scene supports a meaningful GPU PDF/energy test.
 lightFile=out/'area.usda';lightFile.unlink(missing_ok=True)
@@ -60,7 +60,7 @@ disk=UsdLux.DiskLight.Define(coverage,'/Disk');disk.CreateRadiusAttr(.5);disk.Cr
 sphere=UsdLux.SphereLight.Define(coverage,'/Sphere');sphere.CreateRadiusAttr(.25);sphere.CreateIntensityAttr(2);sphere.AddTranslateOp().Set((1,1,0))
 coverage.GetRootLayer().Save()
 coverage_result=bridge.import_stage(str(out/'light-coverage.usda'),out)
-check(len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8,"len(coverage_result['assets'])==2 and len(coverage_result['assets'][0]['triangles'])==8")
+check(len(coverage_result['assets'])==2 and coverage_result['assets'][0]['mesh']['faces']==8,"len(coverage_result['assets'])==2 and coverage_result['assets'][0]['mesh']['faces']==8")
 check(any('disk light imported' in line for line in coverage_result['report']),"any('disk light imported' in line for line in coverage_result['report'])")
 check(any('sphere light imported' in line for line in coverage_result['report']),"any('sphere light imported' in line for line in coverage_result['report'])")
 # Reference scene override is separate; upstream files and notices remain unchanged.
@@ -96,7 +96,7 @@ zero=UsdGeom.Xform.Define(robust,'/Zero');zero.AddScaleOp().Set((0,0,0));quad(ro
 reset=quad(robust,'/Zero/Reset');reset.SetResetXformStack(True);reset.AddTranslateOp().Set((5,0,0))
 UsdLux.MeshLightAPI.Apply(quad(robust,'/Lamp',(20,0,0)).GetPrim())
 UsdLux.VolumeLightAPI.Apply(UsdVol.Volume.Define(robust,'/Fog').GetPrim())
-bad=UsdShade.Material.Define(robust,'/Looks/Bad');bs=UsdShade.Shader.Define(robust,'/Looks/Bad/S');bs.CreateIdAttr('UsdPreviewSurface');bs.CreateInput('opacity',Sdf.ValueTypeNames.Float).Set(.5);bad.CreateSurfaceOutput().ConnectToSource(bs.ConnectableAPI(),'surface')
+bad=UsdShade.Material.Define(robust,'/Looks/Bad');bs=UsdShade.Shader.Define(robust,'/Looks/Bad/S');bs.CreateIdAttr('UsdPreviewSurface');bs.CreateInput('displacement',Sdf.ValueTypeNames.Float).Set(.1);bad.CreateSurfaceOutput().ConnectToSource(bs.ConnectableAPI(),'surface')
 for name,color,x in [('Red',(1,0,0),10),('Blue',(0,0,1),12)]:
  m=quad(robust,'/'+name,(x,0,0));m.CreateDisplayColorAttr([color]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(bad)
 dome=UsdLux.DomeLight.Define(robust,'/Dome');dome.CreateColorAttr((.25,.5,1));dome.CreateIntensityAttr(2)
@@ -104,7 +104,7 @@ cam=UsdGeom.Camera.Define(robust,'/Cam');cam.AddTranslateOp().Set((.5,.5,5))
 robust.GetRootLayer().Save()
 rb=bridge.import_stage(str(out/'robust.usda'),out);report='\n'.join(rb['report'])
 byName={n['name']:n for n in rb['nodes']};assetOf={a['id']:a for a in rb['assets']}
-check(len(assetOf[byName['Good']['mesh']]['triangles'])==5,report)
+check(assetOf[byName['Good']['mesh']]['mesh']['faces']==5,report)
 check('/Good: 3 degenerate faces dropped' in report and '/Good: 1 non-simple polygons fan-triangulated' in report,report)
 check('/Empty: mesh without points or topology skipped' in report and 'mesh' not in byName['Empty'],report)
 check(byName['Zero']['transform']['rotationHidden'][3]==1 and report.count('zero or singular world scale')==1,report)
@@ -113,12 +113,19 @@ check(byName['Reset']['parent']==rb['nodes'][0]['id'] and byName['Reset']['matri
 check('/Lamp: MeshLightAPI emission not applied' in report and '/Fog: VolumeLightAPI emission' in report,report)
 fallbacks=[m for m in rb['materials'] if m['path']=='/Looks/Bad'];check(sorted(m['color'] for m in fallbacks)==[[0,0,1],[1,0,0]] and not any(m.get('mtlx') for m in fallbacks),"sorted(m['color'] for m in fallbacks)==[[0,0,1],[1,0,0]] and not any(m.get('mtlx') for m in fallbacks)")
 check('/Red: material /Looks/Bad fallback to displayColor' in report and '/Blue: material /Looks/Bad fallback to displayColor' in report,report)
+# PreviewSurface opacity becomes OpenPBR geometry_opacity (coverage in the renderer); a threshold is reported.
+cut=Usd.Stage.CreateNew(str(out/'cutout.usda'));UsdGeom.SetStageMetersPerUnit(cut,1);cq=quad(cut,'/Q',(0,0,0))
+cm=UsdShade.Material.Define(cut,'/Looks/Cut');cs=UsdShade.Shader.Define(cut,'/Looks/Cut/S');cs.CreateIdAttr('UsdPreviewSurface');cs.CreateInput('opacity',Sdf.ValueTypeNames.Float).Set(.25);cs.CreateInput('opacityThreshold',Sdf.ValueTypeNames.Float).Set(.5)
+cm.CreateSurfaceOutput().ConnectToSource(cs.ConnectableAPI(),'surface');UsdShade.MaterialBindingAPI.Apply(cq.GetPrim()).Bind(cm);cut.GetRootLayer().Save()
+cr=bridge.import_stage(str(out/'cutout.usda'),out);cmat=[m for m in cr['materials'] if m['path']=='/Looks/Cut']
+check(len(cmat)==1 and 'geometry_opacity' in cmat[0].get('mtlx','') and any('opacityThreshold 0.5 not applied' in l for l in cr['report']),cr['report'])
 # Per-color fallbacks never push a stage past the material limit; the overflow shares the first fallback.
 many=Usd.Stage.CreateNew(str(out/'many-colors.usda'));badMany=UsdShade.Material.Define(many,'/Looks/Bad');badMany.CreateSurfaceOutput().ConnectToSource(UsdShade.Shader.Define(many,'/Looks/Bad/S').ConnectableAPI(),'surface')
-for i in range(60):
- m=quad(many,'/Q%d'%i,(2*i,0,0));m.CreateDisplayColorAttr([(i/60,0,1)]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(badMany)
+manyCount=bridge.MATERIALS+4
+for i in range(manyCount):
+ m=quad(many,'/Q%d'%i,(2*i,0,0));m.CreateDisplayColorAttr([(i/manyCount,0,1)]);UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(badMany)
 many.GetRootLayer().Save();mc=bridge.import_stage(str(out/'many-colors.usda'),out)
-check(len(mc['materials'])==56 and sum('material limit reached' in l for l in mc['report'])==4,mc['report'][:3])
+check(len(mc['materials'])==bridge.MATERIALS and sum('material limit reached' in l for l in mc['report'])==4,mc['report'][:3])
 env=pathlib.Path(rb['environment']['file']).read_bytes();texel=env[-4:];scale=2.0**(texel[3]-136)
 check(rb['environment']['intensity']==2 and env.startswith(b'#?RADIANCE') and [round(c*scale,3) for c in texel[:3]]==[.25,.5,1],texel)
 check('/Dome: untextured dome imported as a constant-color environment' in report and rb['cameras'][0]['focus'] is None,"'/Dome: untextured dome imported as a constant-color environment' in report and rb['cameras'][0]['focus'] is None")
@@ -133,7 +140,7 @@ tiny=UsdLux.RectLight.Define(power,'/Tiny');tiny.CreateWidthAttr(.001);tiny.Crea
 power.GetRootLayer().Save();pw=bridge.import_stage(str(out/'power.usda'),out)
 emission={m['path']:m['emission'][0] for m in pw['materials']};powerAssets={a['id']:a for a in pw['assets']}
 for node in pw['nodes'][1:]:
- tris=powerAssets[node['mesh']]['triangles'];path='/'+node['name']
+ tris=bridge.read_mesh(powerAssets[node['mesh']]['mesh']);path='/'+node['name']
  radiantArea=sum(triangle_area(t) for t in tris)*emission[path]
  expected={'/Disk':3*math.pi*.25,'/DiskN':3,'/Sphere':3*4*math.pi*.0625,'/SphereN':3}.get(path)
  if expected:check(abs(radiantArea/expected-1)<1e-6,(path,radiantArea,expected))
@@ -209,7 +216,7 @@ def snapshot(**patch):
 fast,fastTime=snapshot()
 # The pre-2026-09-28 conversion: iterate each Gf value, index the Vt arrays per corner.
 slow,slowTime=snapshot(vec=lambda v:[float(x) for x in v],rows=lambda values:values)
-converted=json.loads(fast);check(sum(len(a['triangles']) for a in converted['assets'])==2*(n*n-2)+3+1+2,'conversion fixture triangle count')
+converted=json.loads(fast);check(sum(a['mesh']['faces'] for a in converted['assets'])==2*(n*n-2)+3+1+2,'conversion fixture triangle count')
 check(fast==slow,'bulk Vt conversion changes the bridge snapshot')
 print('USD bridge conversion (%d triangles): %.3f s bulk, %.3f s per corner'%(2*(n*n-2)+6,fastTime,slowTime))
 check(fastTime*3<slowTime,'bulk Vt conversion is not faster than per-corner Gf conversion (%.3f s against %.3f s)'%(fastTime,slowTime))

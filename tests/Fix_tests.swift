@@ -228,7 +228,7 @@
     var picked: Int? = -1
     r.pick(SIMD2<Float>(0.5, 0.5)) { picked = $0 }
     waitUntil({ picked != -1 })
-    require(picked == 64 + meshIndex, "pick_kernel returns the graph node under the cursor (\(String(describing: picked)))")
+    require(picked == SceneLimits.materials + meshIndex, "pick_kernel returns the graph node under the cursor (\(String(describing: picked)))")
     controller.selectedNode = nil
     controller.pick(SIMD2<Float>(0.5, 0.5))
     waitUntil({ controller.selectedNode != nil })
@@ -318,11 +318,12 @@
     try r.materials.load(url: checker, slot: 1, channel: 1)
     let library = try gpu.makeLibrary(source: metalSource + """
       kernel void fix_tests_mips(constant MaterialResources &images [[buffer(2)]], device float4 *out [[buffer(0)]]) {
-          // 64 texels wide at density 1: footprint 2/64 is LOD 1, footprint 1 the 1x1 level.
-          out[0] = sample_material_map(images, 1, 0, float2(0.3f, 0.3f), float2(1), 2.0f / 64.0f);
-          out[1] = sample_material_map(images, 1, 1, float2(0.3f, 0.3f), float2(1), 2.0f / 64.0f);
-          out[2] = sample_material_map(images, 1, 0, float2(0.3f, 0.3f), float2(1), 1.0f);
-          out[3] = sample_material_map(images, 1, 1, float2(0.3f, 0.3f), float2(1), 1.0f);
+          // 64 texels wide: an isotropic footprint of 2/64 is LOD 1, footprint 1 the 1x1 level.
+          TextureFootprint two = { float2(2.0f / 64.0f, 0), float2(0, 2.0f / 64.0f) }, whole = { float2(1, 0), float2(0, 1) };
+          out[0] = sample_material_map(images, 1, 0, float2(0.3f, 0.3f), two);
+          out[1] = sample_material_map(images, 1, 1, float2(0.3f, 0.3f), two);
+          out[2] = sample_material_map(images, 1, 0, float2(0.3f, 0.3f), whole);
+          out[3] = sample_material_map(images, 1, 1, float2(0.3f, 0.3f), whole);
       }
       """, options: shaderCompileOptions())
     let pipeline = try gpu.makeComputePipelineState(function: library.makeFunction(name: "fix_tests_mips")!)
@@ -366,7 +367,7 @@
           HitRecord h = {}; h.t = 1; h.normal = float3(0, 0, -1); h.front_face = true; h.mat.slot = 8; h.uv = float2(0.25f);
           h.tangent = float3(1, 0, 0); h.bitangent = float3(0, 1, 0); h.uvDensity = float2(0); h.geometricNormal = h.normal;
           Ray ray = { float3(0, 0, -1), float3(0, 0, 1) };
-          resolve_materialx(h, ray, images, 0.0f);
+          resolve_materialx(h, ray, images, TextureFootprint{});
           out[0] = float4(h.mat.albedo, h.mat.roughness);
       }
       """, options: shaderCompileOptions())

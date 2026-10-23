@@ -3,8 +3,9 @@
 Usage: python3 scripts/render_showcase.py [--shots FILE] [--only NAME ...] [--scale S] [--samples N] [--out DIR]
 
 Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD
-file or opens a .vtrace project, optionally loads an HDRI, sets the camera, lens and render modes, and exports
-through StudioController.startExport with Open Image Denoise, exactly like Export in the app.
+file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera, lens and render modes, and exports
+through StudioController.startExport with Open Image Denoise, exactly like Export in the app. A shot with
+"raw": true exports linear radiance as OpenEXR without a denoiser instead (renderer comparisons).
 --scale and --samples override every shot for quick framing previews. Images go to --out
 (default build/showcase); copy the chosen ones to docs/images by hand.
 """
@@ -46,6 +47,7 @@ struct Shot: Decodable {
   var scene: UInt32?
   var project: String?
   var usd: String?
+  var obj: String?
   var hdri: String?
   var sky: UInt32?
   var fog: UInt32?
@@ -63,6 +65,12 @@ struct Shot: Decodable {
   var lightColor: [Float]?
   var width: Int, height: Int
   var samples: UInt32?
+  var depth: Float?
+  // Raw linear radiance as OpenEXR, without a denoiser (renderer comparisons).
+  var raw: Bool?
+  // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
+  // shot, above 1 brightens it for a night shot. Applied to the compiled programs, not the source files.
+  var emissionScale: Float?
 }
 func waitFor(_ condition: () -> Bool, seconds: Double) -> Bool {
   let deadline = Date().addingTimeInterval(seconds)
@@ -75,6 +83,17 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
   var p: ProjectDocument
   if let path = shot.usd {
     p = try USDImporter.load(URL(fileURLWithPath: path), into: ProjectDocument()).document
+  } else if let path = shot.obj {
+    let url = URL(fileURLWithPath: path)
+    var skipped = 0, report: [String] = []
+    let start = Date()
+    p = ProjectDocument()
+    _ = try p.appendOBJ(try Data(contentsOf: url, options: .alwaysMapped), name: url.lastPathComponent,
+      folder: url.deletingLastPathComponent(), skipped: &skipped, report: &report)
+    print("\(url.lastPathComponent): imported in \(String(format: "%.1f", Date().timeIntervalSince(start))) s, "
+      + "\(p.graph?.assets.reduce(0) { $0 + $1.geometry.count } ?? 0) triangles, \(skipped) degenerate faces skipped, "
+      + "\(p.scenes[6]?.materialX?.count ?? 0) MaterialX materials")
+    for line in report { print("  " + line) }
   } else if let path = shot.project {
     let url = URL(fileURLWithPath: path)
     p = try ProjectDocument.decodeProject(try Data(contentsOf: url), near: url)
@@ -83,6 +102,22 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
     p.scene = shot.scene ?? 0
     testRenderer.sceneIndex = p.scene
     p.camera = CameraState(testRenderer)
+  }
+  if let k = shot.emissionScale, var state = p.scenes[6] {
+    for (slot, var program) in state.materialX ?? [:] {
+      guard let root = program.emission else { continue }
+      if k == 0 { program.emission = nil } else if program.instructions.count + 2 <= 64 {
+        var constant = GraphInstruction(); constant.value = SIMD4(repeating: k)
+        program.instructions.append(constant)
+        var scaled = GraphInstruction(); scaled.code = SIMD4(3, root, Int32(program.instructions.count - 1), 0)
+        program.instructions.append(scaled)
+        program.emission = Int32(program.instructions.count - 1)
+      }
+      state.materialX?[slot] = program
+    }
+    state.emissions = state.emissions?.mapValues { $0 * k }
+    p.scenes[6] = state
+    print("\(shot.name): imported emission scaled by \(k)")
   }
   if let hdri = shot.hdri {
     p.environmentData = try Data(contentsOf: URL(fileURLWithPath: hdri))
@@ -115,13 +150,22 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
   p.options.outputWidth = shot.width
   p.options.outputHeight = shot.height
   p.options.exportSamples = shot.samples ?? 1024
+  if let v = shot.depth { p.options.depth = v }
   try controller.restore(p)
-  controller.exportDenoise = true
-  controller.exportRaw = false
-  let url = outputFolder.appendingPathComponent(shot.name + ".png")
+  if let side = testRenderer.materials.graphTextureSide {
+    let materials = testRenderer.materials
+    let sizes = Dictionary(grouping: materials.graphTextures, by: { max($0.width, $0.height) }).mapValues(\.count).sorted { $0.key > $1.key }
+    print("\(shot.name): large textures decoded at reduced size (down to \(side) px) for the GPU texture budget; "
+      + "\(materials.uniqueTextureBytes(materials.graphTextures) >> 20) MiB of \(materials.textureBudget >> 20) MiB; longer sides "
+      + sizes.map { "\($0.key) x\($0.value)" }.joined(separator: ", "))
+  }
+  let raw = shot.raw ?? false
+  controller.exportDenoise = !raw
+  controller.exportRaw = raw
+  let url = outputFolder.appendingPathComponent(shot.name + (raw ? ".exr" : ".png"))
   try? FileManager.default.removeItem(at: url)
   let start = Date()
-  controller.startExport(url: url, hdr: false)
+  controller.startExport(url: url, hdr: raw)
   guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600),
     FileManager.default.fileExists(atPath: url.path)
   else { fputs("FAIL: \(shot.name) did not export\n", stderr); exit(1) }

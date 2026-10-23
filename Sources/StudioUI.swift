@@ -1361,6 +1361,9 @@ final class StudioController: NSViewController {
     if let resources {
       r.materials = resources
       resources.external = MaterialLibrary.ResidentTextures()
+      if let side = resources.graphTextureSide {
+        show("Large textures are shown at reduced resolution (down to \(side) px) to fit GPU memory; the project keeps the full-size images.")
+      }
     }
     project = p
     r.sceneIndex = p.scene
@@ -2029,27 +2032,29 @@ final class StudioController: NSViewController {
     guard !isBusy else { return }
     let record = undoRecord("Import OBJ")
     let document = snapshot()
-    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, (UUID, Int, Int)) in
+    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] () -> (ProjectDocument, (UUID, Int, Int, [String])) in
       guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
       var document = document  // The build runs on projectIOQueue with its own copy.
-      let objData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
-      guard let objText = String(data: objData, encoding: .utf8) else {
-        throw MaterialLibrary.error("OBJ must be UTF-8 text.")
-      }
+      // Memory-mapped and streamed: files of several GB parse without a text copy.
+      let objData = try self.readBounded(url, maximum: 1 << 40)
       var skipped = 0
-      let root = try document.appendOBJ(objText, name: url.lastPathComponent, skipped: &skipped)
-      return (document, (root, document.graph?.materials.last?.slot ?? 1, skipped))
+      var report: [String] = []
+      let root = try document.appendOBJ(objData, name: url.lastPathComponent, folder: url.deletingLastPathComponent(),
+        skipped: &skipped, report: &report)
+      return (document, (root, document.graph?.materials.last?.slot ?? 1, skipped, report))
     }) { [weak self] result in
       guard let self else { return }
       switch result {
-      case .success(let (root, slot, skipped)):
+      case .success(let (root, slot, skipped, report)):
         self.commit(record)
         self.selectedNode = root
         self.selectedSlot = slot
         self.frameMesh(recordUndo: false)
         self.changed()
-        if skipped > 0 {
-          self.show("Imported \(url.lastPathComponent); skipped \(skipped) degenerate faces.")
+        if skipped > 0 || !report.isEmpty {
+          self.show("Imported \(url.lastPathComponent)"
+            + (skipped > 0 ? "; skipped \(skipped) degenerate faces" : "")
+            + (report.isEmpty ? "." : "; see the import report in the scene hierarchy."))
         }
       case .failure(let error): self.showError(error.localizedDescription)
       }
@@ -2105,7 +2110,7 @@ final class StudioController: NSViewController {
         hi = simd_max(hi, p)
       }
     }
-    for t in lo.x <= hi.x || materials.meshLayout != nil ? UnsafeBufferPointer(rebasing: tris[..<0]) : tris {
+    for t in lo.x <= hi.x || materials.meshLayout != nil ? tris[0..<0] : tris[...] {
       if let graph = project.graph, let family, Int(t.uvc.w) > 0,
         !family.contains(graph.nodes[Int(t.uvc.w) - 1].id)
       {
@@ -2139,8 +2144,8 @@ final class StudioController: NSViewController {
       guard let self, let slot, self.renderer.materials === resources,
         self.renderer.sceneIndex == scene, self.renderer.interactionGeneration == generation
       else { return }
-      if slot >= 64, let graph = self.project.graph, graph.nodes.indices.contains(slot - 64) {
-        let node = graph.nodes[slot - 64]
+      if slot >= SceneLimits.materials, let graph = self.project.graph, graph.nodes.indices.contains(slot - SceneLimits.materials) {
+        let node = graph.nodes[slot - SceneLimits.materials]
         self.selectedNode = node.id
         self.selectedSubset = 0
         self.selectedSlot =

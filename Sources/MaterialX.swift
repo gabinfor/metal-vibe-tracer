@@ -42,6 +42,17 @@ struct MaterialXProgram: Codable {
   // (MSL SpectralMaterial): 20 x transmission_dispersion_scale / transmission_dispersion_abbe_number,
   // thin_film_weight, thin_film_thickness (micrometres) and thin_film_ior; nil when all are default.
   var spectral: SIMD4<Float>?
+  // Register holding OpenPBR geometry_opacity, or nil when it is unauthored or constant 1. The
+  // renderer keeps a hit with that probability (stochastic transparency; docs/SCENE_STORAGE_DESIGN.md,
+  // phase 4), so 0 is cut out and partial coverage is unbiased.
+  var opacity: Int32?
+  // Constant OpenPBR specular_color (a metal's 82-degree edge tint, a dielectric's specular tint),
+  // or nil for white. Constant only: the renderer stores it per slot (MaterialLibrary.slotParameters).
+  var specularColor: SIMD3<Float>?
+  // Constant OpenPBR transmission_color (nil for white) and geometry_thin_walled (nil for false),
+  // stored per slot like specular_color (MaterialLibrary.slotParameters).
+  var transmissionColor: SIMD3<Float>?
+  var thinWalled: Bool?
   static let noSpectral = SIMD4<Float>(0, 0, 0.5, 1.4)
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
@@ -53,6 +64,9 @@ struct MaterialXProgram: Codable {
     }
     if let root = emission, !(0..<instructions.count).contains(Int(root)) {
       throw MaterialLibrary.error("Invalid emission output.")
+    }
+    if let root = opacity, !(0..<instructions.count).contains(Int(root)) {
+      throw MaterialLibrary.error("Invalid opacity output.")
     }
     for (i, n) in instructions.enumerated() {
       guard (0...11).contains(n.code.x),
@@ -710,7 +724,6 @@ private final class MXCompiler {
       ("specular_weight", SIMD4(repeating: 1)), ("base_weight", SIMD4(repeating: 1)),
     ]
     let defaults: [String: SIMD4<Float>] = [
-      "specular_color": SIMD4(repeating: 1),
       "transmission_color": SIMD4(repeating: 1), "transmission_depth": .zero,
       "transmission_scatter": .zero, "transmission_scatter_anisotropy": .zero,
       "transmission_dispersion_scale": .zero,
@@ -721,8 +734,7 @@ private final class MXCompiler {
       "coat_color": SIMD4(repeating: 1), "coat_roughness_anisotropy": .zero,
       "coat_ior": SIMD4(repeating: 1.6), "coat_darkening": SIMD4(repeating: 1),
       "thin_film_weight": .zero, "thin_film_thickness": SIMD4(repeating: 0.5),
-      "thin_film_ior": SIMD4(repeating: 1.4), "geometry_opacity": SIMD4(repeating: 1),
-      "geometry_thin_walled": .zero,
+      "thin_film_ior": SIMD4(repeating: 1.4),
     ]
     // Dispersion and thin film: constants only (spectral transport; MaterialXProgram.spectral).
     let spectralNames = ["transmission_dispersion_scale", "transmission_dispersion_abbe_number", "thin_film_weight",
@@ -740,7 +752,9 @@ private final class MXCompiler {
       spectralValues[name] = v
     }
     for i in shader.children
-    where i.category == "input" && !["base_diffuse_roughness", "emission_luminance", "emission_color"].contains(i.name)
+    where i.category == "input"
+      && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity", "specular_color",
+           "transmission_color", "geometry_thin_walled"].contains(i.name)
       && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
     {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
@@ -795,9 +809,49 @@ private final class MXCompiler {
       let c = try value(color, default: SIMD4(1, 1, 1, 0), label: shader.name + "/emission_color")
       emissionRoot = try append(GraphInstruction(code: SIMD4(3, c, l, 0)))
     }
+    // Opacity (coverage): geometry_opacity, constant or connected. A constant 1 is opaque.
+    var opacityRoot: Int32?
+    if let input = shader.input("geometry_opacity") {
+      guard input.attributes["type"] == "float" else { try fail("geometry_opacity must be a float.") }
+      let constant = linked(input) ? Float(0) : try numbers(input, fallback: SIMD4(repeating: 1)).x
+      if linked(input) || constant < 1 {
+        opacityRoot = try value(input, default: SIMD4(repeating: 1), label: shader.name + "/geometry_opacity")
+      }
+    }
+    // specular_color: a constant colour (the renderer stores one per slot); white is the default.
+    var specularColor: SIMD3<Float>?
+    if let input = shader.input("specular_color") {
+      guard input.attributes["type"] == "color3", !linked(input) else {
+        try fail("specular_color must be a constant color3; connected specular colours are not supported.")
+      }
+      let c = try numbers(input, fallback: SIMD4(repeating: 1))
+      guard (0..<3).allSatisfy({ c[$0].isFinite && c[$0] >= 0 && c[$0] <= 1 }) else { try fail("specular_color must be within 0-1.") }
+      if (0..<3).contains(where: { abs(c[$0] - 1) > 1e-6 }) { specularColor = SIMD3(c.x, c.y, c.z) }
+    }
+    // transmission_color and geometry_thin_walled: constants, stored per slot like specular_color.
+    var transmissionColor: SIMD3<Float>?
+    if let input = shader.input("transmission_color") {
+      guard input.attributes["type"] == "color3", !linked(input) else {
+        try fail("transmission_color must be a constant color3; connected transmission colours are not supported.")
+      }
+      let c = try numbers(input, fallback: SIMD4(repeating: 1))
+      guard (0..<3).allSatisfy({ c[$0].isFinite && c[$0] >= 0 && c[$0] <= 1 }) else { try fail("transmission_color must be within 0-1.") }
+      if (0..<3).contains(where: { abs(c[$0] - 1) > 1e-6 }) { transmissionColor = SIMD3(c.x, c.y, c.z) }
+    }
+    var thinWalled: Bool?
+    if let input = shader.input("geometry_thin_walled") {
+      guard input.attributes["type"] == "boolean", !linked(input) else {
+        try fail("geometry_thin_walled must be a constant boolean.")
+      }
+      if try numbers(input, fallback: .zero).x > 0 { thinWalled = true }
+    }
     var program = MaterialXProgram(
       name: shader.name, source: source, instructions: nodes, roots: roots, images: images,
       parameters: parameters, diffuseRoughness: diffuseRoot, emission: emissionRoot)
+    program.opacity = opacityRoot
+    program.specularColor = specularColor
+    program.transmissionColor = transmissionColor
+    program.thinWalled = thinWalled
     let scale = spectralValues["transmission_dispersion_scale"] ?? 0
     let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
     let spectral = SIMD4<Float>(
@@ -813,21 +867,26 @@ extension MaterialLibrary {
   func prepareMaterialX(_ programs: [Int: MaterialXProgram]) throws {
     let candidate = try materialXCandidate(programs, images: images)
     let old = (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX)
-    let oldArgument = argumentBuffer
+    let oldArgument = argumentBuffer, oldSide = graphTextureSide
+    graphTextureSide = candidate.side
     graphInstructionBuffer = candidate.instructions
     graphHeaderBuffer = candidate.headers
     graphTextures = candidate.textures
     materialX = programs
-    do { try rebuildArguments(images) } catch {
+    do {
+      try rebuildArguments(images)
+      try refreshInstanceOpacity()
+    } catch {
       (graphInstructionBuffer, graphHeaderBuffer, graphTextures, materialX) = old
       argumentBuffer = oldArgument
+      graphTextureSide = oldSide
       throw error
     }
   }
   // Builds graph resources without publishing them. Texture checks count
   // `candidateImages` as the map set that will be published alongside.
   func materialXCandidate(_ programs: [Int: MaterialXProgram], images candidateImages: [MTLTexture]) throws
-    -> (instructions: MTLBuffer, headers: MTLBuffer, textures: [MTLTexture])
+    -> (instructions: MTLBuffer, headers: MTLBuffer, textures: [MTLTexture], side: Int?)
   {
     var instructions: [GraphInstruction] = []
     var headers = Array(repeating: GraphHeader(), count: SceneLimits.materials)
@@ -849,6 +908,43 @@ extension MaterialLibrary {
         }
       }
     }
+    // When the decoded images would not fit `textureBudget`, the largest one is halved (its longer
+    // side capped; images of 256 texels or less are never reduced) until the estimate fits, so large textures shrink first and small
+    // ones stay exact. The estimate counts the live and replaced libraries' textures, as the peak
+    // check does; a texture is reused only at its chosen size.
+    func header(_ data: Data) -> (width: Int, height: Int, depth: Int)? { Self.imageHeader(data) }
+    var unique: [(data: Data, srgb: Bool, header: (width: Int, height: Int, depth: Int))] = []
+    var seen: [Set<Data>] = [[], []]
+    for slot in programs.keys.sorted() {
+      for image in programs[slot]?.images ?? [] where seen[image.srgb ? 1 : 0].insert(image.data).inserted {
+        if let h = header(image.data) { unique.append((image.data, image.srgb, h)) }
+      }
+    }
+    func reused(_ data: Data, _ srgb: Bool, _ h: (width: Int, height: Int, depth: Int), side: Int?) -> MTLTexture? {
+      guard let texture = reusable[srgb ? 1 : 0][data] else { return nil }
+      let size = Self.cappedSize(h.width, h.height, side: side)
+      return abs(texture.width - size.width) <= 1 && abs(texture.height - size.height) <= 1 ? texture : nil
+    }
+    func estimate(_ i: Int, _ side: Int?) -> UInt64 {
+      let h = unique[i].header
+      if reused(unique[i].data, unique[i].srgb, h, side: side) != nil { return 0 }  // counted in `fixed`
+      let size = Self.cappedSize(h.width, h.height, side: side)
+      return Self.estimatedTextureBytes(pixels: UInt64(size.width) * UInt64(size.height), depth: h.depth).partialValue
+    }
+    var sides = [Int?](repeating: nil, count: unique.count)
+    var costs = unique.indices.map { estimate($0, nil) }
+    var total = costs.reduce(uniqueTextureBytes(residentTextures + external.textures + candidateImages), &+)
+    while total > textureBudget, let i = costs.indices.max(by: { costs[$0] < costs[$1] }), costs[i] > 0 {
+      let longer = sides[i] ?? max(unique[i].header.width, unique[i].header.height)
+      guard longer > 256 else { break }
+      sides[i] = longer / 2
+      let cost = estimate(i, sides[i])
+      total = total - costs[i] + cost
+      costs[i] = cost
+    }
+    var chosen: [[Data: Int]] = [[:], [:]]
+    for (i, image) in unique.enumerated() { if let side = sides[i] { chosen[image.srgb ? 1 : 0][image.data] = side } }
+    let side = sides.compactMap { $0 }.min()
     bindings = [[:], [:]]
     for slot in programs.keys.sorted() {
       guard (0..<SceneLimits.materials).contains(slot), let program = programs[slot] else {
@@ -862,16 +958,17 @@ extension MaterialLibrary {
           continue
         }
         guard textures.count < SceneLimits.graphImages else {
-          throw Self.error("Scene exceeds 128 MaterialX images.")
+          throw Self.error("Scene exceeds \(SceneLimits.graphImages) MaterialX images.")
         }
         bindings[image.srgb ? 1 : 0][image.data] = textures.count
         imageIndices.append(textures.count)
-        if let texture = reusable[image.srgb ? 1 : 0][image.data] {
+        let imageSide = chosen[image.srgb ? 1 : 0][image.data]
+        if let h = header(image.data), let texture = reused(image.data, image.srgb, h, side: imageSide) {
           textures.append(texture)
           continue
         }
-        try validateEncodedImage(image.data, pending: candidateImages + textures)
-        let texture = try decodeTexture(image.data, srgb: image.srgb)
+        try validateEncodedImage(image.data, maximumSide: imageSide, pending: candidateImages + textures)
+        let texture = try decodeTexture(image.data, srgb: image.srgb, maximumSide: imageSide)
         try validateDecodedTexture(texture, encodedBytes: image.data.count, pending: candidateImages + textures)
         textures.append(texture)
         try validateCandidateTextures(images: candidateImages, graph: textures)
@@ -901,6 +998,6 @@ extension MaterialLibrary {
       })
     else { throw Self.error("Could not allocate MaterialX graph buffers.") }
     try validateCandidateTextures(images: candidateImages, graph: textures)
-    return (instructionBuffer, headerBuffer, textures)
+    return (instructionBuffer, headerBuffer, textures, side)
   }
 }

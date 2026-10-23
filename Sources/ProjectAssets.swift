@@ -17,24 +17,34 @@ import Synchronization
 //   "assetTable":   {"sha256:<hex>": {"size": <bytes>, "data": "<base64>"}}  ("data" absent: sidecar)
 //   "meshData":     {"<MeshAsset.id>": "sha256:<hex>"}  scene-graph mesh triangles
 //   "triangleData": "sha256:<hex>"                      legacy flat mesh triangles
-// Mesh payloads are the MeshTriangle array's bytes: 32 little-endian Float32 values per
-// triangle in field order a, b, c, na, nb, nc, uvab, uvc. The corresponding "triangles"
-// arrays in the document are empty.
+// The legacy flat mesh payload is the MeshTriangle array's bytes: 32 little-endian Float32
+// values per triangle in field order a, b, c, na, nb, nc, uvab, uvc. Scene-graph mesh payloads
+// are the same in format 3; since format 4 (docs/SCENE_STORAGE_DESIGN.md, phase 3) they are
+// MeshGeometry.payload ("VTMESH01", counts, 32-byte vertices, 16-byte faces), about a quarter
+// of the size. Format 3 mesh payloads are welded on load. The corresponding "triangles" arrays
+// in the document are empty.
 enum ProjectAssets {
-  static let formatVersion = 3
+  static let formatVersion = 4
   static let sidecarFolderName = "AutosaveAssets"
   static let referencePrefix = "sha256:"
   static let triangleBytes = MemoryLayout<MeshTriangle>.stride
-  // Bounds checked before any payload is decoded, read or uploaded. An entry holds at most
-  // the environment (256 MiB); images count against ProjectDocument.embeddedAssetLimit and
-  // meshes against the stored (graph) and legacy flat triangle limits.
-  static let maximumEntryBytes = 256 * 1024 * 1024
-  static let maximumMeshBytes = 2 * SceneLimits.triangles * triangleBytes
+  // Bounds checked before any payload is decoded, read or uploaded. An entry holds at most the
+  // largest single payload: the environment (256 MiB) or one mesh asset of the stored-triangle
+  // limit (header and 112 bytes per face). Images count against ProjectDocument.embeddedAssetLimit
+  // and meshes against the stored (graph) and legacy flat triangle limits; validate() checks each
+  // kind's own size, so Save never writes an entry Open rejects.
+  static let maximumEntryBytes = max(256 * 1024 * 1024, 16 + SceneLimits.triangles * 112)
+  // Formats 1-3: flat and graph triangles of 128 bytes; format 4 graph meshes at most 112 bytes
+  // per face (three unshared vertices and the face).
+  static let maximumMeshBytes = 2 * SceneLimits.flatTriangles * triangleBytes + SceneLimits.triangles * 112
   static let maximumTableBytes = ProjectDocument.embeddedAssetLimit + maximumMeshBytes
-  // Seven scenes of maps and MaterialX images, the environment, the flat mesh and at most
-  // one entry per stored triangle for mesh assets.
+  // Seven scenes of maps and MaterialX images, the environment, the flat mesh and the mesh
+  // assets. Mesh entries keep the former bound of one per stored triangle at 16 M triangles: it
+  // no longer follows SceneLimits.triangles (an addressing bound since 2026-10-21), and real
+  // documents hold one asset per object.
+  static let maximumMeshEntries = 16_000_000
   static let maximumEntries =
-    7 * SceneLimits.materials * (4 + SceneLimits.graphImages) + 2 + SceneLimits.triangles
+    7 * SceneLimits.materials * (4 + SceneLimits.graphImages) + 2 + maximumMeshEntries
   // Unreferenced sidecars younger than this are kept, so payloads another writer stored
   // but has not referenced yet survive a collection.
   static let sidecarGracePeriod: TimeInterval = 600
@@ -276,12 +286,15 @@ enum ProjectAssets {
         for (i, asset) in graph.assets.enumerated() where indices[asset.id] == nil { indices[asset.id] = i }
         var stored = 0
         for (id, reference) in meshes {
-          guard let uuid = UUID(uuidString: id), let i = indices[uuid], graph.assets[i].triangles.isEmpty,
+          guard let uuid = UUID(uuidString: id), let i = indices[uuid], graph.assets[i].geometry.isEmpty,
             let data = table[reference]
           else { throw invalid("a mesh reference is dangling.") }
-          stored += data.count / triangleBytes
+          let geometry = data.prefix(8) == MeshGeometry.magic
+            ? try MeshGeometry(payload: data, maximumFaces: SceneLimits.triangles - stored)
+            : MeshGeometry(triangles: try triangles(data))
+          stored += geometry.count
           guard stored <= SceneLimits.triangles else { throw invalid("stored meshes exceed the triangle limit.") }
-          graph.assets[i].triangles = try triangles(data)
+          graph.assets[i].geometry = geometry
         }
         document.graph = graph
       }
@@ -379,6 +392,7 @@ extension ProjectDocument {
     let collector = ProjectAssets.Collector()
     var copy = self
     copy.version = ProjectAssets.formatVersion
+    copy.scenes = copy.scenes.mapValues { $0.trimmed }
     var triangleData: String?
     if !copy.triangles.isEmpty {
       triangleData = collector.intern(ProjectAssets.triangleData(copy.triangles))
@@ -386,9 +400,9 @@ extension ProjectDocument {
     }
     var meshData: [String: String] = [:]
     if var graph = copy.graph {
-      for i in graph.assets.indices where !graph.assets[i].triangles.isEmpty {
-        meshData[graph.assets[i].id.uuidString] = collector.intern(ProjectAssets.triangleData(graph.assets[i].triangles))
-        graph.assets[i].triangles = []
+      for i in graph.assets.indices where !graph.assets[i].geometry.isEmpty {
+        meshData[graph.assets[i].id.uuidString] = collector.intern(graph.assets[i].geometry.payload)
+        graph.assets[i].geometry = MeshGeometry()
       }
       copy.graph = graph
     }
@@ -415,7 +429,11 @@ extension ProjectDocument {
       }
       return try resolver.data(decoder)
     }
-    return try decoder.decode(ProjectAssets.DecodedFile.self, from: data).document
+    var document = try decoder.decode(ProjectAssets.DecodedFile.self, from: data).document
+    // Files store each scene's slots up to the last one in use (encodedProject); in memory every
+    // state has the full SceneLimits.materials capacity.
+    document.scenes = document.scenes.mapValues { $0.padded }
+    return document
   }
   // Writes an autosave or recovery copy: payloads missing from AutosaveAssets/ first (each
   // atomically), then the JSON atomically, then unreferenced sidecars are collected. A

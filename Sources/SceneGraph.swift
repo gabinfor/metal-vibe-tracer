@@ -4,19 +4,61 @@ import simd
 // REFERENCES.md: PBRT2023, OBJ2026, MATERIALX. Local scene model and GPU bridge.
 // Stable document IDs are independent of GPU slots and BVH triangle ordering.
 enum SceneLimits {
-  static let materials = 64
-  static let graphImages = 128
-  static let nodes = 256
-  // Stored (unique) mesh triangles: document assets, the graph-less mesh and the flat BVH.
-  static let triangles = 1_000_000
-  // Rendered triangles: instances of the stored ones (two-level acceleration only).
-  static let renderedTriangles = 64_000_000
+  // GPU capacities (MSL MATERIAL_SLOTS and GRAPH_IMAGES; docs/SCENE_STORAGE_DESIGN.md phase 2).
+  static let materials = 1024
+  static let graphImages = 4096
+  // Slots a new SceneState stores; states grow to the slot they use (SceneState.reserve).
+  static let storedMaterials = 64
+  // Object IDs of imported nodes start at `materials` and are 32-bit.
+  static let nodes = 65_535
+  // Stored (unique) mesh triangles: document assets and the graph-less mesh. This is an
+  // addressing bound (global vertex and face offsets are 32-bit); what a Mac can render is
+  // decided by MaterialLibrary.meshBudget, which scales with its GPU memory (about 16 M
+  // triangles on a 16 GB M4, many times that on larger Macs).
+  static let triangles = 1 << 30
+  // The flat reference BVH (128-byte world triangles) and project formats 1-3, which predate
+  // the indexed geometry, hold at most this many.
+  static let flatTriangles = 1_000_000
+  // Rendered triangles: instances of the stored ones (two-level acceleration only). Rendered
+  // IDs are 32-bit (HitRecord.triangle, 0xffffffff for analytic hits); instances cost 144 bytes
+  // each, so this is an addressing bound, not a memory one.
+  static let renderedTriangles = Int(Int32.max)
 }
 struct MeshAsset: Codable {
   var id = UUID()
   var name: String
-  var triangles: [MeshTriangle]
+  // Indexed geometry (MeshGeometry); faces' subsets index `subsets`.
+  var geometry: MeshGeometry
   var subsets: [String]
+  init(id: UUID = UUID(), name: String, geometry: MeshGeometry, subsets: [String]) {
+    self.id = id; self.name = name; self.geometry = geometry; self.subsets = subsets
+  }
+  init(id: UUID = UUID(), name: String, triangles: [MeshTriangle], subsets: [String]) {
+    self.init(id: id, name: name, geometry: MeshGeometry(triangles: triangles), subsets: subsets)
+  }
+  // A MeshTriangle view for small meshes, tools and tests: reading decodes every face and
+  // writing re-welds, so large-mesh code paths use `geometry`.
+  var triangles: [MeshTriangle] {
+    get { geometry.triangles }
+    set { geometry = MeshGeometry(triangles: newValue) }
+  }
+  // JSON keeps the MeshTriangle array of project formats 1 and 2 (format 3 and later store
+  // mesh payloads separately and leave it empty).
+  enum CodingKeys: String, CodingKey { case id, name, triangles, subsets }
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+    name = try c.decode(String.self, forKey: .name)
+    geometry = MeshGeometry(triangles: try c.decode([MeshTriangle].self, forKey: .triangles))
+    subsets = try c.decode([String].self, forKey: .subsets)
+  }
+  func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(id, forKey: .id)
+    try c.encode(name, forKey: .name)
+    try c.encode(geometry.triangles, forKey: .triangles)
+    try c.encode(subsets, forKey: .subsets)
+  }
 }
 struct SceneMaterial: Codable {
   var id = UUID()
@@ -35,8 +77,9 @@ struct SceneNode: Codable {
 struct OBJPart {
   var object: String
   var group: String
-  var triangles: [MeshTriangle] = []
+  var geometry = MeshGeometry()
   var subsets: [String] = []
+  var triangles: [MeshTriangle] { geometry.triangles }
 }
 struct SceneGraph: Codable {
   var assets: [MeshAsset] = []
@@ -48,8 +91,13 @@ struct SceneGraph: Codable {
     return try addOBJ(text, name: name, skipped: &skipped)
   }
   mutating func addOBJ(_ text: String, name: String, skipped: inout Int) throws -> UUID {
+    var libraries: [String] = []
+    return try addOBJ(Data(text.utf8), name: name, skipped: &skipped, libraries: &libraries)
+  }
+  mutating func addOBJ(_ data: Data, name: String, skipped: inout Int, libraries: inout [String]) throws -> UUID {
     // The root node is created below; each object and part adds one more.
-    let parts = try OBJMesh.parts(text, skipped: &skipped, nodeBudget: SceneLimits.nodes - nodes.count - 1)
+    let parts = try OBJMesh.parts(data, skipped: &skipped, nodeBudget: SceneLimits.nodes - nodes.count - 1,
+      libraries: &libraries)
     let root = SceneNode(name: name)
     nodes.append(root)
     var parents: [String: UUID] = [:]
@@ -64,7 +112,7 @@ struct SceneGraph: Codable {
         parents[part.object] = object.id
         parent = object.id
       }
-      let asset = MeshAsset(name: part.group, triangles: part.triangles, subsets: part.subsets)
+      let asset = MeshAsset(name: part.group, geometry: part.geometry, subsets: part.subsets)
       assets.append(asset)
       var bindings: [UUID] = []
       for name in part.subsets {
@@ -84,7 +132,7 @@ struct SceneGraph: Codable {
   mutating func addMaterial(_ name: String) throws -> SceneMaterial {
     let used = Set(materials.map(\.slot))
     guard let slot = (8..<SceneLimits.materials).first(where: { !used.contains($0) }) else {
-      throw MaterialLibrary.error("This scene has reached the 56 imported-material limit.")
+      throw MaterialLibrary.error("This scene has reached the \(SceneLimits.materials - 8) imported-material limit.")
     }
     let material = SceneMaterial(name: name, slot: slot)
     materials.append(material)
@@ -144,7 +192,7 @@ struct SceneGraph: Codable {
   func sameGeometry(as other: SceneGraph) -> Bool {
     guard assets.count == other.assets.count, nodes.count == other.nodes.count else { return false }
     for (a, b) in zip(assets, other.assets) {
-      guard a.id == b.id, a.subsets.count == b.subsets.count, sameBytes(a.triangles, b.triangles)
+      guard a.id == b.id, a.subsets.count == b.subsets.count, a.geometry.same(as: b.geometry)
       else { return false }
     }
     for (a, b) in zip(nodes, other.nodes) {
@@ -178,23 +226,19 @@ struct SceneGraph: Codable {
     var triangles = 0
     var storedTriangles = 0
     for asset in assets {
-      storedTriangles += asset.triangles.count
+      storedTriangles += asset.geometry.count
       guard !asset.subsets.isEmpty else {
         try fail("mesh has no material subsets.")
         return
       }
-      for t in asset.triangles {
-        guard
-          [t.a, t.b, t.c, t.na, t.nb, t.nc, t.uvab, t.uvc].allSatisfy({ p in
-            (0..<4).allSatisfy { p[$0].isFinite && abs(p[$0]) < 1e8 }
-          }),
-          t.a.w == 1, t.b.w == 1, t.c.w == 1,
-          t.na.w == 0, t.nb.w == 0, t.nc.w == 0,
-          t.uvc.z >= 0, t.uvc.z < Float(asset.subsets.count), t.uvc.z.rounded() == t.uvc.z
-        else {
-          try fail("invalid triangle or subset.")
-          return
-        }
+      // Every vertex attribute finite and below 1e8; faces index vertices and subsets.
+      let vertexCount = UInt32(asset.geometry.vertices.count), subsetCount = UInt32(asset.subsets.count)
+      let limit = SIMD8<Float>(repeating: 1e8)
+      guard asset.geometry.vertices.allSatisfy({ v in all(simd_abs(v) .< limit) }),
+        asset.geometry.faces.allSatisfy({ f in f.x < vertexCount && f.y < vertexCount && f.z < vertexCount && f.w < subsetCount })
+      else {
+        try fail("invalid triangle or subset.")
+        return
       }
     }
     guard storedTriangles <= SceneLimits.triangles else {
@@ -244,7 +288,7 @@ struct SceneGraph: Codable {
           try fail("missing mesh or material binding.")
           return
         }
-        triangles += asset.triangles.count
+        triangles += asset.geometry.count
       }
     }
     guard triangles <= SceneLimits.renderedTriangles else {
@@ -292,7 +336,7 @@ struct SceneGraph: Codable {
   // The number of triangles forEachRenderTriangle visits (visible mesh instances).
   func renderTriangleCount() throws -> Int {
     try validate()
-    let counts = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0.triangles.count) })
+    let counts = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0.geometry.count) })
     return nodes.reduce(0) { total, node in
       guard let id = node.mesh, let count = counts[id], !worldTransform(node.id).1 else { return total }
       return total + count
@@ -325,7 +369,8 @@ struct SceneGraph: Codable {
               SIMD3(world.columns.2.x, world.columns.2.y, world.columns.2.z)
             ))))
       let slots = node.bindings.map { slotsByID[$0]! }
-      for var t in asset.triangles {
+      for i in 0..<asset.geometry.count {
+        var t = asset.geometry.triangle(i)
         let subset = Int(t.uvc.z)
         let slot = slots[subset]
         t.a = world * t.a
@@ -372,6 +417,13 @@ extension ProjectDocument {
     return try appendOBJ(text, name: name, skipped: &skipped)
   }
   mutating func appendOBJ(_ text: String, name: String, skipped: inout Int) throws -> UUID {
+    var report: [String] = []
+    return try appendOBJ(Data(text.utf8), name: name, folder: nil, skipped: &skipped, report: &report)
+  }
+  // `folder` resolves the OBJ's mtllib files (OBJMaterials); nil imports without materials.
+  mutating func appendOBJ(_ data: Data, name: String, folder: URL?, skipped: inout Int, report: inout [String]) throws
+    -> UUID
+  {
     var p = self
     var graph = p.graph ?? SceneGraph()
     if p.graph == nil, !p.triangles.isEmpty {
@@ -408,8 +460,31 @@ extension ProjectDocument {
       }
       p.scenes[6] = migrated
     }
-    let root = try graph.addOBJ(
-      text, name: name, skipped: &skipped)
+    let existing = graph.materials.count
+    var libraries: [String] = []
+    let root = try graph.addOBJ(data, name: name, skipped: &skipped, libraries: &libraries)
+    if let folder, !libraries.isEmpty {
+      let added = graph.materials[existing...]
+      let (programs, colors) = try OBJMaterials.programs(
+        libraries: libraries, folder: folder, names: Set(added.map(\.name)), report: &report)
+      var state = p.scenes[6] ?? SceneState()
+      for material in added {
+        if let kd = colors[material.name] {
+          state.surfaces[material.slot].enabled = 1
+          state.surfaces[material.slot].color = SIMD4(simd_clamp(kd, .zero, SIMD3(repeating: 1)), 1)
+        }
+        if let program = programs[material.name] {
+          if state.materialX == nil { state.materialX = [:] }
+          state.materialX?[material.slot] = program
+        }
+      }
+      p.scenes[6] = state
+      guard p.embeddedAssetBytes <= ProjectDocument.embeddedAssetLimit else {
+        throw MaterialLibrary.error(
+          "\(name)'s textures need \(p.embeddedAssetBytes >> 20) MiB, beyond the \(ProjectDocument.embeddedAssetLimit >> 20) MiB of images a project embeds.")
+      }
+    }
+    if !report.isEmpty { p.importReport = (p.importReport ?? []) + ["\(name):"] + report }
     p.graph = graph
     p.triangles = []
     p.meshName = "\(graph.assets.count) meshes"

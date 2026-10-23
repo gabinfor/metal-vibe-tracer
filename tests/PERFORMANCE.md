@@ -1,3 +1,44 @@
+# Indexed documents and 10 M-triangle publishes — October 20, 2026
+
+`python3 scripts/measure_mesh_memory.py 999698 9999392` (one welded grid asset built as `MeshGeometry`, 0.50 vertices per triangle; Apple M4, macOS 27.0.1):
+
+| Triangles | Traversal | Document | GPU faces + vertices + BLAS | Hardware BLAS | GPU total | Publish |
+| --- | --- | --- | --- | --- | --- | --- |
+| 999,698 | software | 32.0 B | 16.0 + 16.0 + 32.2 | — | 64.2 B (61 MiB) | 0.11 s |
+| 999,698 | hardware | 32.0 B | 16.0 + 16.0 + 32.2 | 86.1 | 150.3 B (143 MiB) | 0.19 s |
+| 9,999,392 | software | 32.0 B | 16.0 + 16.0 + 28.3 | — | 60.3 B (575 MiB) | 1.07 s |
+| 9,999,392 | hardware | 32.0 B | 16.0 + 16.0 + 28.3 | 86.1 | 146.4 B (1,396 MiB) | 2.31 s |
+
+Publishing no longer welds (the document is already indexed), so 1 M-triangle publishes take 0.11 / 0.19 s instead of 0.28 / 0.36 s.
+
+# 1,024-slot material table — October 20, 2026
+
+Phase 2 of `docs/SCENE_STORAGE_DESIGN.md` against `main` (`ec31256`), Apple M4, export path, raw EXR, two alternating rounds: ASWF Shader Ball (960×720, 256 spp, ReSTIR PT and spectral defaults) 195 / 191 s on `main` and 193 / 189 s with the larger argument buffer and the settings buffer; built-in Pavilion (960×540, 256 spp) 16 / 15 s and 15 / 15 s. Both images are byte-identical to `main`.
+
+# Indexed mesh storage — October 20, 2026
+
+`python3 scripts/measure_mesh_memory.py 999698` (production `MaterialLibrary.setMesh` of one 999,698-triangle welded grid asset, 501,264 vertices; Apple M4, macOS 27.0.1). Resident `meshBytes` per triangle:
+
+| Traversal | Faces | Vertices | BLAS nodes | Hardware BLAS | Total | Publish |
+| --- | --- | --- | --- | --- | --- | --- |
+| Software two-level | 16.0 | 16.0 | 32.2 | — | 64.2 B (61 MiB) | 0.28 s |
+| Hardware | 16.0 | 16.0 | 32.2 | 86.1 | 150.3 B (143 MiB) | 0.36 s |
+
+The previous layout stored 128 B per triangle plus the BLAS nodes in the same buffer (about 160 B in software, 246 B with hardware traversal). Renders are byte-identical to the previous layout (Shader Ball raw EXR, MIS/RGB and ReSTIR PT/spectral).
+
+# Hardware acceleration-structure layouts — October 20, 2026
+
+Apple M4, macOS 27.0.1. `xcrun swiftc -O -swift-version 6 scripts/measure_acceleration.swift -o build/measure_acceleration && build/measure_acceleration 1000000 10000000`. The fixture is a welded displaced grid; each case builds and compacts one primitive structure. Throughput is closest-hit rays with random origins and directions inside the grid's box (4 M rays, best of three passes).
+
+| BLAS input | Shared-edge leaks | B/triangle (compacted) | 10 M build + compaction | 10 M Mrays/s |
+| --- | --- | --- | --- | --- |
+| `MeshTriangle` records (production) | 0 | 86.1 | 0.92 s | 379 |
+| Unwelded `float3` + identity indices | 0 | 86.1 | 0.90 s | 378 |
+| Unwelded `float3`, no indices | 25 / 29,196 | 45.0 (44.2 with `MinimizeMemory`) | 0.46 s | 449 |
+| Welded `float3` + indices | 25 / 29,196 | 45.0 | 0.40 s | 446 |
+
+`PreferFastIntersection` and `MinimizeMemory` change neither leaks nor watertight sizes. The 1 M-triangle throughput runs were disturbed by another GPU job (282–1,151 Mrays/s across repeats) and are not reported. Leak counts are identical across all three usage flags.
+
 # Dispersion sampling — October 4, 2026
 
 `DispersionSampling` (`REFERENCES.md` "October 4 dispersion sampling", `HERO2014`, `CMIS2020`; [docs/SPECTRAL_DESIGN.md](../docs/SPECTRAL_DESIGN.md) §13) against the earlier hero-wavelength termination. Setup: Apple M4, spectral transport, Cornell glass & mirror (scene 3) with the glass sphere (slot 5) as smooth legacy dielectric or rough OpenPBR glass (IOR 1.52), OpenPBR dispersion 1 (Abbe 20) or 0.5 (Abbe 40), and a prism (imported mesh, scene 6). 240×180, MIS strategy, 64 frames with the Z++ sampler, against a 2,048-frame reference rendered with PCG (independent numbers) by spectral MIS with splitting. Linear MSE over the image (and over the glass and mirror pixels). Scratch drivers through the production `renderFrame` path; the shaders measured equal the committed ones except the spectral MIS overlap gate, which the sweep varied (the committed gate, 0.25, disables spectral MIS exactly where the sweep found no gain: the roughness 0.03–0.05 rows).

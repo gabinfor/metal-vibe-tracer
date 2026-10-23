@@ -36,10 +36,11 @@ kernel void openpbr_adapter_checks(device float4 *out [[buffer(0)]], uint index 
 }
 kernel void texture_value_checks(device float4 *out [[buffer(0)]],
     constant MaterialResources &images [[buffer(2)]]) {
-    out[0] = sample_material_map(images, 1, 0, float2(0.25f), float2(1), 0);
-    out[1] = sample_material_map(images, 1, 1, float2(0.25f), float2(1), 0);
-    out[2] = sample_material_map(images, 1, 0, float2(1.25f), float2(1), 0);
-    out[3] = sample_material_map(images, 1, 0, float2(0.25f), float2(1), 1);
+    TextureFootprint point = {}, whole = { float2(1, 0), float2(0, 1) };
+    out[0] = sample_material_map(images, 1, 0, float2(0.25f), point);
+    out[1] = sample_material_map(images, 1, 1, float2(0.25f), point);
+    out[2] = sample_material_map(images, 1, 0, float2(1.25f), point);
+    out[3] = sample_material_map(images, 1, 0, float2(0.25f), whole);
 }
 """
 let adapterLibrary = try gpu.makeLibrary(source: metalSource + adapterChecks, options: shaderCompileOptions())

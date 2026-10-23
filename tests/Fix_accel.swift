@@ -114,7 +114,7 @@
       Ray r={rays[2*id].xyz,rays[2*id+1].xyz}; HitRecord h;
       float scale=rays[2*id].w;
       out[id]=float4(0);
-      if(!trace_scene(r,6,h,images,u) || h.objectID<64) return;
+      if(!trace_scene(r,6,h,images,u) || h.objectID<MATERIAL_SLOTS) return;
       uint seed=id*977u+3u; float self=0, shadowed=0;
       for(int k=0;k<16;++k) {
           float3 d=sample_cosine_hemisphere(k<8 ? h.geometricNormal : -h.geometricNormal,seed);
@@ -136,7 +136,7 @@
       float tMin=ray_t_min(r.origin,u), best=1e20f; int index=-1; HitRecord p;
       if(trace_scene(r,6,p,images.objects,u.light.w,u.light.xyz,tMin)) best=p.t;
       WatertightRay w=watertight_ray(r);
-      for(uint i=0;i<triangles;++i) { float t,b1,b2; if(intersect_mesh_triangle(images.triangles[i],w,tMin,best,t,b1,b2)) { best=t; index=int(i); } }
+      for(uint i=0;i<triangles;++i) { float t,b1,b2; if(intersect_mesh_triangle(stored_triangle(i,images),w,tMin,best,t,b1,b2)) { best=t; index=int(i); } }
       out[id]=float4(best<1e19f ? best : -1.0f, float(index), 0, 0);
   }
   """
@@ -280,7 +280,7 @@
         if x.t < 0 { continue }
         worst[kind] = max(worst[kind], abs(x.t - reference) / max(1e-30, x.error))
         if x.occluded != y.occluded && abs(rays[2 * i].w - x.t) > 2 * x.error { occlusion += 1 }
-        guard x.object >= 64 || y.object >= 64 else { continue }
+        guard x.object >= SceneLimits.materials || y.object >= SceneLimits.materials else { continue }
         meshHits += 1
         // The rendered-triangle ID names the flat BVH's world triangle, except at an exact tie on a
         // shared edge (equal t), where either neighbour is the closest hit.
@@ -332,7 +332,7 @@
         }
       }
       let hits = try trace(two, rays)
-      let closestMisses = hits.filter { $0.t < 0 || $0.object < 64 }.count, anyMisses = hits.filter { !$0.occluded }.count
+      let closestMisses = hits.filter { $0.t < 0 || $0.object < SceneLimits.materials }.count, anyMisses = hits.filter { !$0.occluded }.count
       print("\(mode) instanced watertightness: \(hits.count) rays at shared edges/vertices of \(matrices.count) instances, \(closestMisses) closest-hit misses, \(anyMisses) any-hit misses")
       require(closestMisses == 0 && anyMisses == 0, "rays at shared edges and vertices never pass between instanced triangles")
 
@@ -385,7 +385,7 @@
       }
       let x = try trace(two, rays), y = try trace(flat, rays)
       var mismatched = 0, compared = [0, 0, 0]
-      for i in x.indices where x[i].object >= 64 && y[i].object >= 64 {
+      for i in x.indices where x[i].object >= SceneLimits.materials && y[i].object >= SceneLimits.materials {
         let a = x[i], b = y[i]
         guard simd_distance(a.a, b.a) <= 1e-5 * max(1, simd_length(b.a)) else { continue }  // shared-edge ties
         compared[i / 3000] += 1
@@ -482,43 +482,45 @@
       var hit = try probe(3)
       // Hardware traversal builds a primitive acceleration structure beside each software BLAS.
       let perAsset = mode == .hardware ? 2 : 1
-      require(l.assetBuildCount == 2 * perAsset && l.sceneBuildCount == 1 && hit.object == 65, "initial publish builds both assets once")
-      let buffer = l.triangleBuffer!, builds = l.assetBuildCount
+      require(l.assetBuildCount == 2 * perAsset && l.sceneBuildCount == 1 && hit.object == SceneLimits.materials + 1, "initial publish builds both assets once")
+      // Two-level geometry lives in the streams (faces, vertices, BLAS nodes); a kept face
+      // buffer means no asset was rebuilt or re-encoded.
+      let streams = l.meshStreams!, buffer = streams.faces, builds = l.assetBuildCount
       var moved = graph
       moved.nodes[1].transform.positionScale.x = 6
       try l.setMesh(moved)
       hit = try probe(6)
       var vacated = try probe(3)
-      require(l.triangleBuffer === buffer && l.assetBuildCount == builds && l.sceneBuildCount == 2
-        && hit.object == 65 && vacated.object < 64, "a transform edit rebuilds only the top level")
+      require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.sceneBuildCount == 2
+        && hit.object == SceneLimits.materials + 1 && vacated.object < SceneLimits.materials, "a transform edit rebuilds only the top level")
       var hidden = moved
       hidden.nodes[2].transform.rotationHidden.w = 1
       try l.setMesh(hidden)
       vacated = try probe(-3)
-      require(l.triangleBuffer === buffer && l.assetBuildCount == builds && l.renderedTriangleCount == 2 * first.count
-        && vacated.object < 64, "a visibility edit rebuilds only the top level")
+      require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.renderedTriangleCount == 2 * first.count
+        && vacated.object < SceneLimits.materials, "a visibility edit rebuilds only the top level")
       var rebound = hidden
       rebound.nodes[1].bindings = [m1.id]
       let meshBuilds = l.meshBuildCount, instances = l.meshLayout?.scene
       try l.setMeshBindings(rebound)
       hit = try probe(6)
       let kept = try probe(0)
-      require(l.triangleBuffer === buffer && l.assetBuildCount == builds && l.meshBuildCount == meshBuilds
+      require(l.meshStreams?.faces === buffer && l.assetBuildCount == builds && l.meshBuildCount == meshBuilds
         && hit.slot == m1.slot && kept.slot == m0.slot && l.meshLayout?.scene === instances
         && (mode != .hardware || instances != nil), "a binding edit rewrites only the slot table (no acceleration-structure work)")
       var edited = rebound
       edited.assets[1].triangles = patch(14).triangles
       edited.nodes[2].transform.rotationHidden.w = 0
       let firstRegion = l.meshLayout!.assets[0]
-      let before = Data(bytes: l.triangleBuffer.contents().advanced(by: firstRegion.triangleBase * 128), count: firstRegion.count * 128)
+      let before = (0..<firstRegion.count).map { l.orderedTriangles[firstRegion.triangleBase + $0] }
       try l.setMesh(edited)
       let reused = l.meshLayout!.assets[0]
-      let after = Data(bytes: l.triangleBuffer.contents().advanced(by: reused.triangleBase * 128), count: reused.count * 128)
-      let nodesBefore = Data(bytes: buffer.contents().advanced(by: firstRegion.nodeBase * 128), count: firstRegion.nodeCount * 128)
-      let nodesAfter = Data(bytes: l.triangleBuffer.contents().advanced(by: reused.nodeBase * 128), count: reused.nodeCount * 128)
+      let after = (0..<reused.count).map { l.orderedTriangles[reused.triangleBase + $0] }
+      let nodesBefore = Data(bytes: streams.nodes.contents().advanced(by: firstRegion.nodeBase * 128), count: firstRegion.nodeCount * 128)
+      let nodesAfter = Data(bytes: l.meshStreams!.nodes.contents().advanced(by: reused.nodeBase * 128), count: reused.nodeCount * 128)
       hit = try probe(-3)
-      require(l.triangleBuffer !== buffer && l.assetBuildCount == builds + perAsset && before == after && nodesBefore == nodesAfter
-        && l.triangleCount == first.count + 2 * 14 * 14 && hit.object == 66, "a geometry edit rebuilds only the edited asset")
+      require(l.meshStreams?.faces !== buffer && l.assetBuildCount == builds + perAsset && sameBytes(before, after) && nodesBefore == nodesAfter
+        && l.triangleCount == first.count + 2 * 14 * 14 && hit.object == SceneLimits.materials + 2, "a geometry edit rebuilds only the edited asset")
       // The same paths through the studio controller (undoable edits of the live library), unless
       // the suite runs on the flat reference path (VIBE_ACCELERATION=flat).
       var document = ProjectDocument()
@@ -526,7 +528,7 @@
       try controller.restore(document)
       let live = testRenderer.materials
       if live.acceleration != .flat {
-        let liveBuffer = live.triangleBuffer!, liveBuilds = live.assetBuildCount
+        let liveBuffer = live.meshStreams!.faces, liveBuilds = live.assetBuildCount
         let history = controller.history, grouping = history.groupsByEvent
         history.groupsByEvent = false
         defer { history.groupsByEvent = grouping }
@@ -538,12 +540,12 @@
       grouped { controller.editGraph("Move instance") { g in g.nodes[1].transform.positionScale.z = 2 } }
       grouped { controller.editGraph("Hide instance") { g in g.nodes[2].transform.rotationHidden.w = 1 } }
       grouped { controller.editGraph("Rebind", kind: .bindings) { g in g.nodes[0].bindings = [m1.id] } }
-      require(live === testRenderer.materials && live.triangleBuffer === liveBuffer && live.assetBuildCount == liveBuilds
+      require(live === testRenderer.materials && live.meshStreams?.faces === liveBuffer && live.assetBuildCount == liveBuilds
         && live.meshLayout?.instances.count == 2, "studio transform, visibility and binding edits keep every asset hierarchy")
       for _ in 0..<3 { history.undo(); settle() }
       // Undo may publish a prepared candidate library; it adopts the live buffers instead of building.
       let restored = testRenderer.materials
-      require(restored.triangleBuffer === liveBuffer && restored.meshLayout?.instances.count == 3
+      require(restored.meshStreams?.faces === liveBuffer && restored.meshLayout?.instances.count == 3
         && restored.assetBuildCount == (restored === live ? liveBuilds : 0) && controller.project.graph?.nodes[1].transform.positionScale.z == 0,
         "undoing transform, visibility and binding edits rebuilds no asset hierarchy")
       }
@@ -569,20 +571,23 @@
       // Uncompacted sizes of the batch, from an identical publish on another library.
       let sizing = try library(mode)
       try sizing.setMesh(graph)
-      let indices = MaterialLibrary.unweldedIndices(gpu, count: assets.map(\.count).max()!)!
-      let uncompacted = sizing.meshLayout!.assets.map { a in
+      let largest = assets.map(\.count).max()!
+      let indices = MaterialLibrary.identityIndices(gpu, count: largest)!
+      let transient = MaterialLibrary.transientBuildLayout(sizing.meshLayout!.assets.map(\.count))
+      let positions = gpu.makeBuffer(length: transient.bytes, options: .storageModeShared)!
+      let uncompacted = sizing.meshLayout!.assets.enumerated().map { k, a in
         UInt64(gpu.accelerationStructureSizes(descriptor: MaterialLibrary.primitiveDescriptor(
-          vertices: sizing.triangleBuffer, offset: a.triangleBase * MeshSceneLayout.triangleStride, count: a.count,
-          indices: indices)).accelerationStructureSize)
+          vertices: positions, offset: transient.offsets[k], count: a.count, indices: indices)).accelerationStructureSize)
       }
       let l = try library(mode)
-      let priorLayout = l.meshLayout, priorBuffer = l.triangleBuffer, priorCommands = l.accelerationCommandCount
-      // Every asset fits alone, but not the batch beside the new triangle buffer.
-      l.meshBudgetOverride = l.meshBytes + UInt64(sizing.triangleBuffer.length) + uncompacted.reduce(0, +) - 1
+      let priorLayout = l.meshLayout, priorBuffer = l.meshStreams?.faces, priorCommands = l.accelerationCommandCount
+      // Every asset fits alone, but not the batch beside the new streams and the transient build input.
+      l.meshBudgetOverride = l.meshBytes + UInt64(sizing.meshStreams!.bytes) + UInt64(transient.bytes + 12 * largest)
+        + uncompacted.reduce(0, +) - 1
       var refused = false
       do { try l.setMesh(graph) } catch { refused = true }
       require(refused && uncompacted.count == 3 && uncompacted.max()! < uncompacted.reduce(0, +)
-        && l.triangleBuffer === priorBuffer && l.accelerationCommandCount == priorCommands
+        && l.meshStreams?.faces === priorBuffer && l.accelerationCommandCount == priorCommands
         && l.meshLayout?.scene === priorLayout?.scene && l.meshLayout?.assets.count == priorLayout?.assets.count,
         "a batch over the mesh budget fails before any GPU work and publishes nothing")
       l.meshBudgetOverride = nil
@@ -593,16 +598,16 @@
       let objects = try (0..<3).map { try probe(Float(3 * $0)).object }
       print("\(mode) batched asset build: \(built.count) structures in \(batchCommands) command buffers (instance structure included)")
       require(Set(built.map { ObjectIdentifier($0) }).count == 3 && batchCommands <= 3 && l.sceneRefitCount == 0
-        && l.meshLayout?.sceneRefits == 0 && objects == [64, 65, 66], "three missing asset structures build in one batch")
+        && l.meshLayout?.sceneRefits == 0 && objects == [SceneLimits.materials, SceneLimits.materials + 1, SceneLimits.materials + 2], "three missing asset structures build in one batch")
       // A transform-only edit refits into a new structure and traces like a fresh build.
-      let buffer = l.triangleBuffer!, scene = l.meshLayout?.scene, builds = l.assetBuildCount
+      let buffer = l.meshStreams!.faces, scene = l.meshLayout?.scene, builds = l.assetBuildCount
       var moved = graph
       moved.nodes[1].transform.positionScale.x = 3.4
       moved.nodes[2].transform.positionScale.z = 0.3
       let commands = l.accelerationCommandCount
       try l.setMesh(moved)
       require(l.sceneRefitCount == 1 && l.meshLayout?.sceneRefits == 1 && l.meshLayout?.scene != nil
-        && l.meshLayout?.scene !== scene && l.triangleBuffer === buffer && l.assetBuildCount == builds
+        && l.meshLayout?.scene !== scene && l.meshStreams?.faces === buffer && l.assetBuildCount == builds
         && l.accelerationCommandCount == commands + 1, "a transform-only edit refits the instance structure into a new one")
       let fresh = try library(mode)
       try fresh.setMesh(moved); fresh.hasSceneGraph = true
@@ -614,7 +619,7 @@
       let agree = zip(refitted, rebuilt).allSatisfy { a, b in
         a.object == b.object && a.triangle == b.triangle && abs(a.t - b.t) <= 1e-6 * max(1, abs(b.t))
       }
-      require(fresh.sceneRefitCount == 0 && refitted.filter { $0.object >= 64 }.count > 100 && agree,
+      require(fresh.sceneRefitCount == 0 && refitted.filter { $0.object >= SceneLimits.materials }.count > 100 && agree,
         "a refitted instance structure gives the hits of a rebuilt one")
       // A structural edit (an instance hidden) rebuilds.
       var hidden = moved
@@ -692,7 +697,7 @@
     let flat = try library(.flat)
     var refused = false
     do { try flat.setMesh(big) } catch { refused = true }
-    require(refused, "the flat BVH refuses more than \(SceneLimits.triangles) rendered triangles")
+    require(refused, "the flat BVH refuses more than \(SceneLimits.flatTriangles) rendered triangles")
     let saved = testRenderer.materials.acceleration
     func timed(_ graph: SceneGraph, _ mode: MeshAcceleration, eye: SIMD3<Float>) throws -> (build: Double, gpu: Double, mean: Float, bytes: UInt64) {
       testRenderer.materials.acceleration = mode
@@ -873,3 +878,291 @@
   print("PASS: fix-accel hardware intersector gate")
 }
 try fixAccelChecks()
+
+// The ReSTIR DI reservoir keeps the light ID (imported triangle + 2) in posDir.w of an rgba32Float
+// texture. float(id) rounded IDs above 2^24, which the 64 M rendered-triangle limit allows; the
+// stored bits must round-trip exactly, including through a texture store and load.
+@MainActor func fixDILightIDChecks() throws {
+  let kernels = """
+    kernel void di_id_store(device const uint *ids [[buffer(0)]], texture2d<float, access::write> t [[texture(0)]],
+        uint gid [[thread_position_in_grid]]) {
+        t.write(float4(0.5f, -1.0f, 2.0f, restir_di_pack_light(ids[gid])), uint2(gid, 0));
+    }
+    kernel void di_id_load(device uint *out [[buffer(0)]], texture2d<float, access::read> t [[texture(0)]],
+        uint gid [[thread_position_in_grid]]) {
+        LightSample s = restir_di_stored_sample(t.read(uint2(gid, 0)), float4(1.0f), float3(0.0f, 0.0f, 5.0f), 0.0f);
+        out[gid] = s.isDirectional;
+    }
+    """
+  let library = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  let ids: [UInt32] = [0, 1, 2, 3, 16_777_215, 16_777_216 + 2, 16_777_219, 64_000_001, 1 << 30, 0x7E7F_FFFF]
+  let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: ids.count, height: 1, mipmapped: false)
+  descriptor.usage = [.shaderRead, .shaderWrite]
+  descriptor.storageMode = .private
+  guard let texture = gpu.makeTexture(descriptor: descriptor),
+    let input = ids.withUnsafeBytes({ gpu.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
+    let output = gpu.makeBuffer(length: ids.count * 4, options: .storageModeShared),
+    let command = testRenderer.commandQueue.makeCommandBuffer()
+  else { throw MaterialLibrary.error("Could not allocate the DI light-ID check.") }
+  for (name, buffer) in [("di_id_store", input), ("di_id_load", output)] {
+    let encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(try gpu.makeComputePipelineState(function: library.makeFunction(name: name)!))
+    encoder.setBuffer(buffer, offset: 0, index: 0)
+    encoder.setTexture(texture, index: 0)
+    encoder.dispatchThreads(MTLSize(width: ids.count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: ids.count, height: 1, depth: 1))
+    encoder.endEncoding()
+  }
+  command.commit(); command.waitUntilCompleted()
+  require(command.status == .completed, "DI light-ID GPU command")
+  let decoded = Array(UnsafeBufferPointer(start: output.contents().bindMemory(to: UInt32.self, capacity: ids.count), count: ids.count))
+  require(decoded == ids, "DI reservoir light IDs round-trip exactly above 2^24: \(decoded) != \(ids)")
+  // The previous float(id) encoding loses the low bits of these IDs.
+  require(UInt32(Float(16_777_219)) != 16_777_219, "the float(id) encoding was lossy above 2^24")
+  print("PASS: fix-accel DI reservoir light IDs (exact to \(ids.max()!))")
+}
+try fixDILightIDChecks()
+
+// Phase 2 of docs/SCENE_STORAGE_DESIGN.md: more than 64 materials. One mesh asset of 300 quads,
+// each its own subset bound to its own material (slots 8-307), with distinct surface colours read
+// from the settings buffer, a base-colour map at a slot whose map index exceeds the former
+// 256-texture array, and an emitter at the last slot.
+@MainActor func fixMaterialSlotChecks() throws {
+  let quads = 300
+  var triangles: [MeshTriangle] = []
+  let up = SIMD4<Float>(0, 1, 0, 0)
+  for k in 0..<quads {
+    let x = Float(2 * k), s = Float(k)
+    func p(_ dx: Float, _ dz: Float) -> SIMD4<Float> { SIMD4(x + dx, 0, dz, 1) }
+    triangles.append(MeshTriangle(a: p(0, 0), b: p(0, 1), c: p(1, 1), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 0, 1), uvc: SIMD4(1, 1, s, 0)))
+    triangles.append(MeshTriangle(a: p(0, 0), b: p(1, 1), c: p(1, 0), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 1, 1), uvc: SIMD4(1, 0, s, 0)))
+  }
+  var graph = SceneGraph()
+  let materials = try (0..<quads).map { try graph.addMaterial("M\($0)") }
+  let asset = MeshAsset(name: "quads", triangles: triangles, subsets: (0..<quads).map { "S\($0)" })
+  graph.assets.append(asset)
+  graph.nodes.append(SceneNode(name: "quads", mesh: asset.id, transform: ObjectSettings(positionScale: SIMD4(0, 0, 0, 1)),
+    bindings: materials.map(\.id)))
+  try graph.validate()
+  require(materials.last!.slot == 8 + quads - 1, "material slots run past 64")
+  // A red 2 x 2 PNG.
+  let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8, samplesPerPixel: 4,
+    hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 8, bitsPerPixel: 32)!
+  for i in 0..<4 { bitmap.bitmapData![4 * i] = 255; bitmap.bitmapData![4 * i + 1] = 0; bitmap.bitmapData![4 * i + 2] = 0; bitmap.bitmapData![4 * i + 3] = 255 }
+  let red = bitmap.representation(using: .png, properties: [:])!
+  func color(_ k: Int) -> SIMD4<Float> { SIMD4(0.2 + 0.7 * Float(k) / Float(quads), 0.5, 0.9 - 0.7 * Float(k) / Float(quads), 1) }
+  var state = SceneState()
+  for (k, m) in materials.enumerated() {
+    state.surfaces[m.slot].enabled = 1
+    state.surfaces[m.slot].color = color(k)
+  }
+  let mapped = 280, emitter = quads - 1
+  state.surfaces[materials[mapped].slot].mapMask = 1
+  state.maps[materials[mapped].slot * 4] = red
+  state.names[materials[mapped].slot * 4] = "red.png"
+  state.emissions = [materials[emitter].slot: SIMD3<Float>(3, 2, 1)]
+  require(materials[mapped].slot * 4 >= 256, "the mapped slot's texture index is past the former 256-texture array")
+  let library = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+  try library.restore(state)
+  try library.setMesh(graph)
+  library.hasSceneGraph = true
+  let kernels = """
+    kernel void slot_probe(constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],
+        constant MaterialResources &images [[buffer(2)]], device float4 *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        Ray r={float3(2.0f*float(id)+0.3f,5,0.6f),float3(0,-1,0)}; HitRecord h;
+        if(!trace_scene(r,6,h,images,u)) { out[2*id]=float4(-1); return; }
+        resolve_material(h,r,u,settings,images,0);
+        out[2*id]=float4(float(h.mat.slot),float(h.objectID),h.mat.type==EMISSIVE ? 1.0f : 0.0f,0);
+        out[2*id+1]=float4(h.mat.type==EMISSIVE ? h.mat.emission : h.mat.albedo,0);
+    }
+    """
+  let probe = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  var u = makeUniforms(scene: 6, mode: 0, width: 1, height: 1)
+  u.environment.w = Float(library.nodeCount)
+  u.lens.z = 1
+  let out = gpu.makeBuffer(length: quads * 32, options: .storageModeShared)!
+  let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+  encoder.setComputePipelineState(try gpu.makeComputePipelineState(function: probe.makeFunction(name: "slot_probe")!))
+  require(library.bind(encoder), "slot probe binds scene resources")
+  encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+  encoder.setBuffer(out, offset: 0, index: 3)
+  encoder.dispatchThreads(MTLSize(width: quads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+  encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+  require(command.status == .completed, "slot probe GPU command")
+  let values = out.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2 * quads)
+  var wrong: [Int] = []
+  for k in 0..<quads {
+    let head = values[2 * k], value = values[2 * k + 1]
+    let expected: SIMD3<Float> = k == emitter ? SIMD3(3, 2, 1)
+      : k == mapped ? SIMD3(color(k).x, 0, 0) : SIMD3(color(k).x, color(k).y, color(k).z)
+    let ok = head.x == Float(materials[k].slot) && head.y == Float(SceneLimits.materials)
+      && (head.z == 1) == (k == emitter) && simd_reduce_max(simd_abs(SIMD3(value.x, value.y, value.z) - expected)) < 1e-4
+    if !ok { wrong.append(k) }
+  }
+  require(wrong.isEmpty, "\(quads) materials resolve their own slot, settings, map and emission (wrong: \(wrong.prefix(5)), first \(wrong.first.map { (values[2 * $0], values[2 * $0 + 1]) } as Any))")
+  // Project files store the slots in use (here 308), and decoding restores full capacity.
+  var document = ProjectDocument()
+  document.scene = 6; document.graph = graph; document.scenes[6] = state; document.version = 2
+  let (json, _) = try document.encodedProject()
+  let decoded = try ProjectDocument.decodeProject(json, near: nil)
+  require(state.trimmed.surfaces.count == 8 + quads && decoded.scenes[6]!.surfaces.count == SceneLimits.materials
+    && decoded.scenes[6]!.sameResources(as: state) && SceneState().trimmed.surfaces.count == SceneLimits.storedMaterials,
+    "project files trim unused slots and decoding pads them back")
+  print("PASS: fix-accel \(quads) materials past the former 64-slot limit (settings buffer, map \(materials[mapped].slot * 4), emitter slot \(materials[emitter].slot))")
+}
+try fixMaterialSlotChecks()
+
+// Phase 4 of docs/SCENE_STORAGE_DESIGN.md: alpha cutouts. A quad at y = 1 whose material's
+// geometry_opacity is a 2 x 1 mask (black, white) over an opaque quad at y = 0: rays through the
+// black half reach the lower quad and shadow rays pass, rays through the white half stop on the
+// upper one, on the flat, two-level and hardware traversals alike.
+@MainActor func fixCutoutChecks() throws {
+  let folder = testOutputDirectory.appendingPathComponent("cutout", isDirectory: true)
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  let mask = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 3,
+    hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 6, bitsPerPixel: 24)!
+  for c in 0..<3 { mask.bitmapData![c] = 0; mask.bitmapData![3 + c] = 255 }
+  try mask.representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent("mask.png"))
+  let document = """
+    <materialx version="1.39">
+     <image name="mask" type="float"><input name="file" type="filename" value="mask.png"/></image>
+     <open_pbr_surface name="Cut" type="surfaceshader"><input name="geometry_opacity" type="float" nodename="mask"/></open_pbr_surface>
+    </materialx>
+    """
+  let imported = try MaterialXImporter.read(Data(document.utf8), baseURL: folder, source: "Cut.mtlx")
+  require(imported.materials.count == 1 && imported.materials[0].opacity != nil, "geometry_opacity compiles to an opacity register")
+  let up = SIMD4<Float>(0, 1, 0, 0)
+  func quad(_ y: Float) -> [MeshTriangle] {
+    func p(_ x: Float, _ z: Float) -> SIMD4<Float> { SIMD4(x, y, z, 1) }
+    return [MeshTriangle(a: p(0, 0), b: p(0, 1), c: p(1, 1), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 0, 1), uvc: SIMD4(1, 1, 0, 0)),
+            MeshTriangle(a: p(0, 0), b: p(1, 1), c: p(1, 0), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 1, 1), uvc: SIMD4(1, 0, 0, 0))]
+  }
+  var graph = SceneGraph()
+  let cutMaterial = try graph.addMaterial("Cut"), solidMaterial = try graph.addMaterial("Solid")
+  for (name, y, material) in [("top", Float(1), cutMaterial), ("bottom", Float(0), solidMaterial)] {
+    let asset = MeshAsset(name: name, triangles: quad(y), subsets: ["S"])
+    graph.assets.append(asset)
+    graph.nodes.append(SceneNode(name: name, mesh: asset.id, transform: ObjectSettings(positionScale: SIMD4(0, 0, 0, 1)), bindings: [material.id]))
+  }
+  var state = SceneState()
+  state.materialX = [cutMaterial.slot: imported.materials[0]]
+  let kernels = """
+    kernel void cutout_probe(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+        device float4 *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        float x = id == 0 ? 0.25f : 0.75f;
+        Ray r = {float3(x, 3, 0.5f), float3(0, -1, 0)}; HitRecord h;
+        bool hit = trace_scene(r, 6, h, images, u);
+        out[id] = float4(hit ? h.t : -1.0f, hit ? float(h.objectID) : -1.0f, scene_occluded(r, 6, 2.5f, images, u) ? 1.0f : 0.0f, 0);
+    }
+    """
+  let probe = try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions())
+  let pipeline = try gpu.makeComputePipelineState(function: probe.makeFunction(name: "cutout_probe")!)
+  var modes: [MeshAcceleration] = [.flat, .twoLevel]
+  if gpu.supportsRaytracing { modes.append(.hardware) }
+  for mode in modes {
+    let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    l.acceleration = mode
+    try l.restore(state)
+    try l.setMesh(graph)
+    l.hasSceneGraph = true
+    var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+    u.environment = SIMD4(0, 0, 0, Float(l.nodeCount))
+    u.lens.z = 1
+    u.sunParams.w = 0
+    let out = gpu.makeBuffer(length: 32, options: .storageModeShared)!
+    let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(pipeline)
+    require(l.bind(encoder), "cutout probe binds scene resources")
+    encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+    encoder.setBuffer(out, offset: 0, index: 3)
+    encoder.dispatchThreads(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 2, height: 1, depth: 1))
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    require(command.status == .completed, "cutout probe GPU command")
+    let v = out.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2)
+    let node = Float(SceneLimits.materials)
+    let ok = abs(v[0].x - 3) < 1e-4 && v[0].y == node + 1 && v[0].z == 0
+      && abs(v[1].x - 2) < 1e-4 && v[1].y == node && v[1].z == 1
+    require(ok, "\(mode): cut-out half passes to the lower quad and casts no shadow, opaque half stops rays (\(v[0]), \(v[1]))")
+  }
+  // Hardware: an instance is opaque in the instance structure unless it binds a cutout slot, and a
+  // material edit that adds or removes a cutout updates it, so traversal never skips a cutout.
+  if gpu.supportsRaytracing {
+    let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    l.acceleration = .hardware
+    try l.restore(SceneState())
+    try l.setMesh(graph)
+    l.hasSceneGraph = true
+    func probe() -> (top: Float, opaque: [Bool]) {
+      var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+      u.environment = SIMD4(0, 0, 0, Float(l.nodeCount)); u.lens.z = 1; u.sunParams.w = 0
+      let out = gpu.makeBuffer(length: 32, options: .storageModeShared)!
+      let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+      encoder.setComputePipelineState(pipeline)
+      require(l.bind(encoder), "opacity probe binds scene resources")
+      encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+      encoder.setBuffer(out, offset: 0, index: 3)
+      encoder.dispatchThreads(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 2, height: 1, depth: 1))
+      encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+      return (out.contents().load(as: SIMD4<Float>.self).x, l.meshLayout?.sceneOpaque ?? [])
+    }
+    let before = probe()
+    try l.restore(state)
+    let cut = probe()
+    try l.restore(SceneState())
+    let after = probe()
+    require(before.top == 2 && before.opaque == [true, true] && cut.top == 3 && cut.opaque == [false, true]
+      && after.top == 2 && after.opaque == [true, true],
+      "instance opacity follows material edits (\(before), \(cut), \(after))")
+  }
+  // Partial coverage: a constant geometry_opacity of 0.25 stops a quarter of camera and shadow rays.
+  let partial = try MaterialXImporter.read(Data("""
+    <materialx version="1.39">
+     <open_pbr_surface name="Quarter" type="surfaceshader"><input name="geometry_opacity" type="float" value="0.25"/></open_pbr_surface>
+    </materialx>
+    """.utf8), baseURL: folder, source: "Quarter.mtlx")
+  require(partial.materials.first?.opacity != nil, "a constant partial geometry_opacity compiles to an opacity register")
+  state.materialX = [cutMaterial.slot: partial.materials[0]]
+  // Separate kernels: one kernel tracing a varying ray with both trace_scene and scene_occluded
+  // crashes the shader compiler service (XPC_ERROR_CONNECTION_INTERRUPTED; also before cutouts).
+  let fractionKernels = """
+    float2 fraction_point(uint id) { return float2((float(id % 128u) + 0.5f) / 128.0f, (float(id / 128u) + 0.5f) / 128.0f); }
+    kernel void cutout_fraction_trace(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+        device atomic_uint *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        float2 p = fraction_point(id); Ray r = {float3(p.x, 3, p.y), float3(0, -1, 0)}; HitRecord h;
+        if (trace_scene(r, 6, h, images, u) && abs(h.t - 2.0f) < 1e-3f) atomic_fetch_add_explicit(&out[0], 1u, memory_order_relaxed);
+    }
+    kernel void cutout_fraction_shadow(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+        device atomic_uint *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        float2 p = fraction_point(id); Ray r = {float3(p.x, 3, p.y), float3(0, -1, 0)};
+        if (scene_occluded(r, 6, 2.5f, images, u)) atomic_fetch_add_explicit(&out[1], 1u, memory_order_relaxed);
+    }
+    """
+  let fractionLibrary = try gpu.makeLibrary(source: metalSource + fractionKernels, options: shaderCompileOptions())
+  let fractionPipelines = try ["cutout_fraction_trace", "cutout_fraction_shadow"].map {
+    try gpu.makeComputePipelineState(function: fractionLibrary.makeFunction(name: $0)!)
+  }
+  for mode in modes {
+    let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    l.acceleration = mode
+    try l.restore(state)
+    try l.setMesh(graph)
+    l.hasSceneGraph = true
+    var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+    u.environment = SIMD4(0, 0, 0, Float(l.nodeCount)); u.lens.z = 1; u.sunParams.w = 0
+    let out = gpu.makeBuffer(length: 8, options: .storageModeShared)!
+    memset(out.contents(), 0, 8)
+    let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    for fractionPipeline in fractionPipelines {
+      encoder.setComputePipelineState(fractionPipeline)
+      require(l.bind(encoder), "partial-opacity probe binds scene resources")
+      encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+      encoder.setBuffer(out, offset: 0, index: 3)
+      encoder.dispatchThreads(MTLSize(width: 16384, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    let stopped = Double(out.contents().load(as: UInt32.self)) / 16384, shadowed = Double(out.contents().load(fromByteOffset: 4, as: UInt32.self)) / 16384
+    print("\(mode) partial opacity 0.25: \(stopped) of camera rays and \(shadowed) of shadow rays stop on the quad")
+    require(abs(stopped - 0.25) < 0.02 && abs(shadowed - 0.25) < 0.02, "\(mode): partial opacity is unbiased coverage")
+  }
+  print("PASS: fix-accel opacity cutouts and partial coverage on \(modes.map { "\($0)" }.joined(separator: ", ")) traversal")
+}
+try fixCutoutChecks()

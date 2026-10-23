@@ -36,6 +36,8 @@ PARTS = [
     ('Fix_gpu-memory.swift', {'full'}), ('Fix_presentation.swift', {'full'}),
     ('Fix_persistence.swift', {'full', 'studio'}), ('Fix_frontend.swift', {'full', 'studio'}),
     ('Fix_project-format.swift', {'full', 'studio'}),
+    ('Fix_obj-materials.swift', {'full', 'studio'}),
+    ('Fix_scaling.swift', {'full', 'studio'}),
     ('Fix_usd.swift', {'full', 'usd'}), ('Fix_usd-pivot.swift', {'full', 'usd'}),
     ('Fix_tests.swift', {'full'}),
     ('Fix_build.swift', ALL), ('Fix_swift6.swift', ALL),
@@ -53,6 +55,7 @@ PARTS = [
     ('Fix_ui-modes.swift', {'full', 'studio'}),
     ('Fix_spectral.swift', {'full', 'studio'}),
     ('Fix_spectral-mis.swift', {'full'}),
+    ('Fix_veach-plates.swift', {'full'}),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()

@@ -79,7 +79,7 @@
       for(int k=0;k<16;++k) {
           float3 d=sample_cosine_hemisphere(k<8 ? h.geometricNormal : -h.geometricNormal,seed);
           Ray next={ray_origin(h.position,h.geometricNormal,d,u,h.error),d}; HitRecord s;
-          if(trace_scene(next,6,s,images,u) && s.objectID>=64 && s.t<1e-3f) atomic_fetch_add_explicit(&out[1],1,memory_order_relaxed);
+          if(trace_scene(next,6,s,images,u) && s.objectID>=MATERIAL_SLOTS && s.t<1e-3f) atomic_fetch_add_explicit(&out[1],1,memory_order_relaxed);
           if(k>=8) continue;
           LightSample ls={}; ls.position=h.position+2.0f*d; ls.wi=d; ls.pdf=1; ls.isDirectional=0;
           if(!light_visible(h.position,h.geometricNormal,ls,6,images,u,h.error)) atomic_fetch_add_explicit(&out[2],1,memory_order_relaxed);
@@ -87,7 +87,7 @@
   }
   kernel void fix_geometry_emitter(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
       device atomic_uint *out [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
-      MeshTriangle e=images.triangles[0];
+      MeshTriangle e=scene_triangle(0,images);
       uint seed=gid.y*64+gid.x+7;
       float2 q=rand_f2(seed); if(q.x+q.y>1) q=1-q;
       float3 x=(1-q.x-q.y)*e.a.xyz+q.x*e.b.xyz+q.y*e.c.xyz;
@@ -150,7 +150,7 @@
       if(trace_scene(r,6,p,images.objects,u.light.w,u.light.xyz,tMin)) { best=p.t; bestID=p.mat.slot; }
       for(uint i=0;i<count;++i) {
           float t,b1,b2;
-          if(intersect_mesh_triangle(images.triangles[i],r,tMin,best,t,b1,b2)) { best=t; bestID=64+uint(images.triangles[i].uvc.w)-1; }
+          MeshTriangle tri=scene_triangle(i,images); if(intersect_mesh_triangle(tri,r,tMin,best,t,b1,b2)) { best=t; bestID=MATERIAL_SLOTS+uint(tri.uvc.w)-1; }
       }
       if(hit) atomic_fetch_add_explicit(&out[0],1,memory_order_relaxed);
       bool same=hit==(best<1e19f) && (!hit || (h.objectID==bestID && abs(h.t-best)<=1e-6f*max(1.0f,best)));
@@ -255,8 +255,8 @@
   micro += quad(SIMD3(-1.505, -0.9995, -1.505), SIMD3(0.01, 0, 0), SIMD3(0, 0, 0.01), id: 4)
   let m = vectors(try dispatch("fix_geometry_micro", try graphScene(micro), grid: MTLSize(width: 1, height: 1, depth: 1), bytes: 80), 5)
   print("Microgeometry: \(m)")
-  require(abs(m[0].x - 5e-4) < 1e-6 && m[0].y == 64 && m[0].z == 0, "20 um triangle 0.5 mm away is hit without self-hits")
-  require(abs(m[1].x - 5) < 1e-4 && m[1].y == 64, "20 um triangle is hit from 5 m")
+  require(abs(m[0].x - 5e-4) < 1e-6 && m[0].y == Float(SceneLimits.materials) && m[0].z == 0, "20 um triangle 0.5 mm away is hit without self-hits")
+  require(abs(m[1].x - 5) < 1e-4 && m[1].y == Float(SceneLimits.materials), "20 um triangle is hit from 5 m")
   require(abs(m[2].x - 0.6) < 1e-5 && m[2].y == 1 && m[2].z == 1, "0.3 mm occluder casts a shadow; light beside it reaches the receiver")
   require(abs(m[3].x - 5e-4) < 1e-6 && m[3].y == 1, "graph-mode floor is hit 0.5 mm below a mesh underside")
   require(m[4].x == 1 && m[4].y == 1, "mesh plate 0.5 mm above the floor shadows it")
