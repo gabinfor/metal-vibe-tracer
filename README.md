@@ -224,7 +224,7 @@ Each run writes diagnostic images and fixtures to its own `build/checks/runs/ver
 
 </details>
 
-The September 2026 audit, its remediation and the 2026-10-04 validation are archived in [docs/archive/](docs/archive/README.md). The application is currently distributed as an unsigned local build; signing, notarization, and clean-machine installation remain release packaging work. See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
+Release notes are in [CHANGELOG.md](CHANGELOG.md). The September 2026 audit, its remediation and the 2026-10-04 validation are archived in [docs/archive/](docs/archive/README.md). The application is currently distributed as an unsigned local build; signing, notarization, and clean-machine installation remain release packaging work. See [REFERENCES.md](REFERENCES.md) for algorithm sources, dependency versions, and implementation adaptations.
 
 ## Known limitations
 
