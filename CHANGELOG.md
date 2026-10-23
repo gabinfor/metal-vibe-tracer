@@ -2,6 +2,13 @@
 
 Metal Vibe Tracer is in early development: releases are validated builds, not stable APIs or file formats. Every method below is cited, with its adaptations, in [REFERENCES.md](REFERENCES.md); measurements are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md).
 
+## Unreleased
+
+### Scenes and import
+
+- **Example scenes:** File › Open Example Scene (and the File page) opens Crytek Sponza, San Miguel 2.0 and the Amazon Lumberyard Bistro (exterior, interior) from Morgan McGuire's Computer Graphics Archive (`MCGUIRE2017`) with the README images' camera and lighting. Nothing is bundled: after a consent sheet that gives the size, destination and license, each archive is downloaded once, checked against a pinned size and SHA-256 digest, extracted into Application Support and imported through the OBJ/MTL path. Credits and licenses are shown in the app and carried in the project's import report.
+- The showcase shot settings, including `emissionScale`, moved from `scripts/render_showcase.py` into app code (`ShowcaseShot`, `ProjectDocument.scaleImportedEmission`); the app bundles `scripts/showcase.json`.
+
 ## 0.2.0 — 2026-10-23
 
 121 commits since 0.1.0. Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (189 checks).

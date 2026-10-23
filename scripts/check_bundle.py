@@ -25,7 +25,8 @@ problems = []
 for path in [executable, contents / "Info.plist", resources / "OpenPBR.metal", resources / "usd_bridge.py",
              resources / "OpenUSD/VIBE_RUNTIME.json", resources / "OpenPBR-LICENSE",
              resources / "THIRD_PARTY_NOTICES.md", oidn / "VIBE_RUNTIME.json",
-             resources / "SpectralTables.metal", resources / "FourierSRGB86.bin", resources / "Spectral-UPSTREAM.md"]:
+             resources / "SpectralTables.metal", resources / "FourierSRGB86.bin", resources / "Spectral-UPSTREAM.md",
+             resources / "showcase.json"]:
     if not path.is_file():
         problems.append(f"missing {path.relative_to(app)}")
 
