@@ -41,37 +41,9 @@ for shot in shots:
         shot['samples'] = arguments.samples
 arguments.out.mkdir(parents=True, exist_ok=True)
 
+# The shot schema and its settings (ShowcaseShot, with the emission scaling) are production code in
+# Sources/ExampleScenes.swift, which File > Open Example Scene applies to the same shots.
 driver = r'''
-struct Shot: Decodable {
-  var name: String
-  var scene: UInt32?
-  var project: String?
-  var usd: String?
-  var obj: String?
-  var hdri: String?
-  var sky: UInt32?
-  var fog: UInt32?
-  var ring: UInt32?
-  var strategy: UInt32?
-  var lightTransport: UInt32?
-  var yaw: Float?, pitch: Float?, distance: Float?, fov: Float?
-  var target: [Float]?
-  var aperture: Float?, focusDistance: Float?
-  var exposure: Float?, toneMap: Float?
-  var sunAzimuth: Float?, sunElevation: Float?, sunIntensity: Float?
-  var environmentIntensity: Float?, environmentRotation: Float?
-  var lightIntensity: Float?, lightSize: Float?
-  var lightSpectrum: UInt32?, sunSpectrum: UInt32?
-  var lightColor: [Float]?
-  var width: Int, height: Int
-  var samples: UInt32?
-  var depth: Float?
-  // Raw linear radiance as OpenEXR, without a denoiser (renderer comparisons).
-  var raw: Bool?
-  // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
-  // shot, above 1 brightens it for a night shot. Applied to the compiled programs, not the source files.
-  var emissionScale: Float?
-}
 func waitFor(_ condition: () -> Bool, seconds: Double) -> Bool {
   let deadline = Date().addingTimeInterval(seconds)
   while !condition() && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
@@ -79,7 +51,7 @@ func waitFor(_ condition: () -> Bool, seconds: Double) -> Bool {
 }
 let shotData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
 let outputFolder = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
+for shot in try JSONDecoder().decode([ShowcaseShot].self, from: shotData) {
   var p: ProjectDocument
   if let path = shot.usd {
     p = try USDImporter.load(URL(fileURLWithPath: path), into: ProjectDocument()).document
@@ -103,54 +75,13 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
     testRenderer.sceneIndex = p.scene
     p.camera = CameraState(testRenderer)
   }
-  if let k = shot.emissionScale, var state = p.scenes[6] {
-    for (slot, var program) in state.materialX ?? [:] {
-      guard let root = program.emission else { continue }
-      if k == 0 { program.emission = nil } else if program.instructions.count + 2 <= 64 {
-        var constant = GraphInstruction(); constant.value = SIMD4(repeating: k)
-        program.instructions.append(constant)
-        var scaled = GraphInstruction(); scaled.code = SIMD4(3, root, Int32(program.instructions.count - 1), 0)
-        program.instructions.append(scaled)
-        program.emission = Int32(program.instructions.count - 1)
-      }
-      state.materialX?[slot] = program
-    }
-    state.emissions = state.emissions?.mapValues { $0 * k }
-    p.scenes[6] = state
-    print("\(shot.name): imported emission scaled by \(k)")
-  }
+  if let k = shot.emissionScale { print("\(shot.name): imported emission scaled by \(k)") }
   if let hdri = shot.hdri {
     p.environmentData = try Data(contentsOf: URL(fileURLWithPath: hdri))
     p.environmentName = URL(fileURLWithPath: hdri).lastPathComponent
   }
-  if let v = shot.sky { p.sky = v }
-  if let v = shot.fog { p.fog = v }
-  if let v = shot.ring { p.ring = v }
-  if let v = shot.strategy { p.strategy = v }
-  if let v = shot.lightTransport { p.lightTransport = v }
-  if let v = shot.yaw { p.camera.yaw = v }
-  if let v = shot.pitch { p.camera.pitch = v }
-  if let v = shot.distance { p.camera.distance = v }
-  if let v = shot.fov { p.camera.fov = v }
-  if let v = shot.target { p.camera.target = SIMD3<Float>(v[0], v[1], v[2]) }
-  if let v = shot.aperture { p.options.aperture = v }
-  if let v = shot.focusDistance { p.options.focusDistance = v }
-  if let v = shot.exposure { p.options.exposure = v }
-  if let v = shot.toneMap { p.options.toneMap = v }
-  if let v = shot.sunAzimuth { p.options.sunAzimuth = v }
-  if let v = shot.sunElevation { p.options.sunElevation = v }
-  if let v = shot.sunIntensity { p.options.sunIntensity = v }
-  if let v = shot.environmentIntensity { p.options.environmentIntensity = v }
-  if let v = shot.environmentRotation { p.options.environmentRotation = v }
-  if let v = shot.lightIntensity { p.options.lightIntensity = v }
-  if let v = shot.lightSize { p.options.lightSize = v }
-  if let v = shot.lightSpectrum { p.options.lightSpectrum = v }
-  if let v = shot.sunSpectrum { p.options.sunSpectrum = v }
-  if let v = shot.lightColor { p.options.lightColor = SIMD3<Float>(v[0], v[1], v[2]) }
-  p.options.outputWidth = shot.width
-  p.options.outputHeight = shot.height
-  p.options.exportSamples = shot.samples ?? 1024
-  if let v = shot.depth { p.options.depth = v }
+  shot.apply(to: &p)
+  if shot.samples == nil { p.options.exportSamples = 1024 }
   try controller.restore(p)
   if let side = testRenderer.materials.graphTextureSide {
     let materials = testRenderer.materials
@@ -169,7 +100,7 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
   guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600),
     FileManager.default.fileExists(atPath: url.path)
   else { fputs("FAIL: \(shot.name) did not export\n", stderr); exit(1) }
-  print("\(shot.name): \(shot.width)x\(shot.height), \(p.options.exportSamples) spp, "
+  print("\(shot.name): \(p.options.outputWidth)x\(p.options.outputHeight), \(p.options.exportSamples) spp, "
     + "\(Int(Date().timeIntervalSince(start))) s, camera yaw \(p.camera.yaw) pitch \(p.camera.pitch) "
     + "distance \(p.camera.distance) fov \(p.camera.fov) target \(p.camera.target)")
 }

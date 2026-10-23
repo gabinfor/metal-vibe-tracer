@@ -59,6 +59,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationWillTerminate(_ notification: Notification) {
     // A quit during an OpenUSD import must not leave the python3 helper or its scratch folder behind.
     studio?.usdImportJob?.cancelAndWait(timeout: 3)
+    // An example-scene download stops; its partial archive is replaced on the next attempt.
+    studio?.exampleDownload?.cancel()
   }
 
   // The window opens at once on the empty start screen; the GPU shaders compile in the background

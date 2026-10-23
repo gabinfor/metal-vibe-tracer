@@ -4,9 +4,16 @@ Metal Vibe Tracer is in early development: releases are validated builds, not st
 
 ## Unreleased
 
+### Launch and progress
+
 - **Instant launch:** the window opens at once on an empty start screen (open project, import OBJ/USD, built-in scenes, Restore Last Session) instead of compiling every GPU pipeline on the main thread and restoring the autosave. The core pipelines compile concurrently in the background with a progress bar; ReSTIR PT, reservoir splatting and stochastic pairwise MIS compile on demand (`METALSHADERCOMPILE`). First launch of a new build: window 293 s → 0.97 s, renderer ready after 37 s; cached: 0.21 s → 0.19 s to the window (`tests/PERFORMANCE.md`, "Launch time").
 - **Progress everywhere:** a progress bar with the current step (and Cancel where supported) for shader compilation, project open/save/restore, OBJ/MTL import with texture decoding and downscaling and MaterialX preparation, USD import, mesh hierarchy and acceleration-structure builds, exports and OIDN. USD imports no longer block the window with a sheet.
 - Exports reuse the preview's hierarchies and acceleration structures instead of rebuilding them on the main thread.
+
+### Scenes and import
+
+- **Example scenes:** File › Open Example Scene (and the File page) opens Crytek Sponza, San Miguel 2.0 and the Amazon Lumberyard Bistro (exterior, interior) from Morgan McGuire's Computer Graphics Archive (`MCGUIRE2017`) with the README images' camera and lighting. Nothing is bundled: after a consent sheet that gives the size, destination and license, each archive is downloaded once, checked against a pinned size and SHA-256 digest, extracted into Application Support and imported through the OBJ/MTL path. Credits and licenses are shown in the app and carried in the project's import report.
+- The showcase shot settings, including `emissionScale`, moved from `scripts/render_showcase.py` into app code (`ShowcaseShot`, `ProjectDocument.scaleImportedEmission`); the app bundles `scripts/showcase.json`.
 
 ## 0.2.0 — 2026-10-23
 
