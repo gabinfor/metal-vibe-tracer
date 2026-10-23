@@ -49,6 +49,10 @@ struct MaterialXProgram: Codable {
   // Constant OpenPBR specular_color (a metal's 82-degree edge tint, a dielectric's specular tint),
   // or nil for white. Constant only: the renderer stores it per slot (MaterialLibrary.slotParameters).
   var specularColor: SIMD3<Float>?
+  // Constant OpenPBR transmission_color (nil for white) and geometry_thin_walled (nil for false),
+  // stored per slot like specular_color (MaterialLibrary.slotParameters).
+  var transmissionColor: SIMD3<Float>?
+  var thinWalled: Bool?
   static let noSpectral = SIMD4<Float>(0, 0, 0.5, 1.4)
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
@@ -731,7 +735,6 @@ private final class MXCompiler {
       "coat_ior": SIMD4(repeating: 1.6), "coat_darkening": SIMD4(repeating: 1),
       "thin_film_weight": .zero, "thin_film_thickness": SIMD4(repeating: 0.5),
       "thin_film_ior": SIMD4(repeating: 1.4),
-      "geometry_thin_walled": .zero,
     ]
     // Dispersion and thin film: constants only (spectral transport; MaterialXProgram.spectral).
     let spectralNames = ["transmission_dispersion_scale", "transmission_dispersion_abbe_number", "thin_film_weight",
@@ -750,7 +753,8 @@ private final class MXCompiler {
     }
     for i in shader.children
     where i.category == "input"
-      && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity", "specular_color"].contains(i.name)
+      && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity", "specular_color",
+           "transmission_color", "geometry_thin_walled"].contains(i.name)
       && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
     {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
@@ -824,11 +828,30 @@ private final class MXCompiler {
       guard (0..<3).allSatisfy({ c[$0].isFinite && c[$0] >= 0 && c[$0] <= 1 }) else { try fail("specular_color must be within 0-1.") }
       if (0..<3).contains(where: { abs(c[$0] - 1) > 1e-6 }) { specularColor = SIMD3(c.x, c.y, c.z) }
     }
+    // transmission_color and geometry_thin_walled: constants, stored per slot like specular_color.
+    var transmissionColor: SIMD3<Float>?
+    if let input = shader.input("transmission_color") {
+      guard input.attributes["type"] == "color3", !linked(input) else {
+        try fail("transmission_color must be a constant color3; connected transmission colours are not supported.")
+      }
+      let c = try numbers(input, fallback: SIMD4(repeating: 1))
+      guard (0..<3).allSatisfy({ c[$0].isFinite && c[$0] >= 0 && c[$0] <= 1 }) else { try fail("transmission_color must be within 0-1.") }
+      if (0..<3).contains(where: { abs(c[$0] - 1) > 1e-6 }) { transmissionColor = SIMD3(c.x, c.y, c.z) }
+    }
+    var thinWalled: Bool?
+    if let input = shader.input("geometry_thin_walled") {
+      guard input.attributes["type"] == "boolean", !linked(input) else {
+        try fail("geometry_thin_walled must be a constant boolean.")
+      }
+      if try numbers(input, fallback: .zero).x > 0 { thinWalled = true }
+    }
     var program = MaterialXProgram(
       name: shader.name, source: source, instructions: nodes, roots: roots, images: images,
       parameters: parameters, diffuseRoughness: diffuseRoot, emission: emissionRoot)
     program.opacity = opacityRoot
     program.specularColor = specularColor
+    program.transmissionColor = transmissionColor
+    program.thinWalled = thinWalled
     let scale = spectralValues["transmission_dispersion_scale"] ?? 0
     let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
     let spectral = SIMD4<Float>(

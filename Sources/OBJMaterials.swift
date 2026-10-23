@@ -8,9 +8,14 @@ import simd
 //   Ns                        specular_roughness = sqrt(alpha), alpha = sqrt(2 / (Ns + 2)) (GGX2007)
 //   d (or 1 - Tr) x map_d     geometry_opacity; without map_d, an alpha channel in map_Kd
 //   Ke x map_Ke               emission_color at emission_luminance 1 (radiance)
-//   map_bump / bump           height converted to a tangent-space normal map (heightNormalMap), or
+//   map_bump / bump           height converted to a tangent-space normal map (heightNormalMap, -bm / 128), or
 //                             used directly when the image is a normal map (isNormalMap)
 //   norm                      tangent-space normal map
+//   illum 4, 6, 7, 9          glass: transmission_weight 1, transmission_color = Tf, smooth (the
+//                             model's reflection and refraction are ray traced, not Ns highlights);
+//                             Ni <= 1 or unset ("light does not bend") is geometry_thin_walled
+//   d (or 1 - Tr) < 1         without map_d or a map_Kd alpha channel: glass as above (exporters write
+//                             glass as constant dissolve; masks stay coverage)
 //   illum 0, 1                no specular lobe; illum 2 the default; others are reported
 // Map options -s and -o (UV scale and offset), -clamp, -bm and -imfchan are applied; others are
 // reported and ignored.
@@ -31,7 +36,10 @@ struct MTLMaterial {
   var ni: Float?
   var d: Float?
   var illum = 2
+  var tf: SIMD3<Float>?
   var maps: [String: MTLMap] = [:]
+  // Transparency models: "Glass on" (4, 9) and "Refraction on" (6, 7).
+  var transmits: Bool { [4, 6, 7, 9].contains(illum) }
 }
 enum OBJMaterials {
   // Parses MTL text; `report` names ignored statements and options once each.
@@ -79,7 +87,8 @@ enum OBJMaterials {
         result[m].d = fields.dropFirst().compactMap { Float($0) }.first ?? 1
       case "tr": if result[m].d == nil { result[m].d = 1 - (try numbers()[0]) }
       case "illum": result[m].illum = Int(min(max(try numbers()[0], -1), 99))
-      case "ka", "tf", "map_ka", "sharpness": break  // ambient and transmission filter: no OpenPBR input
+      case "tf": result[m].tf = try color()
+      case "ka", "map_ka", "sharpness": break  // ambient: no OpenPBR input
       case "map_kd", "map_ks", "map_ke", "map_d", "map_bump", "bump", "norm":
         let key = keyword == "bump" ? "map_bump" : keyword
         result[m].maps[key] = try map(Array(fields.dropFirst()), line: lineNumber, note: note)
@@ -196,7 +205,10 @@ enum OBJMaterials {
       let x = clamp ? min(max(x, 0), w - 1) : (x + w) % w, y = clamp ? min(max(y, 0), h - 1) : (y + h) % h
       return height[y * w + x]
     }
-    let k = multiplier / 512
+    // Heights are in UV units scaled by -bm / 128 (MTL gives bumps no world scale). The constant puts
+    // the Crytek Sponza height maps' median slope (0.06-0.13) at that of the archive's authored normal
+    // maps (Bistro ddna and San Miguel N_ maps: median 0.09, quartiles 0.05-0.19); REFERENCES.md MTL2026.
+    let k = multiplier / 128
     var pixels = [UInt8](repeating: 255, count: 4 * w * h)
     for y in 0..<h {
       for x in 0..<w {
@@ -271,7 +283,7 @@ struct MaterialXWriter {
       .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&quot;")
   }
   private static func value(_ v: [Float]) -> String { v.map { String($0) }.joined(separator: ", ") }
-  enum Input { case value([Float]), node(String) }
+  enum Input { case value([Float]), node(String), literal(String) }
   private mutating func node(_ name: String, _ category: String, _ type: String, _ inputs: [(String, String, Input)],
                              attributes: String = "") {
     body += "  <\(category) name=\"\(name)\" type=\"\(type)\"\(attributes)>\n"
@@ -279,6 +291,7 @@ struct MaterialXWriter {
       switch v {
       case .value(let x): body += "    <input name=\"\(input)\" type=\"\(t)\" value=\"\(Self.value(x))\"/>\n"
       case .node(let n): body += "    <input name=\"\(input)\" type=\"\(t)\" nodename=\"\(n)\"/>\n"
+      case .literal(let x): body += "    <input name=\"\(input)\" type=\"\(t)\" value=\"\(x)\"/>\n"
       }
     }
     body += "  </\(category)>\n"
@@ -340,13 +353,29 @@ struct MaterialXWriter {
     } else {
       inputs.append(("base_color", "color3", .value([min(1, max(0, m.kd.x)), min(1, max(0, m.kd.y)), min(1, max(0, m.kd.z))])))
     }
+    // Glass: a transparency model, or constant dissolve without a coverage mask (how exporters write
+    // glass; every such material in the McGuire archive scenes is a glass object).
+    let d = min(1, max(0, m.d ?? 1))
+    let masked = m.maps["map_d"] != nil || (m.maps["map_kd"].flatMap(url).map(OBJMaterials.hasCoverage) ?? false)
+    let glass = m.transmits || (d < 1 && !masked)
+    if glass && !m.transmits {
+      report.append("\(m.name): constant dissolve d \(d) rendered as glass (transmission).")
+    }
     // Specular: Phong exponent to GGX roughness, Ks against the dielectric F0 of Ni.
     let ior = (m.ni ?? 0) > 1 ? min(2.5, max(1.01, m.ni!)) : 1.5
     let f0 = ((ior - 1) / (ior + 1)) * ((ior - 1) / (ior + 1))
     let alpha = (2 / (max(0, m.ns) + 2)).squareRoot()
-    inputs.append(("specular_roughness", "float", .value([alpha.squareRoot()])))
+    inputs.append(("specular_roughness", "float", .value([glass ? 0 : alpha.squareRoot()])))
     inputs.append(("specular_ior", "float", .value([ior])))
-    if ![0, 1, 2].contains(m.illum) {
+    if glass {
+      // Glass: the model's reflection and refraction are ray traced (ideal), filtered by Tf. Ni 1
+      // means light does not bend, which is OpenPBR's thin-walled transmission; Fresnel keeps the
+      // dielectric IOR above (1.5 when Ni is 1 or unset).
+      let tf = simd_clamp(m.tf ?? SIMD3(repeating: 1), SIMD3(repeating: 0), SIMD3(repeating: 1))
+      inputs.append(("transmission_weight", "float", .value([1])))
+      if tf != SIMD3(repeating: 1) { inputs.append(("transmission_color", "color3", .value([tf.x, tf.y, tf.z]))) }
+      if (m.ni ?? 1) <= 1 { inputs.append(("geometry_thin_walled", "boolean", .literal("true"))) }
+    } else if ![0, 1, 2].contains(m.illum) {
       report.append("\(m.name): illum \(m.illum) rendered as illum 2 (diffuse and specular).")
     }
     let weight = m.illum < 2 ? 0 : (m.ks.max() / f0)
@@ -358,8 +387,7 @@ struct MaterialXWriter {
     } else {
       inputs.append(("specular_weight", "float", .value([min(1, weight)])))
     }
-    // Coverage.
-    let d = min(1, max(0, m.d ?? 1))
+    // Coverage (a glass material's constant dissolve is its transparency, above).
     var opacity: String?
     if let map = m.maps["map_d"], let path = url(map) {
       opacity = scalar("d", map, path, alphaDefault: OBJMaterials.hasCoverage(path), sharesColor: false)
@@ -376,7 +404,7 @@ struct MaterialXWriter {
       } else {
         inputs.append(("geometry_opacity", "float", .node(o)))
       }
-    } else if d < 1 {
+    } else if d < 1 && !glass {
       inputs.append(("geometry_opacity", "float", .value([d])))
     }
     // Emission.

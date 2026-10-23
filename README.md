@@ -18,8 +18,33 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 - 🔬 **Recent research, implemented and cited.** ReSTIR DI, GI and PT, plus 2025–2026 papers on spatial reuse, reservoir splatting and control variates. [REFERENCES.md](REFERENCES.md) maps every method to the code that implements it.
 - 🌈 **Spectral light transport.** Four wavelengths per path, CIE illuminants, dispersion and thin-film interference, through every ReSTIR mode.
 - 📏 **Defaults chosen by measurement.** A new method becomes the default only where it wins at equal render time. The figures are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md).
-- 🧪 **Tested on the GPU.** The verification suite runs the production shaders and render path on Metal (179 checks passed on 2026-10-04, Apple M4).
-- 🎬 **Production formats.** OpenPBR surfaces, MaterialX graphs, OpenUSD scenes, and OpenEXR export.
+- 🧪 **Tested on the GPU.** The verification suite runs the production shaders and render path on Metal (189 checks passed on 2026-10-23, Apple M4).
+- 🎬 **Production formats.** OpenPBR surfaces, MaterialX graphs, OpenUSD scenes, OBJ/MTL, and OpenEXR export.
+- 🏛️ **Production-scale scenes.** San Miguel (10 M triangles, 287 materials) and the Amazon Lumberyard Bistro import and render, with alpha cutouts, glass and anisotropic texture filtering.
+- ✅ **Validated against Mitsuba 3.** Built-in scenes agree within 0.1% of mean radiance, and five of seven Bitterli scenes within 2.5% (see [Validation](#validation)).
+
+## Production scenes
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/sponza-noon.jpg" alt="Crytek Sponza at noon, seen through an arch, with coloured drapes and sunlight on the floor"></td>
+    <td width="50%"><img src="docs/images/san-miguel-golden.jpg" alt="San Miguel courtyard at golden hour, with arcades, a fountain, a tree and set tables"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Crytek Sponza</b> at noon. 262 k triangles, 25 materials.</sub></td>
+    <td align="center"><sub><b>San Miguel</b> at golden hour. 10.0 M triangles, 287 materials, imported from OBJ in 12 s; glassware rendered as glass.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/bistro-exterior-golden.jpg" alt="Amazon Lumberyard Bistro street with the Le Petit Coin restaurant, string lights and glass windows"></td>
+    <td width="50%"><img src="docs/images/bistro-interior.jpg" alt="Bistro interior dining room with hanging lamps, a bar and wooden chairs"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Bistro exterior.</b> 2.8 M triangles, 132 materials, 940 Mpixel of textures fitted to the GPU budget, thin-walled glass windows.</sub></td>
+    <td align="center"><sub><b>Bistro interior</b> in the evening. 1.0 M triangles, lit by its own lamps with an incandescent (CIE A) spectrum, glass bottles and cabinets.</sub></td>
+  </tr>
+</table>
+
+<p align="center"><sub>Imported from Morgan McGuire's Computer Graphics Archive (OBJ with MTL materials translated to OpenPBR MaterialX), 1600×900, 128 spp, denoised with Open Image Denoise, on a 16 GB Apple M4. The daylight Bistro exterior has the scene's lamps and emissive signs switched off; the evening interior brightens its lamps 60×.</sub></p>
 
 ## Gallery
 
@@ -60,7 +85,28 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
   </tr>
 </table>
 
-<sub>Every image was rendered through the app's own export path with `python3 scripts/render_showcase.py` (shots in [`scripts/showcase.json`](scripts/showcase.json)). The environments are Poly Haven HDRIs (CC0). The Shader Ball render is an adapted work of the [ASWF Standard Shader Ball](https://github.com/usd-wg/assets/tree/3b75c2dad6a494897557dcca0098257bcf42a8c6/full_assets/StandardShaderBall) by the ASWF USD Working Group (geometry and textures by Chris Rydalch), [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). The changes are listed in [docs/images/README.md](docs/images/README.md).</sub>
+<sub>Every image was rendered through the app's own export path with `python3 scripts/render_showcase.py` (shots in [`scripts/showcase.json`](scripts/showcase.json)). The environments are Poly Haven HDRIs (CC0). The Shader Ball render is an adapted work of the [ASWF Standard Shader Ball](https://github.com/usd-wg/assets/tree/3b75c2dad6a494897557dcca0098257bcf42a8c6/full_assets/StandardShaderBall) by the ASWF USD Working Group (geometry and textures by Chris Rydalch), [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). The changes are listed in [docs/images/README.md](docs/images/README.md). The production scenes are from Morgan McGuire's [Computer Graphics Archive](https://casual-effects.com/data/): Crytek Sponza © 2010 Frank Meinl, Crytek ([CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)); San Miguel © Guillermo M. Leal Llaguno ([CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)); Amazon Lumberyard Bistro © 2017 Amazon Lumberyard ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)). The Contemporary Bathroom is by Mareck, from Benedikt Bitterli's [rendering resources](https://benedikt-bitterli.me/resources/) (CC0).</sub>
+
+## Validation
+
+Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](https://github.com/mitsuba-renderer/mitsuba3) from the same description, and the mean radiance is compared (`scripts/compare_mitsuba.py`, `scripts/compare_scene.py`).
+
+<p align="center"><img src="docs/images/validation-veach-mis.jpg" alt="Veach MIS scene: Metal Vibe Tracer, Mitsuba 3 and their relative difference"></p>
+<p align="center"><sub><b>Veach MIS</b>, Metal Vibe Tracer | Mitsuba 3 | relative difference. Mean radiance agrees within 0.11%, the Cornell box within 0.02%.</sub></p>
+
+<p align="center"><img src="docs/images/validation-bathroom.jpg" alt="Contemporary Bathroom: Metal Vibe Tracer, Mitsuba 3 and their relative difference"></p>
+<p align="center"><sub><b>Contemporary Bathroom</b> (Bitterli's rendering resources, converted to OpenUSD), Metal Vibe Tracer | Mitsuba 3 | relative difference: within 0.1%. Five of seven Bitterli scenes agree within 2.5%; the remaining gaps are documented model differences, such as OpenPBR's energy-conserving rough metals (<a href="REFERENCES.md">REFERENCES.md</a>, <code>BITTERLI2016</code>).</sub></p>
+
+### Recent improvements
+
+<p align="center"><img src="docs/images/filtering-before-after.jpg" alt="Sponza floor and arches before and after anisotropic texture filtering"></p>
+<p align="center"><sub><b>Anisotropic ray-cone texture filtering</b> (before | after). Footprints are ellipses fed to the hardware's anisotropic filter (Akenine-Möller et al., JCGT 2021), and the camera footprint shrinks with the sample count as in pbrt-v4, so receding floors, fabric and stone stay sharp.</sub></p>
+
+<p align="center"><img src="docs/images/glass-before-after.jpg" alt="Bistro upper-floor windows rendered as opaque panels before and as glass after"></p>
+<p align="center"><sub><b>MTL glass as thin-walled OpenPBR transmission</b> (before | after). Glass illumination models, and glass written as constant dissolve, now transmit light filtered by <code>Tf</code>; panes with <code>Ni 1</code> ("light does not bend") are thin-walled.</sub></p>
+
+<p align="center"><img src="docs/images/bump-before-after.jpg" alt="Sponza columns with weak and calibrated bump mapping"></p>
+<p align="center"><sub><b>Calibrated bump mapping</b> (before | after). MTL height maps are converted to normal maps at a strength calibrated on the archive's authored normal maps.</sub></p>
 
 ## Features
 
@@ -68,7 +114,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 | --- | --- |
 | **Path tracing** | ReSTIR DI with first-bounce ReSTIR GI on procedural scenes, and ReSTIR PT for imported scenes. Standard MIS, light-only and BSDF-only modes for comparison. |
 | **Light transport** | Spectral (default) or RGB. CIE illuminant presets, dispersion, and thin film. |
-| **Materials** | OpenPBR surfaces, image textures, normal maps, and a subset of MaterialX graphs. |
+| **Materials** | OpenPBR surfaces, image textures with anisotropic filtering, normal and bump maps, alpha cutouts, thin-walled glass, and a subset of MaterialX graphs. |
 | **Scenes** | Six procedural test scenes, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Scene size is limited by the Mac's GPU memory, not fixed caps. |
 | **Acceleration** | Two-level instancing on Metal hardware ray tracing, with an exact software 4-wide BVH as a fallback. |
 | **Camera and lighting** | Thin-lens depth of field, procedural skies, HDRI environments, and editable area lights. |
@@ -82,7 +128,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 
 - **Path tracing:** ReSTIR with Standard MIS, light-only, and BSDF-only comparison modes. Imported scenes use ReSTIR PT, which reuses whole paths, including glossy, mirror and glass paths, with the improvements of ReSTIR PT Enhanced (Lin et al., SIGGRAPH 2022 and I3D 2026; `RESTIRPT2022`, `RESTIRPTE2026` in [REFERENCES.md](REFERENCES.md)). The procedural scenes use ReSTIR direct lighting with first-bounce diffuse ReSTIR GI, which is faster there; its spatial reuse can pick neighbours by compatibility-guided selection (Junkins et al., HPG 2026; `COMPATRESTIR2026`). An opt-in stochastic pairwise MIS spatial reuse (Hedstrom et al., Eurographics 2026; `SPMIS2026`) reuses DI, GI or PT samples from 64-pixel reuse cells without bias. ReSTIR PT shades pixels with spatio-temporal control variates (Shi et al., SIGGRAPH 2026; `RESTCV2026`): colour estimates accumulated over neighbouring pixels and frames, corrected by the reservoirs' own difference estimates, which lowers colour noise without bias.
 - **Light transport:** RGB or spectral. Spectral transport traces four wavelengths per path, after Christoph Peters' spectral rendering series (bounded-MESE reflectance spectra from sRGB, wavelengths importance-sampled by illuminant and colour-matching functions; `PETERS2019`, `FOURIERSRGB2019`, `PETERSBLOG2025`), with CIE illuminant presets for lights and the sun, dispersion and thin film (`HERO2014` for dispersive glass), through every ReSTIR mode. Automatic, the default since October 3, 2026, uses it for every scene.
-- **Scenes:** imported meshes are traced as instances through a two-level acceleration structure: Metal hardware ray tracing where a launch-time check finds it watertight (Apple M4 does), otherwise an exact software 4-wide SAH hierarchy. Meshes are stored indexed (32 bytes per triangle in the document, about 150 bytes on the GPU with hardware traversal): up to 16,000,000 stored and 64,000,000 rendered triangles, with 1,024 material slots and 65,535 scene nodes (see [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md)).
+- **Scenes:** imported meshes are traced as instances through a two-level acceleration structure: Metal hardware ray tracing where a launch-time check finds it watertight (Apple M4 does), otherwise an exact software 4-wide SAH hierarchy. Meshes are stored indexed (32 bytes per triangle in the document, about 150 bytes on the GPU with hardware traversal), with 1,024 material slots and 65,535 scene nodes. Scene size is bounded by the GPU memory budgets, which scale with the Mac (stored and rendered triangle counts are limited only by 32-bit addressing); textures that exceed the budget are decoded at reduced size (see [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md)).
 - **Thin lens:** a uniform circular aperture and a focus plane perpendicular to the camera's forward axis (`PBRT2023`). The G-buffer, shading and MetalFX guide passes share each pixel's lens sample. It is a thin-lens approximation, not a multi-element optical model.
 
 </details>

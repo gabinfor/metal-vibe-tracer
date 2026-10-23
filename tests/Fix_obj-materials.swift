@@ -50,10 +50,22 @@
     \tPm 0.5
     newmtl Lamp
     \tKe 2 2 1
+    \tillum 5
+    newmtl Pane
+    \tKd 1 1 1
+    \tKs 0.5 0.5 0.5
+    \tNs 100
+    \tNi 1.0
+    \tTf 0.2 0.3 0.4
     \tillum 7
+    newmtl Bottle
+    \tNi 1.5
+    \tillum 4
     """
   let materials = try OBJMaterials.read(mtl, report: &report)
-  require(materials.map(\.name) == ["Leaf", "Stone", "Lamp"], "MTL materials: \(materials.map(\.name))")
+  require(materials.map(\.name) == ["Leaf", "Stone", "Lamp", "Pane", "Bottle"], "MTL materials: \(materials.map(\.name))")
+  require(materials[3].tf == SIMD3(0.2, 0.3, 0.4) && materials[3].transmits && materials[4].transmits && !materials[2].transmits,
+    "MTL Tf and transparency models")
   let leafMap = materials[0].maps["map_kd"]
   require(leafMap?.file == "tex/leaf.png" && leafMap?.scale == SIMD2(2, 3) && leafMap?.offset == SIMD2(0.5, 0),
     "MTL map options and backslash path: \(String(describing: leafMap))")
@@ -70,15 +82,26 @@
     && text.contains("value=\"2.0, 3.0\"") && text.contains("name=\"geometry_opacity\" type=\"float\" nodename=\"m0_alpha\"")
     && text.contains("name=\"emission_color\" type=\"color3\" value=\"2.0, 2.0, 1.0\""),
     "MTL to MaterialX translation:\n\(text)")
-  require(report.contains { $0.contains("illum 7") } && report.contains { $0.contains("alpha channel of tex/leaf.png") },
+  require(report.contains { $0.contains("illum 5") } && !report.contains { $0.contains("illum 7") || $0.contains("illum 4") }
+    && report.contains { $0.contains("alpha channel of tex/leaf.png") },
     "MTL reports illum and alpha coverage: \(report)")
+  // Glass (illum 4/6/7/9): smooth transmission filtered by Tf; Ni 1 ("light does not bend") is thin-walled.
+  let shaders = text.components(separatedBy: "<open_pbr_surface ")
+  let pane = shaders.first { $0.hasPrefix("name=\"m3\"") } ?? "", bottle = shaders.first { $0.hasPrefix("name=\"m4\"") } ?? ""
+  require(pane.contains("name=\"transmission_weight\" type=\"float\" value=\"1.0\"")
+    && pane.contains("name=\"transmission_color\" type=\"color3\" value=\"0.2, 0.3, 0.4\"")
+    && pane.contains("name=\"geometry_thin_walled\" type=\"boolean\" value=\"true\"")
+    && pane.contains("name=\"specular_roughness\" type=\"float\" value=\"0.0\"")
+    && bottle.contains("name=\"transmission_weight\" type=\"float\" value=\"1.0\"")
+    && !bottle.contains("geometry_thin_walled") && !bottle.contains("transmission_color"),
+    "MTL glass translation:\n\(pane)\n\(bottle)")
   // Bump ramp rising with u (x) and constant in v: the normal tilts toward -u, not along v.
   let normalURL = folder.appendingPathComponent("ramp-normal.png")
   try OBJMaterials.heightNormalMap(folder.appendingPathComponent("tex/ramp.png"), multiplier: 64, clamp: true, to: normalURL)
   let normal = NSBitmapImageRep(data: try Data(contentsOf: normalURL))!
   let o = 8 * normal.bytesPerRow + 8 * normal.bitsPerPixel / 8
   let centre = SIMD3<Double>((0..<3).map { Double(normal.bitmapData![o + $0]) / 255 })
-  let expected = simd_normalize(SIMD3<Double>(-64.0 / 512 * 16 / 255 * 16, 0, 1)) * 0.5 + 0.5
+  let expected = simd_normalize(SIMD3<Double>(-64.0 / 128 * 16 / 255 * 16, 0, 1)) * 0.5 + 0.5
   require(simd_length(centre - expected) < 0.01, "bump ramp tilts the normal toward -u (\(centre); expected \(expected))")
   require(OBJMaterials.isNormalMap(normalURL) && !OBJMaterials.isNormalMap(folder.appendingPathComponent("tex/ramp.png")),
     "a bump-slot normal map is told apart from a height map")
@@ -116,6 +139,10 @@
     f 1/1 3/3 2/2
     usemtl Missing
     f 2/2 3/3 1/1
+    usemtl Pane
+    f 1/1 2/2 3/3
+    usemtl Bottle
+    f 1/1 2/2 3/3
     """
   var document = ProjectDocument()
   report = []
@@ -123,9 +150,15 @@
   let graph = document.graph!, state = document.scenes[6]!
   func slot(_ name: String) -> Int { graph.materials.first { $0.name == name }!.slot }
   let leaf = state.materialX?[slot("Leaf")], stone = state.materialX?[slot("Stone")]
-  require(leaf?.opacity != nil && leaf?.images.count == 1 && stone?.opacity != nil && stone?.images.count == 2
+  // Stone's constant dissolve (Tr 0.25) without a mask is glass, not coverage; Leaf's alpha mask stays coverage.
+  require(leaf?.opacity != nil && leaf?.images.count == 1 && stone?.opacity == nil && stone?.thinWalled == true
+    && stone?.images.count == 2 && report.contains { $0.contains("Stone: constant dissolve d 0.75 rendered as glass") }
     && state.materialX?[slot("Missing")] == nil && state.surfaces[slot("Stone")].color == SIMD4(0.5, 0.4, 0.3, 1),
     "OBJ import compiles MTL programs: leaf \(String(describing: leaf?.images.count)), stone \(String(describing: stone?.images.count))")
+  let paneProgram = state.materialX?[slot("Pane")], bottleProgram = state.materialX?[slot("Bottle")]
+  require(paneProgram?.transmissionColor == SIMD3(0.2, 0.3, 0.4) && paneProgram?.thinWalled == true
+    && bottleProgram != nil && bottleProgram?.transmissionColor == nil && bottleProgram?.thinWalled == nil,
+    "OBJ glass compiles to per-slot transmission colour and thin walls")
   require(report.contains { $0.contains("Missing is not defined") } && document.importReport?.first == "scene.obj:"
     && !report.contains { $0.contains("vibe-mtl-") }, "OBJ import report: \(report)")
   print("PASS: OBJ mtllib materials, MTL to OpenPBR MaterialX, bump-to-normal orientation and alpha coverage")

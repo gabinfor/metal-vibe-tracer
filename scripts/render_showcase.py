@@ -68,6 +68,9 @@ struct Shot: Decodable {
   var depth: Float?
   // Raw linear radiance as OpenEXR, without a denoiser (renderer comparisons).
   var raw: Bool?
+  // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
+  // shot, above 1 brightens it for a night shot. Applied to the compiled programs, not the source files.
+  var emissionScale: Float?
 }
 func waitFor(_ condition: () -> Bool, seconds: Double) -> Bool {
   let deadline = Date().addingTimeInterval(seconds)
@@ -99,6 +102,22 @@ for shot in try JSONDecoder().decode([Shot].self, from: shotData) {
     p.scene = shot.scene ?? 0
     testRenderer.sceneIndex = p.scene
     p.camera = CameraState(testRenderer)
+  }
+  if let k = shot.emissionScale, var state = p.scenes[6] {
+    for (slot, var program) in state.materialX ?? [:] {
+      guard let root = program.emission else { continue }
+      if k == 0 { program.emission = nil } else if program.instructions.count + 2 <= 64 {
+        var constant = GraphInstruction(); constant.value = SIMD4(repeating: k)
+        program.instructions.append(constant)
+        var scaled = GraphInstruction(); scaled.code = SIMD4(3, root, Int32(program.instructions.count - 1), 0)
+        program.instructions.append(scaled)
+        program.emission = Int32(program.instructions.count - 1)
+      }
+      state.materialX?[slot] = program
+    }
+    state.emissions = state.emissions?.mapValues { $0 * k }
+    p.scenes[6] = state
+    print("\(shot.name): imported emission scaled by \(k)")
   }
   if let hdri = shot.hdri {
     p.environmentData = try Data(contentsOf: URL(fileURLWithPath: hdri))

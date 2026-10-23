@@ -277,9 +277,9 @@
      HitRecord h={};h.t=1;h.normal=float3(0,0,-1);h.front_face=true;h.mat.slot=slot;h.uv=float2(0.25f);
      h.tangent=float3(1,0,0);h.bitangent=float3(0,1,0);h.uvDensity=float2(0);h.geometricNormal=h.normal;
      Ray r={float3(0,0,-1),float3(0,0,1)};
-     resolve_materialx(h,r,images,0.0f);
+     resolve_materialx(h,r,images,TextureFootprint{});
      out[0]=float4(h.mat.albedo,h.mat.roughness);out[1]=float4(h.mat.metalness,h.mat.coat,0,0);
-     for(uint c=0;c<4;++c) out[2+c]=sample_material_map(images,slot,c,float2(0.25f),float2(0),0.0f);
+     for(uint c=0;c<4;++c) out[2+c]=sample_material_map(images,slot,c,float2(0.25f),TextureFootprint{});
     }
     """
   let library = try gpu.makeLibrary(source: metalSource + kernel, options: shaderCompileOptions())
@@ -442,3 +442,76 @@ try fixMaterialXChecks()
   print("PASS: OpenPBR specular_color compiles, reaches the GPU per slot and tints the metal edge")
 }
 try fixSpecularColorChecks()
+
+// OpenPBR transmission_color and geometry_thin_walled (MTL glass, REFERENCES.md MTL2026): constants
+// compile to MaterialXProgram.transmissionColor / thinWalled (connected colours are rejected), reach
+// the GPU per slot (slot_transmission), and a thin-walled pane transmits without bending from either
+// face, where solid glass refracts; the transmitted colour follows transmission_color.
+@MainActor func fixThinWalledGlassChecks() throws {
+  let folder = testOutputDirectory.appendingPathComponent("thin-walled", isDirectory: true)
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  let glass = try MaterialXImporter.read(Data("""
+    <materialx version="1.39"><open_pbr_surface name="Pane" type="surfaceshader">
+      <input name="transmission_weight" type="float" value="1"/><input name="transmission_color" type="color3" value="0.2, 0.4, 0.8"/>
+      <input name="geometry_thin_walled" type="boolean" value="true"/><input name="specular_roughness" type="float" value="0"/>
+    </open_pbr_surface></materialx>
+    """.utf8), baseURL: folder, source: "Pane.mtlx")
+  require(glass.materials.first?.transmissionColor == SIMD3(0.2, 0.4, 0.8) && glass.materials.first?.thinWalled == true,
+    "constant transmission_color and geometry_thin_walled compile (\(glass.report))")
+  let connected = try MaterialXImporter.read(Data("""
+    <materialx version="1.39"><constant name="c" type="color3"><input name="value" type="color3" value="0.5, 0.5, 0.5"/></constant>
+    <open_pbr_surface name="Linked" type="surfaceshader"><input name="transmission_color" type="color3" nodename="c"/></open_pbr_surface></materialx>
+    """.utf8), baseURL: folder, source: "Linked.mtlx")
+  require(connected.materials.isEmpty && connected.report.contains { $0.contains("transmission_color must be a constant") },
+    "connected transmission_color is rejected: \(connected.report)")
+  var state = SceneState()
+  state.materialX = [8: glass.materials[0]]
+  let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+  try l.restore(state)
+  let kernel = """
+    kernel void glass_probe(constant MaterialResources &images [[buffer(2)]], device float4 *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        if (id != 0) return;
+        out[0] = slot_transmission(8u, images);
+        out[1] = slot_transmission(9u, images);
+        Material m = {}; m.type = OPENPBR; m.usesMaterialX = 1u; m.albedo = float3(0.8f); m.roughness = 0.03f;
+        m.ior = 1.5f; m.specularWeight = 1.0f; m.baseWeight = 1.0f; m.transmission = 1.0f; m.slot = 8u;
+        m.specularColor = float3(1.0f);
+        float3 n = float3(0, 0, 1), wo = normalize(float3(sin(0.7f), 0, cos(0.7f)));
+        // 0: thin-walled, front face; 1: thin-walled, back face; 2: solid, front face.
+        for (uint c = 0; c < 3; ++c) {
+            m.transmissionTint = c < 2 ? slot_transmission(8u, images) : float4(slot_transmission(8u, images).rgb, 0.0f);
+            m.inside = c == 1;
+            OpenPBR_PreparedBsdf p = prepare_openpbr(m, n, wo);
+            float3 direction = float3(0), weight = float3(0);
+            uint seed = 12345u;
+            for (uint i = 0; i < 4096u; ++i) {
+                float3 r = float3(rand_f(seed), rand_f(seed), rand_f(seed)), wi; OpenPBR_DiffuseSpecular f; float pdf; uint lobe;
+                openpbr_sample(p, r, wi, f, pdf, lobe);
+                if (pdf > 0.0f && dot(wi, n) < 0.0f) { direction += wi; weight += openpbr_get_sum_of_diffuse_specular(f); }
+            }
+            out[2 + c] = float4(normalize(direction), dot(normalize(direction), -wo));
+            out[5 + c] = float4(weight / 4096.0f, 0);
+        }
+    }
+    """
+  let library = try gpu.makeLibrary(source: metalSource + kernel, options: shaderCompileOptions())
+  let pipeline = try gpu.makeComputePipelineState(function: library.makeFunction(name: "glass_probe")!)
+  let out = gpu.makeBuffer(length: 8 * 16, options: .storageModeShared)!
+  let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+  encoder.setComputePipelineState(pipeline)
+  require(l.bind(encoder), "glass probe binds material resources")
+  encoder.setBuffer(out, offset: 0, index: 3)
+  encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+  encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+  let v = (0..<8).map { out.contents().load(fromByteOffset: $0 * 16, as: SIMD4<Float>.self) }
+  print("Thin-walled glass checks: \(v)")
+  require(v[0] == SIMD4(0.2, 0.4, 0.8, 1) && v[1] == SIMD4(1, 1, 1, 0),
+    "the slot's transmission_color and thin wall reach the GPU, other slots are clear and solid (\(v[0]), \(v[1]))")
+  require(v[2].w > 0.999 && v[3].w > 0.999, "a thin-walled pane transmits without bending from either face (\(v[2]), \(v[3]))")
+  require(v[4].w < 0.99, "solid glass refracts (\(v[4]))")
+  let tint = SIMD3(v[5].x, v[5].y, v[5].z)
+  require(tint.x > 0.01 && tint.x < tint.y && tint.y < tint.z && tint.z < 1,
+    "transmitted light follows transmission_color (\(tint))")
+  print("PASS: OpenPBR transmission_color and geometry_thin_walled compile, reach the GPU per slot, and thin walls transmit unbent")
+}
+try fixThinWalledGlassChecks()

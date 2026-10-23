@@ -791,7 +791,8 @@ extension MaterialXProgram {
   func sameProgram(as other: MaterialXProgram) -> Bool {
     guard name == other.name, source == other.source, roots == other.roots,
       diffuseRoughness == other.diffuseRoughness, emission == other.emission, opacity == other.opacity,
-      specularColor == other.specularColor,
+      specularColor == other.specularColor, transmissionColor == other.transmissionColor,
+      thinWalled == other.thinWalled,
       sameBytes(instructions, other.instructions),
       images.count == other.images.count, parameters.count == other.parameters.count,
       zip(images, other.images).allSatisfy({ $0.name == $1.name && $0.srgb == $1.srgb && $0.data == $1.data })

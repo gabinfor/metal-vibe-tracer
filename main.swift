@@ -328,6 +328,9 @@ struct Material {
     bool inside;
     float3 geometricNormal;
     float3 specularColor;  // OpenPBR specular_color of a MaterialX material (slot_specular_color)
+    // OpenPBR transmission_color (rgb) and geometry_thin_walled (w > 0) of a MaterialX material
+    // (slot_transmission).
+    float4 transmissionTint;
 };
 
 struct HitRecord {
@@ -362,7 +365,7 @@ struct LightSample {
 struct Uniforms {
     float4 cameraPos;      // xyz = pos, w = fov
     float4 cameraTarget;   // xyz = target, w = maximum path depth (1 = direct lighting only); see scattering_limit
-    float4 cameraUp;       // xyz = up, w = 0
+    float4 cameraUp;       // xyz = up, w = texture footprint scale (texture_footprint_scale; 0 reads as 1)
     float4 sunParams;      // xyz = sun direction, w = sun intensity
     float4x4 currentViewProj;
     float4x4 prevViewProj;
@@ -385,6 +388,16 @@ struct Uniforms {
     float4 lens; // aperture radius, focus distance, scene-graph mode (see uses_scene_graph), independent sun 1 - cos(half angle)
     float4 light; // RGB multiplier, size multiplier
 };
+
+// PBRT2023 (RayIntegrator): the camera's ray differentials, here its texture ray cone, are scaled by
+// max(1/8, 1/sqrt(samples per pixel)), because accumulated jittered samples already filter the
+// pixel (PathTracerRenderer.textureFootprintScale). Only primary hits use the scaled cone
+// (primary_texture_footprint); bounces keep the unscaled camera cone and widen it.
+float texture_footprint_scale(constant Uniforms &u) { return u.cameraUp.w > 0.0f ? u.cameraUp.w : 1.0f; }
+// Texture footprint width of a primary hit at distance t: the camera's pixel cone, scaled.
+float primary_texture_footprint(float t, constant Uniforms &u) {
+    return t * 2.0f * tan(u.cameraPos.w * PI / 360.0f) / float(u.height) * texture_footprint_scale(u);
+}
 
 // lens.z = 1 renders scene 6 from the imported scene graph: per-triangle material
 // slots and emission, an identity root transform, and float-scaled ray offsets.
@@ -574,8 +587,9 @@ struct MaterialResources {
     device MeshWideNode *blasNodes [[id(12)]];
     // Graph-less (legacy) mesh only: per face, its stored uvc.w (low 16 bits) and na.w (high 16).
     device uint *faceExtras [[id(13)]];
-    // Per slot, two float4 (MaterialLibrary.slotParameters): the spectral OpenPBR parameters
-    // (SpectralMaterial), then the constant specular_color (slot_specular_color).
+    // Per slot, three float4 (MaterialLibrary.slotParameters): the spectral OpenPBR parameters
+    // (SpectralMaterial), the constant specular_color (slot_specular_color), and the constant
+    // transmission_color and geometry_thin_walled (slot_transmission).
     device float4 *spectralMaterials [[id(14)]];
     // Alpha cutouts: per slot the register of MaterialX geometry_opacity (-1: opaque), then at
     // MATERIAL_SLOTS the number of cutout slots (MaterialLibrary.rebuildArguments).
@@ -586,7 +600,12 @@ struct MaterialResources {
 // OpenPBR specular_color of a slot (MaterialLibrary.slotParameters; white unless a MaterialX
 // program sets it): a metal's 82-degree edge tint, a dielectric's specular tint.
 float3 slot_specular_color(uint slot, constant MaterialResources &images) {
-    return slot < MATERIAL_SLOTS ? images.spectralMaterials[2 * slot + 1].rgb : float3(1.0f);
+    return slot < MATERIAL_SLOTS ? images.spectralMaterials[3 * slot + 1].rgb : float3(1.0f);
+}
+// OpenPBR transmission_color (rgb) and geometry_thin_walled (w: 1 or 0) of a slot; white and solid
+// unless a MaterialX program sets them.
+float4 slot_transmission(uint slot, constant MaterialResources &images) {
+    return slot < MATERIAL_SLOTS ? images.spectralMaterials[3 * slot + 2] : float4(1.0f, 1.0f, 1.0f, 0.0f);
 }
 
 // Radiance of the area light of scenes 1, 3, 4 and 5 before the light tint (Uniforms.light).
@@ -847,7 +866,7 @@ float3 emitter_rgb(float3 e, thread const Wavelengths &wl) { return spectral_emi
 SpectralMaterial spectral_material(Material m, thread const Wavelengths &wl) {
     SpectralMaterial none = { 0.0f, 0.0f, 0.0f, 1.4f };
     if (m.slot >= MATERIAL_SLOTS) return none;
-    float4 p = wl.images->spectralMaterials[2 * m.slot];
+    float4 p = wl.images->spectralMaterials[3 * m.slot];
     SpectralMaterial r = { p.x, p.y, p.z, p.w };
     return r;
 }
@@ -2049,13 +2068,31 @@ struct SurfaceSettings {
 static_assert(sizeof(SurfaceSettings) == 64, "Swift SurfaceSettings layout");
 
 
+// REFERENCES.md: RAYCONES2021, PBRT2023, METALTEXTURES. A texture footprint: the two axes of the
+// ray cone's ellipse on the surface, as texture-coordinate offsets (the gradients of an explicit-
+// gradient sample, filtered anisotropically by the hardware).
+struct TextureFootprint { float2 dx, dy; };
+TextureFootprint scaled_footprint(TextureFootprint f, float2 scale) { f.dx *= scale; f.dy *= scale; return f; }
+// The cone of width `width` (world units) cut by the surface at `hit`: the minor axis is the width,
+// across the ray's projection onto the surface; the major axis is width / |cos|, along it. Both map
+// to UV through the tangent frame (dP/du, dP/dv directions) and the UV density per world unit.
+TextureFootprint surface_footprint(thread const HitRecord &hit, Ray ray, float width) {
+    float3 n = hit.geometricNormal;
+    float c = abs(dot(ray.direction, n));
+    float3 along = ray.direction - n * dot(ray.direction, n);
+    float3 major = dot(along, along) > 1e-12f ? normalize(along) : hit.tangent;
+    float3 minor = cross(n, major);
+    float3 b = dot(hit.bitangent, hit.bitangent) > 0.25f ? hit.bitangent : cross(hit.normal, hit.tangent);
+    TextureFootprint f;
+    f.dx = hit.uvDensity * float2(dot(major, hit.tangent), dot(major, b)) * (width / max(c, 0.05f));
+    f.dy = hit.uvDensity * float2(dot(minor, hit.tangent), dot(minor, b)) * width;
+    return f;
+}
 float4 sample_material_map(constant MaterialResources &images, uint slot, uint channel,
-                          float2 uv, float2 density, float footprint) {
-    constexpr sampler filter(coord::normalized, address::repeat, filter::linear, mip_filter::linear);
+                          float2 uv, TextureFootprint f) {
+    constexpr sampler filter(coord::normalized, address::repeat, filter::linear, mip_filter::linear, max_anisotropy(16));
     uint index = slot * 4 + channel;
-    float2 size = float2(images.maps[index].get_width(), images.maps[index].get_height());
-    float lod = max(0.0f, log2(max(1e-6f, max(size.x * density.x, size.y * density.y) * footprint)));
-    return images.maps[index].sample(filter, uv, level(lod));
+    return images.maps[index].sample(filter, uv, gradient2d(f.dx, f.dy));
 }
 
 
@@ -2067,7 +2104,9 @@ float3 tangent_space_normal(thread const HitRecord &hit, float3 m) {
 }
 
 // REFERENCES.md: MATERIALX. Bounded, topologically sorted graph expressions.
-void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, float footprint) {
+// `footprint` is the hit's texture footprint in its base UV coordinates; graph densities track how
+// each register's coordinates scale with them (1 at texcoord).
+void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, TextureFootprint footprint) {
     GraphHeader h=images.graphHeaders[hit.mat.slot]; if(h.info.y==0) return;
     float4 values[64]; float2 densities[64];
     for(int i=0;i<h.info.y;++i) {
@@ -2077,18 +2116,19 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         float4 v=n.value;float2 d=float2(0);
         switch(n.code.x) {
         case 0:break;
-        case 1:v=float4(hit.uv.x,1.0f-hit.uv.y,0,0);d=hit.uvDensity;break;
+        case 1:v=float4(hit.uv.x,1.0f-hit.uv.y,0,0);d=float2(1.0f);break;
         case 2:{
             // value.z/w select MaterialX clamp (clamp-to-edge) addressing per axis.
-            constexpr sampler periodic(coord::normalized,address::repeat,filter::linear,mip_filter::linear);
-            constexpr sampler clampU(coord::normalized,s_address::clamp_to_edge,t_address::repeat,filter::linear,mip_filter::linear);
-            constexpr sampler clampV(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear);
-            constexpr sampler clampUV(coord::normalized,address::clamp_to_edge,filter::linear,mip_filter::linear);
-            uint index=uint(n.value.x);float2 size=float2(images.graphImages[index].get_width(),images.graphImages[index].get_height());
-            float lod=max(0.0f,log2(max(1e-6f,max(size.x*da.x,size.y*da.y)*footprint)));
+            constexpr sampler periodic(coord::normalized,address::repeat,filter::linear,mip_filter::linear,max_anisotropy(16));
+            constexpr sampler clampU(coord::normalized,s_address::clamp_to_edge,t_address::repeat,filter::linear,mip_filter::linear,max_anisotropy(16));
+            constexpr sampler clampV(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear,max_anisotropy(16));
+            constexpr sampler clampUV(coord::normalized,address::clamp_to_edge,filter::linear,mip_filter::linear,max_anisotropy(16));
+            uint index=uint(n.value.x);
+            // MaterialX coordinates are bottom-left: the image's t runs against v.
+            float2 flip=float2(1.0f,-1.0f),gx=footprint.dx*da*flip,gy=footprint.dy*da*flip;
             float2 st=float2(a.x,1.0f-a.y);
-            v=n.value.z>0 ? images.graphImages[index].sample(n.value.w>0?clampUV:clampU,st,level(lod))
-                : images.graphImages[index].sample(n.value.w>0?clampV:periodic,st,level(lod));
+            v=n.value.z>0 ? images.graphImages[index].sample(n.value.w>0?clampUV:clampU,st,gradient2d(gx,gy))
+                : images.graphImages[index].sample(n.value.w>0?clampV:periodic,st,gradient2d(gx,gy));
             if(n.value.y>0) v=float4(v.x); break;
         }
         case 3:v=a*b;d=abs(a.xy)*db+abs(b.xy)*da;break;
@@ -2107,6 +2147,7 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
     }
     hit.mat.type=OPENPBR;hit.mat.usesMaterialX=1;
     hit.mat.specularColor=slot_specular_color(hit.mat.slot,images);
+    hit.mat.transmissionTint=slot_transmission(hit.mat.slot,images);
     hit.mat.diffuseRoughness=h.info.z>=0 ? clamp(values[h.info.z].x,0.0f,1.0f) : 0.0f;
     hit.mat.albedo=clamp(values[h.roots0.x].rgb,0.0f,1.0f);
     hit.mat.roughness=clamp(values[h.roots0.y].x,0.03f,1.0f);
@@ -2120,7 +2161,7 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
     hit.mat.specularWeight=clamp(values[h.roots2.z].x,0.0f,1.0f);
     hit.mat.baseWeight=clamp(values[h.roots2.w].x,0.0f,1.0f);
     // OpenPBR emission (nits, before coat/fuzz attenuation) leaves the exterior side only;
-    // geometry_thin_walled is fixed at false. See openpbr_emission.
+    // thin-walled materials emit from the front face only as well. See openpbr_emission.
     hit.mat.emission=h.info.w>=0 && hit.front_face ? clamp(values[h.info.w].rgb,0.0f,1e8f) : float3(0);
     if(h.roots2.x>=0) {
         float3 normal=values[h.roots2.x].xyz;
@@ -2150,18 +2191,20 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
         hit.mat.ior = config.detail.y;
         hit.mat.transmission = config.detail.z;
     }
+    TextureFootprint fp = surface_footprint(hit, ray, footprint);
     if(images.graphHeaders[slot].info.y>0) {
-        resolve_materialx(hit,ray,images,footprint/max(0.05f,abs(dot(ray.direction,hit.geometricNormal))));return;
+        resolve_materialx(hit,ray,images,fp);return;
     }
     if (config.mapMask == 0) return;
     float repeat = max(0.01f, config.detail.w);
-    float2 uv = hit.uv * repeat, density = hit.uvDensity * repeat;
+    float2 uv = hit.uv * repeat;
     ObjectSettings object=images.objects[slot];
     float angle=object.uvTransform.z;
-    uv=float2(cos(angle)*uv.x-sin(angle)*uv.y,sin(angle)*uv.x+cos(angle)*uv.y)+object.uvTransform.xy;
-    // Isotropic ray-cone footprint, enlarged at grazing incidence. Rough
+    float2x2 rotation=float2x2(float2(cos(angle),sin(angle)),float2(-sin(angle),cos(angle)));
+    uv=rotation*uv+object.uvTransform.xy;
+    // Anisotropic ray-cone footprint, in the rotated and repeated map coordinates. Rough
     // secondary rays expand the cone in shading_kernel; mirror chains preserve it.
-    footprint /= max(0.05f, abs(dot(ray.direction, hit.geometricNormal)));
+    fp.dx=rotation*(fp.dx*repeat); fp.dy=rotation*(fp.dy*repeat);
     // Roughness and metalness maps promote an original scene material to OpenPBR.
     // Keep its metal or glass lobe; a matte surface takes the inspector roughness.
     if ((config.mapMask & 6) && hit.mat.type != OPENPBR && (hit.mat.type != GLOSSY || (config.mapMask & 4))) {
@@ -2171,11 +2214,11 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
         if (hit.mat.type == DIFFUSE) hit.mat.roughness = config.surface.x;
         hit.mat.type = OPENPBR;
     }
-    if (config.mapMask & 1) hit.mat.albedo *= sample_material_map(images, slot, 0, uv, density, footprint).rgb;
-    if (config.mapMask & 2) hit.mat.roughness = clamp(sample_material_map(images, slot, 1, uv, density, footprint)[min(object.channels.x,3u)], 0.03f, 1.0f);
-    if (config.mapMask & 4) hit.mat.metalness = clamp(sample_material_map(images, slot, 2, uv, density, footprint)[min(object.channels.y,3u)], 0.0f, 1.0f);
+    if (config.mapMask & 1) hit.mat.albedo *= sample_material_map(images, slot, 0, uv, fp).rgb;
+    if (config.mapMask & 2) hit.mat.roughness = clamp(sample_material_map(images, slot, 1, uv, fp)[min(object.channels.x,3u)], 0.03f, 1.0f);
+    if (config.mapMask & 4) hit.mat.metalness = clamp(sample_material_map(images, slot, 2, uv, fp)[min(object.channels.y,3u)], 0.0f, 1.0f);
     if (config.mapMask & 8) {
-        float3 map = sample_material_map(images, slot, 3, uv, density, footprint).xyz * 2.0f - 1.0f;
+        float3 map = sample_material_map(images, slot, 3, uv, fp).xyz * 2.0f - 1.0f;
         map.xy *= config.normalStrength;
         float3 mapped = tangent_space_normal(hit, float3(map.xy, max(0.05f, map.z)));
         // Keep the shading frame facing the ray and within the geometric surface.
@@ -2241,7 +2284,11 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
     inputs.specular_roughness_anisotropy = mat.anisotropy;
     inputs.fuzz_weight = mat.fuzz;
     inputs.transmission_weight = mat.transmission;
-    float3 outward = mat.transmission > 0.0f && mat.inside ? -n : n;
+    inputs.transmission_color = mat.usesMaterialX ? mat.transmissionTint.rgb : float3(1.0f);
+    // A thin-walled surface is always entered from the side the ray arrives on (upstream
+    // openpbr_bsdf.h: inside = back_facing && !geometry_thin_walled).
+    inputs.geometry_thin_walled = mat.usesMaterialX && mat.transmissionTint.w > 0.0f;
+    float3 outward = mat.transmission > 0.0f && mat.inside && !inputs.geometry_thin_walled ? -n : n;
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
     inputs.geometry_coat_basis = inputs.geometry_basis;
@@ -2259,7 +2306,7 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
 #if VIBE_SPECTRAL
 struct PreparedBsdf { OpenPBR_PreparedBsdf a, b; uint hero; bool flat; };
 OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, float3 baseColor, float3 lambda,
-                                           SpectralMaterial sm) {
+                                           SpectralMaterial sm, float3 transmissionColor) {
     OpenPBR_ResolvedInputs inputs = openpbr_make_default_resolved_inputs();
     inputs.base_color = baseColor;
     inputs.specular_roughness = max(0.03f, mat.roughness);
@@ -2279,29 +2326,39 @@ OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, fl
     inputs.thin_film_weight = sm.thinFilmWeight;
     inputs.thin_film_thickness = sm.thinFilmThickness;
     inputs.thin_film_ior = sm.thinFilmIOR;
-    float3 outward = mat.transmission > 0.0f && mat.inside ? -n : n;
+    inputs.transmission_color = transmissionColor;
+    inputs.geometry_thin_walled = mat.usesMaterialX && mat.transmissionTint.w > 0.0f;
+    float3 outward = mat.transmission > 0.0f && mat.inside && !inputs.geometry_thin_walled ? -n : n;
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
     inputs.geometry_coat_basis = inputs.geometry_basis;
     return openpbr_prepare(inputs, float3(1), lambda, 1.0f, wo);
 }
+// OpenPBR transmission_color at the path's wavelengths: uplifted like a reflectance (white for
+// materials without a MaterialX transmission colour).
+Spectrum spectral_transmission(Material mat, thread const Wavelengths &wl) {
+    float3 t = mat.usesMaterialX ? clamp(mat.transmissionTint.rgb, 0.0f, 1.0f) : float3(1.0f);
+    return t.x == t.y && t.y == t.z ? Spectrum(t.x) : spectral_reflectance(t, wl);
+}
 PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavelengths &wl) {
     SpectralMaterial sm = spectral_material(mat, wl);
     float3 albedo = clamp(mat.albedo, 0.0f, 1.0f);
     Spectrum rho = spectral_albedo(mat, albedo, wl);
+    Spectrum tau = spectral_transmission(mat, wl);
     PreparedBsdf p;
     p.hero = 4u;
     if (wl.heroOnly && spectral_dispersive(mat, wl)) {
         p.hero = spectral_hero(wl); p.flat = true;
-        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[p.hero]), float3(spectral_lambda(wl, p.hero)), sm);
+        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[p.hero]), float3(spectral_lambda(wl, p.hero)), sm, float3(tau[p.hero]));
         return p;
     }
-    p.flat = albedo.x == albedo.y && albedo.y == albedo.z && !(sm.thinFilmWeight > 0.0f) && !spectral_dispersive(mat, wl);
+    p.flat = albedo.x == albedo.y && albedo.y == albedo.z && all(tau == tau.x)
+        && !(sm.thinFilmWeight > 0.0f) && !spectral_dispersive(mat, wl);
     // The upstream BSDF reads wavelengths only for dispersion and thin film.
     float4 lambda = sm.thinFilmWeight > 0.0f || sm.dispersion > 0.0f ? spectral_lambdas(wl)
         : float4(OpenPBR_BaseRgbWavelengths_nm, OpenPBR_BaseRgbWavelengths_nm.x);
-    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm);
-    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm);
+    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm, tau.xyz);
+    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm, float3(tau.w));
     return p;
 }
 Spectrum prepared_lanes(thread const PreparedBsdf &p, float3 a, float b) {
@@ -2437,7 +2494,7 @@ float3 imported_graph_emission(uint index,float b1,float b2,float3 p,float3 posi
     mesh_hit_attributes(h,t,b1,b2,wi);
     h.mat={DIFFUSE,float3(0.7f),float3(0),0,1};h.mat.slot=slot;
     h.mat.inside=!h.front_face;h.mat.tangent=h.tangent;h.mat.geometricNormal=h.geometricNormal;
-    resolve_materialx(h,ray,images,0.0f);
+    resolve_materialx(h,ray,images,TextureFootprint{});
     return openpbr_emission(h.mat,h.normal,-wi);
 }
 float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant MaterialResources &images) {
@@ -2915,7 +2972,8 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
 // BSDF power heuristic of the hero technique uses (the per-hero partition of HERO2014 Sec. 3.3).
 #if VIBE_SPECTRAL
 OpenPBR_PreparedBsdf spectral_mis_lane(Material mat, float3 n, float3 wo, float rho, uint k, thread const Wavelengths &wl) {
-    return prepare_openpbr_lanes(mat, n, wo, float3(rho), float3(spectral_lambda(wl, k)), spectral_material(mat, wl));
+    return prepare_openpbr_lanes(mat, n, wo, float3(rho), float3(spectral_lambda(wl, k)), spectral_material(mat, wl),
+                                 float3(spectral_transmission(mat, wl)[k]));
 }
 // f (without cosine) of every lane at wi, scaled as above; pdf = the hero lane's.
 Spectrum spectral_mis_eval(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf, thread const Wavelengths &wl,
@@ -3107,6 +3165,7 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth, constant 
     m.emission = s.emission;
     m.usesMaterialX = (s.flags & 512u) != 0 ? 1u : 0u;
     m.specularColor = slot_specular_color(m.slot, images);
+    m.transmissionTint = slot_transmission(m.slot, images);
     m.inside = !hit.front_face; m.geometricNormal = s.geometricNormal;
     hit.mat = m;
     return hit;
@@ -3413,7 +3472,7 @@ kernel void restir_temporal_kernel(
         return;
     }
 
-    resolve_material(rec, ray, uniforms, surfaceSettings, materialImages, rec.t * 2.0f * fov_scale / float(uniforms.height));
+    resolve_material(rec, ray, uniforms, surfaceSettings, materialImages, primary_texture_footprint(rec.t, uniforms));
     primarySurfaces[gid.y * uniforms.width + gid.x] = store_primary_surface(rec, ray.direction);
     gbufferPosDepth.write(float4(rec.position, rec.t), gid);
     gbufferNormalMat.write(float4(rec.normal, float(rec.mat.type)), gid);
@@ -5453,7 +5512,7 @@ kernel void splat_layers_kernel(
         primary.origin = eye;
         primary.direction = direction;
         hit.t = t;
-        resolve_material(hit, primary, u, settings, images, t * cone);
+        resolve_material(hit, primary, u, settings, images, primary_texture_footprint(t, u));
         if (!splat_domain_useful(hit.mat.type, u)) continue;
         uint slot = atomic_fetch_add_explicit(&counters[0], 1u, memory_order_relaxed);
         if (slot >= capacity) { atomic_fetch_add_explicit(&counters[1], 1u, memory_order_relaxed); continue; }
@@ -5818,6 +5877,43 @@ kernel void restir_pt_splat_temporal_kernel(
                                                   : float3(previousControls[source - pixels].estimate);
         pt_cv_temporal(deep ? deepControls[j] : controls[tid], c.M, min(t.M, cap), previousEstimate, difference);
     }
+}
+
+// REFERENCES.md: OIDN250. Open Image Denoise's auxiliary features of a perfect-specular transparent
+// surface may be stored for a subsequent hit. Smooth OpenPBR glass (transmission, roughness at most
+// 0.1; MTL glass is smooth) is followed straight through when thin-walled, else refracted, across up
+// to eight glass surfaces, and the albedo and normal of the surface behind it are returned, tinted by
+// transmission_color. Otherwise the denoiser sees the glass's own colour and flat normal and blurs
+// what shows through it. False when `hit` is not such glass.
+bool glass_feature_hit(HitRecord hit, float3 direction, constant Uniforms &u, constant SurfaceSettings *settings,
+                       constant MaterialResources &images, thread float3 &albedo, thread float3 &normal) {
+    float3 tint = float3(1.0f);
+    bool through = false;
+    float pathLength = hit.t;
+    for (int k = 0; k < 8; ++k) {
+        Material m = hit.mat;
+        if (!(m.type == OPENPBR && m.transmission > 0.5f && m.metalness < 0.5f && m.roughness <= 0.1f)) break;
+        through = true;
+        bool thin = m.usesMaterialX && m.transmissionTint.w > 0.0f;
+        if (m.usesMaterialX) tint *= clamp(m.transmissionTint.rgb, 0.0f, 1.0f);
+        float3 next = direction;
+        if (!thin) {
+            next = refract(direction, hit.normal, hit.front_face ? 1.0f / max(m.ior, 1.01f) : max(m.ior, 1.01f));
+            if (dot(next, next) < 1e-8f) next = reflect(direction, hit.normal);
+        }
+        Ray r;
+        r.origin = ray_origin(hit.position, hit.geometricNormal, next, u, hit.error);
+        r.direction = normalize(next);
+        HitRecord h;
+        if (!trace_scene(r, u.sceneIndex, h, images, u)) { albedo = tint; normal = -r.direction; return true; }
+        pathLength += h.t;
+        resolve_material(h, r, u, settings, images, primary_texture_footprint(pathLength, u));
+        hit = h; direction = r.direction;
+    }
+    if (!through) return false;
+    albedo = tint * clamp(hit.mat.type == EMISSIVE ? hit.mat.emission : hit.mat.albedo, 0.0f, 1.0f);
+    normal = hit.normal;
+    return true;
 }
 
 // ============================================================================
@@ -6292,6 +6388,14 @@ kernel void shading_kernel(
     // passing the final stochastic G-buffer sample.
     float4 albedoGuide = gbufferAlbedoRough.read(gid);
     float4 normalGuide = gbufferNormalMat.read(gid);
+    if (posDepth.w > 0.0f) {
+        HitRecord guideHit = load_primary_surface(primarySurfaces[gid.y * uniforms.width + gid.x], posDepth, materialImages);
+        float3 behindAlbedo, behindNormal;
+        if (glass_feature_hit(guideHit, primaryRay.direction, uniforms, surfaceSettings, materialImages, behindAlbedo, behindNormal)) {
+            albedoGuide.xyz = behindAlbedo;
+            normalGuide.xyz = behindNormal;
+        }
+    }
     if (uniforms.frameIndex > 1) {
         float3 previousAlbedo = oidnAlbedoAccum.read(gid).xyz;
         float3 previousNormal = oidnNormalAccum.read(gid).xyz;
@@ -6351,7 +6455,7 @@ DenoiserMaterialGuide trace_denoiser_material(Ray ray, constant Uniforms &u,
             guide.diffuse = tint * sky / max(1.0f, max(sky.x, max(sky.y, sky.z)));
             return guide;
         }
-        resolve_material(hit, ray, u, surfaceSettings, materialImages, hit.t * 2.0f * tan(u.cameraPos.w * PI / 360.0f) / float(u.height));
+        resolve_material(hit, ray, u, surfaceSettings, materialImages, primary_texture_footprint(hit.t, u));
         if (hit.mat.type == OPENPBR) {
             guide.diffuse = tint * hit.mat.albedo * (1.0f - hit.mat.metalness) * (1.0f - hit.mat.transmission);
             guide.specular = tint * mix(float3(0.04f), hit.mat.albedo, hit.mat.metalness);
@@ -7310,12 +7414,15 @@ final class MaterialLibrary {
     // film weight, thickness in micrometres and IOR), from the slots' MaterialX constants;
     // spectralOverrides replaces a slot's (test scenes).
     var spectralOverrides: [Int: SIMD4<Float>] = [:] { didSet { bindingsDirty = true } }
-    // Per slot, two float4: the spectral OpenPBR parameters (MSL SpectralMaterial), then the constant
-    // specular_color (rgb; MSL slot_specular_color).
+    // Per slot, three float4: the spectral OpenPBR parameters (MSL SpectralMaterial), the constant
+    // specular_color (rgb; MSL slot_specular_color), and the constant transmission_color (rgb) and
+    // geometry_thin_walled (w; MSL slot_transmission).
     var slotParameters: [SIMD4<Float>] {
         (0..<SceneLimits.materials).flatMap { slot -> [SIMD4<Float>] in
-            let tint = materialX[slot]?.specularColor ?? SIMD3(repeating: 1)
-            return [spectralOverrides[slot] ?? materialX[slot]?.spectral ?? MaterialXProgram.noSpectral, SIMD4(tint, 0)]
+            let program = materialX[slot]
+            let tint = program?.specularColor ?? SIMD3(repeating: 1)
+            let transmission = SIMD4(program?.transmissionColor ?? SIMD3(repeating: 1), program?.thinWalled == true ? 1 : 0)
+            return [spectralOverrides[slot] ?? program?.spectral ?? MaterialXProgram.noSpectral, SIMD4(tint, 0), transmission]
         }
     }
     var orderedTriangles: StoredTriangles {
@@ -8773,6 +8880,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         renderFrame(output:drawable.texture,drawable:drawable,reservedFrameSlot:true,
                     samples:samplesPerFrame(targetMilliseconds: interval * 800, limit: remaining))
     }
+    // REFERENCES.md: PBRT2023, RAYCONES2021. The camera's texture ray cone is scaled like pbrt-v4's
+    // ray differentials, by max(1/8, 1/sqrt(samples per pixel)): the accumulated, jittered samples
+    // already filter each pixel. The samples are the accumulation's limit (the export's sample
+    // count), or 64 when the viewport accumulates without one (MSL texture_footprint_scale).
+    var textureFootprintScale: Float {
+        max(0.125, 1 / Float(options.maxSamples > 0 ? options.maxSamples : 64).squareRoot())
+    }
     // Samples to encode in one frame (renderFrame `samples`): as many as fit in `targetMilliseconds`
     // of GPU time at the measured time per sample, so a GPU faster than the display or the export
     // loop accumulates more per command buffer instead of idling; at most `limit` and 64. One while
@@ -9045,7 +9159,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var uniforms = Uniforms(
             cameraPos: SIMD4<Float>(camX, camY, camZ, fov),
             cameraTarget: SIMD4<Float>(target.x, target.y, target.z, options.depth),
-            cameraUp: SIMD4<Float>(0, 1, 0, 0),
+            cameraUp: SIMD4<Float>(0, 1, 0, textureFootprintScale),
             sunParams: SIMD4<Float>(sunDir.x, sunDir.y, sunDir.z, sunIntensity),
             currentViewProj: currViewProj,
             prevViewProj: prevViewProj,
