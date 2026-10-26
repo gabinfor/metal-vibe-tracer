@@ -26,14 +26,19 @@ cp THIRD_PARTY_NOTICES.md "$stage/Contents/Resources/THIRD_PARTY_NOTICES.md"
 # CC BY-SA 4.0 (CIE data) and BSD-3-Clause (Peters' phase warp); notices in THIRD_PARTY_NOTICES.md.
 cp build/SpectralTables/SpectralTables.metal build/SpectralTables/FourierSRGB86.bin "$stage/Contents/Resources/"
 cp Vendor/Spectral/UPSTREAM.md "$stage/Contents/Resources/Spectral-UPSTREAM.md"
+# CIE 1931 observer (CC BY-SA 4.0): per-light spectra's normalisation and RGB colour (CIEObserver).
+cp Vendor/Spectral/CIE/CIE_xyz_1931_2deg.csv "$stage/Contents/Resources/CIE_xyz_1931_2deg.csv"
 cp scripts/usd_bridge.py "$stage/Contents/Resources/"
 cp -RL build/OpenUSD "$stage/Contents/Resources/OpenUSD"
 cp Vendor/OpenUSD/UPSTREAM.md "$stage/Contents/Resources/OpenUSD-UPSTREAM.md"
 cp -RH build/OIDN "$stage/Contents/Frameworks/OIDN"
 cp Vendor/OIDN/UPSTREAM.md "$stage/Contents/Resources/OIDN-UPSTREAM.md"
 cp REFERENCES.md "$stage/Contents/Resources/REFERENCES.md"
-# Camera and lighting of File > Open Example Scene (ShowcaseShot); the scenes themselves are downloaded on request.
+# Camera and lighting of File > Open Example Scene (ShowcaseShot). The spectral examples are bundled at their
+# repository paths (SpectralExamples); the McGuire archive scenes are downloaded on request.
 cp scripts/showcase.json "$stage/Contents/Resources/showcase.json"
+mkdir -p "$stage/Contents/Resources/Examples"
+cp -R Examples/Spectral "$stage/Contents/Resources/Examples/Spectral"
 cat > "$stage/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -42,8 +47,8 @@ cat > "$stage/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>local.vibetracer.app</string>
     <key>CFBundleName</key><string>Metal Vibe Tracer</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.2.1</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
+    <key>CFBundleVersion</key><string>4</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

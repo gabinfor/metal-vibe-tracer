@@ -268,6 +268,58 @@ def sphere_proxy(radius):
         triangles.append(dict(a=a+[1],b=b+[1],c=c+[1],na=n+[0],nb=n+[0],nc=n+[0],uvab=[.5,.5,.5,.5],uvc=[.5,.5,0,0]))
     return triangles
 
+# Implicit UsdGeom surfaces, tessellated with their schema attributes: Sphere (radius, poles on Z as in
+# Hydra), Cube (size) and Cylinder (radius, height, axis). Returns (points, face vertex counts, indices,
+# face-varying normals, face-varying st) in the prim's local space, or None for other prims. Curved sides
+# keep smooth analytic normals; faces wind counter-clockwise seen from outside (rightHanded).
+IMPLICIT_SEGMENTS=96
+def implicit_mesh(prim,time):
+    faces=[]
+    def face(corners):
+        # corners: (position, normal, st); flipped where the winding disagrees with the analytic normal.
+        ps=[c[0] for c in corners];n=[sum(c[1][i] for c in corners) for i in range(3)]
+        w=cross(sub(ps[1],ps[0]),sub(ps[2],ps[0])) if len(set(map(tuple,ps)))==len(ps) else cross(sub(ps[2],ps[0]),sub(ps[3],ps[0]))
+        faces.append(corners if sum(x*y for x,y in zip(w,n))>=0 else corners[::-1])
+    def arc(k):
+        a=2*math.pi*k/IMPLICIT_SEGMENTS;return math.cos(a),math.sin(a)
+    if prim.IsA(UsdGeom.Sphere):
+        r=float(UsdGeom.Sphere(prim).GetRadiusAttr().Get(time));rings=IMPLICIT_SEGMENTS//2
+        if not r>0:return None
+        def corner(i,j):
+            t=math.pi*i/rings;c,s=arc(j);n=[math.sin(t)*c,math.sin(t)*s,math.cos(t)]
+            return ([r*x for x in n],n,[j/IMPLICIT_SEGMENTS,1-i/rings])
+        for i in range(rings):
+            for j in range(IMPLICIT_SEGMENTS):
+                a,b,c,d=corner(i,j),corner(i+1,j),corner(i+1,j+1),corner(i,j+1)
+                face([a,b,c] if i==0 else [a,c,d] if i==rings-1 else [a,b,c,d])
+    elif prim.IsA(UsdGeom.Cube):
+        h=float(UsdGeom.Cube(prim).GetSizeAttr().Get(time))/2
+        if not h>0:return None
+        for axis in range(3):
+            for sign in (-1,1):
+                u,v=(axis+1)%3,(axis+2)%3;n=[0.,0.,0.];n[axis]=sign;corners=[]
+                for su,sv in ((-1,-1),(1,-1),(1,1),(-1,1)):
+                    p=[0.,0.,0.];p[axis]=sign*h;p[u]=su*h;p[v]=sv*h;corners.append((p,n,[(su+1)/2,(sv+1)/2]))
+                face(corners)
+    elif prim.IsA(UsdGeom.Cylinder):
+        cyl=UsdGeom.Cylinder(prim);r=float(cyl.GetRadiusAttr().Get(time));h=float(cyl.GetHeightAttr().Get(time))/2
+        if not (r>0 and h>0):return None
+        axis='XYZ'.index(str(cyl.GetAxisAttr().Get(time)));u,v=(axis+1)%3,(axis+2)%3
+        def point(c,s,z):
+            p=[0.,0.,0.];p[u]=r*c;p[v]=r*s;p[axis]=z;return p
+        def radial(c,s):
+            n=[0.,0.,0.];n[u]=c;n[v]=s;return n
+        for j in range(IMPLICIT_SEGMENTS):
+            (c0,s0),(c1,s1)=arc(j),arc(j+1);t0,t1=j/IMPLICIT_SEGMENTS,(j+1)/IMPLICIT_SEGMENTS
+            face([(point(c0,s0,-h),radial(c0,s0),[t0,0]),(point(c1,s1,-h),radial(c1,s1),[t1,0]),(point(c1,s1,h),radial(c1,s1),[t1,1]),(point(c0,s0,h),radial(c0,s0),[t0,1])])
+        for sign in (-1,1):
+            n=[0.,0.,0.];n[axis]=sign
+            face([(point(c,s,sign*h),n,[.5+.5*c,.5+.5*s]) for c,s in map(arc,range(IMPLICIT_SEGMENTS))])
+    else:return None
+    corners=[c for f in faces for c in f]
+    return [c[0] for c in corners],[len(f) for f in faces],list(range(len(corners))),[c[1] for c in corners],[c[2] for c in corners]
+IMPLICIT=(UsdGeom.Sphere,UsdGeom.Cube,UsdGeom.Cylinder)
+
 def constant_environment(directory,color):
     # A uniform latlong Radiance HDR (RGBE) image carries an untextured dome's linear color.
     def rgbe(rgb):
@@ -280,6 +332,36 @@ def constant_environment(directory,color):
     data=b'#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 4 +X 8\n'+rgbe(color)*32
     dest=directory/('dome-'+hashlib.sha256(data).hexdigest()[:16]+'.hdr')
     dest.write_bytes(data);return str(dest)
+
+# A light's spectrum (Swift EmitterLight; docs/VOLUME_DESIGN.md section 2): UsdLux colorTemperature as a
+# blackbody, or the custom vibe:spectrum attributes. Returns {} for the scene's light preset.
+SPECTRUM_PRESETS={'E':0,'D65':1,'A':2,'FL11':3,'HP1':4,'LED-B3':5}
+def light_spectrum(prim,light,time,path,report):
+    kind=prim.GetAttribute('vibe:spectrum').Get(time) if prim.HasAttribute('vibe:spectrum') else None
+    if light.GetEnableColorTemperatureAttr().Get(time):
+        if kind is not None:
+            report.append(path+': vibe:spectrum overrides colorTemperature')
+        else:
+            t=float(light.GetColorTemperatureAttr().Get(time))
+            if not 500<=t<=40000:fail(path+': colorTemperature %g K is outside 500-40000 K'%t)
+            report.append(path+': colorTemperature %g K imported as a Planckian (blackbody) spectrum, normalised to luminance one; 6500 K is not exactly D65'%t)
+            return {'spectrum':'blackbody','temperature':t}
+    if kind is None:return {}
+    def value(name,default):
+        a=prim.GetAttribute('vibe:spectrum:'+name);v=a.Get(time) if a else None
+        return float(default if v is None else v)
+    kind=str(kind)
+    if kind=='inherit':return {}
+    if kind in SPECTRUM_PRESETS:return {'spectrum':'preset','preset':SPECTRUM_PRESETS[kind]}
+    if kind=='blackbody':
+        t=value('temperature',6500)
+        if not 500<=t<=40000:fail(path+': vibe:spectrum:temperature %g K is outside 500-40000 K'%t)
+        return {'spectrum':'blackbody','temperature':t}
+    if kind=='narrowband':
+        c,w=value('center',550),value('fwhm',10)
+        if not (360<=c<=830 and 1<=w<=200):fail(path+': vibe:spectrum:center must be 360-830 nm and vibe:spectrum:fwhm 1-200 nm')
+        return {'spectrum':'narrowband','center':c,'fwhm':w}
+    fail(path+': unknown vibe:spectrum '+kind)
 
 def import_stage(filename,directory,frame=None):
     stage=Usd.Stage.Open(filename,load=Usd.Stage.LoadAll)
@@ -314,6 +396,9 @@ def import_stage(filename,directory,frame=None):
             return materialIndex[path],color
         item={'id':uid(),'name':material.GetPrim().GetName() if material else 'Display color','color':color,'path':path}
         if mtlx:item['mtlx']=mtlx
+        # docs/VOLUME_DESIGN.md section 4: an interior medium scattering by the Rayleigh law (custom attribute).
+        rayleigh=material.GetPrim().GetAttribute('vibe:medium:rayleigh') if material else None
+        if mtlx and rayleigh and rayleigh.Get(time):item['rayleigh']=True
         if len(materials)>=MATERIALS:fail(f'Stage exceeds {MATERIALS} imported materials')
         materials.append(item);materialIndex[key]=item['id']
         if path:materialIndex.setdefault(path,item['id'])
@@ -341,7 +426,7 @@ def import_stage(filename,directory,frame=None):
                 api=UsdLux.LightAPI(prim)
                 if api.GetLightLinkCollectionAPI().GetIncludesRel().GetTargets() or api.GetShadowLinkCollectionAPI().GetIncludesRel().GetTargets() or api.GetLightLinkCollectionAPI().GetExcludesRel().GetTargets() or api.GetShadowLinkCollectionAPI().GetExcludesRel().GetTargets():report.append(path+': light/shadow linking not applied')
             if prim.HasAPI(UsdLux.LightAPI) and imageable and imageable.ComputeVisibility(time)=='invisible':continue
-            if prim.IsA(UsdGeom.Mesh) or prim.IsA(UsdGeom.Xform):
+            if prim.IsA(UsdGeom.Mesh) or prim.IsA(UsdGeom.Xform) or any(prim.IsA(t) for t in IMPLICIT):
                 world=cache.GetLocalToWorldTransform(prim)*conversion
                 pp,parentID,local=attach(prim,world)
                 node={'id':uid(),'name':str(prim.GetName()),'parent':parentID,'transform':identity_settings(),'bindings':[],'matrix':[float(local[r][c]) for r in range(4) for c in range(4)]}
@@ -353,13 +438,19 @@ def import_stage(filename,directory,frame=None):
                     collapsed.add(path)
                 nodes.append(node);nodeIDs[path]=node['id'];worlds[path]=world
                 if len(nodes)>NODES:fail(f'Stage exceeds {NODES:,} imported hierarchy nodes')
-                if not prim.IsA(UsdGeom.Mesh):continue
+                if prim.IsA(UsdGeom.Xform):continue
                 if prim.HasAPI(UsdLux.MeshLightAPI):report.append(path+': MeshLightAPI emission not applied; mesh imported as a surface')
-                mesh=UsdGeom.Mesh(prim);points=mesh.GetPointsAttr().Get(time);counts=mesh.GetFaceVertexCountsAttr().Get(time);indices=mesh.GetFaceVertexIndicesAttr().Get(time)
-                if any(v is None or not len(v) for v in (points,counts,indices)):report.append(path+': mesh without points or topology skipped');continue
-                valid,reason=UsdGeom.Mesh.ValidateTopology(indices,counts,len(points))
-                if not valid:fail(path+': '+reason)
-                if str(mesh.GetSubdivisionSchemeAttr().Get())!='none':report.append(path+': subdivision represented by its polygon control cage')
+                implicit=None if prim.IsA(UsdGeom.Mesh) else implicit_mesh(prim,time)
+                if implicit:
+                    points,counts,indices,normals,uv=implicit;normalInterp=uvInterp='faceVarying'
+                    report.append(path+': '+prim.GetTypeName()+' tessellated into '+str(len(counts))+' polygons')
+                elif not prim.IsA(UsdGeom.Mesh):report.append(path+': degenerate '+prim.GetTypeName()+' skipped');continue
+                else:
+                    mesh=UsdGeom.Mesh(prim);points=mesh.GetPointsAttr().Get(time);counts=mesh.GetFaceVertexCountsAttr().Get(time);indices=mesh.GetFaceVertexIndicesAttr().Get(time)
+                    if any(v is None or not len(v) for v in (points,counts,indices)):report.append(path+': mesh without points or topology skipped');continue
+                    valid,reason=UsdGeom.Mesh.ValidateTopology(indices,counts,len(points))
+                    if not valid:fail(path+': '+reason)
+                    if str(mesh.GetSubdivisionSchemeAttr().Get())!='none':report.append(path+': subdivision represented by its polygon control cage')
                 if len(counts) and max(counts)>4096:fail('Polygon exceeds 4096 corners')
                 default,color=get_material(prim);bindings=[default];colors=[color];subsetNames=['Default'];faceSlots=[0]*len(counts)
                 assigned=set()
@@ -368,8 +459,9 @@ def import_stage(filename,directory,frame=None):
                     for face in subset.GetIndicesAttr().Get(time) or []:
                         if face<0 or face>=len(counts) or face in assigned:fail(path+': invalid or overlapping material subsets')
                         assigned.add(face);faceSlots[face]=slot
-                st=UsdGeom.PrimvarsAPI(prim).FindPrimvarWithInheritance('st');uv=st.ComputeFlattened(time) if st else None;uvInterp=st.GetInterpolation() if st else ''
-                normalVar=UsdGeom.PrimvarsAPI(prim).GetPrimvar('normals');normals=normalVar.ComputeFlattened(time) if normalVar else mesh.GetNormalsAttr().Get(time);normalInterp=normalVar.GetInterpolation() if normalVar else mesh.GetNormalsInterpolation()
+                if not implicit:
+                    st=UsdGeom.PrimvarsAPI(prim).FindPrimvarWithInheritance('st');uv=st.ComputeFlattened(time) if st else None;uvInterp=st.GetInterpolation() if st else ''
+                    normalVar=UsdGeom.PrimvarsAPI(prim).GetPrimvar('normals');normals=normalVar.ComputeFlattened(time) if normalVar else mesh.GetNormalsAttr().Get(time);normalInterp=normalVar.GetInterpolation() if normalVar else mesh.GetNormalsInterpolation()
                 # Large meshes: convert each array once instead of one Gf value per corner.
                 points=rows(points);uv=rows(uv) if uv is not None else None;normals=rows(normals) if normals is not None else None;indices=list(indices)
                 def sample(values,interp,face,corner,vertex,default):
@@ -377,7 +469,8 @@ def import_stage(filename,directory,frame=None):
                     index={'constant':0,'uniform':face,'vertex':vertex,'varying':vertex,'faceVarying':corner}.get(str(interp))
                     if index is None or index>=len(values):fail(path+': invalid primvar interpolation/count')
                     return list(values[index])
-                holes=set(mesh.GetHoleIndicesAttr().Get(time) or []);offset=0;writer=MeshWriter();left=str(mesh.GetOrientationAttr().Get(time))=='leftHanded';dropped=fanned=0
+                holes=set() if implicit else set(mesh.GetHoleIndicesAttr().Get(time) or [])
+                offset=0;writer=MeshWriter();left=not implicit and str(mesh.GetOrientationAttr().Get(time))=='leftHanded';dropped=fanned=0
                 for face,count in enumerate(counts):
                     faceIndices=list(indices[offset:offset+count]);base=offset;offset+=count
                     if face in holes:continue
@@ -421,9 +514,18 @@ def import_stage(filename,directory,frame=None):
                     width=height=2*radius
                 world=cache.GetLocalToWorldTransform(prim)*conversion
                 strength=float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time));color=vec(light.GetColorAttr().Get(time))
-                if light.GetEnableColorTemperatureAttr().Get(time):report.append(path+': light color temperature is not applied')
                 if is_rect and light.GetTextureFileAttr().Get(time):report.append(path+': textured area light imported with constant color')
-                if prim.HasAPI(UsdLux.ShapingAPI) or light.GetFiltersRel().GetTargets() or light.GetDiffuseAttr().Get(time)!=1 or light.GetSpecularAttr().Get(time)!=1:report.append(path+': light shaping, filters and diffuse/specular weights are not applied')
+                if light.GetFiltersRel().GetTargets() or light.GetDiffuseAttr().Get(time)!=1 or light.GetSpecularAttr().Get(time)!=1:report.append(path+': light filters and diffuse/specular weights are not applied')
+                spec=light_spectrum(prim,light,time,path,report)
+                if prim.HasAPI(UsdLux.ShapingAPI):
+                    shaping=UsdLux.ShapingAPI(prim)
+                    if is_rect or is_disk:
+                        cone=float(shaping.GetShapingConeAngleAttr().Get(time));softness=float(shaping.GetShapingConeSoftnessAttr().Get(time));focus=float(shaping.GetShapingFocusAttr().Get(time))
+                        if not all(math.isfinite(v) for v in (cone,softness,focus)):fail(path+': non-finite light shaping')
+                        spec.update({'coneAngle':min(180,max(0,cone)),'coneSoftness':min(1,max(0,softness)),'focus':max(0,focus)})
+                        if any(vec(shaping.GetShapingFocusTintAttr().Get(time))):report.append(path+': shaping:focusTint is not applied')
+                        if shaping.GetShapingIesFileAttr().Get(time):report.append(path+': IES profile is not applied')
+                    else:report.append(path+': light shaping applies to rectangle and disk lights only; not applied to this sphere light')
                 if is_disk:
                     # An equal-area octagon keeps the disk's area pi*r^2, and with it the emitted power.
                     r=radius*math.sqrt(math.pi/(2*math.sqrt(2)))
@@ -446,6 +548,7 @@ def import_stage(filename,directory,frame=None):
                     report.append(path+': emission %.3g exceeds the supported 1e8 and was scaled down'%max(emission))
                     emission=[x*(1e8/max(emission)) for x in emission]
                 material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':emission}
+                if spec:material['light']=spec
                 if len(materials)>=MATERIALS:fail(f'Stage exceeds {MATERIALS} materials including lights')
                 materials.append(material)
                 lightMesh=MeshWriter()
@@ -478,10 +581,23 @@ def import_stage(filename,directory,frame=None):
             elif prim.HasAPI(UsdLux.VolumeLightAPI):report.append(path+': VolumeLightAPI emission and volume geometry '+prim.GetTypeName()+' are not imported')
             elif prim.HasAPI(UsdLux.LightAPI):report.append(path+': unsupported light type '+prim.GetTypeName())
             elif prim.IsA(UsdGeom.Gprim) or prim.GetTypeName() in ('PointInstancer','Volume'):report.append(path+': unsupported geometry '+prim.GetTypeName())
+    # docs/VOLUME_DESIGN.md section 4: the scene medium, from custom attributes on the default prim.
+    medium=None;root=stage.GetDefaultPrim()
+    if root and root.HasAttribute('vibe:medium:density'):
+        # Per stage unit in the stage; the renderer's range (0-100) applies per metre.
+        density=float(root.GetAttribute('vibe:medium:density').Get(time) or 0)/UsdGeom.GetStageMetersPerUnit(stage)
+        def attr(name,default):
+            a=root.GetAttribute('vibe:medium:'+name);v=a.Get(time) if a else None
+            return default if v is None else v
+        albedo=vec(attr('albedo',Gf.Vec3f(0.9)));g=float(attr('anisotropy',0));rayleigh=bool(attr('rayleigh',False))
+        if not (0<=density<=100 and all(0<=x<=1 for x in albedo) and -0.99<=g<=0.99):fail('vibe:medium attributes are out of range (density 0-100 per metre after unit conversion, albedo 0-1, anisotropy -0.99-0.99)')
+        if density>0:
+            medium={'density':density,'albedo':albedo,'anisotropy':g,'rayleigh':rayleigh}
+            report.append('Scene medium: extinction %g per metre, albedo %s, anisotropy %g%s'%(medium['density'],[round(x,3) for x in albedo],g,', Rayleigh scattering' if rayleigh else ''))
     if len(nodes)>NODES or rendered>RENDERED_TRIANGLES or stored>STORED_TRIANGLES:fail('Stage exceeds renderer capacity including lights')
     if not assets:fail('No supported meshes were found')
     report.insert(1,f'{len(assets)} mesh assets, {len(nodes)} nodes, {len(materials)} materials, {rendered} triangles')
-    return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report,'fallbackColors':fallbackColors}
+    return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report,'fallbackColors':fallbackColors,'medium':medium}
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('input');parser.add_argument('output');parser.add_argument('--frame',type=float);args=parser.parse_args()

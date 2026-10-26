@@ -121,8 +121,9 @@ normalized to luminance Y = 1, zero outside the tabulated range, combined into w
 sampling tables and a sRGB-to-spectrum lookup) are adapted material and are licensed under
 CC BY-SA 4.0. The application bundles two of them, `SpectralTables.metal` and
 `FourierSRGB86.bin`, under the same licence (CC BY-SA 4.0); the opt-in `FourierSRGB256.bin`
-is not bundled. Details, checksums and changes: `Vendor/Spectral/UPSTREAM.md`; see REFERENCES.md
-(CIEDATA).
+is not bundled. The application also bundles an unmodified copy of `CIE_xyz_1931_2deg.csv`
+(CC BY-SA 4.0), from which it computes per-light spectra's luminance and colour. Details,
+checksums and changes: `Vendor/Spectral/UPSTREAM.md`; see REFERENCES.md (CIEDATA).
 
 ## Phase warp from Christoph Peters' bounded-MESE code (spectral tables)
 

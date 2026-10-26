@@ -98,6 +98,33 @@ enum ExampleScenes {
   }
 }
 
+// Spectral example scenes (Examples/Spectral), bundled with the application: small OpenUSD stages that show
+// wavelength-dependent effects, opened through the USD importer with the scripts/showcase.json shot of the same
+// name. The shot's `usd` path is the stage's path in the repository and under Contents/Resources in the bundle.
+// REFERENCES.md: OPENPBR (thin film, dispersion), SCHOTTGLASS, DIAMANTI2014, OPENUSD (implicit prims, ShapingAPI),
+// BUCHOLTZ1995, PLANCK, CIEDATA (docs/VOLUME_DESIGN.md: media, light spectra, spot cones).
+struct SpectralExample: Sendable {
+  var shot: String
+  var title: String
+  var summary: String
+}
+
+enum SpectralExamples {
+  static let catalog = [
+    SpectralExample(shot: "spectral-newton-series", title: "Newton's Colour Series",
+                    summary: "Thin-film interference: soap films and anodized titanium"),
+    SpectralExample(shot: "spectral-abbe-row", title: "Abbe Row",
+                    summary: "Dispersion: one slit seen through four optical glasses"),
+    SpectralExample(shot: "spectral-tyndall-tank", title: "Tyndall Tank",
+                    summary: "Rayleigh scattering: a white beam turns blue to the side and orange through a medium"),
+    SpectralExample(shot: "spectral-lamp-spectra", title: "Lamp Spectra",
+                    summary: "The same colours under blackbody, daylight, fluorescent, sodium and LED spots in haze"),
+  ]
+  static func url(_ path: String) -> URL? {
+    runtimeResourceURL(bundled: Bundle.main.resourceURL?.appendingPathComponent(path), repositoryPath: path)
+  }
+}
+
 // The extracted scenes: <root>/<storage>/<folder>, with one marker per installed archive holding its digest.
 struct ExampleLibrary: Sendable {
   var root: URL
@@ -363,6 +390,11 @@ struct ShowcaseShot: Decodable, Sendable {
   var depth: Float?
   // Raw linear radiance as OpenEXR, without a denoiser (renderer comparisons).
   var raw: Bool?
+  // Open Image Denoise for scripts/render_showcase.py's export; off by default, so documentation and test images
+  // show the raw accumulation.
+  var denoise: Bool?
+  // StudioOptions.indirectClamp: a biased per-sample cap of indirect light that removes fireflies.
+  var indirectClamp: Float?
   // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
   // shot, above 1 brightens it for a night shot, since MTL emission has no absolute scale.
   var emissionScale: Float?
@@ -409,6 +441,7 @@ struct ShowcaseShot: Decodable, Sendable {
     if let v = height { p.options.outputHeight = v }
     if let v = samples { p.options.exportSamples = v }
     if let v = depth { p.options.depth = v }
+    if let v = indirectClamp { p.options.indirectClamp = v > 0 ? v : nil }
   }
 }
 
@@ -587,7 +620,35 @@ extension StudioController {
     try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     NSWorkspace.shared.activateFileViewerSelecting([root])
   }
+  // Opens a bundled spectral example as a new, unsaved, untitled project with its showcase shot's settings.
+  func openSpectralExample(_ index: Int) {
+    guard !isBusy, SpectralExamples.catalog.indices.contains(index) else { return }
+    let example = SpectralExamples.catalog[index]
+    let shot: ShowcaseShot
+    let url: URL
+    do {
+      guard let found = try ShowcaseShot.bundled().first(where: { $0.name == example.shot }), let path = found.usd,
+        let stage = SpectralExamples.url(path)
+      else { throw MaterialLibrary.error("\(example.title) is missing from the application bundle.") }
+      (shot, url) = (found, stage)
+    } catch {
+      showError(error.localizedDescription)
+      return
+    }
+    confirmDiscardingChanges { [weak self] in
+      self?.beginImportUSD(from: url, opened: "Opened \(example.title). Spectral light transport renders its effects.") {
+        shot.apply(to: &$0)
+      }
+    }
+  }
   func exampleScenePanel() {
+    heading("Spectral examples")
+    for (index, example) in SpectralExamples.catalog.enumerated() {
+      button(example.title) { [weak self] in self?.openSpectralExample(index) }
+    }
+    text("Small OpenUSD scenes included with Metal Vibe Tracer. "
+      + SpectralExamples.catalog.map { "\($0.title): \($0.summary)." }.joined(separator: " ")
+      + " Thin film, dispersion, lamp spectra and Rayleigh scattering render fully in spectral light transport (the default).")
     heading("Example scenes")
     for (index, scene) in ExampleScenes.catalog.enumerated() {
       button(exampleSceneTitle(scene)) { [weak self] in self?.openExampleScene(index) }
@@ -599,6 +660,7 @@ extension StudioController {
     button("Show downloaded scenes in Finder") { [weak self] in self?.revealExampleScenes() }
   }
   @objc func exampleSceneAction(_ sender: NSMenuItem) { openExampleScene(sender.tag) }
+  @objc func spectralExampleAction(_ sender: NSMenuItem) { openSpectralExample(sender.tag) }
   @objc func exampleCreditsAction() { showExampleCredits() }
   @objc func revealExampleScenesAction() { revealExampleScenes() }
 }

@@ -4,8 +4,10 @@ Usage: python3 scripts/render_showcase.py [--shots FILE] [--only NAME ...] [--sc
 
 Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD
 file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera, lens and render modes, and exports
-through StudioController.startExport with Open Image Denoise, exactly like Export in the app. A shot with
-"raw": true exports linear radiance as OpenEXR without a denoiser instead (renderer comparisons).
+through StudioController.startExport, exactly like Export in the app, from the raw accumulation: documentation
+and test images are not denoised. A shot with "denoise": true uses Open Image Denoise instead (on request, or
+for a high-sample showcase render); "indirectClamp": c caps each sample's indirect luminance at c, a biased
+firefly control that the image notes must state; "raw": true exports linear radiance as OpenEXR (renderer comparisons).
 --scale and --samples override every shot for quick framing previews. Images go to --out
 (default build/showcase); copy the chosen ones to docs/images by hand.
 """
@@ -44,9 +46,14 @@ arguments.out.mkdir(parents=True, exist_ok=True)
 # The shot schema and its settings (ShowcaseShot, with the emission scaling) are production code in
 # Sources/ExampleScenes.swift, which File > Open Example Scene applies to the same shots.
 driver = r'''
-func waitFor(_ condition: () -> Bool, seconds: Double) -> Bool {
+// Every `every` seconds while waiting, `report` prints a progress line (flushed, so it shows while running).
+func waitFor(_ condition: () -> Bool, seconds: Double, every: Double = 0, report: () -> Void = {}) -> Bool {
   let deadline = Date().addingTimeInterval(seconds)
-  while !condition() && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+  var next = Date().addingTimeInterval(every)
+  while !condition() && Date() < deadline {
+    RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+    if every > 0 && Date() >= next { report(); fflush(stdout); next = Date().addingTimeInterval(every) }
+  }
   return condition()
 }
 let shotData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
@@ -90,14 +97,19 @@ for shot in try JSONDecoder().decode([ShowcaseShot].self, from: shotData) {
       + "\(materials.uniqueTextureBytes(materials.graphTextures) >> 20) MiB of \(materials.textureBudget >> 20) MiB; longer sides "
       + sizes.map { "\($0.key) x\($0.value)" }.joined(separator: ", "))
   }
-  let raw = shot.raw ?? false
-  controller.exportDenoise = !raw
-  controller.exportRaw = raw
+  let raw = shot.raw ?? false, denoise = !raw && (shot.denoise ?? false)
+  // Raw accumulation (no OIDN, no MetalFX) unless the shot asks for Open Image Denoise.
+  controller.exportDenoise = denoise
+  controller.exportRaw = !denoise
   let url = outputFolder.appendingPathComponent(shot.name + (raw ? ".exr" : ".png"))
   try? FileManager.default.removeItem(at: url)
   let start = Date()
   controller.startExport(url: url, hdr: raw)
-  guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600),
+  // Progress every 30 s: samples over the target and elapsed time.
+  guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600, every: 30, report: {
+    let done = controller.exportRenderer?.completedSamples ?? p.options.exportSamples
+    print("\(shot.name): \(done) / \(p.options.exportSamples) spp, \(Int(Date().timeIntervalSince(start))) s elapsed")
+  }),
     FileManager.default.fileExists(atPath: url.path)
   else { fputs("FAIL: \(shot.name) did not export\n", stderr); exit(1) }
   print("\(shot.name): \(p.options.outputWidth)x\(p.options.outputHeight), \(p.options.exportSamples) spp, "

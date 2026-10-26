@@ -9,9 +9,9 @@
   let saved = (renderer.indirectReuse, renderer.ptDecorrelation, renderer.ptTemporalWhileAccumulating)
   let savedSettings = renderer.materials.settings
 
-  // Layout: the mode occupies former padding, so the 304-byte stride is unchanged.
-  require(MemoryLayout<Uniforms>.stride == 304 && MemoryLayout<Uniforms>.offset(of: \Uniforms.indirectReuse) == 228
-      && MemoryLayout<Uniforms>.offset(of: \Uniforms.jitter) == 232, "Uniforms.indirectReuse sits at offset 228 of the 304-byte uniforms")
+  // Layout: the mode occupies former padding, within the 336-byte stride (304 before the medium uniforms).
+  require(MemoryLayout<Uniforms>.stride == 336 && MemoryLayout<Uniforms>.offset(of: \Uniforms.indirectReuse) == 228
+      && MemoryLayout<Uniforms>.offset(of: \Uniforms.jitter) == 232, "Uniforms.indirectReuse sits at offset 228 of the 336-byte uniforms")
   require(PathTracerRenderer.primarySurfaceStride == 128 && PathTracerRenderer.ptReservoirStride == 64, "128-byte primary surfaces, 64-byte path reservoirs")
   let environmentDefault: IndirectReuse = ["gi": .restirGI, "pt": .restirPT, "unified": .restirPTUnified][
     ProcessInfo.processInfo.environment["VIBE_INDIRECT_REUSE"] ?? ""] ?? .automatic
@@ -147,7 +147,7 @@
   let layout = gpu.makeBuffer(length: 16, options: .storageModeShared)!
   try run("pt_layout", width: 1) { $0.setBuffer(layout, offset: 0, index: 0) }
   let sizes = (0..<4).map { layout.contents().load(fromByteOffset: $0 * 4, as: UInt32.self) }
-  require(sizes == [304, 228, 64, 128], "MSL Uniforms.indirectReuse, PTReservoir and PrimarySurface match the Swift layout: \(sizes)")
+  require(sizes == [336, 228, 64, 128], "MSL Uniforms.indirectReuse, PTReservoir and PrimarySurface match the Swift layout: \(sizes)")
 
   let units = gpu.makeBuffer(length: 11 * 4, options: .storageModeShared)!
   try run("pt_units", width: 1) { $0.setBuffer(units, offset: 0, index: 0) }

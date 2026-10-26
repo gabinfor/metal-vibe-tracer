@@ -53,6 +53,16 @@ struct MaterialXProgram: Codable {
   // stored per slot like specular_color (MaterialLibrary.slotParameters).
   var transmissionColor: SIMD3<Float>?
   var thinWalled: Bool?
+  // Constant OpenPBR interior-medium inputs (docs/VOLUME_DESIGN.md §4; ADOBEOPENPBR
+  // openpbr_create_volume_from_openpbr_params): transmission_scatter (rgb) and transmission_depth (w, metres);
+  // nil when transmission_depth is zero (no medium). transmission_scatter_anisotropy, and whether the surface
+  // is an index-matched medium boundary (constant specular_weight 0 with transmission_weight 1).
+  var medium: SIMD4<Float>?
+  var mediumAnisotropy: Float?
+  var mediumBoundary: Bool?
+  // Scattering by the Rayleigh law, (550 nm / lambda)^4 times transmission_scatter's luminance per depth, with
+  // transmission_color adding absorption on top (USD vibe:medium:rayleigh on the material; not an OpenPBR input).
+  var mediumRayleigh: Bool?
   static let noSpectral = SIMD4<Float>(0, 0, 0.5, 1.4)
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
@@ -64,6 +74,12 @@ struct MaterialXProgram: Codable {
     }
     if let root = emission, !(0..<instructions.count).contains(Int(root)) {
       throw MaterialLibrary.error("Invalid emission output.")
+    }
+    if let m = medium, !((0..<3).allSatisfy { m[$0].isFinite && m[$0] >= 0 && m[$0] <= 1 } && m.w.isFinite && m.w > 0) {
+      throw MaterialLibrary.error("Invalid interior medium.")
+    }
+    if let g = mediumAnisotropy, !(g.isFinite && (-1...1).contains(g)) {
+      throw MaterialLibrary.error("Invalid interior medium anisotropy.")
     }
     if let root = opacity, !(0..<instructions.count).contains(Int(root)) {
       throw MaterialLibrary.error("Invalid opacity output.")
@@ -715,6 +731,29 @@ private final class MXCompiler {
     cache[e.path] = result
     return result
   }
+  // The interior medium's constants (MaterialXProgram.medium): scatter, depth, anisotropy and the boundary flag.
+  func mediumInputs(_ shader: MXElement) throws -> (medium: SIMD4<Float>?, anisotropy: Float?, boundary: Bool?) {
+    func constant(_ name: String, _ type: String, _ fallback: SIMD4<Float>) throws -> SIMD4<Float> {
+      guard let input = shader.input(name) else { return fallback }
+      guard input.attributes["type"] == type, !linked(input) else { try fail("\(name) must be a constant \(type).") }
+      let v = try numbers(input, fallback: fallback)
+      guard (0..<(type == "color3" ? 3 : 1)).allSatisfy({ v[$0].isFinite }) else { try fail("\(name) must be finite.") }
+      return v
+    }
+    let depth = try constant("transmission_depth", "float", .zero).x
+    let scatter = try constant("transmission_scatter", "color3", .zero)
+    let anisotropy = try constant("transmission_scatter_anisotropy", "float", .zero).x
+    guard depth >= 0, (0..<3).allSatisfy({ scatter[$0] >= 0 && scatter[$0] <= 1 }), (-1...1).contains(anisotropy) else {
+      try fail("transmission_depth must be non-negative, transmission_scatter within 0-1 and its anisotropy within -1 to 1.")
+    }
+    guard depth > 0 else { return (nil, nil, nil) }
+    func constantValue(_ name: String, _ fallback: Float) -> Float? {
+      guard let input = shader.input(name) else { return fallback }
+      return linked(input) ? nil : (try? numbers(input, fallback: SIMD4(repeating: fallback)).x)
+    }
+    let boundary = constantValue("specular_weight", 1) == 0 && constantValue("transmission_weight", 0) == 1
+    return (SIMD4(scatter.x, scatter.y, scatter.z, depth), anisotropy == 0 ? nil : anisotropy, boundary ? true : nil)
+  }
   func compile(_ shader: MXElement, source: String) throws -> MaterialXProgram {
     let inputs: [(String, SIMD4<Float>)] = [
       ("base_color", SIMD4(0.8, 0.8, 0.8, 0)), ("specular_roughness", SIMD4(repeating: 0.3)),
@@ -754,7 +793,8 @@ private final class MXCompiler {
     for i in shader.children
     where i.category == "input"
       && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity", "specular_color",
-           "transmission_color", "geometry_thin_walled"].contains(i.name)
+           "transmission_color", "geometry_thin_walled", "transmission_depth", "transmission_scatter",
+           "transmission_scatter_anisotropy"].contains(i.name)
       && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
     {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
@@ -852,6 +892,7 @@ private final class MXCompiler {
     program.specularColor = specularColor
     program.transmissionColor = transmissionColor
     program.thinWalled = thinWalled
+    (program.medium, program.mediumAnisotropy, program.mediumBoundary) = try mediumInputs(shader)
     let scale = spectralValues["transmission_dispersion_scale"] ?? 0
     let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
     let spectral = SIMD4<Float>(

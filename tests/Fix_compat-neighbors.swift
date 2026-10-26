@@ -11,9 +11,9 @@
   let savedIndirect = renderer.indirectReuse
   renderer.indirectReuse = .restirGI
 
-  // Layout: the mode occupies former padding, so the 304-byte stride is unchanged.
-  require(MemoryLayout<Uniforms>.stride == 304 && MemoryLayout<Uniforms>.offset(of: \Uniforms.spatialNeighbors) == 252,
-    "Uniforms.spatialNeighbors sits at offset 252 of the 304-byte uniforms")
+  // Layout: the mode occupies former padding, within the 336-byte stride (304 before the medium uniforms).
+  require(MemoryLayout<Uniforms>.stride == 336 && MemoryLayout<Uniforms>.offset(of: \Uniforms.spatialNeighbors) == 252,
+    "Uniforms.spatialNeighbors sits at offset 252 of the 336-byte uniforms")
   let blank = makeUniforms(scene: 1, mode: 0, width: 1, height: 1)
   require(blank.spatialNeighbors == SpatialNeighborSelection.compatibility.rawValue,
     "uniforms default to compatibility-guided selection")
@@ -144,7 +144,7 @@
 
   let layout = gpu.makeBuffer(length: 8, options: .storageModeShared)!
   try run("compat_layout", threads: 1) { $0.setBuffer(layout, offset: 0, index: 0) }
-  require(layout.contents().load(as: UInt32.self) == 304 && layout.contents().load(fromByteOffset: 4, as: UInt32.self) == 252,
+  require(layout.contents().load(as: UInt32.self) == 336 && layout.contents().load(fromByteOffset: 4, as: UInt32.self) == 252,
     "MSL Uniforms.spatialNeighbors matches the Swift offset")
 
   let scores = gpu.makeBuffer(length: 10 * 4, options: .storageModeShared)!

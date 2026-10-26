@@ -2,6 +2,24 @@
 
 Metal Vibe Tracer is in early development: releases are validated builds, not stable APIs or file formats. Every method below is cited, with its adaptations, in [REFERENCES.md](REFERENCES.md); measurements are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md).
 
+## 0.3.0 — 2026-10-26
+
+Light as a spectrum, in scenes made to show it: participating media (haze, milky and Rayleigh-scattering volumes), per-light spectra (blackbody, CIE presets, laser lines), spot and beam lights, and four spectral example scenes included with the app, rendered for the README without a denoiser. An optional indirect clamp removes fireflies at the cost of bias. Existing scenes render as before. Projects saved by 0.3.0 can hold media, light spectra and the clamp, which 0.2.x ignores. Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (198 checks).
+
+### Rendering
+
+- **Participating media** (docs/VOLUME_DESIGN.md): homogeneous scene haze (Lighting › Atmosphere › *Participating medium*, or `vibe:medium` attributes on a USD stage's default prim) and object interiors from OpenPBR `transmission_depth`, `transmission_scatter` and `transmission_scatter_anisotropy`, with index-matched boundaries (`specular_weight` 0), Henyey–Greenstein phase functions (`HG1941`) and an optional Rayleigh λ⁻⁴ law (`BUCHOLTZ1995`). Distances are sampled once for all wavelengths with a throughput-weighted mixture over them (`ADOBEOPENPBR`, `PBRT2023`). Scenes with media render with Standard MIS.
+- **Per-light spectra**: each imported light can have a CIE preset, a blackbody temperature (`PLANCK`; UsdLux `colorTemperature`) or a narrow band such as a laser line, normalised to equal luminance and included in wavelength sampling; editable on the Materials page.
+- **Spot and beam lights**: UsdLux `ShapingAPI` cones, softness and focus on rectangle and disk lights (`OPENUSD`), editable on the Materials page; shaped lights are selected in proportion to their cone's power.
+- `Uniforms` grows from 304 to 336 bytes; per-slot material parameters from 3 to 8 float4.
+- **Indirect clamp** (Render page; `StudioOptions.indirectClamp`, `"indirectClamp"` per showcase shot): an optional, biased per-sample cap on the luminance of indirect light (two or more scattering events; with unified ReSTIR PT its whole estimate), which removes fireflies. Off by default; when off, renders are bit-identical to before (`tests/Fix_clamp.swift`). `Uniforms.mediumOptions` is renamed `pathOptions`, whose w holds the cap.
+
+### Scenes and import
+
+- **Spectral example scenes**, included with the app: **Tyndall Tank** (Rayleigh scattering of a beam) and **Lamp Spectra** (five lamp spectra in haze), and **Newton's Colour Series** (thin-film interference: soap films 100–800 nm, anodized titanium 30–150 nm; `DIAMANTI2014`) and **Abbe Row** (a slit seen through 60° prisms of SCHOTT N-SF11, F2, N-BK7 and N-FK51A at minimum deviation; `SCHOTTGLASS`). They are OpenUSD stages in `Examples/Spectral`, listed first in File › Open Example Scene and on the File page, and open without a download or an import report.
+- **OpenUSD implicit prims:** `Sphere`, `Cube` and `Cylinder` prims are tessellated from their schema attributes (smooth normals, outward winding) instead of being skipped (`OPENUSD`).
+- `scripts/render_showcase.py` exports the raw accumulation unless a shot sets `"denoise": true`, and prints samples over the target and elapsed time every 30 s.
+
 ## 0.2.1 — 2026-10-23
 
 The app now opens instantly and shows progress for everything it loads, and the README's production scenes open from inside the app. Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (192 checks).

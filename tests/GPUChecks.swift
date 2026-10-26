@@ -7,7 +7,7 @@ guard let gpu = MTLCreateSystemDefaultDevice() else {
     exit(2)
 }
 let testRenderer = try PathTracerRenderer(device: gpu)
-require(MemoryLayout<Uniforms>.stride == 304, "Swift/Metal uniform layout")
+require(MemoryLayout<Uniforms>.stride == 336, "Swift/Metal uniform layout")
 print("PASS: runtime shader compilation on \(gpu.name)")
 
 let checks = """
@@ -15,7 +15,7 @@ kernel void regression_checks(device uint *results [[buffer(0)]], constant Unifo
     Material matte = { DIFFUSE, float3(0.8f), float3(0), 0.0f, 1.0f };
     HitRecord hit;
     Ray inside = { float3(0), float3(1, 0, 0) };
-    results[0] = sizeof(Uniforms) == 304 && intersect_box(inside, float3(0), float3(1), 0, matte, 0.001f, 100, hit)
+    results[0] = sizeof(Uniforms) == 336 && intersect_box(inside, float3(0), float3(1), 0, matte, 0.001f, 100, hit)
         && abs(hit.t - 1.0f) < 1e-5f && !hit.front_face && hit.normal.x < -0.99f;
     Ray parallel = { float3(2, 0, 0), float3(0, 1, 0) };
     results[1] = !intersect_box(parallel, float3(0), float3(1), 0, matte, 0.001f, 100, hit);
@@ -166,8 +166,9 @@ let testOutputDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.environme
     o.environmentIntensity = u.environment.x; o.environmentRotation = u.environment.y * 180 / .pi
     o.aperture = u.lens.x; o.focusDistance = u.lens.y
     o.lightColor = SIMD3<Float>(u.light.x, u.light.y, u.light.z); o.lightIntensity = 1; o.lightSize = u.light.w
-    // Emitter spectra are not part of the test view: the renderer's current presets are kept.
+    // Emitter spectra and the indirect clamp are not part of the test view: the renderer's current ones are kept.
     o.lightSpectrum = r.options.lightSpectrum; o.sunSpectrum = r.options.sunSpectrum
+    o.indirectClamp = r.options.indirectClamp
     r.options = o
     require((u.environment.z > 0.5) == (r.materials.environmentData != nil),
         "test view environment flag matches the loaded environment")

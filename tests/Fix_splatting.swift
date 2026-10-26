@@ -16,8 +16,8 @@
     Int(min(pool.counters.contents().load(as: UInt32.self), UInt32(pool.capacity)))
   }
 
-  // Plumbing: the mode rides in Uniforms.indirectReuse bit 4 (the 304-byte stride is unchanged).
-  require(MemoryLayout<Uniforms>.stride == 304, "the reservoir-splatting flag needs no new uniform")
+  // Plumbing: the mode rides in Uniforms.indirectReuse bit 4 (no new uniform; the stride is 336 bytes since the medium uniforms).
+  require(MemoryLayout<Uniforms>.stride == 336, "the reservoir-splatting flag needs no new uniform")
   require(TemporalReuse.reprojection.rawValue == 0 && TemporalReuse.splatting.rawValue == 1 && TemporalReuse.automatic.rawValue == 2,
     "TemporalReuse raw values")
   let environmentDefault: TemporalReuse = ["reprojection": .reprojection, "splatting": .splatting][

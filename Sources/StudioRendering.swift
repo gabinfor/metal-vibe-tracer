@@ -110,6 +110,7 @@ extension StudioController {
       r.ptTemporalWhileAccumulating = renderer.ptTemporalWhileAccumulating
       r.skyMode = p.sky
       r.enableFog = p.fog
+      r.medium = p.medium
       r.enableSMS = p.ring
       r.oidnOptions = p.oidn ?? OIDNOptions()
       r.viewportMode = 0

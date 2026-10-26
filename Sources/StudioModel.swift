@@ -60,6 +60,10 @@ struct StudioOptions: Codable {
   // is the RGB colour, which spectral transport renders as D65-shaped light; RGB transport ignores both.
   var lightSpectrum: UInt32?
   var sunSpectrum: UInt32?
+  // The luminance cap of a sample's indirect light (MSL indirect_clamped; biased, removes fireflies); nil or 0
+  // is off, as in projects written before the clamp.
+  var indirectClamp: Float?
+  static let indirectClampRange: ClosedRange<Float> = 0...100_000
 }
 extension StudioOptions {
   static let sunAngleRange: ClosedRange<Float> = 0.1...90
@@ -82,6 +86,7 @@ extension StudioOptions {
       && focusDistance == o.focusDistance && sunAngle == o.sunAngle
       && Illuminant.resolved(lightSpectrum) == Illuminant.resolved(o.lightSpectrum)
       && Illuminant.resolved(sunSpectrum) == Illuminant.resolved(o.sunSpectrum)
+      && (indirectClamp ?? 0) == (o.indirectClamp ?? 0)
   }
 }
 // The ReSTIR strategy's reuse modes, the sampler and the light transport (Render inspector; the
@@ -147,6 +152,8 @@ struct SceneState: Codable {
   var names = Array(repeating: "None", count: SceneLimits.materials * 4)
   var materialX: [Int: MaterialXProgram]?
   var emissions: [Int: SIMD3<Float>]?
+  // Imported lights' spectra and spot cones (EmitterLight); optional so earlier projects open unchanged.
+  var emitterLights: [Int: EmitterLight]?
 }
 struct AutosaveRecovery: Codable {
   var projectPath: String?
@@ -178,6 +185,8 @@ struct ProjectDocument: Codable {
   var controlVariates: UInt32?
   var sampler: UInt32?
   var lightTransport: UInt32?
+  // The scene medium (SceneMedium); nil is clear air, as in projects written before media.
+  var medium: SceneMedium?
   // Written only into autosaves: the document's file association and unsaved state.
   var recovery: AutosaveRecovery?
 
@@ -253,6 +262,7 @@ struct ProjectDocument: Codable {
   func validate() throws {
     func bad() throws { throw MaterialLibrary.error("Invalid or unsupported project data.") }
     guard (1...ProjectAssets.formatVersion).contains(version), scene <= 6, strategy <= 3, sky <= 2, fog <= 1, ring <= 1,
+      medium?.isValid ?? true, StudioOptions.indirectClampRange.contains(options.indirectClamp ?? 0),
       options.maxSamples <= 16_777_214, options.exportSamples > 0,
       options.exportSamples <= 16_777_214,
       (16...8192).contains(options.outputWidth), (16...8192).contains(options.outputHeight),
@@ -313,6 +323,12 @@ struct ProjectDocument: Codable {
         guard (8..<SceneLimits.materials).contains(slot),
           (0..<3).allSatisfy({ e[$0].isFinite && e[$0] >= 0 && e[$0] <= 1e8 })
         else {
+          try bad()
+          return
+        }
+      }
+      for (slot, light) in state.emitterLights ?? [:] {
+        guard (8..<SceneLimits.materials).contains(slot), light.isValid else {
           try bad()
           return
         }
@@ -786,7 +802,7 @@ extension SceneState {
   func sameResources(as other: SceneState) -> Bool {
     let a = padded, b = other.padded
     guard sameBytes(a.surfaces, b.surfaces), sameBytes(a.objects, b.objects), a.names == b.names,
-      a.maps == b.maps, (a.emissions ?? [:]) == (b.emissions ?? [:])
+      a.maps == b.maps, (a.emissions ?? [:]) == (b.emissions ?? [:]), (a.emitterLights ?? [:]) == (b.emitterLights ?? [:])
     else { return false }
     let x = a.materialX ?? [:], y = b.materialX ?? [:]
     guard Set(x.keys) == Set(y.keys) else { return false }
@@ -798,7 +814,8 @@ extension MaterialXProgram {
     guard name == other.name, source == other.source, roots == other.roots,
       diffuseRoughness == other.diffuseRoughness, emission == other.emission, opacity == other.opacity,
       specularColor == other.specularColor, transmissionColor == other.transmissionColor,
-      thinWalled == other.thinWalled,
+      thinWalled == other.thinWalled, medium == other.medium, mediumAnisotropy == other.mediumAnisotropy,
+      mediumBoundary == other.mediumBoundary, mediumRayleigh == other.mediumRayleigh,
       sameBytes(instructions, other.instructions),
       images.count == other.images.count, parameters.count == other.parameters.count,
       zip(images, other.images).allSatisfy({ $0.name == $1.name && $0.srgb == $1.srgb && $0.data == $1.data })
@@ -847,7 +864,7 @@ extension MaterialLibrary {
   func state() -> SceneState {
     SceneState(
       surfaces: settings, objects: objects, maps: payloads, names: fileNames, materialX: materialX,
-      emissions: emissions)
+      emissions: emissions, emitterLights: emitterLights.isEmpty ? nil : emitterLights)
   }
   func restore(_ state: SceneState) throws {
     guard state.surfaces.count <= SceneLimits.materials,
@@ -878,7 +895,7 @@ extension MaterialLibrary {
     let graph = try materialXCandidate(programs, images: replacement)
     try validateCandidateTextures(images: replacement, graph: graph.textures)
     let oldSettings = settings, oldObjects = objects, oldPayloads = payloads, oldNames = fileNames
-    let oldEmissions = emissions, oldMaterialX = materialX, oldImages = images
+    let oldEmissions = emissions, oldEmitterLights = emitterLights, oldMaterialX = materialX, oldImages = images
     let oldGraphTextures = graphTextures, oldGraphInstructions = graphInstructionBuffer
     let oldGraphHeaders = graphHeaderBuffer, oldArgument = argumentBuffer
     let oldObjectBuffer = objectBuffer, oldEmissionBuffer = emissionBuffer, oldEmitterBuffer = emitterBuffer
@@ -890,6 +907,7 @@ extension MaterialLibrary {
       objects = state.objects
         + Array(repeating: ObjectSettings(), count: SceneLimits.materials - state.objects.count)
       emissions = state.emissions ?? [:]
+      emitterLights = state.emitterLights ?? [:]
       graphInstructionBuffer = graph.instructions
       graphHeaderBuffer = graph.headers
       graphTextures = graph.textures
@@ -900,7 +918,7 @@ extension MaterialLibrary {
       fileNames = state.names + Array(repeating: "None", count: SceneLimits.materials * 4 - state.names.count)
     } catch {
       settings = oldSettings; objects = oldObjects; payloads = oldPayloads; fileNames = oldNames
-      emissions = oldEmissions; materialX = oldMaterialX; images = oldImages
+      emissions = oldEmissions; emitterLights = oldEmitterLights; materialX = oldMaterialX; images = oldImages
       graphTextures = oldGraphTextures; graphInstructionBuffer = oldGraphInstructions
       graphHeaderBuffer = oldGraphHeaders; argumentBuffer = oldArgument
       objectBuffer = oldObjectBuffer; emissionBuffer = oldEmissionBuffer; emitterBuffer = oldEmitterBuffer
