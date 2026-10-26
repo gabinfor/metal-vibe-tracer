@@ -47,8 +47,8 @@ cat > "$stage/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>local.vibetracer.app</string>
     <key>CFBundleName</key><string>Metal Vibe Tracer</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.2.1</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
+    <key>CFBundleVersion</key><string>4</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

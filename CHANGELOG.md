@@ -2,7 +2,9 @@
 
 Metal Vibe Tracer is in early development: releases are validated builds, not stable APIs or file formats. Every method below is cited, with its adaptations, in [REFERENCES.md](REFERENCES.md); measurements are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md).
 
-## Unreleased
+## 0.3.0 — 2026-10-26
+
+Light as a spectrum, in scenes made to show it: participating media (haze, milky and Rayleigh-scattering volumes), per-light spectra (blackbody, CIE presets, laser lines), spot and beam lights, and four spectral example scenes included with the app, rendered for the README without a denoiser. An optional indirect clamp removes fireflies at the cost of bias. Existing scenes render as before. Projects saved by 0.3.0 can hold media, light spectra and the clamp, which 0.2.x ignores. Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (198 checks).
 
 ### Rendering
 
