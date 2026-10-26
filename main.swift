@@ -614,6 +614,11 @@ float4 slot_transmission(uint slot, constant MaterialResources &images) {
     return slot < MATERIAL_SLOTS ? images.spectralMaterials[SLOT_PARAMETERS * slot + 2] : float4(1.0f, 1.0f, 1.0f, 0.0f);
 }
 
+// Whether any slot has an emitter record (MaterialLibrary.slotParameters stores their count after the slots);
+// without one, light samples skip looking up their slot (light_sample_slot).
+bool emitter_records(constant MaterialResources &images) {
+    return images.spectralMaterials[SLOT_PARAMETERS * MATERIAL_SLOTS].x > 0.0f;
+}
 // Imported lights (EmitterLight; docs/VOLUME_DESIGN.md §2-3; REFERENCES.md OPENUSD ShapingAPI). RGB
 // transport's colour of an emitter slot's spectrum (white for the scene preset and presets).
 float3 slot_emitter_rgb(uint slot, constant MaterialResources &images) {
@@ -2094,7 +2099,7 @@ float3 environment_rgb(float3 d, constant Uniforms &u, constant MaterialResource
 // re-evaluated wherever a reused sample is moved to another receiver.
 uint light_sample_slot(LightSample ls, constant MaterialResources &images, thread float &shaping) {
     shaping = 1.0f;
-    if (!MESHES || ls.isDirectional < 2u) return MATERIAL_SLOTS;
+    if (!MESHES || ls.isDirectional < 2u || !emitter_records(images)) return MATERIAL_SLOTS;
     MeshTriangle t = scene_triangle(ls.isDirectional - 2u, images);
     shaping = emitter_triangle_shaping(t, -ls.wi, images);
     return uint(t.uvc.z);
@@ -2116,7 +2121,7 @@ float3 environment_rgb(float3 d, constant Uniforms &u, constant MaterialResource
 }
 uint light_sample_slot(LightSample ls, constant MaterialResources &images, thread float &shaping) {
     shaping = 1.0f;
-    if (!MESHES || ls.isDirectional < 2u) return MATERIAL_SLOTS;
+    if (!MESHES || ls.isDirectional < 2u || !emitter_records(images)) return MATERIAL_SLOTS;
     MeshTriangle t = scene_triangle(ls.isDirectional - 2u, images);
     shaping = emitter_triangle_shaping(t, -ls.wi, images);
     return uint(t.uvc.z);
@@ -3289,7 +3294,16 @@ void medium_box(constant Uniforms &u, constant MaterialResources &images, thread
     if (MESHES && u.sceneIndex == 6 && u.environment.w >= 1 && mesh_two_level(images)) {
         lo = mesh_header(images).lo.xyz; hi = mesh_header(images).hi.xyz;
     } else if (MESHES && u.sceneIndex == 6 && u.environment.w >= 1) {
-        lo = images.nodes[0].lo.xyz; hi = images.nodes[0].hi.xyz;
+        // Flat hierarchy: object-space bounds, placed by the legacy mesh's object transform (trace_scene).
+        float3 a = images.nodes[0].lo.xyz, b = images.nodes[0].hi.xyz;
+        ObjectSettings o = images.objects[7];
+        if (uses_scene_graph(u)) { o.positionScale = float4(0, 0, 0, 1); o.rotationHidden = float4(0); }
+        lo = float3(INFINITY); hi = float3(-INFINITY);
+        for (uint k = 0u; k < 8u; ++k) {
+            float3 c = float3(k & 1u ? b.x : a.x, k & 2u ? b.y : a.y, k & 4u ? b.z : a.z);
+            float3 w = rotate_object(c * o.positionScale.w, o.rotationHidden.xyz) + o.positionScale.xyz;
+            lo = min(lo, w); hi = max(hi, w);
+        }
     }
     float pad = 0.02f * length(hi - lo);
     lo -= pad; hi += pad;
@@ -7914,7 +7928,14 @@ final class MaterialLibrary {
         return MaterialLibrary.hardwareWatertight ? .hardware : .twoLevel
     }
     var objectBuffer: MTLBuffer!
-    var materialX: [Int:MaterialXProgram] = [:] { didSet { emittersDirty = true } }
+    var materialX: [Int:MaterialXProgram] = [:] {
+        didSet {
+            emittersDirty = true
+            // volume_path enters interior media through solid (not thin-walled) surfaces only.
+            hasInteriorMedia = materialX.values.contains { $0.medium != nil && $0.thinWalled != true }
+        }
+    }
+    private(set) var hasInteriorMedia = false
     var graphInstructionBuffer: MTLBuffer!, graphHeaderBuffer: MTLBuffer!
     var graphTextures: [MTLTexture] = []
     // The smallest side a graph image was decoded at to fit `textureBudget` (materialXCandidate),
@@ -7941,6 +7962,7 @@ final class MaterialLibrary {
     static let slotStride = 8
     var slotParameters: [SIMD4<Float>] {
         let observer = CIEObserver.shared
+        // After the slots, one float4: the number of emitter records (MSL emitter_records).
         return (0..<SceneLimits.materials).flatMap { slot -> [SIMD4<Float>] in
             let program = materialX[slot]
             let tint = program?.specularColor ?? SIMD3(repeating: 1)
@@ -7950,7 +7972,7 @@ final class MaterialLibrary {
                 + emitter + [program?.medium ?? .zero,
                              SIMD4(program?.mediumAnisotropy ?? 0, program?.mediumBoundary == true ? 1 : 0,
                                    program?.mediumRayleigh == true ? 1 : 0, 0)]
-        }
+        } + [SIMD4(Float(emitterLights.count), 0, 0, 0)]   // MSL emitter_records
     }
     var orderedTriangles: StoredTriangles {
         if let streams = meshStreams, meshLayout != nil {
@@ -9072,7 +9094,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     func renderMemoryError(width: Int, height: Int, indirectReuse candidateIndirect: IndirectReuse? = nil,
                            temporalReuse candidateTemporal: TemporalReuse? = nil,
                            spatialNeighbors candidateSpatial: SpatialNeighborSelection? = nil) -> String? {
-        let usesReSTIR = samplingMode == 0 && viewportMode == 0
+        let usesReSTIR = activeSamplingMode == 0 && viewportMode == 0
         let usesMetalFX = denoiserEnabled && supportsMetalFX && usesReSTIR
         let indirectMode = candidateIndirect ?? indirectReuse
         let activeIndirect = resolvedIndirectReuse(indirectMode)
@@ -9588,7 +9610,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // accumulation restarts (the view changes, and the first frames measure) and while MetalFX
     // runs, whose temporal history takes one jittered sample per frame (encodePresentation).
     func samplesPerFrame(targetMilliseconds: Double, limit: Int) -> Int {
-        let metalFX = denoiserEnabled && supportsMetalFX && samplingMode == 0 && viewportMode == 0
+        let metalFX = denoiserEnabled && supportsMetalFX && activeSamplingMode == 0 && viewportMode == 0
         guard frameIndex >= 4, gpuMillisecondsPerSample > 0, !metalFX else { return 1 }
         return max(1, min(Int(targetMilliseconds / gpuMillisecondsPerSample), limit, 64))
     }

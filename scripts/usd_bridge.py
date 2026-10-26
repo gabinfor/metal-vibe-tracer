@@ -337,14 +337,16 @@ def constant_environment(directory,color):
 # blackbody, or the custom vibe:spectrum attributes. Returns {} for the scene's light preset.
 SPECTRUM_PRESETS={'E':0,'D65':1,'A':2,'FL11':3,'HP1':4,'LED-B3':5}
 def light_spectrum(prim,light,time,path,report):
-    spec={}
-    if light.GetEnableColorTemperatureAttr().Get(time):
-        t=float(light.GetColorTemperatureAttr().Get(time))
-        if not 500<=t<=40000:fail(path+': colorTemperature %g K is outside 500-40000 K'%t)
-        spec={'spectrum':'blackbody','temperature':t}
-        report.append(path+': colorTemperature %g K imported as a Planckian (blackbody) spectrum, normalised to luminance one; 6500 K is not exactly D65'%t)
     kind=prim.GetAttribute('vibe:spectrum').Get(time) if prim.HasAttribute('vibe:spectrum') else None
-    if kind is None:return spec
+    if light.GetEnableColorTemperatureAttr().Get(time):
+        if kind is not None:
+            report.append(path+': vibe:spectrum overrides colorTemperature')
+        else:
+            t=float(light.GetColorTemperatureAttr().Get(time))
+            if not 500<=t<=40000:fail(path+': colorTemperature %g K is outside 500-40000 K'%t)
+            report.append(path+': colorTemperature %g K imported as a Planckian (blackbody) spectrum, normalised to luminance one; 6500 K is not exactly D65'%t)
+            return {'spectrum':'blackbody','temperature':t}
+    if kind is None:return {}
     def value(name,default):
         a=prim.GetAttribute('vibe:spectrum:'+name);v=a.Get(time) if a else None
         return float(default if v is None else v)
@@ -582,14 +584,15 @@ def import_stage(filename,directory,frame=None):
     # docs/VOLUME_DESIGN.md section 4: the scene medium, from custom attributes on the default prim.
     medium=None;root=stage.GetDefaultPrim()
     if root and root.HasAttribute('vibe:medium:density'):
-        density=float(root.GetAttribute('vibe:medium:density').Get(time) or 0)
+        # Per stage unit in the stage; the renderer's range (0-100) applies per metre.
+        density=float(root.GetAttribute('vibe:medium:density').Get(time) or 0)/UsdGeom.GetStageMetersPerUnit(stage)
         def attr(name,default):
             a=root.GetAttribute('vibe:medium:'+name);v=a.Get(time) if a else None
             return default if v is None else v
         albedo=vec(attr('albedo',Gf.Vec3f(0.9)));g=float(attr('anisotropy',0));rayleigh=bool(attr('rayleigh',False))
-        if not (0<=density<=100 and all(0<=x<=1 for x in albedo) and -0.99<=g<=0.99):fail('vibe:medium attributes are out of range (density 0-100 per metre, albedo 0-1, anisotropy -0.99-0.99)')
+        if not (0<=density<=100 and all(0<=x<=1 for x in albedo) and -0.99<=g<=0.99):fail('vibe:medium attributes are out of range (density 0-100 per metre after unit conversion, albedo 0-1, anisotropy -0.99-0.99)')
         if density>0:
-            medium={'density':density*UsdGeom.GetStageMetersPerUnit(stage)**-1,'albedo':albedo,'anisotropy':g,'rayleigh':rayleigh}
+            medium={'density':density,'albedo':albedo,'anisotropy':g,'rayleigh':rayleigh}
             report.append('Scene medium: extinction %g per metre, albedo %s, anisotropy %g%s'%(medium['density'],[round(x,3) for x in albedo],g,', Rayleigh scattering' if rayleigh else ''))
     if len(nodes)>NODES or rendered>RENDERED_TRIANGLES or stored>STORED_TRIANGLES:fail('Stage exceeds renderer capacity including lights')
     if not assets:fail('No supported meshes were found')

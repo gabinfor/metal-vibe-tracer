@@ -19,7 +19,7 @@ struct SceneMedium: Codable, Equatable, Sendable {
 extension PathTracerRenderer {
   // Whether the frame has participating media: the scene medium, or an imported slot's interior medium.
   var hasMedia: Bool {
-    (medium?.density ?? 0) > 0 || (sceneIndex == 6 && materials.materialX.values.contains { $0.medium != nil })
+    (medium?.density ?? 0) > 0 || (sceneIndex == 6 && materials.hasInteriorMedia)
   }
   // The strategy the frame runs: media render with Standard MIS (MSL volume_path), never ReSTIR.
   var activeSamplingMode: UInt32 { hasMedia && samplingMode == 0 ? 1 : samplingMode }
