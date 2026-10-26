@@ -26,6 +26,8 @@ cp THIRD_PARTY_NOTICES.md "$stage/Contents/Resources/THIRD_PARTY_NOTICES.md"
 # CC BY-SA 4.0 (CIE data) and BSD-3-Clause (Peters' phase warp); notices in THIRD_PARTY_NOTICES.md.
 cp build/SpectralTables/SpectralTables.metal build/SpectralTables/FourierSRGB86.bin "$stage/Contents/Resources/"
 cp Vendor/Spectral/UPSTREAM.md "$stage/Contents/Resources/Spectral-UPSTREAM.md"
+# CIE 1931 observer (CC BY-SA 4.0): per-light spectra's normalisation and RGB colour (CIEObserver).
+cp Vendor/Spectral/CIE/CIE_xyz_1931_2deg.csv "$stage/Contents/Resources/CIE_xyz_1931_2deg.csv"
 cp scripts/usd_bridge.py "$stage/Contents/Resources/"
 cp -RL build/OpenUSD "$stage/Contents/Resources/OpenUSD"
 cp Vendor/OpenUSD/UPSTREAM.md "$stage/Contents/Resources/OpenUSD-UPSTREAM.md"

@@ -2,14 +2,15 @@
 
 Metal Vibe Tracer rendered these images for the project documentation. They are not bundled with the application.
 
-The README images were rendered on 2026-10-20 on an Apple M4 with `python3 scripts/render_showcase.py`, using the renderer code of `8bd999a`. The script reads the shots from `scripts/showcase.json` and exports each one through the app's Export path (`StudioController.startExport`, spectral transport by default, Open Image Denoise). The PNG output was cropped where noted and converted to JPEG (quality 90) with `sips`.
+The README images were rendered on 2026-10-20 on an Apple M4 with `python3 scripts/render_showcase.py`, using the renderer code of `8bd999a`. The script reads the shots from `scripts/showcase.json` and exports each one through the app's Export path (`StudioController.startExport`, spectral transport by default). Images rendered from 2026-10-23 on are exported from the raw accumulation, without a denoiser (the script's default since then); the images listed with an earlier date were denoised with Open Image Denoise. The PNG output was cropped where noted and converted to JPEG (quality 90) with `sips`.
 
 | File | Content |
 | --- | --- |
 | `pavilion-hdri.jpg` | Built-in Architectural Pavilion lit by the Poly Haven **Art Studio** HDRI (CC0), with a thin-lens camera. 1920×1080, 1024 spp. |
 | `cornell-glass-mirror.jpg` | Built-in Cornell Glass & Mirror scene, showing the glass sphere's caustic. 1200×1200, 1024 spp. |
 | `spectral-incandescent-a.jpg`, `spectral-fluorescent-fl11.jpg`, `spectral-sodium-hp1.jpg` | Built-in Cornell Glass & Mirror scene with the area light's **Light spectrum** set to CIE A, FL11 and HP1. 1000×1000, 1024 spp each. |
-| `spectral-newton-series.jpg`, `spectral-abbe-row.jpg` | The bundled spectral examples (`Examples/Spectral`, `SCHOTTGLASS`, `DIAMANTI2014`): Newton's colour series (1600×900, 512 spp) and the Abbe row (1600×900, 1024 spp). Rendered on 2026-10-23 with the code committed alongside them. |
+| `spectral-tyndall-tank.jpg`, `spectral-lamp-spectra.jpg` | The bundled media examples (`Examples/Spectral`; docs/VOLUME_DESIGN.md): the Tyndall tank (exposure +1, 1024 spp) and the lamp spectra (exposure +0.5, 2048 spp), 1600×900, not denoised. Rendered on 2026-10-23 with the code committed alongside them. |
+| `spectral-newton-series.jpg`, `spectral-abbe-row.jpg` | The bundled spectral examples (`Examples/Spectral`, `SCHOTTGLASS`, `DIAMANTI2014`): Newton's colour series and the Abbe row, 1600×900, 1024 spp each, not denoised. Rendered on 2026-10-23 with the code committed alongside them. |
 | `pavilion-depth-of-field.jpg` | Built-in Pavilion close-up with a 0.09 aperture radius focused on the copper sphere, lit by the Poly Haven **Studio Small 01** HDRI (CC0). Rendered at 1600×1200, 1024 spp, and cropped to 1600×900 (rows 100–999) to match the twilight image beside it. |
 | `pavilion-twilight.jpg` | Built-in Pavilion from a low camera, with the roof beams against the **Twilight / Studio** sky preset. 1920×1080, 1024 spp. |
 | `shaderball-loft.jpg` | ASWF Standard Shader Ball, side view, lit by the Poly Haven **Photo Studio Loft Hall** HDRI (CC0). Rendered at 1600×1200, 512 spp, and cropped to 1200×1200 (columns 380–1579) to match the Cornell image beside it (attribution below). |

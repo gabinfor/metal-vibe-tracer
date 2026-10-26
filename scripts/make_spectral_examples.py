@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Writes the bundled spectral example stages, Examples/Spectral/*.usda (SpectralExamples in
-Sources/ExampleScenes.swift; REFERENCES.md SCHOTTGLASS, DIAMANTI2014, OPENPBR).
+Sources/ExampleScenes.swift; REFERENCES.md SCHOTTGLASS, DIAMANTI2014, OPENPBR, BUCHOLTZ1995, PLANCK, CIEDATA;
+docs/VOLUME_DESIGN.md for the media, light spectra and spot cones).
 
 Usage: python3 scripts/make_spectral_examples.py [OUTPUT_DIR]   (default Examples/Spectral)
 
@@ -9,14 +10,14 @@ prism rotations and slit positions come from a 2D trace of the camera ray throug
 """
 import math,pathlib,sys
 OUT=pathlib.Path(sys.argv[1]) if len(sys.argv)>1 else pathlib.Path(__file__).resolve().parents[1]/'Examples/Spectral'
-def mat(name,inputs,comment=''):
+def mat(name,inputs,comment='',extra=()):
     lines=[f'def Material "{name}"','{',f'    token outputs:mtlx:surface.connect = </Scene/Looks/{name}/Surface.outputs:out>',
            '    def Shader "Surface"','    {','        uniform token info:id = "ND_open_pbr_surface_surfaceshader"']
     if comment:lines.insert(0,'# '+comment)
     for key,(t,v) in inputs.items():
         val=f'({", ".join(f"{x:g}" for x in v)})' if isinstance(v,tuple) else (('true' if v else 'false') if isinstance(v,bool) else f'{v:g}')
         lines.append(f'        {t} inputs:{key} = {val}')
-    lines+=['        token outputs:out','    }','}']
+    lines+=['        token outputs:out','    }']+['    '+e for e in extra]+['}']
     return '\n'.join('        '+l for l in lines)
 def bind(name):return f'        rel material:binding = </Scene/Looks/{name}>'
 def xf(t=None,r=None,s=None):
@@ -33,8 +34,10 @@ def camera(eye,target,focal,name='Camera'):
     # USD rotateXYZ applies X first, then Y: pitch about X, then yaw about Y.
     return prim('Camera',name,xf(eye,(pitch,yaw,0))+[f'        float focalLength = {focal:g}','        float horizontalAperture = 36','        float verticalAperture = 20.25',
         '        float2 clippingRange = (0.01, 100)'])
-def stage(doc,body):
-    return '#usda 1.0\n(\n    doc = """'+doc+'"""\n    defaultPrim = "Scene"\n    metersPerUnit = 1\n    upAxis = "Y"\n)\n\ndef Xform "Scene"\n{\n'+'\n\n'.join(body)+'\n}\n'
+def stage(doc,body,root=()):
+    # root: attributes of the default prim (the scene medium's vibe:medium attributes).
+    head=''.join('    '+a+'\n' for a in root)+('\n' if root else '')
+    return '#usda 1.0\n(\n    doc = """'+doc+'"""\n    defaultPrim = "Scene"\n    metersPerUnit = 1\n    upAxis = "Y"\n)\n\ndef Xform "Scene"\n{\n'+head+'\n\n'.join(body)+'\n}\n'
 def cyclorama(look,back,radius=1.5,height=8,half=100,arc=16):
     # A photo-studio infinity cove: floor from z = half to z = back, a quarter circle of the given radius,
     # then a wall up to `height`; smooth normals, so no horizon line or edge shows behind the subject.
@@ -130,3 +133,46 @@ for i,(name,nd,vd) in enumerate(glasses):
 lights=[prim('DomeLight','Ambient',['        color3f inputs:color = (1, 1, 1)','        float inputs:intensity = 0.25'])]
 doc="Abbe row: 60-degree prisms of SCHOTT N-SF11, F2, N-BK7 and N-FK51A (Abbe numbers 25.7 to 84.5) each turned to minimum deviation towards a thin white slit, as in a spectroscope. Through each prism its slit spreads into a spectrum, wider as the Abbe number falls. Dispersion renders in spectral light transport only."
 (OUT/'AbbeRow.usda').write_text(stage(doc,[prim('Scope','Looks',['\n\n'.join(looks)]),camera(eye,(0,0.3,0),30),camera((1.2,4.0,3.2),(-0.9,0,-0.7),24,'Overview'),cyclorama('Floor',-2.6)]+prisms+bars+lights))
+
+# A shaped disk light (UsdLux ShapingAPI cone) facing along its local -Z, with an optional spectrum.
+def spot(name,position,rotation,radius,intensity,cone,softness,spectrum=()):
+    return prim('DiskLight',name,xf(position,rotation)+[f'        float inputs:radius = {radius:g}',f'        float inputs:intensity = {intensity:g}',
+        f'        float inputs:shaping:cone:angle = {cone:g}',f'        float inputs:shaping:cone:softness = {softness:g}']+['        '+a for a in spectrum],
+        'prepend apiSchemas = ["ShapingAPI"]')
+
+# ---- Tyndall tank ---------------------------------------------------------------------------------
+looks=[mat('Floor',{'base_color':('color3f',(0.05,0.05,0.055)),'specular_roughness':('float',0.4)}),
+       mat('Card',{'base_color':('color3f',(0.85,0.85,0.85)),'specular_roughness':('float',0.6)}),
+       mat('Milk',{'specular_weight':('float',0),'transmission_weight':('float',1),'transmission_depth':('float',0.7),
+                   'transmission_scatter':('color3f',(1,1,1))},
+           'Index-matched boundary (specular_weight 0) around a Rayleigh-scattering medium (BUCHOLTZ1995): sigma_s = (550 nm / lambda)^4 / 0.7 per metre.',
+           extra=('bool vibe:medium:rayleigh = true',))]
+tank=[prim('Cube','Tank',['        double size = 1']+xf((0,0.36,0),None,(2.2,0.6,0.6))+[bind('Milk')]),
+      prim('Cube','Card',['        double size = 1']+xf((2.0,0.6,0),(0,40,0),(0.02,1.2,1.2))+[bind('Card')]),
+      spot('Beam',(-1.75,0.36,0),(0,-90,0),0.05,30000,2,0.5),
+      prim('DomeLight','Ambient',['        color3f inputs:color = (1, 1, 1)','        float inputs:intensity = 0.04'])]
+doc="Tyndall tank: a white beam crosses 2.2 m of a Rayleigh-scattering medium (scattering proportional to lambda^-4). Seen from the side the beam glows blue near its entry; the light that gets through is orange on the card. The medium needs spectral transport for its continuous lambda^-4 law (RGB evaluates it at three wavelengths)."
+(OUT/'TyndallTank.usda').write_text(stage(doc,[prim('Scope','Looks',['\n\n'.join(looks)]),camera((0.15,1.0,3.4),(0.15,0.36,0),32),cyclorama('Floor',-1.5)]+tank))
+
+# ---- Lamp spectra -----------------------------------------------------------------------------------
+lamps=[('Incandescent',['token vibe:spectrum = "blackbody"','float vibe:spectrum:temperature = 2700'],'2700 K blackbody'),
+       ('Daylight',['token vibe:spectrum = "D65"'],'CIE D65'),
+       ('Fluorescent',['token vibe:spectrum = "FL11"'],'CIE FL11 narrow-band fluorescent'),
+       ('Sodium',['token vibe:spectrum = "HP1"'],'CIE HP1 high-pressure sodium'),
+       ('LED',['token vibe:spectrum = "LED-B3"'],'CIE LED-B3 phosphor white LED')]
+looks=[mat('Floor',{'base_color':('color3f',(0.18,0.18,0.18)),'specular_roughness':('float',0.5)}),
+       mat('Plinth',{'base_color':('color3f',(0.8,0.8,0.8)),'specular_roughness':('float',0.5)}),
+       mat('Red',{'base_color':('color3f',(0.7,0.08,0.06)),'specular_roughness':('float',0.3)}),
+       mat('Green',{'base_color':('color3f',(0.1,0.55,0.12)),'specular_roughness':('float',0.3)}),
+       mat('Blue',{'base_color':('color3f',(0.08,0.15,0.65)),'specular_roughness':('float',0.3)})]
+objects=[]
+for i,(name,spectrum,label) in enumerate(lamps):
+    x=-2.2+1.1*i
+    objects.append(prim('Cylinder','Plinth_'+name,['        uniform token axis = "Y"','        double radius = 0.28','        double height = 0.3']+xf((x,0.15,0))+[bind('Plinth')]))
+    for j,(colour,dx,dz) in enumerate([('Red',-0.12,0.07),('Green',0.12,0.07),('Blue',0,-0.13)]):
+        objects.append(prim('Sphere',f'{colour}_{name}',['        double radius = 0.09']+xf((x+dx,0.39,dz))+[bind(colour)]))
+    objects.append(spot('Lamp_'+name,(x,2.6,0),(-90,0,0),0.08,900,13,0.4,spectrum))
+objects.append(prim('DomeLight','Ambient',['        color3f inputs:color = (1, 1, 1)','        float inputs:intensity = 0.02']))
+doc="Lamp spectra: the same red, green and blue spheres under five spot lamps of equal luminance in light haze: a 2700 K blackbody, CIE D65, FL11 (fluorescent), HP1 (sodium) and LED-B3. Under sodium light the colours collapse to orange and black. The lamps' spectra render in spectral transport; RGB uses the blackbody's colour and keeps presets white."
+haze=('float vibe:medium:density = 0.06','color3f vibe:medium:albedo = (0.95, 0.95, 0.95)','float vibe:medium:anisotropy = 0.5')
+(OUT/'LampSpectra.usda').write_text(stage(doc,[prim('Scope','Looks',['\n\n'.join(looks)]),camera((0,1.6,5.2),(0,0.6,0),30),cyclorama('Floor',-1.8)]+objects,root=haze))

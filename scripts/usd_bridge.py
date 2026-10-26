@@ -333,6 +333,34 @@ def constant_environment(directory,color):
     dest=directory/('dome-'+hashlib.sha256(data).hexdigest()[:16]+'.hdr')
     dest.write_bytes(data);return str(dest)
 
+# A light's spectrum (Swift EmitterLight; docs/VOLUME_DESIGN.md section 2): UsdLux colorTemperature as a
+# blackbody, or the custom vibe:spectrum attributes. Returns {} for the scene's light preset.
+SPECTRUM_PRESETS={'E':0,'D65':1,'A':2,'FL11':3,'HP1':4,'LED-B3':5}
+def light_spectrum(prim,light,time,path,report):
+    spec={}
+    if light.GetEnableColorTemperatureAttr().Get(time):
+        t=float(light.GetColorTemperatureAttr().Get(time))
+        if not 500<=t<=40000:fail(path+': colorTemperature %g K is outside 500-40000 K'%t)
+        spec={'spectrum':'blackbody','temperature':t}
+        report.append(path+': colorTemperature %g K imported as a Planckian (blackbody) spectrum, normalised to luminance one; 6500 K is not exactly D65'%t)
+    kind=prim.GetAttribute('vibe:spectrum').Get(time) if prim.HasAttribute('vibe:spectrum') else None
+    if kind is None:return spec
+    def value(name,default):
+        a=prim.GetAttribute('vibe:spectrum:'+name);v=a.Get(time) if a else None
+        return float(default if v is None else v)
+    kind=str(kind)
+    if kind=='inherit':return {}
+    if kind in SPECTRUM_PRESETS:return {'spectrum':'preset','preset':SPECTRUM_PRESETS[kind]}
+    if kind=='blackbody':
+        t=value('temperature',6500)
+        if not 500<=t<=40000:fail(path+': vibe:spectrum:temperature %g K is outside 500-40000 K'%t)
+        return {'spectrum':'blackbody','temperature':t}
+    if kind=='narrowband':
+        c,w=value('center',550),value('fwhm',10)
+        if not (360<=c<=830 and 1<=w<=200):fail(path+': vibe:spectrum:center must be 360-830 nm and vibe:spectrum:fwhm 1-200 nm')
+        return {'spectrum':'narrowband','center':c,'fwhm':w}
+    fail(path+': unknown vibe:spectrum '+kind)
+
 def import_stage(filename,directory,frame=None):
     stage=Usd.Stage.Open(filename,load=Usd.Stage.LoadAll)
     if not stage:fail('Could not open USD stage')
@@ -366,6 +394,9 @@ def import_stage(filename,directory,frame=None):
             return materialIndex[path],color
         item={'id':uid(),'name':material.GetPrim().GetName() if material else 'Display color','color':color,'path':path}
         if mtlx:item['mtlx']=mtlx
+        # docs/VOLUME_DESIGN.md section 4: an interior medium scattering by the Rayleigh law (custom attribute).
+        rayleigh=material.GetPrim().GetAttribute('vibe:medium:rayleigh') if material else None
+        if mtlx and rayleigh and rayleigh.Get(time):item['rayleigh']=True
         if len(materials)>=MATERIALS:fail(f'Stage exceeds {MATERIALS} imported materials')
         materials.append(item);materialIndex[key]=item['id']
         if path:materialIndex.setdefault(path,item['id'])
@@ -481,9 +512,18 @@ def import_stage(filename,directory,frame=None):
                     width=height=2*radius
                 world=cache.GetLocalToWorldTransform(prim)*conversion
                 strength=float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time));color=vec(light.GetColorAttr().Get(time))
-                if light.GetEnableColorTemperatureAttr().Get(time):report.append(path+': light color temperature is not applied')
                 if is_rect and light.GetTextureFileAttr().Get(time):report.append(path+': textured area light imported with constant color')
-                if prim.HasAPI(UsdLux.ShapingAPI) or light.GetFiltersRel().GetTargets() or light.GetDiffuseAttr().Get(time)!=1 or light.GetSpecularAttr().Get(time)!=1:report.append(path+': light shaping, filters and diffuse/specular weights are not applied')
+                if light.GetFiltersRel().GetTargets() or light.GetDiffuseAttr().Get(time)!=1 or light.GetSpecularAttr().Get(time)!=1:report.append(path+': light filters and diffuse/specular weights are not applied')
+                spec=light_spectrum(prim,light,time,path,report)
+                if prim.HasAPI(UsdLux.ShapingAPI):
+                    shaping=UsdLux.ShapingAPI(prim)
+                    if is_rect or is_disk:
+                        cone=float(shaping.GetShapingConeAngleAttr().Get(time));softness=float(shaping.GetShapingConeSoftnessAttr().Get(time));focus=float(shaping.GetShapingFocusAttr().Get(time))
+                        if not all(math.isfinite(v) for v in (cone,softness,focus)):fail(path+': non-finite light shaping')
+                        spec.update({'coneAngle':min(180,max(0,cone)),'coneSoftness':min(1,max(0,softness)),'focus':max(0,focus)})
+                        if any(vec(shaping.GetShapingFocusTintAttr().Get(time))):report.append(path+': shaping:focusTint is not applied')
+                        if shaping.GetShapingIesFileAttr().Get(time):report.append(path+': IES profile is not applied')
+                    else:report.append(path+': light shaping applies to rectangle and disk lights only; not applied to this sphere light')
                 if is_disk:
                     # An equal-area octagon keeps the disk's area pi*r^2, and with it the emitted power.
                     r=radius*math.sqrt(math.pi/(2*math.sqrt(2)))
@@ -506,6 +546,7 @@ def import_stage(filename,directory,frame=None):
                     report.append(path+': emission %.3g exceeds the supported 1e8 and was scaled down'%max(emission))
                     emission=[x*(1e8/max(emission)) for x in emission]
                 material={'id':uid(),'name':str(prim.GetName())+' emission','color':[0,0,0],'path':path,'emission':emission}
+                if spec:material['light']=spec
                 if len(materials)>=MATERIALS:fail(f'Stage exceeds {MATERIALS} materials including lights')
                 materials.append(material)
                 lightMesh=MeshWriter()
@@ -538,10 +579,22 @@ def import_stage(filename,directory,frame=None):
             elif prim.HasAPI(UsdLux.VolumeLightAPI):report.append(path+': VolumeLightAPI emission and volume geometry '+prim.GetTypeName()+' are not imported')
             elif prim.HasAPI(UsdLux.LightAPI):report.append(path+': unsupported light type '+prim.GetTypeName())
             elif prim.IsA(UsdGeom.Gprim) or prim.GetTypeName() in ('PointInstancer','Volume'):report.append(path+': unsupported geometry '+prim.GetTypeName())
+    # docs/VOLUME_DESIGN.md section 4: the scene medium, from custom attributes on the default prim.
+    medium=None;root=stage.GetDefaultPrim()
+    if root and root.HasAttribute('vibe:medium:density'):
+        density=float(root.GetAttribute('vibe:medium:density').Get(time) or 0)
+        def attr(name,default):
+            a=root.GetAttribute('vibe:medium:'+name);v=a.Get(time) if a else None
+            return default if v is None else v
+        albedo=vec(attr('albedo',Gf.Vec3f(0.9)));g=float(attr('anisotropy',0));rayleigh=bool(attr('rayleigh',False))
+        if not (0<=density<=100 and all(0<=x<=1 for x in albedo) and -0.99<=g<=0.99):fail('vibe:medium attributes are out of range (density 0-100 per metre, albedo 0-1, anisotropy -0.99-0.99)')
+        if density>0:
+            medium={'density':density*UsdGeom.GetStageMetersPerUnit(stage)**-1,'albedo':albedo,'anisotropy':g,'rayleigh':rayleigh}
+            report.append('Scene medium: extinction %g per metre, albedo %s, anisotropy %g%s'%(medium['density'],[round(x,3) for x in albedo],g,', Rayleigh scattering' if rayleigh else ''))
     if len(nodes)>NODES or rendered>RENDERED_TRIANGLES or stored>STORED_TRIANGLES:fail('Stage exceeds renderer capacity including lights')
     if not assets:fail('No supported meshes were found')
     report.insert(1,f'{len(assets)} mesh assets, {len(nodes)} nodes, {len(materials)} materials, {rendered} triangles')
-    return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report,'fallbackColors':fallbackColors}
+    return {'nodes':nodes,'assets':assets,'materials':materials,'cameras':cameras,'environment':environment,'sun':sun,'report':report,'fallbackColors':fallbackColors,'medium':medium}
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('input');parser.add_argument('output');parser.add_argument('--frame',type=float);args=parser.parse_args()

@@ -128,7 +128,7 @@
     var swiftGraph = units
     swiftGraph.sceneGraphMode = true
     require(swiftGraph.lens.z == 1 && swiftGraph.sceneGraphMode && !units.sceneGraphMode, "Swift scene-graph flag accessor")
-    require(MemoryLayout<Uniforms>.stride == 304 && MemoryLayout<Uniforms>.offset(of: \.reservoirHistory) == 248,
+    require(MemoryLayout<Uniforms>.stride == 336 && MemoryLayout<Uniforms>.offset(of: \.reservoirHistory) == 248,
         "Swift reservoir history occupies the former alignment gap")
     let unitOut = gpu.makeBuffer(length: 6 * 16, options: .storageModeShared)!
     run(try pipeline("fix_integrator_units"), width: 1, height: 1) {
@@ -139,7 +139,7 @@
     }
     let unit = (0..<6).map { unitOut.contents().load(fromByteOffset: $0 * 16, as: SIMD4<Float>.self) }
     print("Integrator unit checks: \(unit)")
-    require(unit[0] == SIMD4<Float>(304, 248, 1, 0), "MSL uniform layout and uses_scene_graph")
+    require(unit[0] == SIMD4<Float>(336, 248, 1, 0), "MSL uniform layout and uses_scene_graph")
     require(unit[1] == SIMD4<Float>(6, 0, 15, 0), "scattering_limit drives every depth predicate; depth 1 is direct only")
     require(abs(unit[2].x - 1) < 1e-5 && unit[2].y > 10 && unit[2].z == 0 && unit[2].w < 1e-4,
         "ReSTIR GI reconnection Jacobian (Ouyang et al. 2021, Eq. 11)")

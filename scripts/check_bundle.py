@@ -26,7 +26,7 @@ for path in [executable, contents / "Info.plist", resources / "OpenPBR.metal", r
              resources / "OpenUSD/VIBE_RUNTIME.json", resources / "OpenPBR-LICENSE",
              resources / "THIRD_PARTY_NOTICES.md", oidn / "VIBE_RUNTIME.json",
              resources / "SpectralTables.metal", resources / "FourierSRGB86.bin", resources / "Spectral-UPSTREAM.md",
-             resources / "showcase.json"]:
+             resources / "showcase.json", resources / "CIE_xyz_1931_2deg.csv"]:
     if not path.is_file():
         problems.append(f"missing {path.relative_to(app)}")
 

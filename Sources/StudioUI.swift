@@ -528,6 +528,9 @@ final class StudioController: NSViewController {
       self.changed()
       self.rebuild()
     }
+    if renderer.hasMedia && renderer.samplingMode == 0 {
+      text("This scene has participating media, which render with Standard MIS; the ReSTIR settings below apply to scenes without media.")
+    }
     restirModeControls()
     button(renderer.denoiserEnabled ? "MetalFX: On" : "MetalFX: Off") { [weak self] in
       guard let self else { return }
@@ -879,13 +882,38 @@ final class StudioController: NSViewController {
     text(
       "Spectral light transport only: a preset replaces the RGB colour's daylight-like spectrum, and the light colour tints it like a filter. Light spectrum covers area and sphere lights and imported emitters; the sky and environment images stay RGB."
     )
-    popup(["Atmosphere: Clear", "Atmosphere: Fog preview"], Int(renderer.enableFog), label: "Atmosphere") {
+    let atmosphere = renderer.medium != nil ? 2 : Int(renderer.enableFog)
+    popup(["Atmosphere: Clear", "Atmosphere: Fog preview", "Atmosphere: Participating medium"], atmosphere, label: "Atmosphere") {
       [weak self] i in
       guard let self else { return }
-      self.checkpoint("Fog")
-      self.renderer.enableFog = UInt32(i)
+      self.checkpoint("Atmosphere")
+      self.renderer.enableFog = i == 1 ? 1 : 0
+      self.renderer.medium = i == 2 ? (self.renderer.medium ?? SceneMedium()) : nil
+      self.changed()
+      self.rebuild()
+    }
+    if let medium = renderer.medium { mediumControls(medium) }
+  }
+  // The scene medium (SceneMedium; docs/VOLUME_DESIGN.md §4), on the Lighting page.
+  func mediumControls(_ medium: SceneMedium) {
+    func update(_ change: (inout SceneMedium) -> Void) {
+      var edited = renderer.medium ?? SceneMedium()
+      change(&edited)
+      renderer.medium = edited
+    }
+    number("Density (per metre)", medium.density, 0...5, 0.05, entry: SceneMedium.densityRange) { v in update { $0.density = v } }
+    for (i, channel) in ["R", "G", "B"].enumerated() {
+      number("Scattering albedo \(channel)", medium.albedo[i], 0...1, 0.9) { v in update { $0.albedo[i] = v } }
+    }
+    number("Anisotropy (g)", medium.anisotropy, -0.99...0.99, 0) { v in update { $0.anisotropy = v } }
+    popup(["Grey scattering", "Rayleigh scattering (λ⁻⁴)"], medium.rayleigh ? 1 : 0, label: "Scattering law") { [weak self] i in
+      guard let self else { return }
+      self.checkpoint("Scattering law")
+      update { $0.rayleigh = i == 1 }
       self.changed()
     }
+    text(
+      "Homogeneous haze in the scene's bounding box: density is the extinction per metre (at 550 nm with the Rayleigh law), albedo the scattered fraction, and anisotropy the Henyey-Greenstein g (positive scatters forward). Scenes with media render with Standard MIS instead of ReSTIR. Rayleigh scattering is bluer at short wavelengths, so beams turn orange as they cross it.")
   }
   func objectNames() -> [String] {
     switch renderer.sceneIndex {
@@ -969,6 +997,7 @@ final class StudioController: NSViewController {
       }
       text(
         "One-sided rectangular light. Move and rotate it in Objects. Values are linear radiance.")
+      emitterLightControls(slot)
       return
     }
     let material = renderer.materials.settings[slot]
@@ -1249,6 +1278,7 @@ final class StudioController: NSViewController {
     p.strategy = renderer.samplingMode
     p.sky = renderer.skyMode
     p.fog = renderer.enableFog
+    p.medium = renderer.medium
     p.ring = renderer.enableSMS
     p.denoise = renderer.denoiserEnabled
     p.oidn = renderer.oidnOptions
@@ -1462,7 +1492,7 @@ final class StudioController: NSViewController {
     let r = renderer
     let radianceChanged =
       resourcesChanged || r.sceneIndex != p.scene || r.samplingMode != p.strategy
-      || r.skyMode != p.sky || r.enableFog != p.fog || r.enableSMS != p.ring
+      || r.skyMode != p.sky || r.enableFog != p.fog || r.medium != p.medium || r.enableSMS != p.ring
       || !r.options.sameRadiance(as: p.options) || ReSTIRModes(r) != p.restirModes
     let oidn = p.oidn ?? OIDNOptions()
     if oidn != r.oidnOptions, r.offlineDenoisedPreview != nil {
@@ -1481,6 +1511,7 @@ final class StudioController: NSViewController {
     r.samplingMode = p.strategy
     r.skyMode = p.sky
     r.enableFog = p.fog
+    r.medium = p.medium
     r.enableSMS = p.ring
     r.denoiserEnabled = p.denoise && r.supportsMetalFX
     r.oidnOptions = oidn

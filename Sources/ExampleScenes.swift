@@ -101,7 +101,8 @@ enum ExampleScenes {
 // Spectral example scenes (Examples/Spectral), bundled with the application: small OpenUSD stages that show
 // wavelength-dependent effects, opened through the USD importer with the scripts/showcase.json shot of the same
 // name. The shot's `usd` path is the stage's path in the repository and under Contents/Resources in the bundle.
-// REFERENCES.md: OPENPBR (thin film, dispersion), SCHOTTGLASS, DIAMANTI2014, OPENUSD (implicit prims).
+// REFERENCES.md: OPENPBR (thin film, dispersion), SCHOTTGLASS, DIAMANTI2014, OPENUSD (implicit prims, ShapingAPI),
+// BUCHOLTZ1995, PLANCK, CIEDATA (docs/VOLUME_DESIGN.md: media, light spectra, spot cones).
 struct SpectralExample: Sendable {
   var shot: String
   var title: String
@@ -114,6 +115,10 @@ enum SpectralExamples {
                     summary: "Thin-film interference: soap films and anodized titanium"),
     SpectralExample(shot: "spectral-abbe-row", title: "Abbe Row",
                     summary: "Dispersion: one slit seen through four optical glasses"),
+    SpectralExample(shot: "spectral-tyndall-tank", title: "Tyndall Tank",
+                    summary: "Rayleigh scattering: a white beam turns blue to the side and orange through a medium"),
+    SpectralExample(shot: "spectral-lamp-spectra", title: "Lamp Spectra",
+                    summary: "The same colours under blackbody, daylight, fluorescent, sodium and LED spots in haze"),
   ]
   static func url(_ path: String) -> URL? {
     runtimeResourceURL(bundled: Bundle.main.resourceURL?.appendingPathComponent(path), repositoryPath: path)
@@ -385,6 +390,9 @@ struct ShowcaseShot: Decodable, Sendable {
   var depth: Float?
   // Raw linear radiance as OpenEXR, without a denoiser (renderer comparisons).
   var raw: Bool?
+  // Open Image Denoise for scripts/render_showcase.py's export; off by default, so documentation and test images
+  // show the raw accumulation.
+  var denoise: Bool?
   // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
   // shot, above 1 brightens it for a night shot, since MTL emission has no absolute scale.
   var emissionScale: Float?
@@ -637,7 +645,7 @@ extension StudioController {
     }
     text("Small OpenUSD scenes included with Metal Vibe Tracer. "
       + SpectralExamples.catalog.map { "\($0.title): \($0.summary)." }.joined(separator: " ")
-      + " Thin film and dispersion render in spectral light transport (the default).")
+      + " Thin film, dispersion, lamp spectra and Rayleigh scattering render fully in spectral light transport (the default).")
     heading("Example scenes")
     for (index, scene) in ExampleScenes.catalog.enumerated() {
       button(exampleSceneTitle(scene)) { [weak self] in self?.openExampleScene(index) }

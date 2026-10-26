@@ -11,6 +11,34 @@ struct USDImportSnapshot: Decodable {
     var path: String
     var mtlx: String?
     var emission: [Float]?
+    // usd_bridge.py light_spectrum and ShapingAPI: an imported light's spectrum and spot cone (EmitterLight).
+    var light: Light?
+    // vibe:medium:rayleigh on the material: its interior medium scatters by the Rayleigh law.
+    var rayleigh: Bool?
+  }
+  struct Light: Decodable {
+    var spectrum: String?
+    var preset: UInt32?
+    var temperature: Float?
+    var center: Float?
+    var fwhm: Float?
+    var coneAngle: Float?
+    var coneSoftness: Float?
+    var focus: Float?
+    var emitter: EmitterLight? {
+      var e = EmitterLight()
+      switch spectrum {
+      case nil: break
+      case "preset": guard let k = preset else { return nil }; e.spectrum = .preset(k)
+      case "blackbody": guard let t = temperature else { return nil }; e.spectrum = .blackbody(kelvin: t)
+      case "narrowband": guard let c = center, let w = fwhm else { return nil }; e.spectrum = .narrowband(center: c, fwhm: w)
+      default: return nil
+      }
+      e.coneAngle = coneAngle
+      e.coneSoftness = coneSoftness ?? 0
+      e.focus = focus ?? 0
+      return e.isValid ? e : nil
+    }
   }
   struct Camera: Decodable {
     var name: String
@@ -47,6 +75,8 @@ struct USDImportSnapshot: Decodable {
   var sun: Sun?
   var report: [String]
   var fallbackColors: [String: [[Float]]]?
+  // The scene medium from vibe:medium attributes on the default prim (docs/VOLUME_DESIGN.md §4).
+  var medium: SceneMedium?
 }
 struct USDImportResult {
   var document: ProjectDocument
@@ -228,12 +258,22 @@ enum USDImporter {
         }
         if state.emissions == nil { state.emissions = [:] }
         state.emissions?[slot] = SIMD3(e[0], e[1], e[2])
+        if let light = material.light {
+          guard let emitter = light.emitter else {
+            throw MaterialLibrary.error("USD light \(material.path) has an invalid spectrum or shaping.")
+          }
+          if !emitter.isDefault {
+            if state.emitterLights == nil { state.emitterLights = [:] }
+            state.emitterLights?[slot] = emitter
+          }
+        }
       }
       if let xml = material.mtlx {
         let imported = try MaterialXImporter.read(
           Data(xml.utf8), baseURL: folder, source: url.lastPathComponent + ":" + material.name)
         if var program = imported.materials.first {
           program.name = material.name
+          if material.rayleigh == true, program.medium != nil { program.mediumRayleigh = true }
           if state.materialX == nil { state.materialX = [:] }
           state.materialX?[slot] = program
         } else {
@@ -305,6 +345,7 @@ enum USDImporter {
     p.scenes[6] = state
     p.options.aperture = 0
     p.fog = 0
+    p.medium = snapshot.medium.flatMap { $0.isValid ? $0 : nil }
     p.ring = 0
     p.environmentData = nil
     p.environmentName = "Procedural sky"

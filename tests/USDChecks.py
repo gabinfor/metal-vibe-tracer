@@ -242,7 +242,34 @@ implicit=bridge.import_stage(str(out/'shapes.usda'),out)
 check(len(implicit['assets'])==3 and any('/Flat: degenerate Sphere skipped' in line for line in implicit['report']),implicit['report'])
 check(next(n for n in implicit['nodes'] if n['name']=='Box')['matrix'][12]==3,'implicit prim keeps its transform')
 # The bundled spectral examples import with every material translated.
-for name in ['NewtonSeries.usda','AbbeRow.usda']:
+for name in ['NewtonSeries.usda','AbbeRow.usda','TyndallTank.usda','LampSpectra.usda']:
  example=bridge.import_stage(str(ROOT/'Examples/Spectral'/name),out)
  check(all(m.get('mtlx') or m.get('emission') for m in example['materials']) and len(example['cameras'])==(2 if name=='AbbeRow.usda' else 1),name+': '+str(example['report']))
+ if name=='TyndallTank.usda':check(any(m.get('rayleigh') for m in example['materials']) and any((m.get('light') or {}).get('coneAngle')==2 for m in example['materials']),'Tyndall tank: Rayleigh medium and a 2-degree beam')
+ if name=='LampSpectra.usda':
+  kinds=sorted(str((m.get('light') or {}).get('spectrum')) for m in example['materials'] if m.get('light'))
+  check(kinds==['blackbody','preset','preset','preset','preset'] and example['medium'] and example['medium']['anisotropy']==0.5,'lamp spectra: five lamp spectra and haze: '+str(kinds))
 print('PASS: USD implicit Sphere, Cube and Cylinder tessellation; bundled spectral examples')
+# Light spectra, ShapingAPI cones and the scene medium (docs/VOLUME_DESIGN.md): colorTemperature becomes a blackbody,
+# vibe:spectrum attributes select presets and narrow bands, shaping applies to rectangle and disk lights only, and
+# out-of-range values fail the import.
+lights=Usd.Stage.CreateNew(str(out/'lights.usda'));UsdGeom.SetStageMetersPerUnit(lights,0.01)
+world=UsdGeom.Xform.Define(lights,'/World');lights.SetDefaultPrim(world.GetPrim())
+world.GetPrim().CreateAttribute('vibe:medium:density',Sdf.ValueTypeNames.Float).Set(0.5)
+world.GetPrim().CreateAttribute('vibe:medium:rayleigh',Sdf.ValueTypeNames.Bool).Set(True)
+UsdGeom.Cube.Define(lights,'/World/Box')
+warm=UsdLux.RectLight.Define(lights,'/World/Warm');warm.CreateEnableColorTemperatureAttr(True);warm.CreateColorTemperatureAttr(3000)
+spot=UsdLux.DiskLight.Define(lights,'/World/Spot');shape=UsdLux.ShapingAPI.Apply(spot.GetPrim());shape.CreateShapingConeAngleAttr(20);shape.CreateShapingConeSoftnessAttr(2)
+spot.GetPrim().CreateAttribute('vibe:spectrum',Sdf.ValueTypeNames.Token).Set('narrowband');spot.GetPrim().CreateAttribute('vibe:spectrum:center',Sdf.ValueTypeNames.Float).Set(589)
+ball=UsdLux.SphereLight.Define(lights,'/World/Ball');UsdLux.ShapingAPI.Apply(ball.GetPrim()).CreateShapingConeAngleAttr(10)
+ball.GetPrim().CreateAttribute('vibe:spectrum',Sdf.ValueTypeNames.Token).Set('HP1')
+lights.GetRootLayer().Save()
+result=bridge.import_stage(str(out/'lights.usda'),out);specs={m['name']:m.get('light') for m in result['materials'] if m.get('emission')}
+check(specs['Warm emission']=={'spectrum':'blackbody','temperature':3000.0},'colorTemperature imports as a blackbody: '+str(specs))
+check(specs['Spot emission']=={'spectrum':'narrowband','center':589.0,'fwhm':10.0,'coneAngle':20.0,'coneSoftness':1.0,'focus':0.0},'disk light shaping and narrow band: '+str(specs))
+check(specs['Ball emission']=={'spectrum':'preset','preset':4} and any('not applied to this sphere light' in l for l in result['report']),'sphere light keeps its preset; its shaping is reported')
+check(result['medium'] and abs(result['medium']['density']-50)<1e-4 and result['medium']['rayleigh'],'scene medium density converts per stage unit to per metre: '+str(result['medium']))
+spot.GetPrim().GetAttribute('vibe:spectrum:center').Set(900);lights.GetRootLayer().Save()
+try:bridge.import_stage(str(out/'lights.usda'),out);check(False,'an out-of-range narrow band fails the import')
+except ValueError as e:check('vibe:spectrum:center' in str(e),str(e))
+print('PASS: USD light spectra (colorTemperature, vibe:spectrum), ShapingAPI cones and the scene medium')

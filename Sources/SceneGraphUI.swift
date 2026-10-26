@@ -124,6 +124,7 @@ extension StudioController {
           }
           state.materialX?.removeValue(forKey: slot)
           state.emissions?.removeValue(forKey: slot)
+          state.emitterLights?.removeValue(forKey: slot)
         }
         try renderer.materials.restore(state)
       }
