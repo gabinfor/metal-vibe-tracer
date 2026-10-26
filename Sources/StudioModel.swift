@@ -60,6 +60,10 @@ struct StudioOptions: Codable {
   // is the RGB colour, which spectral transport renders as D65-shaped light; RGB transport ignores both.
   var lightSpectrum: UInt32?
   var sunSpectrum: UInt32?
+  // The luminance cap of a sample's indirect light (MSL indirect_clamped; biased, removes fireflies); nil or 0
+  // is off, as in projects written before the clamp.
+  var indirectClamp: Float?
+  static let indirectClampRange: ClosedRange<Float> = 0...100_000
 }
 extension StudioOptions {
   static let sunAngleRange: ClosedRange<Float> = 0.1...90
@@ -82,6 +86,7 @@ extension StudioOptions {
       && focusDistance == o.focusDistance && sunAngle == o.sunAngle
       && Illuminant.resolved(lightSpectrum) == Illuminant.resolved(o.lightSpectrum)
       && Illuminant.resolved(sunSpectrum) == Illuminant.resolved(o.sunSpectrum)
+      && (indirectClamp ?? 0) == (o.indirectClamp ?? 0)
   }
 }
 // The ReSTIR strategy's reuse modes, the sampler and the light transport (Render inspector; the
@@ -257,7 +262,7 @@ struct ProjectDocument: Codable {
   func validate() throws {
     func bad() throws { throw MaterialLibrary.error("Invalid or unsupported project data.") }
     guard (1...ProjectAssets.formatVersion).contains(version), scene <= 6, strategy <= 3, sky <= 2, fog <= 1, ring <= 1,
-      medium?.isValid ?? true,
+      medium?.isValid ?? true, StudioOptions.indirectClampRange.contains(options.indirectClamp ?? 0),
       options.maxSamples <= 16_777_214, options.exportSamples > 0,
       options.exportSamples <= 16_777_214,
       (16...8192).contains(options.outputWidth), (16...8192).contains(options.outputHeight),

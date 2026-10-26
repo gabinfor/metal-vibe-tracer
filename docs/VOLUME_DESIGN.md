@@ -161,7 +161,7 @@ As implemented, 8 float4 per slot (`SLOT_PARAMETERS`, `MaterialLibrary.slotStrid
 | 6 | interior medium: `transmission_scatter` (rgb), w = `transmission_depth` (0 when none) |
 | 7 | interior medium: anisotropy, index-matched boundary flag, Rayleigh flag, 0 |
 
-`Uniforms` gains `float4 mediumScatter` (rgb albedo, w = density) and `float4 mediumOptions`
+`Uniforms` gains `float4 mediumScatter` (rgb albedo, w = density) and `float4 pathOptions` (named `mediumOptions` until the indirect clamp used its w)
 (anisotropy, Rayleigh, media present, 0); it grows from 304 to 336 bytes. The scene medium's box is not a
 uniform: `medium_box` reads the imported scene's world bounds from the node buffer's header
 (`MeshSceneHeader.lo/hi`), or the procedural scenes' fog boxes.

@@ -6,7 +6,8 @@ Each shot in the JSON file (default scripts/showcase.json) selects a built-in sc
 file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera, lens and render modes, and exports
 through StudioController.startExport, exactly like Export in the app, from the raw accumulation: documentation
 and test images are not denoised. A shot with "denoise": true uses Open Image Denoise instead (on request, or
-for a high-sample showcase render); "raw": true exports linear radiance as OpenEXR (renderer comparisons).
+for a high-sample showcase render); "indirectClamp": c caps each sample's indirect luminance at c, a biased
+firefly control that the image notes must state; "raw": true exports linear radiance as OpenEXR (renderer comparisons).
 --scale and --samples override every shot for quick framing previews. Images go to --out
 (default build/showcase); copy the chosen ones to docs/images by hand.
 """

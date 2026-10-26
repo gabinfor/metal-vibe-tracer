@@ -389,7 +389,7 @@ struct Uniforms {
     float4 lens; // aperture radius, focus distance, scene-graph mode (see uses_scene_graph), independent sun 1 - cos(half angle)
     float4 light; // RGB multiplier, size multiplier
     float4 mediumScatter; // scene medium: single-scattering albedo (rgb), extinction per metre (w); docs/VOLUME_DESIGN.md §4
-    float4 mediumOptions; // scene medium anisotropy, Rayleigh law (1), media present (1: volume_path), 0
+    float4 pathOptions; // scene medium anisotropy, Rayleigh law (1), media present (1: volume_path), indirect clamp (0: off)
 };
 
 // PBRT2023 (RayIntegrator): the camera's ray differentials, here its texture ray cone, are scaled by
@@ -3191,9 +3191,26 @@ bool restir_gi_has_complementary_bsdf(float pathDepth) {
     return scattering_limit(pathDepth) >= 2;
 }
 
+// Optional per-sample clamp of indirect light (StudioOptions.indirectClamp, Uniforms.pathOptions.w; 0 is off).
+// It is biased: a sample's indirect estimate keeps its colour with its luminance capped. Indirect is light
+// after two or more non-delta scattering events: NEE from the second scattering vertex on, and emitters or the
+// sky reached after two (mirror and glass chains do not count, so a surface seen in a mirror keeps its direct
+// light); ReSTIR GI is indirect, and with unified ReSTIR PT its whole reused estimate is,
+// which removes fireflies and the energy of the rare bright paths that cause them. path_add sends a
+// contribution to the direct sum, or to the indirect sum when the clamp is on, so an unclamped sample adds
+// exactly as before.
+bool indirect_clamp_on(constant Uniforms &u) { return u.pathOptions.w > 0.0f; }
+void path_add(thread float3 &direct, thread float3 &indirect, float3 c, bool isIndirect, constant Uniforms &u) {
+    if (isIndirect && indirect_clamp_on(u)) indirect += c; else direct += c;
+}
+float3 indirect_clamped(float3 c, constant Uniforms &u) {
+    float luminance = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+    return luminance > u.pathOptions.w ? c * (u.pathOptions.w / luminance) : c;
+}
+
 // ============================================================================
 // Homogeneous participating media (docs/VOLUME_DESIGN.md §4; REFERENCES.md ADOBEOPENPBR, PBRT2023, HG1941,
-// BUCHOLTZ1995). volume_path is the integrator of frames with media (Uniforms.mediumOptions.z): a
+// BUCHOLTZ1995). volume_path is the integrator of frames with media (Uniforms.pathOptions.z): a
 // unidirectional path tracer with NEE and MIS that tracks one medium at a time, the scene medium
 // (Uniforms.mediumScatter, bounded by the scene's box) or the interior medium of the closed transmissive slot
 // the path is inside (slot_medium). Index-matched boundaries (slot_boundary) change the medium without
@@ -3220,10 +3237,10 @@ struct Medium { Spectrum sigmaS, sigmaT; float g; };
 // scattering coefficient scales as (550 / lambda)^4 and absorption stays density x (1 - albedo).
 Medium scene_medium(constant Uniforms &u, thread const Wavelengths &wl) {
     Medium m;
-    m.g = u.mediumOptions.x;
+    m.g = u.pathOptions.x;
     float density = u.mediumScatter.w;
     Spectrum albedo = clamp(spectral_reflectance(saturate(u.mediumScatter.rgb), wl), 0.0f, 1.0f);
-    if (u.mediumOptions.y > 0.0f) {
+    if (u.pathOptions.y > 0.0f) {
         Spectrum r = 550.0f / medium_lambdas(wl);
         r *= r;
         m.sigmaS = density * albedo * r * r;
@@ -3380,7 +3397,8 @@ Spectrum medium_shadow(float3 p, float3 n, float error, LightSample ls, uint slo
 }
 template <typename R>
 __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, constant SurfaceSettings *settings, constant MaterialResources &images,
-                   thread R &seed, thread Wavelengths &wl) {
+                   thread R &seed, thread Wavelengths &wl, thread float3 &indirect) {
+    // Indirect (path_add): NEE after one scattering event, emission after two (`scatter` counts them).
     float3 radiance = float3(0.0f);
     Spectrum throughput = Spectrum(1.0f), laneRatio = Spectrum(1.0f);
     // Transmittance per lane since the last scattering vertex: its lane mean scales that vertex's BSDF or
@@ -3419,7 +3437,7 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
                     float phase = hg_phase(dot(ray.direction, ls.wi), medium.g);
                     bool useMIS = u.samplingMode <= 1u && scatter < limit;
                     float weight = useMIS ? power_heuristic(ls.pdf, phase * lane_mean(Tr)) : 1.0f;
-                    radiance += spectrum_rgb(throughput * Tr * phase * light_spectrum(ls, images, wl) * (weight / ls.pdf), wl);
+                    path_add(radiance, indirect, spectrum_rgb(throughput * Tr * phase * light_spectrum(ls, images, wl) * (weight / ls.pdf), wl), scatter >= 1, u);
                 }
             }
             if (scatter >= limit) {
@@ -3446,7 +3464,7 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
             if (u.sceneIndex == 0 || u.sceneIndex == 6) {
                 float lightPDF = eval_environment_pdf(ray.direction, previousNormal, u, images);
                 float weight = emission_weight(previousDelta, previousNEE, previousMIS, previousPdf * lane_mean(segment), lightPDF);
-                radiance += spectrum_rgb(throughput * weight * environment_spectrum(ray.direction, u, images, wl), wl);
+                path_add(radiance, indirect, spectrum_rgb(throughput * weight * environment_spectrum(ray.direction, u, images, wl), wl), scatter >= 2, u);
             }
             break;
         }
@@ -3461,14 +3479,14 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
         if (rec.mat.type == EMISSIVE) {
             float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, u, images, rec.triangle);
             float weight = emission_weight(previousDelta, previousNEE, previousMIS, previousPdf * lane_mean(segment), lightPDF);
-            radiance += spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, rec.mat.slot, images, wl), wl);
+            path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, rec.mat.slot, images, wl), wl), scatter >= 2, u);
             break;
         }
         float3 surfaceEmission = openpbr_emission(rec.mat, rec.normal, -ray.direction);
         if (any(surfaceEmission > 0.0f)) {
             float lightPDF = u.sceneIndex == 6 ? eval_light_pdf(previousPosition, rec.position, rec.mat, u, images, rec.triangle) : 0.0f;
             float weight = emission_weight(previousDelta, previousNEE, previousMIS, previousPdf * lane_mean(segment), lightPDF);
-            radiance += spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, rec.mat.slot, images, wl), wl);
+            path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, rec.mat.slot, images, wl), wl), scatter >= 2, u);
         }
         if (emissionOnly) break;
         ++vertices;
@@ -3491,7 +3509,7 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
                     Spectrum bsdf = lanes_eval_bsdf_with_pdf(rec.mat, rec.normal, -ray.direction, ls.wi, pdf, wl, laneRatio);
                     bool useMIS = u.samplingMode <= 1u && scatter < limit;
                     float weight = useMIS ? power_heuristic(ls.pdf, pdf * lane_mean(Tr)) : 1.0f;
-                    radiance += spectrum_rgb(throughput * Tr * bsdf * abs(dot(rec.normal, ls.wi)) * light_spectrum(ls, images, wl) * (weight / ls.pdf), wl);
+                    path_add(radiance, indirect, spectrum_rgb(throughput * Tr * bsdf * abs(dot(rec.normal, ls.wi)) * light_spectrum(ls, images, wl) * (weight / ls.pdf), wl), scatter >= 1, u);
                 }
             }
         }
@@ -6400,6 +6418,8 @@ kernel void shading_kernel(
 
     float4 posDepth = gbufferPosDepth.read(gid);
     float3 radiance = float3(0.0f);
+    // The sample's indirect estimate while the indirect clamp is on (path_add, indirect_clamped).
+    float3 indirect = float3(0.0f);
     float specularHitDistance = 0.0f;
 
     // Inspection views only need the G-buffer. Keep guide accumulation alive,
@@ -6436,10 +6456,10 @@ kernel void shading_kernel(
     // must not replay them. (Z-mode sampling events of the two passes are distinct.)
     decorrelate_shading_seed(seed.state);
 
-    bool media = uniforms.mediumOptions.z > 0.0f;
+    bool media = uniforms.pathOptions.z > 0.0f;
     if (media) {
         // Participating media (docs/VOLUME_DESIGN.md §4): the whole path from the camera, with Standard MIS.
-        radiance = volume_path(primaryRay, uniforms, surfaceSettings, materialImages, seed, wl);
+        radiance = volume_path(primaryRay, uniforms, surfaceSettings, materialImages, seed, wl, indirect);
     } else if (posDepth.w <= 0.0f) {
         if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
             radiance = environment_rgb(primaryRay.direction, uniforms, materialImages, wl);
@@ -6643,7 +6663,7 @@ kernel void shading_kernel(
                     Wavelengths sampleWavelengths = sample_wavelengths(selectedGIU, wl);
                     Spectrum primaryBSDF = eval_bsdf(mat, norm, -primaryRay.direction, direction, sampleWavelengths);
                     float geometry = gi_geometry(pos, norm, selectedGIPosPdf.xyz, selectedGINormal.xyz);
-                    radiance += spectrum_rgb(primaryBSDF * selectedGIRadiance * geometry * giW, sampleWavelengths);
+                    path_add(radiance, indirect, spectrum_rgb(primaryBSDF * selectedGIRadiance * geometry * giW, sampleWavelengths), true, uniforms);
                 }
             } else if (mat.type != DIELECTRIC && !(mat.type == GLOSSY && mat.roughness < 0.02f) && uniforms.samplingMode != 3) {
                 sampler_event(seed, 1u, Z_NEE);
@@ -6665,7 +6685,7 @@ kernel void shading_kernel(
             if (uniforms.enableSMS == 1 && mat.type == DIFFUSE) {
                 sampler_event(seed, 1u, Z_CAUSTIC);
                 float3 caustic = sample_specular_manifold_caustic(pos, norm, uniforms, seed, materialImages);
-                radiance += caustic * mat.albedo;
+                path_add(radiance, indirect, caustic * mat.albedo, true, uniforms);
             }
 
             Ray currentRay = primaryRay;
@@ -6680,11 +6700,11 @@ kernel void shading_kernel(
             const int scatteringLimit = scattering_limit(uniforms.cameraTarget.w);
             bool emissionOnly = false;
             if (unifiedPT) {
-                float4 indirect = ptIndirect.read(gid);
-                radiance += indirect.rgb;
-                if (mat.type == GLOSSY || mat.type == DIELECTRIC || mat.type == OPENPBR) specularHitDistance = indirect.w;
+                float4 pt = ptIndirect.read(gid);
+                path_add(radiance, indirect, pt.rgb, true, uniforms);
+                if (mat.type == GLOSSY || mat.type == DIELECTRIC || mat.type == OPENPBR) specularHitDistance = pt.w;
             } else if (restirPT) {
-                radiance += ptIndirect.read(gid).rgb;
+                path_add(radiance, indirect, ptIndirect.read(gid).rgb, true, uniforms);
             }
             // Lane splitting (spectral_split): when the continuation split at its first delta
             // dispersive vertex, it is traced once more for each further lane. Such a pass replays the
@@ -6738,7 +6758,7 @@ kernel void shading_kernel(
                         float lightPDF = eval_environment_pdf(nextDirection, previousNormal, uniforms,materialImages);
                         float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
                         if (lane == 0u || splitPass)
-                            radiance += spectrum_rgb(throughput * weight * environment_spectrum(nextDirection, uniforms, materialImages, wl), wl);
+                            path_add(radiance, indirect, spectrum_rgb(throughput * weight * environment_spectrum(nextDirection, uniforms, materialImages, wl), wl), scatteringDepth >= 2, uniforms);
                     }
                     break;
                 }
@@ -6746,7 +6766,7 @@ kernel void shading_kernel(
                     float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms,materialImages,rec.triangle);
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
                     if (lane == 0u || splitPass)
-                        radiance += spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, rec.mat.slot, materialImages, wl), wl);
+                        path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, rec.mat.slot, materialImages, wl), wl), scatteringDepth >= 2, uniforms);
                     break;
                 }
                 // A MaterialX emitter also scatters: add its emission with the same MIS
@@ -6758,7 +6778,7 @@ kernel void shading_kernel(
                         ? eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms, materialImages, rec.triangle) : 0.0f;
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
                     if (lane == 0u || splitPass)
-                        radiance += spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, rec.mat.slot, materialImages, wl), wl);
+                        path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, rec.mat.slot, materialImages, wl), wl), scatteringDepth >= 2, uniforms);
                 }
                 if (emissionOnly) break;
                 // The x2 emission above is a two-vertex path; ReSTIR PT holds the longer ones.
@@ -6784,7 +6804,7 @@ kernel void shading_kernel(
                         bool useMIS = uniforms.samplingMode <= 1 && scatteringDepth < scatteringLimit;
                         float weight = useMIS ? power_heuristic(ls.pdf, pdf) : 1.0f;
                         if (lane == 0u || splitPass)
-                            radiance += spectrum_rgb(throughput * bsdf * cosine * light_spectrum(ls, materialImages, wl) * weight / ls.pdf, wl);
+                            path_add(radiance, indirect, spectrum_rgb(throughput * bsdf * cosine * light_spectrum(ls, materialImages, wl) * weight / ls.pdf, wl), scatteringDepth >= 1, uniforms);
                     }
                 }
                 currentHit = rec;
@@ -6813,6 +6833,8 @@ kernel void shading_kernel(
             }
         }
     }
+
+    if (indirect_clamp_on(uniforms)) radiance += indirect_clamped(indirect, uniforms);
 
     if (uniforms.enableFog == 1 && !media) {
         radiance = apply_camera_fog(radiance, primaryRay, posDepth.w > 0.0f ? posDepth.w : 100.0f, uniforms, seed, materialImages, wl);
@@ -7319,7 +7341,7 @@ struct Uniforms {
     var light = SIMD4<Float>(1, 1, 1, 1)
     // The scene medium and media switch (MSL Uniforms; PathTracerRenderer.mediumUniforms).
     var mediumScatter = SIMD4<Float>(0, 0, 0, 0)
-    var mediumOptions = SIMD4<Float>(0, 0, 0, 0)
+    var pathOptions = SIMD4<Float>(0, 0, 0, 0)
 
     // Mirrors MSL uses_scene_graph: scene 6 renders the imported scene graph.
     var sceneGraphMode: Bool {
@@ -9861,7 +9883,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             environment: SIMD4(options.environmentIntensity, options.environmentRotation * .pi / 180, materials.environmentData == nil ? 0 : 1, Float(materials.nodeCount)),
             lens: SIMD4(options.aperture,options.focusDistance,materials.hasSceneGraph ? 1 : 0,sceneIndex == 6 ? options.independentSunCone : 0),
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize),
-            mediumScatter: mediumUniforms.scatter, mediumOptions: mediumUniforms.options
+            mediumScatter: mediumUniforms.scatter, pathOptions: mediumUniforms.options
         )
         uniforms.sceneGraphMode = materials.hasSceneGraph
         lastUniforms=uniforms

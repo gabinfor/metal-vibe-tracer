@@ -393,6 +393,8 @@ struct ShowcaseShot: Decodable, Sendable {
   // Open Image Denoise for scripts/render_showcase.py's export; off by default, so documentation and test images
   // show the raw accumulation.
   var denoise: Bool?
+  // StudioOptions.indirectClamp: a biased per-sample cap of indirect light that removes fireflies.
+  var indirectClamp: Float?
   // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
   // shot, above 1 brightens it for a night shot, since MTL emission has no absolute scale.
   var emissionScale: Float?
@@ -439,6 +441,7 @@ struct ShowcaseShot: Decodable, Sendable {
     if let v = height { p.options.outputHeight = v }
     if let v = samples { p.options.exportSamples = v }
     if let v = depth { p.options.depth = v }
+    if let v = indirectClamp { p.options.indirectClamp = v > 0 ? v : nil }
   }
 }
 

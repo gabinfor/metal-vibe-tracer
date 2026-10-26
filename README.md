@@ -258,6 +258,7 @@ Release notes are in [CHANGELOG.md](CHANGELOG.md). The September 2026 audit, its
 - **Some spectral features are experimental.** Spectral MIS for rough dispersive glass measured about 4× the default's error (an open issue), and the sky models and imported UsdLux spectra are not spectral.
 - **Import coverage is partial.** OpenUSD import is a snapshot (no animation, subdivision, volumes, curves or USD export), and MaterialX support is a bounded importer.
 - **Participating media are homogeneous and render with Standard MIS**, not ReSTIR. Glass still blocks shadow rays, so light reaches media behind glass only through sampled paths (only index-matched boundaries pass light), and narrow beams in thin haze are noisy until accumulated.
+- **The indirect clamp** (Render page, off by default) removes fireflies by capping each sample's indirect light, which biases bright indirect effects. Images rendered with it say so.
 - **The fog preview and the ring-caustic boost** are approximate preview effects. The Atmosphere popup's *Participating medium* is the physically based alternative.
 
 <details>

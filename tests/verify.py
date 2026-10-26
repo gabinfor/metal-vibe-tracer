@@ -58,6 +58,7 @@ PARTS = [
     ('Fix_spectral.swift', {'full', 'studio'}),
     ('Fix_spectral-mis.swift', {'full'}),
     ('Fix_volumes.swift', {'full'}),
+    ('Fix_clamp.swift', {'full'}),
     ('Fix_veach-plates.swift', {'full'}),
 ]
 # One GPU suite at a time per checkout; each run writes into its own output directory.

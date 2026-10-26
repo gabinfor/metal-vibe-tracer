@@ -528,6 +528,11 @@ final class StudioController: NSViewController {
       self.changed()
       self.rebuild()
     }
+    number("Indirect clamp (0 = off)", renderer.options.indirectClamp ?? 0, 0...100, 0, entry: StudioOptions.indirectClampRange) {
+      [weak self] v in self?.renderer.options.indirectClamp = v > 0 ? v : nil
+    }
+    text(
+      "Caps the luminance each sample's indirect light can add, which removes fireflies. It is biased: bright indirect effects such as caustics lose energy, the more so the lower the cap. 0 keeps the unbiased render. Values of about 10-50 times a lit surface's brightness rarely change anything but the fireflies. With ReSTIR PT on imported scenes it caps the whole reused estimate, direct light included.")
     if renderer.hasMedia && renderer.samplingMode == 0 {
       text("This scene has participating media, which render with Standard MIS; the ReSTIR settings below apply to scenes without media.")
     }

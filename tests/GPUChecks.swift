@@ -166,8 +166,9 @@ let testOutputDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.environme
     o.environmentIntensity = u.environment.x; o.environmentRotation = u.environment.y * 180 / .pi
     o.aperture = u.lens.x; o.focusDistance = u.lens.y
     o.lightColor = SIMD3<Float>(u.light.x, u.light.y, u.light.z); o.lightIntensity = 1; o.lightSize = u.light.w
-    // Emitter spectra are not part of the test view: the renderer's current presets are kept.
+    // Emitter spectra and the indirect clamp are not part of the test view: the renderer's current ones are kept.
     o.lightSpectrum = r.options.lightSpectrum; o.sunSpectrum = r.options.sunSpectrum
+    o.indirectClamp = r.options.indirectClamp
     r.options = o
     require((u.environment.z > 0.5) == (r.materials.environmentData != nil),
         "test view environment flag matches the loaded environment")
