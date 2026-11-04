@@ -8857,7 +8857,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     private(set) var lastPresentationUsedMetalFX = false
     private(set) var lastMetalFXReset = false
     // Display-only: toggling leaves progressive samples intact, but resets MetalFX history.
-    var denoiserEnabled = true {
+    var denoiserEnabled = false {
         didSet { if oldValue != denoiserEnabled { metalFXHistoryNeedsReset = true; presentationNeedsRefresh = true } }
     }
 
@@ -9398,7 +9398,6 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         measuredMetalFXScalerBytesPerPixel = other.flatMap {
             $0.device.registryID == device.registryID ? $0.measuredMetalFXScalerBytesPerPixel : nil
         }
-        denoiserEnabled = supportsMetalFX
         applyPreset(.perspective)
     }
 

@@ -4,6 +4,12 @@ Metal Vibe Tracer is in early development: releases are validated builds, not st
 
 ## Unreleased
 
+### Interface
+
+- **Scene selector:** the inspector's **Scene** popup is labelled and lists, in groups, the built-in scenes, the five example scenes included with the app and the four download examples (with the size still to download; choosing one shows the consent sheet). **Inspector page** is labelled too.
+- **Start screen:** **Example scenes** and **Download examples** sections under the built-in scenes; like them, they can be chosen while the shaders compile.
+- **MetalFX is off by default:** new projects show the raw accumulation; the Render page's **MetalFX denoiser (preview)** checkbox turns it on, and projects saved with it on keep it.
+
 ### Rendering
 
 - **Light tree** (docs/LIGHT_TREE_DESIGN.md; `CONTY2018`, `PBRT2023`): imported emitter triangles are chosen through a light BVH by their importance at the shaded point instead of by power alone, for every strategy and in both light transports. **Render › Light sampling** offers Automatic (the light tree), Light tree and Power; the choice is saved in the project. Nodes are 32 bytes (pbrt-v4's compact light bounds), emitters that share their place and facing (one lamp's triangles) share a leaf and are chosen by power, and a scene whose emitters all form one leaf skips the tree. At equal time it lowered error by 60–87% in Lamp Spectra, 8–17% in the Bistro interior and 15% in the Tyndall Tank, and cost about 5% in San Miguel (tests/PERFORMANCE.md, "Light tree"). Imported scenes with emitters render with less noise but not bit-identically to 0.3.0; **Power** renders as before. A fifth bundled example, **Lantern Arcade** (416 lamps over polished stone), shows the difference: at equal time the tree halves the visible noise with ReSTIR and cuts it by two thirds with Standard MIS. `scripts/measure_light_sampling.py` repeats the comparisons; showcase shots accept `"lightSampling"`.

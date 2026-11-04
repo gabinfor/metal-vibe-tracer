@@ -11,9 +11,11 @@ import simd
 //   map_bump / bump           height converted to a tangent-space normal map (heightNormalMap, -bm / 128), or
 //                             used directly when the image is a normal map (isNormalMap)
 //   norm                      tangent-space normal map
-//   illum 4, 6, 7, 9          glass: transmission_weight 1, transmission_color = Tf, smooth (the
-//                             model's reflection and refraction are ray traced, not Ns highlights);
-//                             Ni <= 1 or unset ("light does not bend") is geometry_thin_walled
+//   illum 4, 6, 7, 9          glass: transmission_weight 1, transmission_color = 1 - Tf (McGuire's
+//                             reading, which his archive's files follow: Tf 1 transmits nothing and is
+//                             opaque illum 2), smooth (the model's reflection and refraction are ray
+//                             traced, not Ns highlights); Ni <= 1 or unset ("light does not bend") is
+//                             geometry_thin_walled
 //   d (or 1 - Tr) < 1         without map_d or a map_Kd alpha channel: glass as above (exporters write
 //                             glass as constant dissolve; masks stay coverage)
 //   illum 0, 1                no specular lobe; illum 2 the default; others are reported
@@ -39,7 +41,10 @@ struct MTLMaterial {
   var tf: SIMD3<Float>?
   var maps: [String: MTLMap] = [:]
   // Transparency models: "Glass on" (4, 9) and "Refraction on" (6, 7).
-  var transmits: Bool { [4, 6, 7, 9].contains(illum) }
+  // A transparency model's transmitted fraction, 1 - Tf (white without Tf; MTL2026, MCGUIRE2012).
+  var transmitted: SIMD3<Float> { 1 - simd_clamp(tf ?? .zero, .zero, SIMD3(repeating: 1)) }
+  var transparencyModel: Bool { [4, 6, 7, 9].contains(illum) }
+  var transmits: Bool { transparencyModel && transmitted.max() > 0 }
 }
 enum OBJMaterials {
   // Parses MTL text; `report` names ignored statements and options once each.
@@ -371,13 +376,15 @@ struct MaterialXWriter {
     inputs.append(("specular_roughness", "float", .value([glass ? 0 : alpha.squareRoot()])))
     inputs.append(("specular_ior", "float", .value([ior])))
     if glass {
-      // Glass: the model's reflection and refraction are ray traced (ideal), filtered by Tf. Ni 1
+      // Glass: the model's reflection and refraction are ray traced (ideal), filtered by 1 - Tf. Ni 1
       // means light does not bend, which is OpenPBR's thin-walled transmission; Fresnel keeps the
       // dielectric IOR above (1.5 when Ni is 1 or unset).
-      let tf = simd_clamp(m.tf ?? SIMD3(repeating: 1), SIMD3(repeating: 0), SIMD3(repeating: 1))
+      let t = m.transparencyModel ? m.transmitted : SIMD3(repeating: 1)
       inputs.append(("transmission_weight", "float", .value([1])))
-      if tf != SIMD3(repeating: 1) { inputs.append(("transmission_color", "color3", .value([tf.x, tf.y, tf.z]))) }
+      if t != SIMD3(repeating: 1) { inputs.append(("transmission_color", "color3", .value([t.x, t.y, t.z]))) }
       if (m.ni ?? 1) <= 1 { inputs.append(("geometry_thin_walled", "boolean", .literal("true"))) }
+    } else if m.transparencyModel {
+      report.append("\(m.name): illum \(m.illum) with Tf 1 transmits nothing (1 - Tf); rendered opaque as illum 2.")
     } else if ![0, 1, 2].contains(m.illum) {
       report.append("\(m.name): illum \(m.illum) rendered as illum 2 (diffuse and specular).")
     }

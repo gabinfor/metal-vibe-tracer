@@ -32,6 +32,9 @@ struct ExampleScene: Sendable {
 
   // The credited work: Bistro's exterior and interior are one scene.
   var work: String { title.components(separatedBy: " (")[0] }
+  // The title on buttons and in the scene selector, without the publisher ("Bistro (exterior)"); the credits,
+  // menu and consent sheet keep the full title.
+  var shortTitle: String { title.replacingOccurrences(of: "Amazon Lumberyard ", with: "") }
   var attribution: String {
     "\(title): \(credit), from Morgan McGuire's Computer Graphics Archive (casual-effects.com/data). "
       + "\(license) (\(licenseURL.absoluteString)). Renders of it are adapted works and must credit it."

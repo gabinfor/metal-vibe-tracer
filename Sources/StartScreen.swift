@@ -4,10 +4,12 @@ import UniformTypeIdentifiers
 // What the start screen asks for. A nil URL asks with an open panel first.
 enum StartAction {
   case openProject(URL?), importOBJ(URL?), importUSD(URL?), builtInScene(Int), restoreSession
+  // A bundled example (SpectralExamples.catalog) or a downloadable one (ExampleScenes.catalog, after consent).
+  case example(Int), download(Int)
 }
 
 // The window's empty start state: nothing is loaded and nothing renders until the user opens a
-// project, imports a model, picks a built-in scene or restores the last session. While the GPU
+// project, imports a model, picks a built-in or example scene or restores the last session. While the GPU
 // shaders compile at launch (AppDelegate) it shows their progress and the action queued until
 // they are ready; afterwards StudioController shows it over the viewport.
 final class StartScreenView: NSView {
@@ -26,7 +28,8 @@ final class StartScreenView: NSView {
   // Built-in scene titles (StudioController.sceneNames without the imported-mesh studio).
   static let builtInScenes = Array(StudioController.sceneNames.prefix(6))
 
-  init() {
+  // `library` gives the download examples' remaining sizes.
+  init(library: ExampleLibrary = ExampleLibrary()) {
     super.init(frame: .zero)
     wantsLayer = true
     identifier = NSUserInterfaceItemIdentifier("start-screen")
@@ -39,7 +42,7 @@ final class StartScreenView: NSView {
     let title = NSTextField(labelWithString: "Metal Vibe Tracer")
     title.font = .systemFont(ofSize: 26, weight: .semibold)
     let subtitle = NSTextField(wrappingLabelWithString:
-      "No scene is loaded. Open a project, import a model or start from a built-in scene.")
+      "No scene is loaded. Open a project, import a model, or start from a built-in or example scene.")
     subtitle.alignment = .center
     subtitle.textColor = .secondaryLabelColor
     content.addArrangedSubview(title)
@@ -64,23 +67,39 @@ final class StartScreenView: NSView {
     content.addArrangedSubview(files)
     content.setCustomSpacing(22, after: files)
 
-    let heading = NSTextField(labelWithString: "Built-in scenes")
-    heading.font = .systemFont(ofSize: 13, weight: .semibold)
-    content.addArrangedSubview(heading)
-    let rows = stride(from: 0, to: Self.builtInScenes.count, by: 3).map { start in
-      (start..<min(start + 3, Self.builtInScenes.count)).map { index -> NSView in
-        let button = ActionButton(Self.builtInScenes[index]) { [weak self] in self?.onAction?(.builtInScene(index)) }
-        button.identifier = NSUserInterfaceItemIdentifier("start-scene-\(index)")
-        actionButtons.append(button)
-        return button
+    // Scene sections: a heading, an optional note and a grid of buttons, `perRow` to a row.
+    func section(_ title: String, note: String? = nil, perRow: Int = 3, _ buttons: [(String, String, StartAction)]) {
+      let heading = NSTextField(labelWithString: title)
+      heading.font = .systemFont(ofSize: 13, weight: .semibold)
+      content.addArrangedSubview(heading)
+      if let note {
+        let label = NSTextField(labelWithString: note)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        content.addArrangedSubview(label)
+        content.setCustomSpacing(4, after: heading)
       }
+      let rows = stride(from: 0, to: buttons.count, by: perRow).map { start in
+        buttons[start..<min(start + perRow, buttons.count)].map { title, id, action -> NSView in
+          let button = ActionButton(title) { [weak self] in self?.onAction?(action) }
+          button.identifier = NSUserInterfaceItemIdentifier(id)
+          actionButtons.append(button)
+          return button
+        }
+      }
+      let grid = NSGridView(views: rows)
+      grid.rowSpacing = 8
+      grid.columnSpacing = 8
+      for column in 0..<grid.numberOfColumns { grid.column(at: column).xPlacement = .fill }
+      content.addArrangedSubview(grid)
+      content.setCustomSpacing(22, after: grid)
     }
-    let grid = NSGridView(views: rows)
-    grid.rowSpacing = 8
-    grid.columnSpacing = 8
-    for column in 0..<grid.numberOfColumns { grid.column(at: column).xPlacement = .fill }
-    content.addArrangedSubview(grid)
-    content.setCustomSpacing(22, after: grid)
+    section("Built-in scenes", Self.builtInScenes.enumerated().map { ($1, "start-scene-\($0)", .builtInScene($0)) })
+    section("Example scenes", SpectralExamples.catalog.enumerated().map { ($1.title, "start-example-\($0)", .example($0)) })
+    section("Download examples", note: "From Morgan McGuire's archive; downloaded once, after you agree.", perRow: 2,
+            ExampleScenes.catalog.enumerated().map { index, scene in
+              (Self.downloadTitle(scene, library), "start-download-\(index)", .download(index))
+            })
 
     restoreRow.orientation = .horizontal
     restoreRow.spacing = 10
@@ -173,6 +192,11 @@ final class StartScreenView: NSView {
     for button in actionButtons { button.isEnabled = enabled }
   }
   func button(_ id: String) -> NSButton? { actionButtons.first { $0.identifier?.rawValue == id } }
+  // A download example's short title with the size still to download ("Crytek Sponza · 80 MB"), or the title alone.
+  static func downloadTitle(_ scene: ExampleScene, _ library: ExampleLibrary) -> String {
+    let bytes = library.downloadBytes(scene)
+    return bytes > 0 ? "\(scene.shortTitle) · \(ExampleScenes.megabytes(bytes))" : scene.shortTitle
+  }
 }
 
 extension StartScreenView {
@@ -200,6 +224,8 @@ extension StartScreenView {
     case .importOBJ(let url): return "Importing \(url?.lastPathComponent ?? "an OBJ mesh")"
     case .importUSD(let url): return "Opening \(url?.lastPathComponent ?? "a USD scene")"
     case .builtInScene(let index): return "Loading \(builtInScenes[index])"
+    case .example(let index): return "Opening \(SpectralExamples.catalog[index].title)"
+    case .download(let index): return "Opening \(ExampleScenes.catalog[index].title)"
     case .restoreSession: return "Restoring the last session"
     }
   }

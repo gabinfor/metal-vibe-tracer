@@ -424,6 +424,50 @@ final class StudioController: NSViewController {
     label.textColor = .secondaryLabelColor
     add(label)
   }
+  // A small label naming the control below it.
+  func caption(_ value: String) {
+    let label = NSTextField(labelWithString: value)
+    label.font = .systemFont(ofSize: 11, weight: .medium)
+    label.textColor = .secondaryLabelColor
+    add(label)
+  }
+  // The scene selector: built-in scenes, the bundled examples and the downloadable ones (with their download size),
+  // in labelled groups. Choosing an example opens it like File > Open Example Scene; the selector keeps showing the
+  // current scene.
+  func scenePicker() {
+    let popup = ActionPopup([], selected: 0, label: "Scene") { _ in }
+    let menu = NSMenu()
+    func add(_ title: String, tag: Int) {
+      let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+      item.tag = tag
+      menu.addItem(item)
+    }
+    menu.addItem(.sectionHeader(title: "Built-in scenes"))
+    for (index, name) in Self.sceneNames.enumerated() { add(name, tag: index) }
+    menu.addItem(.separator())
+    menu.addItem(.sectionHeader(title: "Example scenes"))
+    for (index, example) in SpectralExamples.catalog.enumerated() { add(example.title, tag: Self.exampleTag + index) }
+    menu.addItem(.separator())
+    menu.addItem(.sectionHeader(title: "Download examples"))
+    for (index, scene) in ExampleScenes.catalog.enumerated() {
+      add(StartScreenView.downloadTitle(scene, exampleLibrary), tag: Self.downloadTag + index)
+    }
+    popup.menu = menu
+    popup.selectItem(withTag: Int(renderer.sceneIndex))
+    popup.actionBlock = { [weak self, weak popup] _ in
+      guard let self, self.acceptsEdits, let tag = popup?.selectedTag() else { return }
+      switch tag {
+      case Self.downloadTag...: self.openExampleScene(tag - Self.downloadTag)
+      case Self.exampleTag...: self.openSpectralExample(tag - Self.exampleTag)
+      default: self.switchScene(tag)
+      }
+      // An example opens asynchronously (or after a sheet); until then the selector shows the current scene.
+      popup?.selectItem(withTag: Int(self.renderer.sceneIndex))
+    }
+    stack.addArrangedSubview(popup)
+    popup.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
+  }
+  static let exampleTag = 100, downloadTag = 200
   func heading(_ value: String) {
     let l = NSTextField(labelWithString: value)
     l.font = .systemFont(ofSize: 14, weight: .semibold)
@@ -487,6 +531,9 @@ final class StudioController: NSViewController {
       button("‹ Back to Inspector") { [weak self] in self?.page = 0; self?.rebuild() }
       heading("Settings")
     } else {
+      caption("Scene")
+      scenePicker()
+      caption("Inspector page")
       popup(
         ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page,
         label: "Inspector page"
@@ -494,7 +541,6 @@ final class StudioController: NSViewController {
         self?.page = i
         self?.rebuild()
       }
-      popup(Self.sceneNames, Int(renderer.sceneIndex), label: "Scene") { [weak self] i in self?.switchScene(i) }
     }
     if exportRenderer != nil {
       heading("Rendering export…")
@@ -542,13 +588,16 @@ final class StudioController: NSViewController {
       text("This scene has participating media, which render with Standard MIS; the ReSTIR settings below apply to scenes without media.")
     }
     restirModeControls()
-    button(renderer.denoiserEnabled ? "MetalFX: On" : "MetalFX: Off") { [weak self] in
-      guard let self else { return }
+    let metalFX = ActionButton("MetalFX denoiser (preview)") { [weak self] in
+      guard let self, self.acceptsEdits else { return }
       self.checkpoint("MetalFX")
       self.renderer.denoiserEnabled.toggle()
       self.changed(reset: false)
       self.rebuild()
     }
+    metalFX.setButtonType(.switch)
+    metalFX.state = renderer.denoiserEnabled ? .on : .off
+    add(metalFX)
     if renderer.samplingMode != 0 {
       text("MetalFX is available with ReSTIR Direct + Indirect. This strategy displays raw accumulation.")
     }
@@ -2486,7 +2535,8 @@ final class StudioController: NSViewController {
 extension StudioController {
   // Covers the viewport and inspector with `view` (the launch screen, reused) until a document loads.
   // Nothing renders meanwhile, and no autosave is written, so the last session stays restorable.
-  func showStartScreen(_ view: StartScreenView = StartScreenView()) {
+  func showStartScreen(_ given: StartScreenView? = nil) {
+    let view = given ?? StartScreenView(library: exampleLibrary)
     view.setRestore(Self.autosaveDate(at: autosaveURL))
     view.onAction = { [weak self] action in self?.performStartAction(action) }
     view.onCancelPending = nil
@@ -2541,6 +2591,8 @@ extension StudioController {
     case .importOBJ(let url?): beginImportOBJ(from: url)
     case .importUSD(let url?): beginImportUSD(from: url)
     case .builtInScene(let index): startBuiltInScene(index)
+    case .example(let index): openSpectralExample(index)
+    case .download(let index): openExampleScene(index)
     case .restoreSession:
       restoringSession = true
       restoreAutosave()
