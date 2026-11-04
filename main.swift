@@ -2589,13 +2589,142 @@ float imported_geometry(float3 p,float3 position,uint index,constant MaterialRes
     float3 n=cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz);
     return d2>1e-12f && dot(n,n)>1e-20f ? max(0.0f,dot(normalize(n),-d*rsqrt(d2)))/d2:0;
 }
-// emitters = [count, triangle indices, cumulative area x weight (float bits), total].
-// emissions[slot].w is the slot's selection weight: the luminance of a constant emitter,
-// or the host estimate of a MaterialX emitter (MaterialXProgram.emissionWeight); zero
-// for slots outside the list. A triangle's area density is that weight over the total.
-float imported_emitter_area_pdf(uint index,constant MaterialResources &images) {
+// emitters = [count, triangle indices, cumulative area x weight (float bits), total, light tree node count, ...].
+// emissions[slot].w is the slot's selection weight: the luminance of a constant emitter, or the host estimate of
+// a MaterialX emitter (MaterialXProgram.emissionWeight); zero for slots outside the list. Without a light tree
+// (node count 0) a triangle's area density is that weight over the total. With one (MaterialLibrary.lightTreeList)
+// the indices are sorted, the second section holds each one's leaf position, and the density is the tree's
+// choice probability at the receiver over the triangle's area (light_tree_pmf).
+//
+// Light BVH (CONTY2018; PBRT2023 BVHLightSampler; LightTree.swift, docs/LIGHT_TREE_DESIGN.md): each node bounds
+// its emitters' positions, power and cone of normals, both walks choose a child in proportion to its importance
+// at the receiver, and a leaf's emitter is chosen by power. The importance uses no receiver normal, so sampling
+// and the BSDF-hit PDF (eval_light_pdf, which has none) agree exactly.
+constant uint LIGHT_TREE_MAX_DEPTH = 64u; // LightTree.maxDepth
+constant uint LIGHT_TREE_NO_PARENT = 0x7ffffffu; // LightTree.noParent
+struct LightTreeNode { float3 lo, hi, w; float phi, cosO, cosE; uint child, parent, count; };
+uint light_tree_node_count(constant MaterialResources &images) {
+    uint count=images.emitters[0];
+    return count==0 ? 0u : images.emitters[2*count+2];
+}
+// LightTree.octahedral, decoded.
+float3 light_tree_axis(uint q) {
+    float2 f=float2(float(q&0xffffu),float(q>>16))/65535.0f*2.0f-1.0f;
+    float3 v=float3(f,1.0f-abs(f.x)-abs(f.y));
+    if(v.z<0.0f) v.xy=(1.0f-abs(v.yx))*select(float2(-1.0f),float2(1.0f),v.xy>=0.0f);
+    return normalize(v);
+}
+// The tree's location in the emitter list and the box its node bounds are quantised in, read once per walk.
+struct LightTreeView { device const uint4 *nodes; device const uint *leaves; float3 lo, scale; };
+LightTreeView light_tree(constant MaterialResources &images) {
+    device const uint *e=images.emitters;uint count=e[0];
+    LightTreeView t;
+    t.nodes=(device const uint4 *)(e+e[2*count+3]);t.leaves=e+e[2*count+4];
+    t.lo=float3(as_type<float>(e[2*count+5]),as_type<float>(e[2*count+6]),as_type<float>(e[2*count+7]));
+    float3 hi=float3(as_type<float>(e[2*count+8]),as_type<float>(e[2*count+9]),as_type<float>(e[2*count+10]));
+    t.scale=(hi-t.lo)/65535.0f;
+    return t;
+}
+// A node (LightTree.node, 8 words): child is the second child, or a leaf's first position; the first child follows.
+LightTreeNode light_tree_node(uint i,LightTreeView t) {
+    uint4 a=t.nodes[2u*i],b=t.nodes[2u*i+1u];
+    LightTreeNode n;
+    n.w=light_tree_axis(a.x);n.phi=as_type<float>(a.y);
+    n.cosO=float(a.z&0xffffu)/65535.0f*2.0f-1.0f;n.cosE=float(a.z>>16)/65535.0f*2.0f-1.0f;
+    n.lo=t.lo+float3(float(a.w&0xffffu),float(a.w>>16),float(b.x&0xffffu))*t.scale;
+    n.hi=t.lo+float3(float(b.x>>16),float(b.y&0xffffu),float(b.y>>16))*t.scale;
+    n.child=b.z;n.parent=b.w&LIGHT_TREE_NO_PARENT;n.count=b.w>>27;
+    return n;
+}
+// Per leaf position: the emitter's rendered-triangle ID (0), power (1) and leaf node (2).
+uint light_tree_leaf_word(uint position,uint k,LightTreeView t) { return t.leaves[3u*position+k]; }
+float light_tree_leaf_sum(LightTreeNode n,LightTreeView t) {
+    float sum=0.0f;
+    for(uint i=0;i<n.count;++i) sum+=as_type<float>(light_tree_leaf_word(n.child+i,1u,t));
+    return sum;
+}
+// cos(max(0, a - b)) and sin(max(0, a - b)) from the sines and cosines of a and b (pbrt-v4).
+float cos_sub_clamped(float sinA,float cosA,float sinB,float cosB) { return cosA>cosB ? 1.0f : cosA*cosB+sinA*sinB; }
+float sin_sub_clamped(float sinA,float cosA,float sinB,float cosB) { return cosA>cosB ? 0.0f : sinA*cosB-cosA*sinB; }
+// pbrt-v4 CompactLightBounds::Importance without the receiver normal: power over a clamped squared distance,
+// times the cosine of the smallest angle between the node's normal cone and the direction to p, widened by
+// the angle the bounds subtend; zero beyond the emission angle.
+float light_tree_importance(LightTreeNode n,float3 p) {
+    if(!(n.phi>0.0f)) return 0.0f;
+    float3 pc=0.5f*(n.lo+n.hi);
+    float d2=max(distance_squared(p,pc),max(0.5f*length(n.hi-n.lo),1e-20f));
+    if(all(p>=n.lo) && all(p<=n.hi)) return n.phi/d2;
+    float3 wi=(p-pc)*rsqrt(distance_squared(p,pc));
+    float cosW=dot(n.w,wi),sinW=sqrt(max(0.0f,1.0f-cosW*cosW));
+    float s2=distance_squared(pc,n.hi)/distance_squared(pc,p);
+    float cosB=s2>=1.0f ? -1.0f : sqrt(max(0.0f,1.0f-s2)),sinB=sqrt(max(0.0f,1.0f-cosB*cosB));
+    float sinO=sqrt(max(0.0f,1.0f-n.cosO*n.cosO));
+    float cosX=cos_sub_clamped(sinW,cosW,sinO,n.cosO),sinX=sin_sub_clamped(sinW,cosW,sinO,n.cosO);
+    float cosP=cos_sub_clamped(sinX,cosX,sinB,cosB);
+    return cosP<=n.cosE ? 0.0f : n.phi*cosP/d2;
+}
+// Walks from the root with one uniform number, rescaled at each choice, then chooses within the leaf by power;
+// returns the emitter's leaf position and its probability at p, or 0xffffffff where no light below a node
+// reaches p.
+uint light_tree_sample(float3 p,float u,LightTreeView t,thread float &pmf) {
+    pmf=1.0f;uint index=0;
+    for(uint depth=0;depth<=LIGHT_TREE_MAX_DEPTH;++depth) {
+        LightTreeNode n=light_tree_node(index,t);
+        if(n.count!=0u) {
+            float sum=light_tree_leaf_sum(n,t),target=u*sum,cumulative=0.0f,chosen=0.0f;
+            uint position=0xffffffffu;
+            for(uint i=0;i<n.count && sum>0.0f;++i) {
+                float power=as_type<float>(light_tree_leaf_word(n.child+i,1u,t));
+                if(!(power>0.0f)) continue;
+                position=n.child+i;chosen=power;cumulative+=power;
+                if(target<cumulative) break;
+            }
+            if(position==0xffffffffu) break;
+            pmf*=chosen/sum;return position;
+        }
+        float l=light_tree_importance(light_tree_node(index+1u,t),p);
+        float r=light_tree_importance(light_tree_node(n.child,t),p);
+        if(!(l+r>0.0f)) break;
+        float pl=l/(l+r);
+        if(u<pl) {u=min(u/pl,0x1.fffffep-1f);index=index+1u;pmf*=pl;}
+        else {u=min((u-pl)/(1.0f-pl),0x1.fffffep-1f);index=n.child;pmf*=r/(l+r);}
+    }
+    pmf=0.0f;return 0xffffffffu;
+}
+// The same choices, recomputed from the emitter's leaf up to the root.
+float light_tree_pmf(float3 p,uint position,LightTreeView t) {
+    uint index=light_tree_leaf_word(position,2u,t);
+    LightTreeNode node=light_tree_node(index,t);
+    float sum=light_tree_leaf_sum(node,t);
+    float pmf=sum>0.0f ? as_type<float>(light_tree_leaf_word(position,1u,t))/sum : 0.0f;
+    for(uint depth=0;depth<=LIGHT_TREE_MAX_DEPTH && pmf>0.0f;++depth) {
+        uint parent=node.parent;
+        if(parent==LIGHT_TREE_NO_PARENT) return pmf;
+        LightTreeNode up=light_tree_node(parent,t);
+        float l=light_tree_importance(light_tree_node(parent+1u,t),p);
+        float r=light_tree_importance(light_tree_node(up.child,t),p);
+        float mine=index==parent+1u ? l : r;
+        if(!(l+r>0.0f) || !(mine>0.0f)) return 0.0f;
+        pmf*=mine/(l+r);index=parent;node=up;
+    }
+    return 0.0f;
+}
+// A rendered triangle's leaf position (light tree), or 0xffffffff.
+uint imported_emitter_position(uint triangle,constant MaterialResources &images) {
+    uint count=images.emitters[0],low=0,high=count;
+    while(low<high) {uint middle=(low+high)/2;if(images.emitters[1+middle]<triangle) low=middle+1; else high=middle;}
+    return low<count && images.emitters[1+low]==triangle ? images.emitters[1+count+low] : 0xffffffffu;
+}
+float imported_triangle_area(MeshTriangle t) { return 0.5f*length(cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz)); }
+// Density, per unit area of the triangle, of choosing it as seen from the receiver p.
+float imported_emitter_area_pdf(uint index,float3 p,constant MaterialResources &images) {
     uint count=images.emitters[0];
     if(count==0) return 0.0f;
+    if(light_tree_node_count(images)>0) {
+        uint position=imported_emitter_position(index,images);
+        float area=imported_triangle_area(scene_triangle(index,images));
+        return position!=0xffffffffu && area>0.0f ? light_tree_pmf(p,position,light_tree(images))/area : 0.0f;
+    }
     float total=as_type<float>(images.emitters[2*count+1]);uint slot=uint(scene_triangle(index,images).uvc.z);
     if(slot<8 || slot>=MATERIAL_SLOTS || !(total>0)) return 0.0f;
     return images.emissions[slot].w/total;
@@ -2626,8 +2755,16 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
     float importedProbability=imported_light_probability(u,materialImages);
     if(importedProbability>0 && rand_f(seed)<importedProbability) {
         uint count=materialImages.emitters[0],low=0,high=count-1;float3 q=rand_f3(seed);float value=q.x;
-        while(low<high) {uint middle=(low+high)/2;if(as_type<float>(materialImages.emitters[1+count+middle])>=value) high=middle; else low=middle+1;}
-        uint index=materialImages.emitters[1+low];
+        bool tree=light_tree_node_count(materialImages)>0;float pmf=0.0f;uint index;
+        if(tree) {
+            LightTreeView lightTree=light_tree(materialImages);
+            uint position=light_tree_sample(p,value,lightTree,pmf);
+            if(position==0xffffffffu) return ls;
+            index=light_tree_leaf_word(position,0u,lightTree);
+        } else {
+            while(low<high) {uint middle=(low+high)/2;if(as_type<float>(materialImages.emitters[1+count+middle])>=value) high=middle; else low=middle+1;}
+            index=materialImages.emitters[1+low];
+        }
         MeshTriangle t=scene_triangle(index,materialImages);float2 r=q.yz;float root=sqrt(r.x);
         ls.position=(1-root)*t.a.xyz+root*(1-r.y)*t.b.xyz+root*r.y*t.c.xyz;
         float3 delta=ls.position-p;ls.dist=length(delta);ls.wi=delta/max(ls.dist,1e-8f);
@@ -2636,7 +2773,9 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
         // Graph-driven emission varies over the surface: evaluate it at this sample.
         if(uses_scene_graph(u) && geometry>1e-12f && !any(ls.emission>0))
             ls.emission=imported_graph_emission(index,root*(1-r.y),root*r.y,p,ls.position,ls.wi,materialImages);
-        ls.pdf=geometry>1e-12f ? importedProbability*imported_emitter_area_pdf(index,materialImages)/geometry:0;
+        float area=tree ? imported_triangle_area(t) : 0.0f;
+        float areaPdf=!tree ? imported_emitter_area_pdf(index,p,materialImages) : area>0.0f ? pmf/area : 0.0f;
+        ls.pdf=geometry>1e-12f ? importedProbability*areaPdf/geometry:0;
         return ls;
     }
     if ((u.sceneIndex == 0 || u.sceneIndex == 6)) {
@@ -2795,7 +2934,7 @@ float eval_light_pdf(float3 p,float3 hit_pos,Material mat,constant Uniforms &u,c
     if(u.sceneIndex!=6) return eval_light_pdf(p,hit_pos,mat,u);
     if(!MESHES || triangle==0xffffffffu || images.emitters[0]==0) return 0.0f;
     float g=imported_geometry(p,hit_pos,triangle,images);
-    return g>1e-12f ? imported_light_probability(u,images)*imported_emitter_area_pdf(triangle,images)/g : 0.0f;
+    return g>1e-12f ? imported_light_probability(u,images)*imported_emitter_area_pdf(triangle,p,images)/g : 0.0f;
 }
 
 // Artistic ring-caustic approximation. This is not an unbiased SMS estimator:
@@ -7468,6 +7607,18 @@ enum LightTransport: UInt32, Sendable {
     func resolved() -> LightTransport { self == .automatic ? .spectral : self }
 }
 
+// How imported emitter triangles are chosen for next-event estimation (MaterialLibrary.lightTree):
+// in proportion to power (area x luminance), or with a light BVH by their importance at the receiver
+// (CONTY2018; docs/LIGHT_TREE_DESIGN.md).
+enum LightSampling: UInt32, Sendable {
+    case power = 0
+    case tree = 1
+    // Host-side default: the light tree. At equal time it lowered error by 5-87% where lights are spread
+    // through the scene and cost about 5% where they are not (tests/PERFORMANCE.md, "Light tree").
+    case automatic = 2
+    func resolved() -> LightSampling { self == .automatic ? .tree : self }
+}
+
 // How spectral transport samples dispersive interfaces (MSL SpectralScene.dispersionSampling bits;
 // REFERENCES.md HERO2014, CMIS2020). `hero` is the earlier behaviour: the first dispersive vertex keeps
 // one uniformly chosen lane, times four. `spectralMIS` keeps all four lanes through rough dispersive
@@ -7944,6 +8095,8 @@ final class MaterialLibrary {
     var emissions:[Int:SIMD3<Float>]=[:] {didSet{bindingsDirty=true;emittersDirty=true}}
     // Imported lights' spectra and spot cones (EmitterLight), by slot; absent slots inherit the scene preset.
     var emitterLights: [Int: EmitterLight] = [:] { didSet { bindingsDirty = true; emittersDirty = true } }
+    // Imported emitters are chosen with a light BVH (LightSampling.tree) instead of by power alone.
+    var lightTree = false { didSet { if oldValue != lightTree { bindingsDirty = true; emittersDirty = true } } }
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
     // Whether imported emitters exist (constant or MaterialX emission).
     var hasEmitters: Bool {
@@ -8249,18 +8402,23 @@ final class MaterialLibrary {
             // REFERENCES.md: PBRT2023 power light sampling. Emitters are chosen by area x
             // weight; the shader's imported_emitter_area_pdf uses the same (Float) weights.
             // IDs are rendered-triangle IDs (HitRecord.triangle); areas are world areas.
-            var indices=[UInt32](),total=0.0,cumulative=[Double]()
+            // With lightTree (CONTY2018), the list is sorted by ID and a light BVH follows it.
+            var entries=[(id:UInt32,power:Double,triangle:MeshTriangle)]()
             forEachRenderedTriangle(emitting: { weights[$0] != nil }) { id, t in
                 let slot=Int(exactly:t.uvc.z) ?? 0
                 guard slot>=8, weights[slot] != nil else { return }
                 let edge1=SIMD3<Double>(Double(t.b.x-t.a.x),Double(t.b.y-t.a.y),Double(t.b.z-t.a.z))
                 let edge2=SIMD3<Double>(Double(t.c.x-t.a.x),Double(t.c.y-t.a.y),Double(t.c.z-t.a.z))
-                indices.append(UInt32(id))
-                total+=0.5*simd_length(simd_cross(edge1,edge2))*Double(emissionValues[slot].w);cumulative.append(total)
+                entries.append((UInt32(id),0.5*simd_length(simd_cross(edge1,edge2))*Double(emissionValues[slot].w),t))
             }
+            if lightTree { entries.sort { $0.id < $1.id } }
+            var total=0.0
+            let cumulative=entries.map { total+=$0.power; return total }
             if total>0 && total.isFinite {
-                let cdf=cumulative.indices.map { $0==cumulative.count-1 ? Float(1).bitPattern : Float(cumulative[$0]/total).bitPattern }
-                emitterValues=[UInt32(indices.count)]+indices+cdf+[Float(total).bitPattern]
+                if let tree=lightTreeList(entries,total:total) { emitterValues=tree } else {
+                    let cdf=cumulative.indices.map { $0==cumulative.count-1 ? Float(1).bitPattern : Float(cumulative[$0]/total).bitPattern }
+                    emitterValues=[UInt32(entries.count)]+entries.map(\.id)+cdf+[Float(total).bitPattern,0]
+                }
             } else { emitterValues=[0,0] }
         } else { emitterValues = [] }
         guard let eb=emissionValues.withUnsafeBytes({bindingBuffer(bytes:$0.baseAddress!,length:$0.count)}) else{throw Self.error("Could not allocate scene emitters.")}
@@ -8282,6 +8440,41 @@ final class MaterialLibrary {
         argumentBuffer = buffer
         images = replacement
         bindingsDirty = false
+    }
+
+    // The emitter list with a light tree (MSL light_tree_node_count), for entries sorted by ID: count, the IDs,
+    // each ID's leaf position, the total power, then node count, node offset and leaf offset in words, the box the
+    // node bounds are quantised in (6 floats), padding to a 16-byte boundary, the nodes (LightTree, 8 words each)
+    // and per leaf position its emitter's ID, power and leaf node. nil (power sampling) without lightTree, when the
+    // build keeps every emitter in one leaf (power sampling without the walk: one lamp's triangles, which gain
+    // nothing from separate choices) and for a tree the GPU cannot walk.
+    func lightTreeList(_ entries: [(id: UInt32, power: Double, triangle: MeshTriangle)], total: Double) -> [UInt32]? {
+        guard lightTree, entries.count > 1 else { return nil }
+        let emitters = entries.map { e -> LightTree.Emitter in
+            let t = e.triangle, slot = Int(exactly: t.uvc.z) ?? 0
+            // A UsdLux spot emits nothing beyond its cone (MSL emitter_shaping).
+            let cone = emitterLights[slot]?.coneAngle.map { cos(Double(min($0, 90)) * .pi / 180) } ?? 0
+            return LightTree.Emitter(a: SIMD3(t.a.x, t.a.y, t.a.z), b: SIMD3(t.b.x, t.b.y, t.b.z),
+                                     c: SIMD3(t.c.x, t.c.y, t.c.z), power: e.power, cosEmission: cone)
+        }
+        let tree = LightTree.build(emitters)
+        guard tree.nodeCount > 1, tree.depth <= LightTree.maxDepth, tree.nodeCount < LightTree.maxNodes else { return nil }
+        let count = entries.count
+        var position = [UInt32](repeating: 0, count: count)
+        for (leaf, input) in tree.order.enumerated() { position[input] = UInt32(leaf) }
+        var words = [UInt32(count)] + entries.map(\.id) + position + [Float(total).bitPattern]
+        var nodeOffset = words.count + 9
+        while nodeOffset % 4 != 0 { nodeOffset += 1 }
+        let leafOffset = nodeOffset + tree.words.count
+        words += [UInt32(tree.nodeCount), UInt32(nodeOffset), UInt32(leafOffset)]
+        words += [tree.grid.lo.x, tree.grid.lo.y, tree.grid.lo.z, tree.grid.hi.x, tree.grid.hi.y, tree.grid.hi.z].map(\.bitPattern)
+        words += [UInt32](repeating: 0, count: nodeOffset - words.count)
+        words.reserveCapacity(leafOffset + 3 * count)
+        words += tree.words
+        for (leaf, input) in tree.order.enumerated() {
+            words += [entries[input].id, Float(entries[input].power).bitPattern, tree.leafNode[leaf]]
+        }
+        return words
     }
 
     func load(url: URL, slot: Int, channel: Int) throws {
@@ -8658,7 +8851,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // Called on the main queue when background-compiled scene kernel groups become ready (requestKernels).
     var onKernelsReady: (() -> Void)?
     let supportsMetalFX: Bool
-    var materials: MaterialLibrary
+    var materials: MaterialLibrary { didSet { materials.lightTree = activeLightSampling == .tree } }
     private(set) var metalFX: MetalFXDenoiser?
     private(set) var metalFXHistoryNeedsReset = true
     private(set) var lastPresentationUsedMetalFX = false
@@ -8789,6 +8982,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         didSet { if oldValue != lightTransport { resetAccumulation() } }
     }
     var activeLightTransport: LightTransport { resolvedLightTransport(lightTransport) }
+    // Power or light-tree selection of imported emitters (LightSampling); applied to whichever
+    // MaterialLibrary the renderer holds.
+    var lightSampling = PathTracerRenderer.defaultLightSampling {
+        didSet { if oldValue != lightSampling { materials.lightTree = activeLightSampling == .tree; resetAccumulation() } }
+    }
+    var activeLightSampling: LightSampling { lightSampling.resolved() }
     var dispersionSampling = PathTracerRenderer.defaultDispersionSampling {
         didSet { if oldValue != dispersionSampling { resetAccumulation() } }
     }
@@ -8896,6 +9095,17 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         switch ProcessInfo.processInfo.environment["VIBE_LIGHT_TRANSPORT"] {
         case "rgb": return .rgb
         case "spectral": return .spectral
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultLightSampling: LightSampling {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with either light selection.
+        switch ProcessInfo.processInfo.environment["VIBE_LIGHT_SAMPLING"] {
+        case "power": return .power
+        case "tree": return .tree
         default: break
         }
 #endif
@@ -9177,7 +9387,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
         self.materialFunction = fnTemporal
         self.pickPipeline = shaders.mesh.pick
-        self.materials = try MaterialLibrary(device: device, function: fnTemporal)
+        let materials = try MaterialLibrary(device: device, function: fnTemporal)
+        materials.lightTree = PathTracerRenderer.defaultLightSampling.resolved() == .tree
+        self.materials = materials
         self.restirTemporalPipeline = shaders.mesh.temporal
         self.shadingPipeline = shaders.mesh.shading
         self.metalFXGuidePipeline = shaders.mesh.guides

@@ -1,3 +1,28 @@
+# Light tree — November 4, 2026
+
+`python3 scripts/measure_light_sampling.py --sequences 4` (Apple M4, 16 GB, macOS 27; `LightSampling`, [docs/LIGHT_TREE_DESIGN.md](../docs/LIGHT_TREE_DESIGN.md)). Every imported README shot at 320×180, preview scale 1, its own strategy and render modes (ReSTIR PT, spectral): linear MSE of 64 accumulated frames against the average of a 1,024-frame power reference and a 1,024-frame light-tree reference, mean of 4 sequences per selection, alternating; median GPU frame time; equal time = tree MSE × time / (power MSE × time). Emitters counts the emitter triangles; tree nodes 0 is power sampling (no emitters, or the build keeps them all in one leaf).
+
+| Scene | Emitters | Tree nodes | MSE power | MSE tree | Tone-mapped | Power ms | Tree ms | Equal time |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Newton's Colour Series | 2 | 0 | 1.584e-4 | 1.577e-4 (−0%) | +1% | 47.36 | 48.22 | 1.01 |
+| Tyndall Tank | 8 | 15 | 2.329e-3 | 2.069e-3 (−11%) | +103%* | 32.06 | 30.67 | 0.85 |
+| Lamp Spectra | 40 | 79 | 3.015e-3 | 9.891e-4 (−67%) | −63% | 30.89 | 30.41 | 0.32 |
+| Abbe Row | 1,520 | 655 | 0.3132 | 0.3195 (+2%) | +1007%* | 56.72 | 56.79 | 1.02 |
+| Shader Ball loft | 10 | 9 | 1.614e-3 | 1.475e-3 (−9%) | −8% | 59.07 | 60.05 | 0.93 |
+| Bistro exterior | 0 | 0 | 1.307e-4 | 1.459e-4 (+12%)† | +3% | 93.26 | 92.70 | 1.11† |
+| Sponza | 0 | 0 | 8.583e-5 | 8.426e-5 (−2%) | +1% | 44.19 | 44.16 | 0.98 |
+| San Miguel | 4,032 | 3,751 | 4.045e-5 | 4.032e-5 (−0%) | −0% | 86.25 | 90.92 | 1.05 |
+| Bistro interior | 37,436 | 41,339 | 2.267e-3 | 1.941e-3 (−14%) | −35% | 68.99 | 74.49 | 0.92 |
+
+\* Rare fireflies dominate the tone-mapped MSE of these scenes and land in either selection. Over 12 sequences (`--only spectral-tyndall-tank spectral-abbe-row --sequences 12`) the tree has fewer pixel channels more than 0.1 off the reference in tone-mapped value (Tyndall Tank 20,097 against 21,164; Abbe Row 188,937 against 194,555), its tone-mapped MSE is −8% and −42%, and its equal time 0.84 and 0.97.
+† No emitters: both selections run the same code, so ±12% is this measurement's sequence noise; differences of that size elsewhere are not significant.
+
+**Bias:** the two 1,024-frame references' mean radiance agrees within 0.5% in every scene (Bistro interior 1.0047; Lamp Spectra 0.9955 with one earlier run's references, 0.9998 with 4,096-frame references, power's reference being the noisy one). `tests/Fix_light-tree.swift` checks both selections against a quadrature reference.
+
+**Layout and leaves.** The first version stored 64-byte nodes with one emitter per leaf (always splitting, as pbrt does). Against it, the 32-byte nodes with leaves of up to eight emitters that gain nothing from splitting (`LightTree.maxLeaf`, `leafRatio` 0.75) and the walk's once-per-walk header lowered the tree's frame-time cost in San Miguel from +8% to +5% and in the Bistro interior from +10–11% to +8%, and halved its memory (Bistro interior: 4.7 to 1.7 MiB). Equal time with the first version, same setup with 3 sequences: Lamp Spectra 0.29, Bistro interior 0.83, Tyndall Tank 0.84, Shader Ball 0.95, San Miguel 1.10, Abbe Row 1.03. Run-to-run differences of 5–10% in the Bistro interior's equal time (0.83–0.92 over three runs) are within the noise noted above.
+
+**Default:** `LightSampling.automatic` resolves to the light tree. It wins at equal time where lights are spread through the scene (Lamp Spectra 0.13–0.40 over four runs, Bistro interior 0.83–0.92, Tyndall Tank 0.84–0.85, Shader Ball 0.91–0.95), ties where there are few or no emitters and in Abbe Row (0.96–1.03), and loses about 5% in San Miguel, whose emitters gain nothing at the shaded points for +5% traversal time. The tree takes 32 B per node and 12 B per emitter for the leaf table (1.7 MiB for the Bistro interior) and a host build when the emitter list changes.
+
 # Launch time — October 23, 2026
 
 `xcrun swiftc -O -swift-version 6 scripts/measure_launch.swift -o build/measure_launch && build/measure_launch build/MetalVibeTracer.app [--cold]` (Apple M4, 16 GB, macOS 27.0.1). *Window* is the time from process launch until the app's window is on screen (CGWindowList); *ready* is when the renderer exists and a scene can be chosen (the `VIBE_LAUNCH shaders-ready` trace; 0.2.0 has no trace, its window appears only after every pipeline is compiled). *Cold* runs a bundle copy under a new bundle identifier, so the Metal compiler service has no cached library or pipeline (the first launch of a new build); the copy and its caches are deleted afterwards.

@@ -263,6 +263,11 @@ final class StudioController: NSViewController {
   // Figures from tests/PERFORMANCE.md (Spectral transport cost).
   static let lightTransportHelp =
     "Spectral traces four wavelengths per path: illuminant presets (sodium, fluorescent, LED, incandescent), dispersion and thin film render physically, and saturated colours interreflect without RGB's errors, for about a third more frame time and some colour noise per frame. Automatic uses Spectral. RGB is faster and renders RGB-lit scenes almost the same; it ignores presets, dispersion and thin film. The spectral shaders compile in the background the first time."
+  static let lightSamplingChoices: [(mode: LightSampling, title: String)] = [
+    (.automatic, "Automatic"), (.tree, "Light tree"), (.power, "Power"),
+  ]
+  static let lightSamplingHelp =
+    "How imported scenes choose an emitter for each light sample. Light tree picks emitters by how much light they can send to the point being shaded (a light BVH), so scenes with many lights spread over a large space need fewer samples. Power picks them in proportion to their power alone, wherever they are. Both are unbiased; procedural scenes, the sky and the environment are unaffected."
   // Emitter spectra (StudioOptions.lightSpectrum / sunSpectrum): nil is the RGB colour.
   static let illuminantTitles = [
     "RGB colour", "E (equal energy)", "D65 (daylight)", "A (incandescent, 2856 K)", "FL11 (narrow-band fluorescent)",
@@ -620,6 +625,12 @@ final class StudioController: NSViewController {
       automatic: name(r.resolvedLightTransport(.automatic), Self.lightTransportChoices),
       help: Self.lightTransportHelp, enabled: true
     ) { $0.lightTransport = $1 }
+    // The light sampling applies to every strategy's imported emitters.
+    choice(
+      "Light sampling", Self.lightSamplingChoices, current: r.lightSampling,
+      automatic: name(LightSampling.automatic.resolved(), Self.lightSamplingChoices),
+      help: Self.lightSamplingHelp, enabled: true
+    ) { $0.lightSampling = $1 }
     if r.activeLightTransport == .spectral && !r.spectralShaders.compiling && r.spectralShaders.kernels == nil,
       let failure = r.spectralShaders.failure
     {

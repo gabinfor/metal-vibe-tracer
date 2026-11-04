@@ -376,6 +376,8 @@ struct ShowcaseShot: Decodable, Sendable {
   var ring: UInt32?
   var strategy: UInt32?
   var lightTransport: UInt32?
+  // LightSampling raw value (0 power, 1 light tree); nil keeps the project's choice.
+  var lightSampling: UInt32?
   var yaw: Float?, pitch: Float?, distance: Float?, fov: Float?
   var target: [Float]?
   var aperture: Float?, focusDistance: Float?
@@ -418,6 +420,7 @@ struct ShowcaseShot: Decodable, Sendable {
     if let v = ring { p.ring = v }
     if let v = strategy { p.strategy = v }
     if let v = lightTransport { p.lightTransport = v }
+    if let v = lightSampling { p.lightSampling = v }
     if let v = yaw { p.camera.yaw = v }
     if let v = pitch { p.camera.pitch = v }
     if let v = distance { p.camera.distance = v }

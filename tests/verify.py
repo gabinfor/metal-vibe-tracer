@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Compile the app and run the actual Metal kernels without opening a window.
-Usage: python3 tests/verify.py [--studio-only | --usd-only] [--require-reference]
+Usage: python3 tests/verify.py [--studio-only | --usd-only | --only FILE ...] [--require-reference]
+
+--only runs just the named test files (e.g. Fix_light-tree.swift), after the shared GPU helpers and studio
+controller, with their full-suite checks: the quick check while working on a change. The full suite gates
+releases and changes to shared rendering paths (CONTRIBUTING.md).
 """
 from pathlib import Path
 import os
@@ -12,12 +16,20 @@ import platform
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness
 
-FLAGS = {'--studio-only', '--usd-only', '--require-reference'}
-unknown = [a for a in sys.argv[1:] if a not in FLAGS]
+FLAGS = {'--studio-only', '--usd-only', '--only', '--require-reference'}
+arguments = sys.argv[1:]
+only = []
+if '--only' in arguments:
+    start = arguments.index('--only') + 1
+    end = next((i for i in range(start, len(arguments)) if arguments[i].startswith('--')), len(arguments))
+    only, arguments = arguments[start:end], arguments[:start] + arguments[end:]
+    if not only:
+        raise SystemExit('verify.py: --only needs at least one test file')
+unknown = [a for a in arguments if a not in FLAGS]
 if unknown:
     raise SystemExit('verify.py: unknown argument(s) ' + ' '.join(unknown) + '; expected ' + ', '.join(sorted(FLAGS)))
-if '--studio-only' in sys.argv and '--usd-only' in sys.argv:
-    raise SystemExit('verify.py: --studio-only and --usd-only are exclusive')
+if sum(f in arguments for f in ('--studio-only', '--usd-only', '--only')) > 1:
+    raise SystemExit('verify.py: --studio-only, --usd-only and --only are exclusive')
 mode = 'studio' if '--studio-only' in sys.argv else 'usd' if '--usd-only' in sys.argv else 'full'
 reference = [a for a in sys.argv[1:] if a == '--require-reference']
 ALL = {'full', 'studio', 'usd'}
@@ -60,7 +72,16 @@ PARTS = [
     ('Fix_volumes.swift', {'full'}),
     ('Fix_clamp.swift', {'full'}),
     ('Fix_veach-plates.swift', {'full'}),
+    ('Fix_light-tree.swift', {'full'}),
 ]
+if only:
+    files = {name.partition(':')[0] for name, _ in PARTS}
+    missing = [f for f in only if f not in files]
+    if missing:
+        raise SystemExit('verify.py: not a suite test file: ' + ' '.join(missing))
+    # The shared helpers and controller, then the named files in suite order, with their full-suite checks.
+    PARTS = [('GPUChecks.swift:helpers', ALL), ('StudioChecks.swift:controller', ALL)] + \
+        [(name, ALL) for name, _ in PARTS if ':' not in name and name in only]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()
 root = harness.ROOT
@@ -72,11 +93,13 @@ subprocess.run([sys.executable, str(root / 'scripts/generate_spectral_tables.py'
 subprocess.run(['/usr/bin/python3', str(root / 'scripts/prepare_usd.py')], check=True)
 subprocess.run([sys.executable, str(root / 'scripts/prepare_oidn.py'), '--arch', platform.machine()], check=True)
 # -E ignores PYTHONOPTIMIZE and friends, so assert-based helper checks cannot pass vacuously.
-subprocess.run(['/usr/bin/python3', '-E', str(root / 'tests/USDChecks.py')] + reference, check=True, env=environment)
-subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_build.py')], check=True, env=environment)
-subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_tests.py')], check=True, env=environment)
-# Offline spectral-table checks (round trip, sampling, noise, reproducibility, float32 include).
-subprocess.run([sys.executable, '-E', str(root / 'tests/SpectralTables.py')], check=True, env=environment)
+# The offline Python checks belong to the suites, not to --only runs.
+if not only:
+    subprocess.run(['/usr/bin/python3', '-E', str(root / 'tests/USDChecks.py')] + reference, check=True, env=environment)
+    subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_build.py')], check=True, env=environment)
+    subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_tests.py')], check=True, env=environment)
+    # Offline spectral-table checks (round trip, sampling, noise, reproducibility, float32 include).
+    subprocess.run([sys.executable, '-E', str(root / 'tests/SpectralTables.py')], check=True, env=environment)
 source = harness.production_source()
 for name, modes in PARTS:
     if mode not in modes:

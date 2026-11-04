@@ -105,6 +105,7 @@ extension StudioController {
       r.controlVariates = p.restirModes.controlVariates
       r.sampler = p.restirModes.sampler
       r.lightTransport = p.restirModes.lightTransport
+      r.lightSampling = p.restirModes.lightSampling
       r.zTemporal = renderer.zTemporal
       r.ptDecorrelation = renderer.ptDecorrelation
       r.ptTemporalWhileAccumulating = renderer.ptTemporalWhileAccumulating
