@@ -1,6 +1,6 @@
 # Large-scene storage: design proposal
 
-Status: **2026-10-20. Phases 0–3 are implemented (results below); phase 4 imports Bitterli's scenes (group A) and McGuire's Sponza, San Miguel and Bistro interior (group B); the Bistro exterior's texture budget remains.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
+Status: **2026-10-20. Phases 0–3 are implemented (results below); phase 4 imports Bitterli's scenes (group A) and McGuire's Sponza, San Miguel and Bistro interior (group B); the Bistro exterior renders since 2026-10-21 with its largest textures downscaled to the GPU budget.** Citation keys marked *(proposed)* are not in `REFERENCES.md` yet; they are added, with their adaptations, in the change that implements them.
 
 ## Goal
 
@@ -20,7 +20,7 @@ Import and render production test scenes that the current limits reject, such as
 
 - `MeshTriangle`: 128 B, unindexed. It holds three positions, three normals and the UVs as `float4`s. `uvc.z`, `uvc.w` and `na.w` carry the subset, slot and node.
 - Software BLAS nodes (`MeshWideNode`, 128 B) share the triangle buffer, which is addressed in 128-byte units.
-- The Metal hardware BLAS is built from the same records: vertex stride 16, indices `8k, 8k+1, 8k+2`. Its compacted size is **86 B per triangle** (phase 0). Fix_accel measured **leaks on shared edges with welded or packed vertices** and none with this unwelded layout (`Acceleration.swift:844`); phase 0 confirmed it on macOS 27.
+- The Metal hardware BLAS is built from the same records: vertex stride 16, indices `8k, 8k+1, 8k+2`. Its compacted size is **86 B per triangle** (phase 0). Fix_accel measured **leaks on shared edges with welded or packed vertices** and none with this unwelded layout (`hardwareLeaks` in `Acceleration.swift`); phase 0 confirmed it on macOS 27.
 - Resident total today: about **214 B per triangle** with hardware traversal (128 + 86).
 
 ## Research summary

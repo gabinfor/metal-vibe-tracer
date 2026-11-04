@@ -471,9 +471,9 @@ half an 8-bit step), so at equal time it loses wherever the scene is RGB (1.15�
 Automatic therefore resolves to Spectral only for an illuminant preset other than D65, dispersion
 or thin film, where RGB cannot render the effect: narrow-line spectra (FL11, HP1) on coloured surfaces, dispersion's colour fringes and thin-film iridescence, while RGB scenes differ only by RGB's interreflection error (up to 3% in one channel in the Pavilion).
 
-Not done: spectral sky models, Planckian `colorTemperature`, measured conductor spectra, per-light
-spectra for imported UsdLux lights (they follow the Light spectrum preset), and phase 2 of §4 (a
-generated float4 variant of the upstream BSDF).
+Not done: spectral sky models, measured conductor spectra, and phase 2 of §4 (a generated float4
+variant of the upstream BSDF). Planckian `colorTemperature` and per-light spectra for imported lights
+were added in 0.3.0 ([VOLUME_DESIGN.md](VOLUME_DESIGN.md) §2).
 
 ## 12. Cost reductions and the spectral default (2026-10-03)
 

@@ -145,8 +145,7 @@ enum USDImporter {
   // flattened host copy (R-101), and it throws what forEachRenderTriangle throws for invalid
   // combined transforms. The pivot keeps a two-sided Möller–Trumbore test rather than the
   // renderer's watertight one (WOOP2013): it only places the orbit target, a ray that slips
-  // through a shared edge falls back to the bounds depth, and results stay those of the
-  // earlier flattened-array computation.
+  // through a shared edge falls back to the bounds depth.
   static func sceneExtent(
     _ graph: SceneGraph, rays: [(eye: SIMD3<Float>, forward: SIMD3<Float>)]
   ) throws -> (lo: SIMD3<Float>, hi: SIMD3<Float>, hits: [Float?]) {

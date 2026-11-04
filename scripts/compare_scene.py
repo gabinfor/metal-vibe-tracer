@@ -16,7 +16,6 @@ REFERENCES.md BITTERLI2016 and scripts/mitsuba_probes.py for bisecting a differe
 import argparse
 import json
 import pathlib
-import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET

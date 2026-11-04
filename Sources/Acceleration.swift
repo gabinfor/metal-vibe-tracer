@@ -243,7 +243,7 @@ enum WideBVH {
       return (measure(r.start, middle), measure(middle, r.end))
     }
     // Builds the subtree of `root` into `nodes` (indices local to `nodes`). Items with fewer than
-    // `defer` triangles are left for later when `deferred` is given.
+    // `deferThreshold` triangles are left for later when `deferred` is given.
     func run(_ root: Range, depth: Int, nodes: inout [MeshWideNode], deferThreshold: Int = 0,
                       deferred: inout [(Range, Int, Int, Int)]) -> Int {
       var depthReached = depth
@@ -797,7 +797,7 @@ extension MaterialLibrary {
   // measured watertight alike). Every uncompacted structure of the batch is live at once, so
   // their total is checked against the budget before anything is allocated. `pending` counts
   // the structures this publish has already built, which stay live beside the published mesh.
-  // Scratch memory and compaction targets are transient and, as before, not budgeted.
+  // Scratch memory and compaction targets are transient and not budgeted.
   func buildStructures(_ descriptors: [MTLAccelerationStructureDescriptor], compact: Bool = false,
                        pending: inout UInt64) throws -> [MTLAccelerationStructure] {
     if accelerationQueue == nil { accelerationQueue = device.makeCommandQueue() }
@@ -1110,7 +1110,7 @@ extension MaterialLibrary {
   // A transform-only edit of `previous` (same instance count, instanced structures and
   // per-instance indices) refits its structure into a new one; any other change rebuilds.
   // Built with usage .refit (so it can be refitted later) but not .preferFastBuild: transform
-  // edits, the frequent case, now refit, so full builds follow only structural edits, and every
+  // edits, the frequent case, refit, so full builds follow only structural edits, and every
   // ray traverses this structure.
   func buildSceneStructure(_ layout: inout MeshSceneLayout, previous: MeshSceneLayout?, pending: inout UInt64) throws {
     layout.scene = nil

@@ -23,7 +23,6 @@ re-implementation from the papers; only the 95-entry warp table is taken from th
 code (Vendor/Spectral/Peters2019/XYZWarp.h, unmodified).
 """
 import array
-import cmath
 import csv
 import hashlib
 import json
@@ -83,7 +82,6 @@ PARAMETERS = {
     "icdfSegments": ICDF_SEGMENTS, "defensiveFraction": DEFENSIVE_FRACTION,
     "illuminants": [i[0] for i in ILLUMINANTS],
 }
-OUTPUTS = ("FourierSRGB256.bin", "FourierSRGB86.bin", "SpectralTables.metal")
 PI = math.pi
 MOMENT_SCALE = 1.0 / PI                      # |c1|, |c2| <= 1/pi for signals in [0, 1]
 
@@ -727,7 +725,6 @@ LUT_SOURCES = ("verify_inputs", "read_table", "resample", "parse_warp", "inverse
                "rgb_of_lagrange", "rgb_and_jacobian", "solve3", "solve_lagrange", "encode_moments",
                "decode_moments", "linear_srgb_of_moments", "code_error", "_init_worker", "solve_code",
                "_coarse_line", "interpolation_axis", "interpolate", "_lut_plane", "lut_header", "generate_luts")
-LUT_OUTPUTS = ("FourierSRGB256.bin", "FourierSRGB86.bin")
 # The default outputs: the coarse grid (about 100 s on 10 processes, once) and the cheap ones.
 COARSE_SOURCES = ("verify_inputs", "read_table", "resample", "parse_warp", "inverse3", "apply3", "Data",
                   "lagrange3", "moments_of_lagrange", "clamp_moments", "srgb_eotf", "srgb_oetf", "code_target",

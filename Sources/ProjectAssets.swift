@@ -39,9 +39,8 @@ enum ProjectAssets {
   static let maximumMeshBytes = 2 * SceneLimits.flatTriangles * triangleBytes + SceneLimits.triangles * 112
   static let maximumTableBytes = ProjectDocument.embeddedAssetLimit + maximumMeshBytes
   // Seven scenes of maps and MaterialX images, the environment, the flat mesh and the mesh
-  // assets. Mesh entries keep the former bound of one per stored triangle at 16 M triangles: it
-  // no longer follows SceneLimits.triangles (an addressing bound since 2026-10-21), and real
-  // documents hold one asset per object.
+  // assets. Mesh entries are bounded at 16 M, independent of SceneLimits.triangles (an addressing
+  // bound); real documents hold one asset per object.
   static let maximumMeshEntries = 16_000_000
   static let maximumEntries =
     7 * SceneLimits.materials * (4 + SceneLimits.graphImages) + 2 + maximumMeshEntries
@@ -129,7 +128,7 @@ enum ProjectAssets {
       return key
     }
   }
-  // Decoding: the loaded table of a format-3 file; nil for versions 1 and 2.
+  // Decoding: the loaded table of a format 3 or later file; nil for versions 1 and 2.
   final class Resolver: Sendable {
     let sidecars: URL?
     let table = Mutex<[String: Data]?>(nil)
@@ -416,7 +415,7 @@ extension ProjectDocument {
         document: copy, meshData: meshData, triangleData: triangleData, collector: collector, inline: inline))
     return (json, collector.payloads)
   }
-  // Decodes project format 1, 2 or 3. `url` locates a format-3 autosave's AutosaveAssets
+  // Decodes project formats 1 to `formatVersion`. `url` locates a format 3 or later autosave's AutosaveAssets
   // sidecars; nil accepts only inline payloads. Table bounds, digests and references are
   // checked here, before validate() and before any GPU resource is prepared.
   static func decodeProject(_ data: Data, near url: URL?) throws -> ProjectDocument {

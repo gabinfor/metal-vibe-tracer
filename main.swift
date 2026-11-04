@@ -2189,7 +2189,6 @@ static_assert(sizeof(SurfaceSettings) == 64, "Swift SurfaceSettings layout");
 // ray cone's ellipse on the surface, as texture-coordinate offsets (the gradients of an explicit-
 // gradient sample, filtered anisotropically by the hardware).
 struct TextureFootprint { float2 dx, dy; };
-TextureFootprint scaled_footprint(TextureFootprint f, float2 scale) { f.dx *= scale; f.dy *= scale; return f; }
 // The cone of width `width` (world units) cut by the surface at `hit`: the minor axis is the width,
 // across the ray's projection onto the surface; the major axis is width / |cos|, along it. Both map
 // to UV through the tangent frame (dP/du, dP/dv directions) and the UV density per world unit.
@@ -4862,7 +4861,7 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
 }
 
 // Paired spatial reuse (RESTIRPTE2026 Sec. 3): PT_NEIGHBORS self-inverse pairing textures of
-// sides 254, 230 and 210 (PathTracerRenderer.makePairingTextures), each flipped, transposed and
+// sides 254, 230 and 210 (ReSTIRPTPairing, built by makePairingTexture), each flipped, transposed and
 // offset per frame (Sec. 3.2). Pixel p's n-th partner q has p as its own n-th partner, so the
 // shift of p's path to q, computed once by restir_pt_shift_kernel, serves both pixels.
 constant int PT_PAIRING_SIDES[3] = { 254, 230, 210 };
@@ -8375,8 +8374,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Reservoir splatting (HONG2026): per pixel an activation mask (4 B), SplatLayers (48 B) and a
         // splat source (8 B); per deep-domain slot a splat source (8 B) and, in each of two pools,
         // a SplatDomain (32 B), a PrimarySurface (128 B) and the active reuse's reservoirs (DI 48 B,
-        // GI 64 B, PT 64 B and its 16 B ReSTCV estimate), with PathTracerRenderer.splatSlotsPerPixel
-        // slots per pixel.
+        // GI 64 B, PT 64 B and its 16 B ReSTCV estimate), with one slot per
+        // PathTracerRenderer.splatSlotDivisor pixels.
         static func splatBytesPerPixel(_ mode: IndirectReuse) -> UInt64 {
             let reservoirs: UInt64
             let pt = 64 + UInt64(PathTracerRenderer.ptControlStride)
@@ -8794,9 +8793,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         didSet { if oldValue != dispersionSampling { resetAccumulation() } }
     }
     func resolvedLightTransport(_ mode: LightTransport) -> LightTransport { mode.resolved() }
-    // Whether the scene has area or sphere lights or imported emitters (StudioOptions.lightSpectrum),
-    // and a sun (StudioOptions.sunSpectrum).
-    var sceneHasLights: Bool { (1...5).contains(sceneIndex) || (sceneIndex == 6 && materials.hasEmitters) }
+    // Whether the scene has a sun (StudioOptions.sunSpectrum).
     var sceneHasSun: Bool { (sceneIndex == 0 || sceneIndex == 6) && options.sunIntensity > 0 }
     // Wavelength sampling (spectral_icdf_kernel): an equal mixture of the illuminants the scene's
     // emitters use; the sky, environment maps and RGB-coloured lights count as D65. Imported lights with
@@ -9117,7 +9114,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // (and splat resources); the old ones stay live (in residentFrameBytes) for in-flight frames.
         let reservoirs = pixels.multipliedReportingOverflow(
             by: FrameResourcePlan.reservoirSetBytesPerPixel(activeIndirect, splatting: splatting, stochasticPairwise: stochasticPairwise))
-        // reservoirSet(usesReSTIR: true)
+        // The value reservoirSet(usesReSTIR: true) takes for this plan.
         let candidateSet = (activeIndirect.rawValue + 1) | (splatting ? 16 : 0) | (stochasticPairwise ? 32 : 0)
         let additionalReservoirs = !resizes && plan.usesReSTIR && frameReservoirs != candidateSet
             ? reservoirs.partialValue : 0

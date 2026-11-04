@@ -2,7 +2,7 @@
 
 Usage:
   build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py variant SCENE.xml MODE
-      Writes scene_<MODE>.xml beside SCENE.xml (relative paths keep resolving) and prints its path.
+      Writes scene_<MODE>.xml (":" as "_") beside SCENE.xml (relative paths keep resolving) and prints its path.
       MODE flat: every BSDF becomes a two-sided diffuse 0.5; drop:KIND: only BSDFs containing KIND
       (e.g. roughconductor) are flattened. Nested BSDF ids keep a flattened copy, since Mitsuba ids
       are global. A scene that matches when flattened has no transport or emitter error.

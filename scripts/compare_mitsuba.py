@@ -13,14 +13,13 @@ linear radiance (OpenEXR, no denoiser) through scripts/render_showcase.py; Mitsu
 its Metal backend. Each configuration is compared on mean radiance per channel, relative MSE, and
 region means, and a side-by-side image (Vibe | Mitsuba | relative difference) is written.
 
-Known model differences are listed per scene in NOTES and printed with the results.
+Known model differences are noted per scene in SCENES and printed with the results.
 """
 import argparse
 import copy
 import json
 import math
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -368,7 +367,6 @@ for name, (index, _, cam, (w, h), note) in selected.items():
         results.append(row)
         print(json.dumps(row))
         scale = 0.5 / max(1e-6, float(np.percentile(lum(ref), 90)))
-        rel = np.abs(lum(vibe) - lum(ref)) / np.maximum(lum(ref), 0.05 * lum(ref).mean())
         smooth = np.kron(np.where(valid, block_rel, 0), np.ones((k, k)))
         smooth = np.pad(smooth, ((0, h - smooth.shape[0]), (0, w - smooth.shape[1])))
         gap = np.ones((h, 8, 3))

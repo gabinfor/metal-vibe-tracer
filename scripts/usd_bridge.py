@@ -2,7 +2,7 @@
 """OPENUSD: read a composed stage with Pixar's SDK; emit a bounded renderer snapshot.
 No input file is executed. This process only loads USD's installed core plugins.
 """
-import sys, pathlib, os, json, math, uuid, hashlib, argparse, struct, xml.etree.ElementTree as ET
+import sys, pathlib, json, math, uuid, hashlib, argparse, struct, xml.etree.ElementTree as ET
 from array import array
 HERE=pathlib.Path(__file__).resolve().parent
 # Mirror SceneLimits.triangles (stored, distinct meshes) and SceneLimits.renderedTriangles.
@@ -20,7 +20,7 @@ def vec(v): return [float(v[i]) for i in range(len(v))]
 def rows(values):
     # A whole Vt vector array as lists of floats through the buffer protocol (the values vec gives).
     # Half-precision arrays have no memoryview format and convert element by element; arrays of
-    # scalars are returned unchanged, so a mistyped primvar fails where it is sampled, as before.
+    # scalars are returned unchanged, so a mistyped primvar fails where it is sampled.
     try:
         view=memoryview(values)
         return view.tolist() if view.ndim==2 else values

@@ -3,10 +3,10 @@ import simd
 
 // Per-emitter spectra and spot shaping (docs/VOLUME_DESIGN.md §2-3). REFERENCES.md: PLANCK, CIEDATA, OPENUSD
 // (UsdLux ShapingAPI). An imported light's material slot carries an EmitterLight; the slot's emission (linear
-// RGB radiance) is its tint times intensity, as before.
+// RGB radiance) is its tint times intensity.
 struct EmitterLight: Codable, Equatable, Sendable {
   enum Spectrum: Codable, Equatable, Sendable {
-    // The scene's light preset (StudioOptions.lightSpectrum), as for every emitter before per-light spectra.
+    // The scene's light preset (StudioOptions.lightSpectrum).
     case inherit
     // An Illuminant preset (raw value).
     case preset(UInt32)
