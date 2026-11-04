@@ -61,11 +61,26 @@
     newmtl Bottle
     \tNi 1.5
     \tillum 4
+    newmtl Tile
+    \tKd 0.5 0.5 0.5
+    \tTf 1.00 1.00 1.00
+    \tNi 1.00
+    \tillum 4
+    \tmap_Kd -mm 0.2 0.5 tex/stone.png
+    newmtl Mirror
+    \tKd 0.8 0.8 0.8
+    \tKs 0.95 0.95 0.95
+    \tNs 100000
+    \tillum 3
+    newmtl Case
+    \td 0.4
+    \tTf 0.25 0.25 0.25
     """
   let materials = try OBJMaterials.read(mtl, report: &report)
-  require(materials.map(\.name) == ["Leaf", "Stone", "Lamp", "Pane", "Bottle"], "MTL materials: \(materials.map(\.name))")
-  require(materials[3].tf == SIMD3(0.2, 0.3, 0.4) && materials[3].transmits && materials[4].transmits && !materials[2].transmits,
-    "MTL Tf and transparency models")
+  require(materials.map(\.name) == ["Leaf", "Stone", "Lamp", "Pane", "Bottle", "Tile", "Mirror", "Case"], "MTL materials: \(materials.map(\.name))")
+  require(materials[3].tf == SIMD3(0.2, 0.3, 0.4) && materials[3].transmits && materials[4].transmits && !materials[2].transmits
+    && materials[5].transparencyModel && !materials[5].transmits && materials[5].maps["map_kd"]?.range == SIMD2(0.2, 0.5),
+    "MTL Tf and transparency models (Tf 1 transmits nothing)")
   let leafMap = materials[0].maps["map_kd"]
   require(leafMap?.file == "tex/leaf.png" && leafMap?.scale == SIMD2(2, 3) && leafMap?.offset == SIMD2(0.5, 0),
     "MTL map options and backslash path: \(String(describing: leafMap))")
@@ -82,14 +97,34 @@
     && text.contains("value=\"2.0, 3.0\"") && text.contains("name=\"geometry_opacity\" type=\"float\" nodename=\"m0_alpha\"")
     && text.contains("name=\"emission_color\" type=\"color3\" value=\"2.0, 2.0, 1.0\""),
     "MTL to MaterialX translation:\n\(text)")
-  require(report.contains { $0.contains("illum 5") } && !report.contains { $0.contains("illum 7") || $0.contains("illum 4") }
+  require(!report.contains { $0.contains("illum 5") || $0.contains("-mm") } && !report.contains { $0.contains("illum 7") || $0.contains("illum 4") }
     && report.contains { $0.contains("alpha channel of tex/leaf.png") },
     "MTL reports illum and alpha coverage: \(report)")
-  // Glass (illum 4/6/7/9): smooth transmission filtered by Tf; Ni 1 ("light does not bend") is thin-walled.
+  // Glass (illum 4/6/7/9): smooth transmission filtered by 1 - Tf; Ni 1 ("light does not bend") is thin-walled;
+  // Tf 1 transmits nothing and is opaque.
   let shaders = text.components(separatedBy: "<open_pbr_surface ")
   let pane = shaders.first { $0.hasPrefix("name=\"m3\"") } ?? "", bottle = shaders.first { $0.hasPrefix("name=\"m4\"") } ?? ""
+  let tile = shaders.first { $0.hasPrefix("name=\"m5\"") } ?? ""
+  require(!tile.isEmpty && !tile.contains("transmission") && !report.contains { $0.contains("Tile:") },
+    "MTL illum 4 with Tf 1 is opaque:\n\(tile)")
+  // -mm base gain: the image is scaled by the gain and offset by the base.
+  require(text.contains("<image name=\"m5_kd_raw\"") && text.contains("<multiply name=\"m5_kd_gain\" type=\"color3\"")
+    && text.contains("name=\"in2\" type=\"color3\" value=\"0.5, 0.5, 0.5\"")
+    && text.contains("<add name=\"m5_kd\" type=\"color3\"") && text.contains("value=\"0.2, 0.2, 0.2\""),
+    "MTL -mm base and gain:\n\(tile)")
+  // Ray-traced reflection (illum 3) beyond a dielectric's Ks is metal, tinted by Ks.
+  let mirror = shaders.first { $0.hasPrefix("name=\"m6\"") } ?? ""
+  require(mirror.contains("name=\"base_metalness\" type=\"float\" value=\"0.95\"")
+    && report.contains { $0.contains("Mirror: illum 3 reflection") } && !report.contains { $0.contains("illum 3 rendered") },
+    "MTL illum 3 mirror is metal:\n\(mirror)")
+  // Dissolve glass is filtered by 1 - Tf too (Stone, without Tf, stays white).
+  let glassCase = shaders.first { $0.hasPrefix("name=\"m7\"") } ?? ""
+  let stoneShader = shaders.first { $0.hasPrefix("name=\"m1\"") } ?? ""
+  require(glassCase.contains("name=\"transmission_color\" type=\"color3\" value=\"0.75, 0.75, 0.75\"")
+    && stoneShader.contains("transmission_weight") && !stoneShader.contains("transmission_color"),
+    "MTL dissolve glass transmits 1 - Tf:\n\(glassCase)")
   require(pane.contains("name=\"transmission_weight\" type=\"float\" value=\"1.0\"")
-    && pane.contains("name=\"transmission_color\" type=\"color3\" value=\"0.2, 0.3, 0.4\"")
+    && pane.contains("name=\"transmission_color\" type=\"color3\" value=\"0.8, 0.7, 0.6\"")
     && pane.contains("name=\"geometry_thin_walled\" type=\"boolean\" value=\"true\"")
     && pane.contains("name=\"specular_roughness\" type=\"float\" value=\"0.0\"")
     && bottle.contains("name=\"transmission_weight\" type=\"float\" value=\"1.0\"")
@@ -156,7 +191,7 @@
     && state.materialX?[slot("Missing")] == nil && state.surfaces[slot("Stone")].color == SIMD4(0.5, 0.4, 0.3, 1),
     "OBJ import compiles MTL programs: leaf \(String(describing: leaf?.images.count)), stone \(String(describing: stone?.images.count))")
   let paneProgram = state.materialX?[slot("Pane")], bottleProgram = state.materialX?[slot("Bottle")]
-  require(paneProgram?.transmissionColor == SIMD3(0.2, 0.3, 0.4) && paneProgram?.thinWalled == true
+  require(paneProgram?.transmissionColor.map { simd_length($0 - SIMD3(0.8, 0.7, 0.6)) < 1e-6 } == true && paneProgram?.thinWalled == true
     && bottleProgram != nil && bottleProgram?.transmissionColor == nil && bottleProgram?.thinWalled == nil,
     "OBJ glass compiles to per-slot transmission colour and thin walls")
   require(report.contains { $0.contains("Missing is not defined") } && document.importReport?.first == "scene.obj:"

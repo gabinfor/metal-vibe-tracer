@@ -1,7 +1,7 @@
 import Cocoa
 import simd
 
-// REFERENCES.md: MTL2026, GGX2007, ENDERTON2010, MATERIALX, OPENPBR. OBJ `mtllib` materials, translated into one
+// REFERENCES.md: MTL2026, MCGUIRE2012, GGX2007, ENDERTON2010, MATERIALX, OPENPBR. OBJ `mtllib` materials, translated into one
 // OpenPBR MaterialX document and compiled by MaterialXImporter like any other graph:
 //   Kd x map_Kd               base_color (map sRGB)
 //   Ks x map_Ks, Ni           specular_weight = max(Ks) / F0(Ni), clamped to 0-1; specular_ior = Ni
@@ -13,20 +13,24 @@ import simd
 //   norm                      tangent-space normal map
 //   illum 4, 6, 7, 9          glass: transmission_weight 1, transmission_color = 1 - Tf (McGuire's
 //                             reading, which his archive's files follow: Tf 1 transmits nothing and is
-//                             opaque illum 2), smooth (the model's reflection and refraction are ray
+//                             opaque, read as illum 2 without a report), smooth (the model's reflection and refraction are ray
 //                             traced, not Ns highlights); Ni <= 1 or unset ("light does not bend") is
 //                             geometry_thin_walled
 //   d (or 1 - Tr) < 1         without map_d or a map_Kd alpha channel: glass as above (exporters write
 //                             glass as constant dissolve; masks stay coverage)
+//   illum 3, 5, 8             ray-traced reflection: a Ks beyond the dielectric's reach (Ks > F0(Ni)) is
+//                             base_metalness = max(Ks), so a mirror (Ks 0.95) reflects as one
 //   illum 0, 1                no specular lobe; illum 2 the default; others are reported
-// Map options -s and -o (UV scale and offset), -clamp, -bm and -imfchan are applied; others are
-// reported and ignored.
+// Map options -s and -o (UV scale and offset), -clamp, -bm, -mm (base + gain x texel, on colour and
+// scalar maps) and -imfchan are applied; others are reported and ignored.
 struct MTLMap {
   var file: String
   var scale = SIMD2<Float>(1, 1)
   var offset = SIMD2<Float>(0, 0)
   var clamp = false
   var bumpMultiplier: Float = 1
+  // -mm base gain: the texel value v becomes base + gain x v.
+  var range = SIMD2<Float>(0, 1)
   var channel: String?
 }
 struct MTLMaterial {
@@ -113,7 +117,7 @@ enum OBJMaterials {
       while v.count < maximum, i < tokens.count, let x = Float(tokens[i]) { v.append(x); i += 1 }
       return v
     }
-    let arity = ["-blendu": 1, "-blendv": 1, "-boost": 1, "-cc": 1, "-texres": 1, "-type": 1, "-mm": 2]
+    let arity = ["-blendu": 1, "-blendv": 1, "-boost": 1, "-cc": 1, "-texres": 1, "-type": 1]
     while i < tokens.count, tokens[i].hasPrefix("-"), tokens[i].count > 1, Float(tokens[i]) == nil {
       let option = tokens[i].lowercased()
       i += 1
@@ -125,6 +129,9 @@ enum OBJMaterials {
         if option == "-s" { map.scale = uv } else { map.offset = uv }
       case "-t": _ = values(3); note("MTL map option -t (turbulence) is not supported and was ignored.")
       case "-bm": map.bumpMultiplier = values(1).first ?? 1
+      case "-mm":
+        let v = values(2)
+        map.range = SIMD2(v.first ?? 0, v.count > 1 ? v[1] : 1)
       case "-clamp": map.clamp = i < tokens.count && tokens[i].lowercased() == "on"; i += 1
       case "-imfchan": map.channel = i < tokens.count ? tokens[i].lowercased() : nil; i += 1
       default:
@@ -313,7 +320,17 @@ struct MaterialXWriter {
       inputs += "    <input name=\"uaddressmode\" type=\"string\" value=\"clamp\"/>\n"
       inputs += "    <input name=\"vaddressmode\" type=\"string\" value=\"clamp\"/>\n"
     }
-    body += "  <image name=\"\(name)\" type=\"\(type)\">\n\(inputs)  </image>\n"
+    // -mm base gain on colour and scalar maps: the image node is `name`_raw and `name` is base + gain x texel.
+    let components = ["float": 1, "color3": 3][type]
+    guard map.range != SIMD2(0, 1), let components else {
+      body += "  <image name=\"\(name)\" type=\"\(type)\">\n\(inputs)  </image>\n"
+      return
+    }
+    body += "  <image name=\"\(name)_raw\" type=\"\(type)\">\n\(inputs)  </image>\n"
+    node(name + "_gain", "multiply", type, [("in1", type, .node(name + "_raw")),
+      ("in2", type, .value(Array(repeating: map.range.y, count: components)))])
+    node(name, "add", type, [("in1", type, .node(name + "_gain")),
+      ("in2", type, .value(Array(repeating: map.range.x, count: components)))])
   }
   // UV scale and offset of a map (nil for the default coordinates).
   private mutating func coordinates(_ name: String, _ map: MTLMap) -> String? {
@@ -379,16 +396,26 @@ struct MaterialXWriter {
       // Glass: the model's reflection and refraction are ray traced (ideal), filtered by 1 - Tf. Ni 1
       // means light does not bend, which is OpenPBR's thin-walled transmission; Fresnel keeps the
       // dielectric IOR above (1.5 when Ni is 1 or unset).
-      let t = m.transparencyModel ? m.transmitted : SIMD3(repeating: 1)
+      // Dissolve glass with Tf 1 (or none) transmits white: its dissolve, not Tf, says it is glass.
+      let t = m.transmitted.max() > 0 ? m.transmitted : SIMD3(repeating: 1)
       inputs.append(("transmission_weight", "float", .value([1])))
       if t != SIMD3(repeating: 1) { inputs.append(("transmission_color", "color3", .value([t.x, t.y, t.z]))) }
       if (m.ni ?? 1) <= 1 { inputs.append(("geometry_thin_walled", "boolean", .literal("true"))) }
-    } else if m.transparencyModel {
-      report.append("\(m.name): illum \(m.illum) with Tf 1 transmits nothing (1 - Tf); rendered opaque as illum 2.")
-    } else if ![0, 1, 2].contains(m.illum) {
+    } else if !m.transparencyModel, ![0, 1, 2, 3, 5, 8].contains(m.illum) {
       report.append("\(m.name): illum \(m.illum) rendered as illum 2 (diffuse and specular).")
     }
     let weight = m.illum < 2 ? 0 : (m.ks.max() / f0)
+    // Ray-traced reflection models whose Ks a dielectric cannot reach: the excess is metal reflection.
+    if [3, 5, 8].contains(m.illum), !glass, m.ks.max() > f0 {
+      let metal = min(1, m.ks.max())
+      inputs.append(("base_metalness", "float", .value([metal])))
+      // Without map_Kd the metal takes Ks's tint at full strength, so it reflects Ks rather than Kd x Ks.
+      if m.maps["map_kd"] == nil, let i = inputs.firstIndex(where: { $0.0 == "base_color" }) {
+        let tint = simd_clamp(m.kd, .zero, SIMD3(repeating: 1)) * (1 - metal) + m.ks / m.ks.max() * metal
+        inputs[i] = ("base_color", "color3", .value([tint.x, tint.y, tint.z]))
+      }
+      report.append("\(m.name): illum \(m.illum) reflection Ks \(m.ks.max()) rendered as metalness \(metal).")
+    }
     if m.illum >= 2, let map = m.maps["map_ks"], let path = url(map) {
       let n = scalar("ks", map, path, alphaDefault: false, sharesColor: false)
       node(n + "_weight", "multiply", "float", [("in1", "float", .node(n)), ("in2", "float", .value([weight]))])

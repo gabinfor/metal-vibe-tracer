@@ -15,8 +15,9 @@
     return found
   }
   let catalog = ExampleScenes.catalog
-  require(catalog.map(\.shot) == ["sponza-noon", "san-miguel-golden", "bistro-exterior-golden", "bistro-interior"],
-    "example catalog lists Sponza, San Miguel and both Bistro shots: \(catalog.map(\.shot))")
+  require(catalog.map(\.shot) == ["sponza-noon", "san-miguel-golden", "bistro-exterior-golden", "bistro-interior",
+    "bedroom", "breakfast-room", "buddha", "chinese-dragon", "fireplace-room", "living-room"],
+    "example catalog lists Sponza, San Miguel, both Bistro shots and the six research models: \(catalog.map(\.shot))")
   for scene in catalog {
     guard let shot = shots.first(where: { $0.name == scene.shot }) else {
       require(false, "showcase.json has the \(scene.shot) shot")
@@ -36,12 +37,18 @@
       require(archive.bytes > 0 && archive.unpackedBytes >= archive.bytes, "\(archive.name) sizes")
       require(!archive.folder.contains("..") && !archive.folder.hasPrefix("/"), "\(archive.name) extracts inside its scene")
     }
-    require(scene.attribution.contains(scene.credit) && scene.attribution.contains(scene.licenseURL.absoluteString),
-      "\(scene.title) attribution names the author and links the license")
+    require(scene.attribution.contains(scene.credit) && scene.attribution.contains(scene.licenseURL.absoluteString)
+      && scene.attribution.hasSuffix(scene.terms), "\(scene.title) attribution names the author, links the license and gives its terms")
   }
-  require(ExampleScenes.credits.count == 3 && ExampleScenes.credits.contains { $0.hasPrefix("Amazon Lumberyard Bistro © 2017") }
-    && ExampleScenes.credits.allSatisfy { $0.contains("creativecommons.org/licenses/by/") },
-    "credits list each work once with its license: \(ExampleScenes.credits)")
+  let credits = ExampleScenes.credits
+  require(credits.count == 9 && credits.contains { $0.hasPrefix("Amazon Lumberyard Bistro © 2017") }
+    && credits.filter { $0.contains("creativecommons.org/licenses/by/") }.count == 6
+    && credits.contains { $0.hasPrefix("Bedroom") && $0.contains("creativecommons.org/licenses/by-sa/4.0/") }
+    && credits.filter { $0.contains("graphics.stanford.edu/data/3Dscanrep/") }.count == 2,
+    "credits list each work once with its license: \(credits)")
+  // The Stanford scans carry the repository's non-commercial and good-taste terms; the Bedroom's ShareAlike.
+  require(catalog.filter { $0.terms == ExampleScenes.stanfordTerms }.map(\.shot) == ["buddha", "chinese-dragon"]
+    && catalog[4].terms.contains("CC BY-SA 4.0"), "per-scene terms: the Stanford scans' and the Bedroom's ShareAlike")
   let exterior = catalog[2], interior = catalog[3]
   require(exterior.storage == interior.storage
     && Array(exterior.archives.dropFirst()) == Array(interior.archives.dropFirst())
@@ -168,6 +175,14 @@
   sponza.apply(to: &still)
   require(emitters(still).count == 1 && emitters(still)[0].instructions.count == before.instructions.count,
     "a shot without emissionScale leaves emission unchanged")
+  // The Bedroom scan is Z-up: its shot turns the imported top-level objects -90 degrees about X.
+  var upright = plain
+  try shot("bedroom").apply(to: &upright)
+  let roots = upright.graph?.nodes.filter { $0.parent == nil } ?? []
+  let turned = roots.first.map { upright.graph!.worldTransform($0.id).0 * SIMD4<Float>(0, 0, 1, 0) } ?? .zero
+  require(!roots.isEmpty && roots.allSatisfy { abs($0.transform.rotationHidden.x + .pi / 2) < 1e-6 }
+    && simd_length(SIMD3(turned.x, turned.y, turned.z) - SIMD3(0, 1, 0)) < 1e-5,
+    "the bedroom shot stands a Z-up OBJ upright (+Z becomes +Y): \(turned)")
   // A program without room for the two scaling instructions keeps its emission; constant Ke scales too.
   var full = plain
   let slot = full.scenes[6]!.materialX!.first { $0.value.emission != nil }!.key
@@ -189,8 +204,9 @@
   controller.exampleLibrary = ExampleLibrary(root: folder.appendingPathComponent("controller", isDirectory: true))
   defer { controller.exampleLibrary = previousLibrary }
   for item in entries { _ = controller.validateMenuItem(item) }
-  require(entries.map(\.tag) == [0, 1, 2, 3] && entries.first?.title == "Crytek Sponza — 80 MB download…"
-    && entries.last?.title == "Amazon Lumberyard Bistro (interior) — 1.4 GB download…"
+  require(entries.map(\.tag) == Array(catalog.indices) && entries.first?.title == "Crytek Sponza — 80 MB download…"
+    && entries[3].title == "Amazon Lumberyard Bistro (interior) — 1.4 GB download…"
+    && entries.last?.title == "Living Room — 15 MB download…"
     && examples?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true,
     "File > Open Example Scene lists the scenes with their download sizes: \(entries.map(\.title))")
   let installed = controller.exampleLibrary
