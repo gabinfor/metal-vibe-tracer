@@ -119,6 +119,8 @@ enum SpectralExamples {
                     summary: "Rayleigh scattering: a white beam turns blue to the side and orange through a medium"),
     SpectralExample(shot: "spectral-lamp-spectra", title: "Lamp Spectra",
                     summary: "The same colours under blackbody, daylight, fluorescent, sodium and LED spots in haze"),
+    SpectralExample(shot: "spectral-lantern-arcade", title: "Lantern Arcade",
+                    summary: "Many lights: 416 lamps from 2000 K to 6500 K over polished stone, where the light tree shines"),
   ]
   static func url(_ path: String) -> URL? {
     runtimeResourceURL(bundled: Bundle.main.resourceURL?.appendingPathComponent(path), repositoryPath: path)

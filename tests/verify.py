@@ -2,8 +2,8 @@
 """Compile the app and run the actual Metal kernels without opening a window.
 Usage: python3 tests/verify.py [--studio-only | --usd-only | --only FILE ...] [--require-reference]
 
---only runs just the named test files (e.g. Fix_light-tree.swift), after the shared GPU helpers and studio
-controller, with their full-suite checks: the quick check while working on a change. The full suite gates
+--only runs just the named test files (e.g. Fix_light-tree.swift), with the shared helpers and OpenUSD fixtures
+their suite needs and their full-suite checks: the quick check while working on a change. The full suite gates
 releases and changes to shared rendering paths (CONTRIBUTING.md).
 """
 from pathlib import Path
@@ -79,9 +79,12 @@ if only:
     missing = [f for f in only if f not in files]
     if missing:
         raise SystemExit('verify.py: not a suite test file: ' + ' '.join(missing))
-    # The shared helpers and controller, then the named files in suite order, with their full-suite checks.
-    PARTS = [('GPUChecks.swift:helpers', ALL), ('StudioChecks.swift:controller', ALL)] + \
-        [(name, ALL) for name, _ in PARTS if ':' not in name and name in only]
+    # The shared GPU helpers, then the base of the smallest suite that has every named file (the studio
+    # controller for files of the OpenUSD suite, all of StudioChecks.swift, whose helpers the Studio suite's
+    # files use, otherwise), then the named files in suite order, with their full-suite checks.
+    usd = all('usd' in modes for name, modes in PARTS if name in only)
+    PARTS = [('GPUChecks.swift:helpers', ALL), ('StudioChecks.swift:controller' if usd else 'StudioChecks.swift', ALL)] + \
+        [(name, ALL) for name, _ in PARTS if ':' not in name and name in only and name != 'StudioChecks.swift']
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()
 root = harness.ROOT
@@ -93,9 +96,10 @@ subprocess.run([sys.executable, str(root / 'scripts/generate_spectral_tables.py'
 subprocess.run(['/usr/bin/python3', str(root / 'scripts/prepare_usd.py')], check=True)
 subprocess.run([sys.executable, str(root / 'scripts/prepare_oidn.py'), '--arch', platform.machine()], check=True)
 # -E ignores PYTHONOPTIMIZE and friends, so assert-based helper checks cannot pass vacuously.
-# The offline Python checks belong to the suites, not to --only runs.
+# USDChecks.py also writes the OpenUSD fixtures the GPU files read, so --only runs keep it; the other
+# offline checks belong to the suites.
+subprocess.run(['/usr/bin/python3', '-E', str(root / 'tests/USDChecks.py')] + reference, check=True, env=environment)
 if not only:
-    subprocess.run(['/usr/bin/python3', '-E', str(root / 'tests/USDChecks.py')] + reference, check=True, env=environment)
     subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_build.py')], check=True, env=environment)
     subprocess.run([sys.executable, '-E', str(root / 'tests/Fix_tests.py')], check=True, env=environment)
     # Offline spectral-table checks (round trip, sampling, noise, reproducibility, float32 include).

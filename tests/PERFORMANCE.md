@@ -17,6 +17,15 @@
 \* Rare fireflies dominate the tone-mapped MSE of these scenes and land in either selection. Over 12 sequences (`--only spectral-tyndall-tank spectral-abbe-row --sequences 12`) the tree has fewer pixel channels more than 0.1 off the reference in tone-mapped value (Tyndall Tank 20,097 against 21,164; Abbe Row 188,937 against 194,555), its tone-mapped MSE is −8% and −42%, and its equal time 0.84 and 0.97.
 † No emitters: both selections run the same code, so ±12% is this measurement's sequence noise; differences of that size elsewhere are not significant.
 
+**Lantern Arcade** (`Examples/Spectral/LanternArcade.usda`, made for this comparison: 416 lamps, 832 emitter triangles, 831 tree nodes; `--only spectral-lantern-arcade --sequences 4`, and `--strategy 1` for Standard MIS). The lamps are in view at radiance up to 1,400, so their anti-aliasing noise, the same with either selection, dominates the linear MSE; the tone-mapped MSE and the outlier count (pixel channels more than 0.1 off the reference in tone-mapped value, over all sequences) show the lit surfaces.
+
+| Strategy | MSE power | MSE tree | Tone-mapped | Power ms | Tree ms | Tone-mapped equal time | Outliers power / tree | Mean tree / power |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ReSTIR (default) | 5.597 | 5.847 (+4%) | −46% | 23.41 | 21.56 | 0.50 | 145,090 / 68,165 | 1.0004 |
+| Standard MIS | 6.414 | 6.371 (−1%) | −69% | 13.92 | 13.54 | 0.30 | 220,634 / 100,714 | 1.0000 |
+
+The tree is also faster here, because it never chooses a lamp facing away from the point and so traces fewer shadow rays; exports measured 17 s for 59 spp with power sampling and 13 s for 64 spp with the tree at 960×540 (docs/images/light-tree-before-after.jpg). ReSTIR's resampling already recovers part of what a poor candidate distribution loses, so Standard MIS shows the tree's own effect.
+
 **Bias:** the two 1,024-frame references' mean radiance agrees within 0.5% in every scene (Bistro interior 1.0047; Lamp Spectra 0.9955 with one earlier run's references, 0.9998 with 4,096-frame references, power's reference being the noisy one). `tests/Fix_light-tree.swift` checks both selections against a quadrature reference.
 
 **Layout and leaves.** The first version stored 64-byte nodes with one emitter per leaf (always splitting, as pbrt does). Against it, the 32-byte nodes with leaves of up to eight emitters that gain nothing from splitting (`LightTree.maxLeaf`, `leafRatio` 0.75) and the walk's once-per-walk header lowered the tree's frame-time cost in San Miguel from +8% to +5% and in the Bistro interior from +10–11% to +8%, and halved its memory (Bistro interior: 4.7 to 1.7 MiB). Equal time with the first version, same setup with 3 sequences: Lamp Spectra 0.29, Bistro interior 0.83, Tyndall Tank 0.84, Shader Ball 0.95, San Miguel 1.10, Abbe Row 1.03. Run-to-run differences of 5–10% in the Bistro interior's equal time (0.83–0.92 over three runs) are within the noise noted above.

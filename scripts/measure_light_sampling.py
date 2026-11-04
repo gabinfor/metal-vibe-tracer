@@ -1,14 +1,15 @@
 """Equal-time comparison of power and light-tree emitter selection (LightSampling; docs/LIGHT_TREE_DESIGN.md).
 
 Usage: python3 scripts/measure_light_sampling.py [--only NAME ...] [--width W] [--height H] [--frames N]
-                                               [--reference N] [--sequences S]
+                                               [--reference N] [--sequences S] [--strategy K]
 
 For each shot of scripts/showcase.json (the README scenes, with their camera, lighting and render modes), renders
 the raw accumulation through the production renderFrame path (one sample per pixel per frame, preview scale 1):
 a reference of --reference frames with each selection, averaged, then --sequences independent accumulations of
 --frames frames per selection, alternating the two. Reports linear and tone-mapped (x / (1 + x)) MSE against the
 reference, the light tree's node count (0: power sampling, for few emitters), the median GPU frame time, the equal-time ratio (tree MSE x time) / (power MSE x time), below 1 where the
-light tree wins, the ratio of the two references' mean radiance (1 without bias) and, over all sequences, the
+light tree wins, the same ratio for tone-mapped MSE (what the display shows: in scenes with visible lamps the
+linear MSE is dominated by the lamps' own anti-aliasing noise), the ratio of the two references' mean radiance (1 without bias) and, over all sequences, the
 pixel channels whose tone-mapped value is more than 0.1 off the reference (fireflies). Reference noise adds the same amount to both MSEs, which pulls the ratio toward 1.
 A development tool like scripts/measure_throughput.py; it is not part of the suite. Shots whose files are missing
 are skipped.
@@ -32,6 +33,7 @@ parser.add_argument('--height', type=int, default=180)
 parser.add_argument('--frames', type=int, default=64)
 parser.add_argument('--reference', type=int, default=1024)
 parser.add_argument('--sequences', type=int, default=3)
+parser.add_argument('--strategy', type=int, help='override every shot\'s strategy (0 ReSTIR, 1 Standard MIS)')
 arguments = parser.parse_args()
 
 shots = json.loads((harness.ROOT / 'scripts/showcase.json').read_text())
@@ -42,6 +44,9 @@ shots = [s for s in shots if any(k in s for k in ('usd', 'obj', 'project'))
          and all((harness.ROOT / s[k]).exists() for k in ('usd', 'obj', 'project', 'hdri') if k in s)]
 if not shots:
     raise SystemExit('measure_light_sampling.py: no shot to measure')
+if arguments.strategy is not None:
+    for shot in shots:
+        shot['strategy'] = arguments.strategy
 
 driver = r'''
 let shots = try JSONDecoder().decode([ShowcaseShot].self, from: try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
@@ -82,8 +87,8 @@ func mse(_ a: [SIMD4<Float>], _ b: [SIMD4<Float>], tone: Bool) -> Double {
   return sum / Double(max(1, count))
 }
 func median(_ v: [Double]) -> Double { let s = v.sorted(); return s.isEmpty ? 0 : s[s.count / 2] }
-print("| Scene | Emitters | Tree nodes | MSE power | MSE tree | Tone-mapped | Power ms | Tree ms | Equal time | Mean tree / power | Outliers power / tree |")
-print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+print("| Scene | Emitters | Tree nodes | MSE power | MSE tree | Tone-mapped | Power ms | Tree ms | Equal time | Tone-mapped equal time | Mean tree / power | Outliers power / tree |")
+print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 for shot in shots {
   var p: ProjectDocument
   if let path = shot.usd {
@@ -140,7 +145,8 @@ for shot in shots {
   func percent(_ a: Double, _ b: Double) -> String { String(format: "%+.0f%%", 100 * (a / b - 1)) }
   print("| \(shot.name) | \(emitters) | \(nodes) | \(String(format: "%.4g", ep.linear)) | \(String(format: "%.4g", et.linear)) (\(percent(et.linear, ep.linear)))"
     + " | \(percent(et.tone, ep.tone)) | \(String(format: "%.2f", tp)) | \(String(format: "%.2f", tt))"
-    + " | \(String(format: "%.2f", et.linear * tt / (ep.linear * tp))) | \(String(format: "%.4f", mean(treeReference) / mean(powerReference))) | \(outliers[.power]!) / \(outliers[.tree]!) |")
+    + " | \(String(format: "%.2f", et.linear * tt / (ep.linear * tp))) | \(String(format: "%.2f", et.tone * tt / (ep.tone * tp)))"
+    + " | \(String(format: "%.4f", mean(treeReference) / mean(powerReference))) | \(outliers[.power]!) / \(outliers[.tree]!) |")
   fflush(stdout)
 }
 '''

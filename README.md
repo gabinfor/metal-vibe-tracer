@@ -122,6 +122,9 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 
 ### Recent improvements
 
+<p align="center"><img src="docs/images/light-tree-before-after.jpg" alt="A lantern-lit colonnade at night: grainy with power light sampling, much cleaner with the light tree at the same render time"></p>
+<p align="center"><sub><b>Light tree</b> (power sampling | light tree, equal render time, not denoised). The <b>Lantern Arcade</b> example has 416 lamps; each point is lit by its few nearest ones, which the light tree finds and power sampling does not. Visible noise falls by about half with the default ReSTIR and by two thirds with Standard MIS.</sub></p>
+
 <p align="center"><img src="docs/images/filtering-before-after.jpg" alt="Sponza floor and arches before and after anisotropic texture filtering"></p>
 <p align="center"><sub><b>Anisotropic ray-cone texture filtering</b> (before | after). Footprints are ellipses fed to the hardware's anisotropic filter (Akenine-Möller et al., JCGT 2021), and the camera footprint shrinks with the sample count as in pbrt-v4, so receding floors, fabric and stone stay sharp.</sub></p>
 
@@ -140,7 +143,7 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 | **Light transport** | Spectral (default) or RGB. CIE illuminant presets, per-light spectra (blackbody, presets, laser lines), dispersion, and thin film. |
 | **Participating media** | Homogeneous haze and object interiors (OpenPBR `transmission_*`), Henyey-Greenstein scattering, an optional Rayleigh λ⁻⁴ law, and spot and beam lights (UsdLux `ShapingAPI`). |
 | **Materials** | OpenPBR surfaces, image textures with anisotropic filtering, normal and bump maps, alpha cutouts, thin-walled glass, and a subset of MaterialX graphs. |
-| **Scenes** | Six procedural test scenes, four bundled spectral examples, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Scene size is limited by the Mac's GPU memory, not fixed caps. |
+| **Scenes** | Six procedural test scenes, five bundled spectral examples, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Scene size is limited by the Mac's GPU memory, not fixed caps. |
 | **Acceleration** | Two-level instancing on Metal hardware ray tracing, with an exact software 4-wide BVH as a fallback. |
 | **Camera and lighting** | Thin-lens depth of field, procedural skies, HDRI environments, and editable area lights. |
 | **Denoising** | MetalFX for the interactive preview, and Open Image Denoise for snapshots and exports. |
@@ -241,7 +244,7 @@ The verification suite runs the production shaders on Metal and checks rendering
 <details>
 <summary><b>Test harness and benchmark details</b></summary>
 
-`python3 tests/verify.py [--studio-only | --usd-only | --only FILE ...] [--require-reference]` runs the full suite, the Studio subset, the OpenUSD subset, or only the named test files (after the shared GPU helpers, with their full-suite checks; the quick check while working on a change). `--require-reference` makes a missing ASWF Shader Ball download fail instead of being skipped with a message. Unknown flags are rejected.
+`python3 tests/verify.py [--studio-only | --usd-only | --only FILE ...] [--require-reference]` runs the full suite, the Studio subset, the OpenUSD subset, or only the named test files (with the shared helpers and fixtures their suite needs, and their full-suite checks; the quick check while working on a change). `--require-reference` makes a missing ASWF Shader Ball download fail instead of being skipped with a message. Unknown flags are rejected.
 
 `tests/harness.py` assembles the test program from `main.swift`, `Sources/*.swift` and an explicit, ordered list of test files. Every cut uses a marker that must occur exactly once, so a moved marker fails the build instead of dropping code. The harness compiles with `-swift-version 6 -D VIBE_TESTING` and passes the repository root through `VIBE_TRACER_REPOSITORY`. Only such test builds may load resources from the repository; release builds use the bundle. The suite also runs `tests/USDChecks.py`, `tests/Fix_build.py` and `tests/Fix_tests.py`. `build/verify.lock` allows one suite run per checkout at a time; a second run waits.
 
