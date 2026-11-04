@@ -23,9 +23,13 @@ Implementing a method from a paper is welcome. Cite the paper, and write the imp
 
 ## Before opening a pull request
 
+Build the app and run the test files that cover your change:
+
 ```bash
 ./build.sh
-python3 tests/verify.py
+python3 tests/verify.py --only Fix_lights.swift Fix_light-tree.swift
 ```
+
+Run the full suite (`python3 tests/verify.py`, about 25 minutes) when the change touches shared rendering paths (the core shaders, default render modes, `Uniforms` or buffer layouts), and before every release.
 
 Changes to default rendering behaviour should include equal-time measurements; see [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and the Development section of the [README](README.md#development).

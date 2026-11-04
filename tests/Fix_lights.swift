@@ -158,6 +158,9 @@
   }
   let emitterTriangles = [downTriangle(999, 999, 1, slot: 8), downTriangle(1000.5, 999, 2, slot: 8), downTriangle(999, 1001, 1, slot: 9)]
   testRenderer.materials.emissions = [8: SIMD3(2, 2, 2), 9: SIMD3(8, 8, 8)]
+  // Power sampling's fixed selection ratios (the light tree's depend on the receiver; tests/Fix_light-tree.swift).
+  let savedLightTree = testRenderer.materials.lightTree
+  testRenderer.materials.lightTree = false
   try testRenderer.materials.setMesh(emitterTriangles)
   var emitterView = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
   emitterView.environment = SIMD4(0, 0, 0, Float(testRenderer.materials.nodeCount))
@@ -181,6 +184,7 @@
   require(abs((observed[0.5] ?? 0) - 1.0 / 9) < 0.01 && abs((observed[2] ?? 0) - 4.0 / 9) < 0.01
     && abs((observed[5] ?? 0) - 4.0 / 9) < 0.01, "imported emitters are chosen by area x luminance")
   testRenderer.materials.emissions = [:]
+  testRenderer.materials.lightTree = savedLightTree
   print("PASS: imported emitter PDFs are O(1) and exact at 1 km; emitters are power sampled")
 
   // R-01 / R-11 / R-48: HDRI importance sampling on a non-uniform 64 x 32 map.

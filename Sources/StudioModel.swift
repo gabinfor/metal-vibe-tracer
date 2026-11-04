@@ -99,9 +99,10 @@ struct ReSTIRModes: Equatable, Sendable {
   var controlVariates: ControlVariates
   var sampler: SamplerMode
   var lightTransport: LightTransport
+  var lightSampling: LightSampling
   // Projects without a stored choice use these: .automatic, or in -D VIBE_TESTING builds the
   // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE / VIBE_CONTROL_VARIATES /
-  // VIBE_SAMPLER / VIBE_LIGHT_TRANSPORT override. A stored choice wins.
+  // VIBE_SAMPLER / VIBE_LIGHT_TRANSPORT / VIBE_LIGHT_SAMPLING override. A stored choice wins.
   static var defaults: ReSTIRModes {
     ReSTIRModes(
       indirectReuse: PathTracerRenderer.defaultIndirectReuse,
@@ -109,22 +110,26 @@ struct ReSTIRModes: Equatable, Sendable {
       temporalReuse: PathTracerRenderer.defaultTemporalReuse,
       controlVariates: PathTracerRenderer.defaultControlVariates,
       sampler: PathTracerRenderer.defaultSampler,
-      lightTransport: PathTracerRenderer.defaultLightTransport)
+      lightTransport: PathTracerRenderer.defaultLightTransport,
+      lightSampling: PathTracerRenderer.defaultLightSampling)
   }
   init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse,
        controlVariates: ControlVariates = PathTracerRenderer.defaultControlVariates,
        sampler: SamplerMode = PathTracerRenderer.defaultSampler,
-       lightTransport: LightTransport = PathTracerRenderer.defaultLightTransport) {
+       lightTransport: LightTransport = PathTracerRenderer.defaultLightTransport,
+       lightSampling: LightSampling = PathTracerRenderer.defaultLightSampling) {
     self.indirectReuse = indirectReuse
     self.spatialNeighbors = spatialNeighbors
     self.temporalReuse = temporalReuse
     self.controlVariates = controlVariates
     self.sampler = sampler
     self.lightTransport = lightTransport
+    self.lightSampling = lightSampling
   }
   @MainActor init(_ r: PathTracerRenderer) {
     self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse,
-              controlVariates: r.controlVariates, sampler: r.sampler, lightTransport: r.lightTransport)
+              controlVariates: r.controlVariates, sampler: r.sampler, lightTransport: r.lightTransport,
+              lightSampling: r.lightSampling)
   }
   @MainActor func apply(_ r: PathTracerRenderer) {
     r.indirectReuse = indirectReuse
@@ -133,6 +138,7 @@ struct ReSTIRModes: Equatable, Sendable {
     r.controlVariates = controlVariates
     r.sampler = sampler
     r.lightTransport = lightTransport
+    r.lightSampling = lightSampling
   }
 }
 struct OIDNOptions: Codable, Equatable {
@@ -177,14 +183,15 @@ struct ProjectDocument: Codable {
   var oidn: OIDNOptions?
   var viewportMode: UInt32?
   // Raw values of IndirectReuse, SpatialNeighborSelection, TemporalReuse, ControlVariates,
-  // SamplerMode and LightTransport; optional so projects written before the Render inspector
-  // exposed them open with the default (automatic).
+  // SamplerMode, LightTransport and LightSampling; optional so projects written before the Render
+  // inspector exposed them open with the default (automatic).
   var indirectReuse: UInt32?
   var spatialNeighbors: UInt32?
   var temporalReuse: UInt32?
   var controlVariates: UInt32?
   var sampler: UInt32?
   var lightTransport: UInt32?
+  var lightSampling: UInt32?
   // The scene medium (SceneMedium); nil is clear air, as in projects written before media.
   var medium: SceneMedium?
   // Written only into autosaves: the document's file association and unsaved state.
@@ -200,7 +207,8 @@ struct ProjectDocument: Codable {
         temporalReuse: temporalReuse.flatMap(TemporalReuse.init(rawValue:)) ?? fallback.temporalReuse,
         controlVariates: controlVariates.flatMap(ControlVariates.init(rawValue:)) ?? fallback.controlVariates,
         sampler: sampler.flatMap(SamplerMode.init(rawValue:)) ?? fallback.sampler,
-        lightTransport: lightTransport.flatMap(LightTransport.init(rawValue:)) ?? fallback.lightTransport)
+        lightTransport: lightTransport.flatMap(LightTransport.init(rawValue:)) ?? fallback.lightTransport,
+        lightSampling: lightSampling.flatMap(LightSampling.init(rawValue:)) ?? fallback.lightSampling)
     }
     set {
       indirectReuse = newValue.indirectReuse.rawValue
@@ -209,6 +217,7 @@ struct ProjectDocument: Codable {
       controlVariates = newValue.controlVariates.rawValue
       sampler = newValue.sampler.rawValue
       lightTransport = newValue.lightTransport.rawValue
+      lightSampling = newValue.lightSampling.rawValue
     }
   }
 
@@ -293,6 +302,7 @@ struct ProjectDocument: Codable {
       controlVariates.map({ ControlVariates(rawValue: $0) != nil }) ?? true,
       sampler.map({ SamplerMode(rawValue: $0) != nil }) ?? true,
       lightTransport.map({ LightTransport(rawValue: $0) != nil }) ?? true,
+      lightSampling.map({ LightSampling(rawValue: $0) != nil }) ?? true,
       options.lightSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true,
       options.sunSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true
     else { try bad(); return }

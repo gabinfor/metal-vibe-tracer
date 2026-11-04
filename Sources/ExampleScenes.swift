@@ -119,6 +119,8 @@ enum SpectralExamples {
                     summary: "Rayleigh scattering: a white beam turns blue to the side and orange through a medium"),
     SpectralExample(shot: "spectral-lamp-spectra", title: "Lamp Spectra",
                     summary: "The same colours under blackbody, daylight, fluorescent, sodium and LED spots in haze"),
+    SpectralExample(shot: "spectral-lantern-arcade", title: "Lantern Arcade",
+                    summary: "Many lights: 416 lamps from 2000 K to 6500 K over polished stone, where the light tree shines"),
   ]
   static func url(_ path: String) -> URL? {
     runtimeResourceURL(bundled: Bundle.main.resourceURL?.appendingPathComponent(path), repositoryPath: path)
@@ -376,6 +378,8 @@ struct ShowcaseShot: Decodable, Sendable {
   var ring: UInt32?
   var strategy: UInt32?
   var lightTransport: UInt32?
+  // LightSampling raw value (0 power, 1 light tree); nil keeps the project's choice.
+  var lightSampling: UInt32?
   var yaw: Float?, pitch: Float?, distance: Float?, fov: Float?
   var target: [Float]?
   var aperture: Float?, focusDistance: Float?
@@ -418,6 +422,7 @@ struct ShowcaseShot: Decodable, Sendable {
     if let v = ring { p.ring = v }
     if let v = strategy { p.strategy = v }
     if let v = lightTransport { p.lightTransport = v }
+    if let v = lightSampling { p.lightSampling = v }
     if let v = yaw { p.camera.yaw = v }
     if let v = pitch { p.camera.pitch = v }
     if let v = distance { p.camera.distance = v }

@@ -7,6 +7,7 @@ The README images were rendered on 2026-10-20 on an Apple M4 with `python3 scrip
 | File | Content |
 | --- | --- |
 | `pavilion-hdri.jpg` | Built-in Architectural Pavilion lit by the Poly Haven **Art Studio** HDRI (CC0), with a thin-lens camera. 1920×1080, 1024 spp. |
+| `light-tree-before-after.jpg` | The bundled Lantern Arcade (`Examples/Spectral/LanternArcade.usda`) at 960×540, default ReSTIR PT and spectral transport, not denoised: power light sampling at 59 spp (17 s) and the light tree at 64 spp (13 s), the sample counts set from the measured frame times so the light tree has no more time than power sampling. Rendered on 2026-11-04 with `scripts/render_showcase.py` (`"lightSampling"` 0 and 1). |
 | `cornell-glass-mirror.jpg` | Built-in Cornell Glass & Mirror scene, showing the glass sphere's caustic. 1200×1200, 1024 spp. |
 | `spectral-incandescent-a.jpg`, `spectral-fluorescent-fl11.jpg`, `spectral-sodium-hp1.jpg` | Built-in Cornell Glass & Mirror scene with the area light's **Light spectrum** set to CIE A, FL11 and HP1. 1000×1000, 1024 spp each. |
 | `spectral-tyndall-tank.jpg`, `spectral-lamp-spectra.jpg` | The bundled media examples (`Examples/Spectral`; docs/VOLUME_DESIGN.md): the Tyndall tank (exposure +1, 1024 spp) and the lamp spectra (exposure +0.5, 2048 spp), 1600×900, not denoised. Rendered on 2026-10-23 with the code committed alongside them. |

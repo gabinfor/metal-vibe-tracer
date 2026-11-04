@@ -2,6 +2,12 @@
 
 Metal Vibe Tracer is in early development: releases are validated builds, not stable APIs or file formats. Every method below is cited, with its adaptations, in [REFERENCES.md](REFERENCES.md); measurements are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md).
 
+## Unreleased
+
+### Rendering
+
+- **Light tree** (docs/LIGHT_TREE_DESIGN.md; `CONTY2018`, `PBRT2023`): imported emitter triangles are chosen through a light BVH by their importance at the shaded point instead of by power alone, for every strategy and in both light transports. **Render › Light sampling** offers Automatic (the light tree), Light tree and Power; the choice is saved in the project. Nodes are 32 bytes (pbrt-v4's compact light bounds), emitters that share their place and facing (one lamp's triangles) share a leaf and are chosen by power, and a scene whose emitters all form one leaf skips the tree. At equal time it lowered error by 60–87% in Lamp Spectra, 8–17% in the Bistro interior and 15% in the Tyndall Tank, and cost about 5% in San Miguel (tests/PERFORMANCE.md, "Light tree"). Imported scenes with emitters render with less noise but not bit-identically to 0.3.0; **Power** renders as before. A fifth bundled example, **Lantern Arcade** (416 lamps over polished stone), shows the difference: at equal time the tree halves the visible noise with ReSTIR and cuts it by two thirds with Standard MIS. `scripts/measure_light_sampling.py` repeats the comparisons; showcase shots accept `"lightSampling"`.
+
 ## 0.3.0 — 2026-10-26
 
 Light as a spectrum, in scenes made to show it: participating media (haze, milky and Rayleigh-scattering volumes), per-light spectra (blackbody, CIE presets, laser lines), spot and beam lights, and four spectral example scenes included with the app, rendered for the README without a denoiser. An optional indirect clamp removes fireflies at the cost of bias. Existing scenes render as before. Projects saved by 0.3.0 can hold media, light spectra and the clamp, which 0.2.x ignores. Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (198 checks).
