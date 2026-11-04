@@ -135,8 +135,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       start.setProgress(nil)
       studio.showStartScreen(start)
       launchTrace("shaders-ready")
-      // Warm the groups a first scene most likely needs: ReSTIR PT (imported scenes' default) and
-      // spectral transport (Automatic's); both compile in the background.
+      // Warm the groups a first scene most likely needs: ReSTIR PT (imported scenes' default) and,
+      // when it is the active transport, spectral transport; both compile in the background.
       renderer.requestKernels([.pt])
       if renderer.activeLightTransport == .spectral { _ = renderer.prepareSpectralShaders() }
       if let pending = pendingStart {

@@ -188,7 +188,7 @@ enum OBJMaterials {
 
   // Tangent-space normal map from a height map (MTL bump): n = normalize(-k dh/du, -k dh/dv, 1),
   // with central differences (wrapping unless clamped), h in 0-1 per texel scaled to UV units by
-  // the image size (stored values, without colour management), and k = bm / 512 — a local strength convention (1 at a 512-texel-wide map),
+  // the image size (stored values, without colour management), and k = bm / 128 (see below),
   // since MTL defines no world scale for bump heights. Rows run top to bottom, so +v is up.
   static func heightNormalMap(_ url: URL, multiplier: Float, clamp: Bool, to output: URL) throws {
     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),

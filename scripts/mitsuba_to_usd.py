@@ -28,11 +28,9 @@ Textures: bitmap files keep their path (sRGB unless raw); checkerboards are bake
 import argparse
 import json
 import math
-import os
 import pathlib
 import re
 import struct
-import sys
 import xml.etree.ElementTree as ET
 import zlib
 

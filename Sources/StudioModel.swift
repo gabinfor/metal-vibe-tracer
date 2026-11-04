@@ -655,8 +655,8 @@ enum OBJMesh {
   // Returns the BVH triangle order (ordered[i] = input[order[i]]) and the nodes.
   static func hierarchy(_ input: UnsafeBufferPointer<MeshTriangle>) -> ([Int], [MeshNode]) {
     guard !input.isEmpty else { return ([], []) }
-    // Partition integer references in place. Recursive triangle copies and a
-    // full sort at every node used to dominate large imported-scene edits.
+    // Partition integer references in place, without copying triangles or fully sorting at
+    // every node, which would dominate large imported-scene edits.
     let centers = input.map { ($0.a + $0.b + $0.c) / 3 }
     var order = Array(input.indices)
     var nodes: [MeshNode] = []
