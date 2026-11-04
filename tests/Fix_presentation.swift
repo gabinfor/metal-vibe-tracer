@@ -33,7 +33,7 @@
     bytesPerRow: values.count * 16)
   let out = sharedTexture(.rgba32Float, values.count, 1)
   renderer.options.exposure = 0; renderer.options.whiteBalance = 0; renderer.options.compare = 0
-  let curves: [(Float, (Float) -> Float)] = [(2, { $0 }), (1, { $0 / (1 + $0) }), (0, filmic)]
+  let curves: [(Int, (Float) -> Float)] = [(2, { $0 }), (1, { $0 / (1 + $0) }), (0, filmic)]
   for (toneMap, curve) in curves {
     renderer.options.toneMap = toneMap
     let command = renderer.commandQueue.makeCommandBuffer()!

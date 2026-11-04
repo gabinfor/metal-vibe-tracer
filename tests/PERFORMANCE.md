@@ -813,7 +813,7 @@ mesh layout (`MeshAcceleration.flat`); "current" is this change with its default
 - Every frame goes through the production `PathTracerRenderer.renderFrame` path (the
   `render()` helper in `tests/GPUChecks.swift`): pass 1 G-buffer/ReSTIR temporal, pass 2
   shading, MetalFX when enabled, and display tone mapping.
-- 640×480, preview scale 1, path depth 16, default sun/sky, default camera preset of each
+- 640×480, preview scale 1, path depth 16, default sun/sky, default camera of each
   scene. Strategy ReSTIR DI+GI unless marked MIS.
 - Each run starts from a reset accumulation and the same jitter/seed sequence, renders 12
   frames and times frames 5–12 (GPU command-buffer start to end, no CPU readback). Three
