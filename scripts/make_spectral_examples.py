@@ -189,36 +189,48 @@ looks=[mat('Stone',{'base_color':('color3f',(0.06,0.06,0.065)),'specular_roughne
        mat('Teal',{'base_color':('color3f',(0.05,0.45,0.45)),'specular_roughness':('float',0.3)}),
        mat('Chrome',{'base_metalness':('float',1),'base_color':('color3f',(0.92,0.92,0.92)),'specular_roughness':('float',0.04)})]
 objects=[prim('Cube','Floor',['        double size = 1']+xf((0,-0.05,-30),None,(70,0.1,90))+[bind('Stone')])]
+# Repeated prims inherit a class that holds what they share (USD inherits arcs; classes are abstract and do not
+# render), so each one states only its position and, for lamps, its colour temperature.
+def cls(kind,name,body,binding=None):
+    return prim(kind,name,body+([bind(binding)] if binding else [])).replace(f'    def {kind} "{name}"',f'    class {kind} "{name}"',1)
+classes=[cls('RectLight','_Lantern',['        float3 xformOp:rotateXYZ = (-90, 0, 0)','        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]',
+             '        float inputs:width = 0.12','        float inputs:height = 0.12','        float inputs:intensity = 1400','        bool inputs:enableColorTemperature = true']),
+         cls('RectLight','_HallLamp',['        float3 xformOp:rotateXYZ = (-90, 0, 0)','        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]',
+             '        float inputs:width = 0.2','        float inputs:height = 0.2','        float inputs:intensity = 700','        bool inputs:enableColorTemperature = true']),
+         cls('Cylinder','_Pillar',['        uniform token axis = "Y"','        double radius = 0.28','        double height = 4.2','        uniform token[] xformOpOrder = ["xformOp:translate"]'],'Pillar'),
+         cls('Cylinder','_Column',['        uniform token axis = "Y"','        double radius = 0.16','        double height = 4.6','        uniform token[] xformOpOrder = ["xformOp:translate"]'],'Pillar'),
+         cls('Cube','_Lintel',['        double size = 1','        float3 xformOp:scale = (6.8, 0.3, 0.45)','        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]'],'Pillar')]
+def instance(kind,name,base,x,y,z,extra=()):
+    return '\n'.join([f'    def {kind} "{name}" (inherits = </Scene/{base}>)','    {',f'        double3 xformOp:translate = ({x:g}, {y:g}, {z:g})']+['        '+e for e in extra]+['    }'])
 lamps=[]
-def lamp(name,x,y,z,size,kelvin,intensity):
-    return prim('RectLight',name,xf((round(x,3),round(y,3),round(z,3)),(-90,0,0))+[f'        float inputs:width = {size:g}',f'        float inputs:height = {size:g}',
-        f'        float inputs:intensity = {intensity:g}','        bool inputs:enableColorTemperature = true',f'        float inputs:colorTemperature = {kelvin:g}'])
+def lamp(base,name,x,y,z,kelvin):
+    return instance('RectLight',name,base,round(x,3),round(y,3),round(z,3),(f'float inputs:colorTemperature = {kelvin:g}',))
 # The colonnade: pillar pairs every 4 m along the aisle, joined by lintels.
 for k in range(21):
     z=10-4*k
     for side,x in (('L',-3.0),('R',3.0)):
-        objects.append(prim('Cylinder',f'Pillar_{side}{k:02d}',['        uniform token axis = "Y"','        double radius = 0.28','        double height = 4.2']+xf((x,2.1,z))+[bind('Pillar')]))
-    objects.append(prim('Cube',f'Lintel_{k:02d}',['        double size = 1']+xf((0,4.35,z),None,(6.8,0.3,0.45))+[bind('Pillar')]))
+        objects.append(instance('Cylinder',f'Pillar_{side}{k:02d}','_Pillar',x,2.1,z))
+    objects.append(instance('Cube',f'Lintel_{k:02d}','_Lintel',0,4.35,z))
 # Two lantern strings hanging between the lintels, sagging along catenary-like arcs, warm 2000-2800 K.
 for string,x in (('A',-1.1),('B',1.1)):
     for k in range(20):
         for m in range(5):
             t=(m+0.5)/5;z=10-4*k-4*t;y=4.0-0.9*4*t*(1-t)
-            lamps.append(lamp(f'Lantern_{string}{k:02d}_{m}',x,y,z,0.12,round(rng.uniform(2000,2800),-1),1400))
+            lamps.append(lamp('_Lantern',f'Lantern_{string}{k:02d}_{m}',x,y,z,round(rng.uniform(2000,2800),-1)))
 # Side halls: lamps hung at varied heights, mostly warm with a few cool accents.
 for side,sign in (('L',-1),('R',1)):
     for i in range(6):
         for j in range(18):
             x=sign*(6.5+4.2*i+rng.uniform(-0.6,0.6));z=8-4.6*j+rng.uniform(-0.8,0.8)
             kelvin=round(rng.uniform(5000,6500),-1) if rng.random()<0.3 else round(rng.uniform(2400,3400),-1)
-            lamps.append(lamp(f'Hall_{side}{i}_{j:02d}',x,rng.uniform(2.6,4.4),z,0.2,kelvin,700))
+            lamps.append(lamp('_HallLamp',f'Hall_{side}{i}_{j:02d}',x,rng.uniform(2.6,4.4),z,kelvin))
             # A forest of slender columns between the hall lamps, for their light to fall on.
             if j%2==0:
-                objects.append(prim('Cylinder',f'Column_{side}{i}_{j:02d}',['        uniform token axis = "Y"','        double radius = 0.16','        double height = 4.6']+xf((round(sign*(8.6+4.2*i),3),2.3,round(6-4.6*j,3)))+[bind('Pillar')]))
+                objects.append(instance('Cylinder',f'Column_{side}{i}_{j:02d}','_Column',round(sign*(8.6+4.2*i),3),2.3,round(6-4.6*j,3)))
 for look,x,z,r in (('Red',-1.0,5.2,0.38),('Teal',1.3,6.4,0.32)):
     objects.append(prim('Sphere',f'Sphere_{look}',[f'        double radius = {r:g}']+xf((x,r,z))+[bind(look)]))
 objects.append(prim('Cylinder','Plinth',['        uniform token axis = "Y"','        double radius = 0.5','        double height = 0.8']+xf((0,0.4,-6))+[bind('Pillar')]))
 objects.append(prim('Sphere','Sculpture',['        double radius = 0.75']+xf((0,1.55,-6))+[bind('Chrome')]))
 objects.append(prim('DomeLight','Night',['        color3f inputs:color = (0.25, 0.35, 0.7)','        float inputs:intensity = 0.06']))
 doc="Lantern arcade: an 80 m colonnade at night under two strings of warm lanterns, with side halls of lamps hung at varied heights, over polished stone that mirrors them: 416 lamps from 2000 K to 6500 K. Each point is lit by its few nearest lamps; the light tree (Render > Light sampling) finds them, while power sampling spreads its samples over all of them. Colour temperatures render as blackbody spectra in spectral transport and as their colour in RGB."
-(OUT/'LanternArcade.usda').write_text(stage(doc,[prim('Scope','Looks',['\n\n'.join(looks)]),camera((0.4,1.1,12.5),(-0.2,1.9,-20.0),22)]+objects+lamps))
+(OUT/'LanternArcade.usda').write_text(stage(doc,[prim('Scope','Looks',['\n\n'.join(looks)]),camera((0.4,1.1,12.5),(-0.2,1.9,-20.0),22)]+classes+objects+lamps))
