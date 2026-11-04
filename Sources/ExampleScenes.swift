@@ -1,8 +1,8 @@
 import Cocoa
 import CryptoKit
 
-// REFERENCES.md: MCGUIRE2017, OBJ2026, MTL2026, SHA256FIPS. Example scenes from Morgan McGuire's Computer
-// Graphics Archive. Nothing is bundled: File > Open Example Scene downloads an archive only after the user
+// REFERENCES.md: MCGUIRE2017, OBJ2026, MTL2026, SHA256FIPS, STANFORD3DSCAN, BITTERLI2016 (the Fireplace and Living
+// Room cameras). Example scenes from Morgan McGuire's Computer Graphics Archive. Nothing is bundled: File > Open Example Scene downloads an archive only after the user
 // agrees to its size and license, checks it against the size and SHA-256 digest pinned below, extracts it
 // into Application Support and imports it through ProjectDocument.appendOBJ, unchanged, with the camera and
 // lighting of the README image (the scripts/showcase.json shot of the same name, ShowcaseShot).
@@ -29,6 +29,8 @@ struct ExampleScene: Sendable {
   var credit: String
   var license: String
   var licenseURL: URL
+  // What the license asks of renders, after the license in the consent sheet and the import report.
+  var terms = "Images rendered from it are adapted works and must credit it."
 
   // The credited work: Bistro's exterior and interior are one scene.
   var work: String { title.components(separatedBy: " (")[0] }
@@ -37,7 +39,7 @@ struct ExampleScene: Sendable {
   var shortTitle: String { title.replacingOccurrences(of: "Amazon Lumberyard ", with: "") }
   var attribution: String {
     "\(title): \(credit), from Morgan McGuire's Computer Graphics Archive (casual-effects.com/data). "
-      + "\(license) (\(licenseURL.absoluteString)). Renders of it are adapted works and must credit it."
+      + "\(license) (\(licenseURL.absoluteString)). \(terms)"
   }
 }
 
@@ -61,6 +63,14 @@ enum ExampleScenes {
   static let cc30 = URL(string: "https://creativecommons.org/licenses/by/3.0/")!
   static let cc40 = URL(string: "https://creativecommons.org/licenses/by/4.0/")!
   static let bistroCredit = "© 2017 Amazon Lumberyard"
+  static let ccBySA40 = URL(string: "https://creativecommons.org/licenses/by-sa/4.0/")!
+  static let stanford = URL(string: "https://graphics.stanford.edu/data/3Dscanrep/")!
+  static let stanfordTerms = "For research and non-commercial use; images must credit the Stanford Computer Graphics "
+    + "Laboratory. The model has religious and cultural significance: keep renderings in good taste."
+  // A single-archive research model extracted into a folder of its own name (sizes and digests of 2026-11-04).
+  private static func research(_ model: String, _ bytes: Int64, unpacked: Int64, _ sha256: String) -> [ExampleArchive] {
+    [archive("\(model).zip", "research/model/\(model)/\(model).zip", folder: "", bytes, unpacked: unpacked, sha256)]
+  }
   static let catalog = [
     ExampleScene(
       shot: "sponza-noon", title: "Crytek Sponza", summary: "262 k triangles, at noon", storage: "sponza",
@@ -88,6 +98,45 @@ enum ExampleScenes {
                          unpacked: 108_416_959, "3faa41f8d6860d1267268348d44d2b74c64a8bfb55dd4b03c562a70ab83b1062")]
         + bistroTextures,
       credit: bistroCredit, license: "CC BY 4.0", licenseURL: cc40),
+    ExampleScene(
+      shot: "bedroom", title: "Bedroom", summary: "383 k triangles, a photogrammetry scan", storage: "bedroom",
+      obj: "iscv2.obj",
+      archives: research("bedroom", 34_180_493, unpacked: 64_565_388,
+                         "90834c4336ec1b6f8331175b5600e5f7ce2b863ea7b345ef1b9545f209c4ef94"),
+      credit: "© 2017 fhernand", license: "CC BY-SA 4.0", licenseURL: ccBySA40,
+      terms: "Images rendered from it are adapted works: credit it and share them under CC BY-SA 4.0."),
+    ExampleScene(
+      shot: "breakfast-room", title: "Breakfast Room", summary: "270 k triangles, sunlight through blinds",
+      storage: "breakfast_room", obj: "breakfast_room.obj",
+      archives: research("breakfast_room", 6_446_862, unpacked: 23_472_999,
+                         "e56ff9b4c89b680cfd5c4c00390533ae28fff7a122d6fc8c92c273a9066c0ca8"),
+      credit: "© Wig42", license: "CC BY 3.0", licenseURL: cc30),
+    ExampleScene(
+      shot: "buddha", title: "Happy Buddha", summary: "1.1 M triangles, a Stanford scan", storage: "buddha",
+      obj: "buddha.obj",
+      archives: research("buddha", 22_519_689, unpacked: 93_037_212,
+                         "c14c098ce8d8caaf05696c54396197bf16a22837ef1275cca04d42fd6ab9a6a8"),
+      credit: "© 1996 Stanford University", license: "Stanford 3D Scanning Repository terms", licenseURL: stanford,
+      terms: stanfordTerms),
+    ExampleScene(
+      shot: "chinese-dragon", title: "Chinese Dragon", summary: "871 k triangles, a Stanford scan", storage: "dragon",
+      obj: "dragon.obj",
+      archives: research("dragon", 17_847_685, unpacked: 74_094_075,
+                         "111124359a31e4d6b2eeb5398e5bc96a5d9e2d2a130afb10bb4cfbc011bdb797"),
+      credit: "© 1996 Stanford University", license: "Stanford 3D Scanning Repository terms", licenseURL: stanford,
+      terms: stanfordTerms),
+    ExampleScene(
+      shot: "fireplace-room", title: "Fireplace Room", summary: "143 k triangles, Bitterli's camera",
+      storage: "fireplace_room", obj: "fireplace_room.obj",
+      archives: research("fireplace_room", 9_107_724, unpacked: 32_691_058,
+                         "9d7be47b9f2065e13a57c1831072d1599bb10ac4740582d6fc0f94efd80ff724"),
+      credit: "© Wig42", license: "CC BY 3.0", licenseURL: cc30),
+    ExampleScene(
+      shot: "living-room", title: "Living Room", summary: "581 k triangles, Bitterli's camera",
+      storage: "living_room", obj: "living_room.obj",
+      archives: research("living_room", 14_547_906, unpacked: 60_888_828,
+                         "f14daf4f566871e18c262a450db9ae0285b7124e93e05b3a8bfbcbf674a21aeb"),
+      credit: "© 2012 Jay-Artist", license: "CC BY 3.0", licenseURL: cc30),
   ]
   // One line per credited work, for the credits sheet and the File inspector.
   static var credits: [String] {
@@ -405,6 +454,9 @@ struct ShowcaseShot: Decodable, Sendable {
   // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
   // shot, above 1 brightens it for a night shot, since MTL emission has no absolute scale.
   var emissionScale: Float?
+  // Rotation of the imported scene's top-level objects, X, Y, Z in degrees (as in the Objects inspector):
+  // [-90, 0, 0] stands a Z-up OBJ upright, since the camera's up is +Y.
+  var rotation: [Float]?
 
   static func load(_ url: URL) throws -> [ShowcaseShot] {
     try JSONDecoder().decode([ShowcaseShot].self, from: Data(contentsOf: url))
@@ -420,6 +472,14 @@ struct ShowcaseShot: Decodable, Sendable {
   // Everything but the scene source (scene, usd, obj, project, hdri) and the export mode (raw).
   func apply(to p: inout ProjectDocument) {
     if let k = emissionScale { p.scaleImportedEmission(by: k) }
+    if let r = rotation, r.count == 3, var graph = p.graph {
+      for i in graph.nodes.indices where graph.nodes[i].parent == nil {
+        graph.nodes[i].transform.rotationHidden.x = r[0] * .pi / 180
+        graph.nodes[i].transform.rotationHidden.y = r[1] * .pi / 180
+        graph.nodes[i].transform.rotationHidden.z = r[2] * .pi / 180
+      }
+      p.graph = graph
+    }
     if let v = sky { p.sky = v }
     if let v = fog { p.fog = v }
     if let v = ring { p.ring = v }
@@ -510,8 +570,7 @@ extension StudioController {
       \((library.root.path as NSString).abbreviatingWithTildeInPath). Each archive is checked against its expected size \
       and SHA-256 digest before it is extracted.
 
-      \(scene.title) \(scene.credit). \(scene.license), \(scene.licenseURL.absoluteString). Images rendered from it \
-      are adapted works and must credit it.
+      \(scene.title) \(scene.credit). \(scene.license), \(scene.licenseURL.absoluteString). \(scene.terms)
       """
     alert.addButton(withTitle: "Download \(ExampleScenes.megabytes(download))")
     alert.addButton(withTitle: "Cancel")

@@ -19,7 +19,7 @@ The README images were rendered on 2026-10-20 on an Apple M4 with `python3 scrip
 | `validation-veach-mis.jpg` | `scripts/compare_mitsuba.py` side-by-side of the built-in Veach MIS scene (Metal Vibe Tracer \| Mitsuba 3.9.1 \| relative block difference), RGB, Standard MIS, 4,096 / 16,384 spp, 2026-10-22, resized to 1600 px wide. |
 | `validation-bathroom.jpg` | `scripts/compare_scene.py` side-by-side of Bitterli's Contemporary Bathroom by Mareck (CC0), converted to OpenUSD (Metal Vibe Tracer \| Mitsuba 3.9.1 `volpath` \| relative block difference), 2026-10-21 at `2124b70`. |
 | `filtering-before-after.jpg` | 1:1 crops of 1920×1080, 128-spp Sponza renders before and after anisotropic ray-cone filtering (the "after" render applied the footprint scale at every hit, which looks the same at primary hits as the committed version). |
-| `glass-before-after.jpg` | 1:1 crops of 960×540, 64-spp Bistro exterior renders before and after MTL glass translation. |
+| `glass-before-after.jpg` | 1:1 crops of 960×540, 64-spp Bistro exterior renders before and after MTL glass translation. The "after" reads `Tf` as the specification's transmission filter (20% for these panes); since 2026-11-04 the importer reads it as 1 − transmission (80%), so the panes now render clearer. |
 | `bump-before-after.jpg` | 1:1 crops of 1920×1080, 128-spp Sponza gallery renders with bump strength `-bm`/512 and 4× that (`-bm`/128, the new constant). |
 | `grazing-cylinder.png` | Built-in grazing-angle cylinder regression comparison (commit `86f8c7d`, 2026-09-08). Not shown in the README. |
 

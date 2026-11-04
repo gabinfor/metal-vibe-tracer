@@ -46,7 +46,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 
 <p align="center"><sub>Imported from Morgan McGuire's Computer Graphics Archive (OBJ with MTL materials translated to OpenPBR MaterialX), 1600×900, 128 spp, denoised with Open Image Denoise, on a 16 GB Apple M4. The daylight Bistro exterior has the scene's lamps and emissive signs switched off; the evening interior brightens its lamps 60×.</sub></p>
 
-To open these scenes in the app, choose them under **Download examples** on the start screen or in the inspector's **Scene** selector, or from **File › Open Example Scene**. They are not bundled. A scene is downloaded once from the archive after you agree to its size and license (Sponza 80 MB, San Miguel 536 MB, Bistro 1.4 GB). The download is checked against a pinned SHA-256 digest, extracted into Application Support and opened with the camera and lighting shown above. **Credits and Licenses…** in the same menu lists the attributions.
+To open these scenes in the app, choose them under **Download examples** on the start screen or in the inspector's **Scene** selector, or from **File › Open Example Scene**. They are not bundled. A scene is downloaded once from the archive after you agree to its size and license (Sponza 80 MB, San Miguel 536 MB, Bistro 1.4 GB). The download is checked against a pinned SHA-256 digest, extracted into Application Support and opened with the camera and lighting shown above. The same lists offer six smaller models from the archive: the **Bedroom** photogrammetry scan (34 MB, CC BY-SA 4.0), the **Breakfast Room** (6 MB), **Fireplace Room** (9 MB) and **Living Room** (15 MB) interiors (CC BY 3.0; the last two open with Benedikt Bitterli's reference cameras), and Stanford's **Happy Buddha** (23 MB) and **Chinese Dragon** (18 MB) scans, which are for research and non-commercial use. **Credits and Licenses…** in the same menu lists the attributions.
 
 ## Gallery
 
@@ -129,7 +129,7 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 <p align="center"><sub><b>Anisotropic ray-cone texture filtering</b> (before | after). Footprints are ellipses fed to the hardware's anisotropic filter (Akenine-Möller et al., JCGT 2021), and the camera footprint shrinks with the sample count as in pbrt-v4, so receding floors, fabric and stone stay sharp.</sub></p>
 
 <p align="center"><img src="docs/images/glass-before-after.jpg" alt="Bistro upper-floor windows rendered as opaque panels before and as glass after"></p>
-<p align="center"><sub><b>MTL glass as thin-walled OpenPBR transmission</b> (before | after). Glass illumination models, and glass written as constant dissolve, now transmit light filtered by <code>Tf</code>; panes with <code>Ni 1</code> ("light does not bend") are thin-walled.</sub></p>
+<p align="center"><sub><b>MTL glass as thin-walled OpenPBR transmission</b> (before | after). Glass illumination models, and glass written as constant dissolve, now transmit light; panes with <code>Ni 1</code> ("light does not bend") are thin-walled. Since November 4, 2026 they transmit 1 − <code>Tf</code>, as McGuire's archive writes it, so these panes are clearer than shown here.</sub></p>
 
 <p align="center"><img src="docs/images/bump-before-after.jpg" alt="Sponza columns with weak and calibrated bump mapping"></p>
 <p align="center"><sub><b>Calibrated bump mapping</b> (before | after). MTL height maps are converted to normal maps at a strength calibrated on the archive's authored normal maps.</sub></p>
@@ -223,7 +223,7 @@ Projects embed imported assets and can be reopened without the original files. E
 - [MaterialX examples](Examples/MaterialX/README.md)
 - [OpenUSD examples and reference scenes](Examples/OpenUSD/README.md)
 - [Spectral example scenes](Examples/Spectral/README.md): thin-film interference (Newton's colour series), dispersion (the Abbe row), Rayleigh scattering (the Tyndall tank) and lamp spectra in haze, included with the app under **File › Open Example Scene**.
-- McGuire's Sponza, San Miguel and Bistro: **File › Open Example Scene** downloads them on request (see [Production scenes](#production-scenes)).
+- McGuire's Sponza, San Miguel, Bistro, Bedroom, Breakfast Room, Fireplace Room, Living Room, Happy Buddha and Chinese Dragon: **File › Open Example Scene** downloads them on request (see [Production scenes](#production-scenes)).
 - [Poly Haven HDRI test selection](Examples/HDRI/README.md). Download it with `python3 scripts/fetch_test_hdris.py`. `scripts/render_showcase.py` needs it to render the README images.
 
 ## Development
