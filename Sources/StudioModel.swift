@@ -168,7 +168,8 @@ struct AutosaveRecovery: Codable {
 struct ProjectDocument: Codable {
   var version = 2
   var scene: UInt32 = 0, strategy: UInt32 = 0, sky: UInt32 = 0, fog: UInt32 = 0, ring: UInt32 = 0
-  var denoise = true
+  // MetalFX in the preview: off by default (the raw accumulation), on in projects that saved it on.
+  var denoise = false
   var options = StudioOptions()
   var camera = CameraState()
   var views: [String: CameraState] = [:]

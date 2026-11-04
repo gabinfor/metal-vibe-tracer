@@ -46,7 +46,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 
 <p align="center"><sub>Imported from Morgan McGuire's Computer Graphics Archive (OBJ with MTL materials translated to OpenPBR MaterialX), 1600×900, 128 spp, denoised with Open Image Denoise, on a 16 GB Apple M4. The daylight Bistro exterior has the scene's lamps and emissive signs switched off; the evening interior brightens its lamps 60×.</sub></p>
 
-To open these scenes in the app, choose **File › Open Example Scene**. They are not bundled. A scene is downloaded once from the archive after you agree to its size and license (Sponza 80 MB, San Miguel 536 MB, Bistro 1.4 GB). The download is checked against a pinned SHA-256 digest, extracted into Application Support and opened with the camera and lighting shown above. **Credits and Licenses…** in the same menu lists the attributions.
+To open these scenes in the app, choose them under **Download examples** on the start screen or in the inspector's **Scene** selector, or from **File › Open Example Scene**. They are not bundled. A scene is downloaded once from the archive after you agree to its size and license (Sponza 80 MB, San Miguel 536 MB, Bistro 1.4 GB). The download is checked against a pinned SHA-256 digest, extracted into Application Support and opened with the camera and lighting shown above. **Credits and Licenses…** in the same menu lists the attributions.
 
 ## Gallery
 
@@ -146,7 +146,7 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 | **Scenes** | Six procedural test scenes, five bundled spectral examples, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Scene size is limited by the Mac's GPU memory, not fixed caps. |
 | **Acceleration** | Two-level instancing on Metal hardware ray tracing, with an exact software 4-wide BVH as a fallback. |
 | **Camera and lighting** | Thin-lens depth of field, procedural skies, HDRI environments, and editable area lights. |
-| **Denoising** | MetalFX for the interactive preview, and Open Image Denoise for snapshots and exports. |
+| **Denoising** | MetalFX for the interactive preview (off by default), and Open Image Denoise for snapshots and exports. |
 | **Viewport** | Beauty, albedo, world normals, depth, and material/roughness views. |
 | **Projects** | Portable `.vtrace` files with embedded assets, saved camera views, undo/redo, and autosave recovery. |
 | **Export** | sRGB PNG and linear HDR OpenEXR (32-bit float) at independent resolutions and sample counts. |
@@ -190,7 +190,7 @@ If the checkout is inside iCloud Drive (for example `~/Documents`), the build ma
 
 ## Usage
 
-The app opens instantly on an empty start screen: open a project, import an OBJ or USD scene, pick a built-in scene, or restore the last autosaved session. Shaders compile in the background with a progress bar (about half a minute on the first launch of a new build on an Apple M4, well under a second afterwards), and long operations (imports, opens, saves, acceleration-structure builds, exports, OIDN) show their progress at the bottom of the window. Then choose a scene in the inspector and adjust its camera, lighting, materials, and objects. Use **Render** to change the sampling strategy, the ReSTIR reuse modes (indirect reuse, spatial neighbours, temporal reuse) or the viewport mode. **Settings…** is available in the top toolbar and the macOS application menu.
+The app opens instantly on an empty start screen: open a project, import an OBJ or USD scene, pick a built-in or example scene (including the downloadable ones), or restore the last autosaved session. Shaders compile in the background with a progress bar (about half a minute on the first launch of a new build on an Apple M4, well under a second afterwards), and long operations (imports, opens, saves, acceleration-structure builds, exports, OIDN) show their progress at the bottom of the window. Then switch scenes with the inspector's **Scene** selector, which lists the same built-in, example and download scenes, and adjust its camera, lighting, materials, and objects. Use **Render** to change the sampling strategy, the ReSTIR reuse modes (indirect reuse, spatial neighbours, temporal reuse) or the viewport mode. **Settings…** is available in the top toolbar and the macOS application menu.
 
 | Action | Control |
 | --- | --- |

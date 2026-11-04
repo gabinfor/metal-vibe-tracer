@@ -79,12 +79,16 @@ if only:
     missing = [f for f in only if f not in files]
     if missing:
         raise SystemExit('verify.py: not a suite test file: ' + ' '.join(missing))
-    # The shared GPU helpers, then the base of the smallest suite that has every named file (the studio
-    # controller for files of the OpenUSD suite, all of StudioChecks.swift, whose helpers the Studio suite's
-    # files use, otherwise), then the named files in suite order, with their full-suite checks.
-    usd = all('usd' in modes for name, modes in PARTS if name in only)
-    PARTS = [('GPUChecks.swift:helpers', ALL), ('StudioChecks.swift:controller' if usd else 'StudioChecks.swift', ALL)] + \
-        [(name, ALL) for name, _ in PARTS if ':' not in name and name in only and name != 'StudioChecks.swift']
+    # The base of the smallest suite that has every named file (the GPU helpers and the studio controller for
+    # files of the OpenUSD suite, all of StudioChecks.swift for the Studio suite's), then the named files in suite
+    # order, with their full-suite checks.
+    # Files of the full suite only also use helpers from all of GPUChecks.swift and MaterialChecks.swift.
+    named = [modes for name, modes in PARTS if name in only]
+    usd, full = all('usd' in m for m in named), any(m == {'full'} for m in named)
+    base = ['GPUChecks.swift', 'MaterialChecks.swift'] if full else ['GPUChecks.swift:helpers']
+    base.append('StudioChecks.swift:controller' if usd else 'StudioChecks.swift')
+    PARTS = [(name, ALL) for name in base] + \
+        [(name, ALL) for name, _ in PARTS if ':' not in name and name in only and name not in base]
 # One GPU suite at a time per checkout; each run writes into its own output directory.
 lock = harness.suite_lock()
 root = harness.ROOT
