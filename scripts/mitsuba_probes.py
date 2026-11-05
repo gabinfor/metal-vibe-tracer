@@ -70,8 +70,9 @@ HEAD = '''<scene version="3.0.0">
 def probe(outdir, name, bsdf, side='front', glint=False):
     out = pathlib.Path(outdir) / name; out.mkdir(parents=True, exist_ok=True)
     rot = '<rotate y="1" angle="180"/>' if side == 'back' else ''
-    # Transmitting BSDFs (mask, principledthin) cannot be nested in twosided; write them as given, with the id added.
-    kind = next((k for k in ('mask', 'principledthin') if bsdf.lstrip().startswith(f'<bsdf type="{k}"')), None)
+    # Transmitting BSDFs (mask, principledthin, thindielectric) cannot be nested in twosided; write them as given,
+    # with the id added.
+    kind = next((k for k in ('mask', 'principledthin', 'thindielectric') if bsdf.lstrip().startswith(f'<bsdf type="{k}"')), None)
     probe_bsdf = (bsdf.replace(f'<bsdf type="{kind}"', f'<bsdf type="{kind}" id="probe"', 1) if kind
                   else f'<bsdf type="twosided" id="probe">{bsdf}</bsdf>')
     body = f'''  {probe_bsdf}
