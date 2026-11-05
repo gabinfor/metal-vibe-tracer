@@ -13,13 +13,16 @@ import simd
 //   norm                      tangent-space normal map
 //   illum 4, 6, 7, 9          glass: transmission_weight 1, transmission_color = 1 - Tf (McGuire's
 //                             reading, which his archive's files follow: Tf 1 transmits nothing and is
-//                             opaque, read as illum 2 without a report), smooth (the model's reflection and refraction are ray
+//                             opaque, read as a reflection model below), smooth (the model's reflection and refraction are ray
 //                             traced, not Ns highlights); Ni <= 1 or unset ("light does not bend") is
 //                             geometry_thin_walled
 //   d (or 1 - Tr) < 1         without map_d or a map_Kd alpha channel: glass as above (exporters write
-//                             glass as constant dissolve; masks stay coverage)
+//                             glass as constant dissolve; masks stay coverage) when untextured or named
+//                             glass; other textured dissolve is coverage d
 //   illum 3, 5, 8             ray-traced reflection: a Ks beyond the dielectric's reach (Ks > F0(Ni)) is
-//                             base_metalness = max(Ks), so a mirror (Ks 0.95) reflects as one
+//                             base_metalness = max(Ks), so a mirror (Ks 0.95) reflects as one; likewise
+//                             illum 4, 6, 7 when 1 - Tf makes them opaque ("Reflection: Ray trace on")
+//   Kd 0 0 0 with map_Kd      the map alone (exporters' texture-driven colour), not black
 //   illum 0, 1                no specular lobe; illum 2 the default; others are reported
 // Map options -s and -o (UV scale and offset), -clamp, -bm, -mm (base + gain x texel, on colour and
 // scalar maps) and -imfchan are applied; others are reported and ignored.
@@ -369,7 +372,9 @@ struct MaterialXWriter {
     if let map = m.maps["map_kd"], let path = url(map) {
       let n = prefix + "_kd"
       file(n, type: "color3", path: path.path, colorspace: "srgb_texture", map: map, uv: coordinates(n, map))
-      if m.kd != SIMD3(repeating: 1) {
+      // Kd 0 0 0 beside map_Kd is how exporters write a texture-driven colour (the McGuire archive's
+      // tables, paintings and leaves); the specification's product would be black, so the map stands alone.
+      if m.kd != SIMD3(repeating: 1), m.kd != .zero {
         node(n + "_tint", "multiply", "color3", [("in1", "color3", .node(n)), ("in2", "color3", .value([m.kd.x, m.kd.y, m.kd.z]))])
         inputs.append(("base_color", "color3", .node(n + "_tint")))
       } else {
@@ -379,12 +384,16 @@ struct MaterialXWriter {
       inputs.append(("base_color", "color3", .value([min(1, max(0, m.kd.x)), min(1, max(0, m.kd.y)), min(1, max(0, m.kd.z))])))
     }
     // Glass: a transparency model, or constant dissolve without a coverage mask (how exporters write
-    // glass; every such material in the McGuire archive scenes is a glass object).
+    // glass). A textured dissolve material is glass only when its name says so (the Bistro's dirty
+    // panes); other textured ones, such as the Living Room's paper lampshade, are partial coverage.
     let d = min(1, max(0, m.d ?? 1))
     let masked = m.maps["map_d"] != nil || (m.maps["map_kd"].flatMap(url).map(OBJMaterials.hasCoverage) ?? false)
-    let glass = m.transmits || (d < 1 && !masked)
+    let dissolveGlass = d < 1 && !masked && (m.maps["map_kd"] == nil || m.name.lowercased().contains("glass"))
+    let glass = m.transmits || dissolveGlass
     if glass && !m.transmits {
       report.append("\(m.name): constant dissolve d \(d) rendered as glass (transmission).")
+    } else if d < 1 && !masked && !glass {
+      report.append("\(m.name): textured constant dissolve d \(d) rendered as coverage.")
     }
     // Specular: Phong exponent to GGX roughness, Ks against the dielectric F0 of Ni.
     let ior = (m.ni ?? 0) > 1 ? min(2.5, max(1.01, m.ni!)) : 1.5
@@ -405,8 +414,9 @@ struct MaterialXWriter {
       report.append("\(m.name): illum \(m.illum) rendered as illum 2 (diffuse and specular).")
     }
     let weight = m.illum < 2 ? 0 : (m.ks.max() / f0)
-    // Ray-traced reflection models whose Ks a dielectric cannot reach: the excess is metal reflection.
-    if [3, 5, 8].contains(m.illum), !glass, m.ks.max() > f0 {
+    // Reflection models whose Ks a dielectric cannot reach: the excess is metal reflection. The opaque
+    // transparency models (4, 6, 7 with Tf 1) keep their ray-traced reflection.
+    if [3, 4, 5, 6, 7, 8].contains(m.illum), !glass, m.ks.max() > f0 {
       let metal = min(1, m.ks.max())
       inputs.append(("base_metalness", "float", .value([metal])))
       // Without map_Kd the metal takes Ks's tint at full strength, so it reflects Ks rather than Kd x Ks.
