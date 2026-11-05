@@ -7870,13 +7870,6 @@ func frameJitter(_ index: UInt32) -> SIMD2<Float> {
     return SIMD2<Float>(halton(n, base: 2) - 0.5, halton(n, base: 3) - 0.5)
 }
 
-enum CameraPreset: Int {
-    case perspective = 0
-    case front = 1
-    case closeUp = 2
-    case overhead = 3
-}
-
 // Reversed-Z projection (near -> 1, far -> 0). Floating-point depth keeps
 // near-uniform relative precision across the range, which MetalFX needs for
 // distant history rejection; x/y and w are unchanged by the reversal.
@@ -8954,7 +8947,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     static var simulateUnsupportedMetalFX = false
 #endif
 
-    var sceneIndex: UInt32 = 0 { didSet { if oldValue != sceneIndex { applyPreset(.perspective) } } }
+    var sceneIndex: UInt32 = 0 { didSet { if oldValue != sceneIndex { applyDefaultCamera() } } }
     var samplingMode: UInt32 = 0 { didSet { if oldValue != samplingMode { resetAccumulation() } } } // 0 ReSTIR DI+GI, 1 MIS, 2 light, 3 BSDF
     var enableSMS: UInt32 = 0 { didSet { if oldValue != enableSMS { resetAccumulation() } } }
     var skyMode: UInt32 = 0 { didSet { if oldValue != skyMode { resetAccumulation() } } }
@@ -9398,7 +9391,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         measuredMetalFXScalerBytesPerPixel = other.flatMap {
             $0.device.registryID == device.registryID ? $0.measuredMetalFXScalerBytesPerPixel : nil
         }
-        applyPreset(.perspective)
+        applyDefaultCamera()
     }
 
     // Spectral pipelines and moment grid for this frame: ready, compiling in the background (the frame
@@ -9591,35 +9584,13 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return weights
     }
 
-    func applyPreset(_ preset: CameraPreset) {
-        if sceneIndex == 0 {
-            switch preset {
-            case .perspective: yaw = 0.42;  pitch = 0.22; distance = 4.6; target = SIMD3<Float>(0.15, -0.25, 0.70); fov = 38.0
-            case .front:       yaw = 0.00;  pitch = 0.12; distance = 4.4; target = SIMD3<Float>(0.10, -0.20, 0.70); fov = 38.0
-            case .closeUp:     yaw = 0.58;  pitch = 0.28; distance = 2.3; target = SIMD3<Float>(0.65, -0.55, 0.35); fov = 34.0
-            case .overhead:    yaw = 0.00;  pitch = 1.15; distance = 4.8; target = SIMD3<Float>(0.00, -0.30, 0.50); fov = 45.0
-            }
-        } else if sceneIndex == 2 {
-            switch preset {
-            case .perspective: yaw = 0.52;  pitch = 0.28; distance = 5.3; target = SIMD3<Float>(0, 0.1, 0.1); fov = 40.0
-            case .front:       yaw = 0.00;  pitch = 0.38; distance = 5.6; target = SIMD3<Float>(0, 0.3, 0.3); fov = 38.0
-            case .closeUp:     yaw = -0.32; pitch = 0.18; distance = 3.2; target = SIMD3<Float>(-0.8, -0.2, 0); fov = 34.0
-            case .overhead:    yaw = 0.00;  pitch = 1.05; distance = 6.2; target = SIMD3<Float>(0, 0.4, 0.2); fov = 42.0
-            }
-        } else if sceneIndex == 5 {
-            switch preset {
-            case .perspective: yaw = 0.65;  pitch = 0.60; distance = 2.9; target = SIMD3<Float>(0.3, -0.6, -0.1); fov = 42.0
-            case .front:       yaw = 0.00;  pitch = 0.55; distance = 3.3; target = SIMD3<Float>(0.1, -0.6, 0.0); fov = 45.0
-            case .closeUp:     yaw = 0.35;  pitch = 0.45; distance = 1.7; target = SIMD3<Float>(0.45, -0.75, -0.15); fov = 36.0
-            case .overhead:    yaw = 0.00;  pitch = 1.25; distance = 2.8; target = SIMD3<Float>(0.3, -0.7, -0.1); fov = 46.0
-            }
-        } else {
-            switch preset {
-            case .perspective: yaw = 0.45;  pitch = 0.25; distance = 3.4; target = SIMD3<Float>(0, -0.1, 0); fov = 42.0
-            case .front:       yaw = 0.00;  pitch = 0.00; distance = 3.3; target = SIMD3<Float>(0, 0, 0); fov = 40.0
-            case .closeUp:     yaw = -0.25; pitch = 0.10; distance = 2.2; target = SIMD3<Float>(0.15, -0.45, -0.1); fov = 36.0
-            case .overhead:    yaw = 0.00;  pitch = 1.15; distance = 3.2; target = SIMD3<Float>(0, -0.2, 0); fov = 45.0
-            }
+    // The scene's default view; the user then orbits, pans and zooms from it.
+    func applyDefaultCamera() {
+        switch sceneIndex {
+        case 0: yaw = 0.42; pitch = 0.22; distance = 4.6; target = SIMD3<Float>(0.15, -0.25, 0.70); fov = 38.0
+        case 2: yaw = 0.52; pitch = 0.28; distance = 5.3; target = SIMD3<Float>(0, 0.1, 0.1); fov = 40.0
+        case 5: yaw = 0.65; pitch = 0.60; distance = 2.9; target = SIMD3<Float>(0.3, -0.6, -0.1); fov = 42.0
+        default: yaw = 0.45; pitch = 0.25; distance = 3.4; target = SIMD3<Float>(0, -0.1, 0); fov = 42.0
         }
         resetAccumulation()
     }
@@ -9749,7 +9720,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         encoder.setTexture(normals ?? oidnNormalAccum ?? historyNormalMat ?? raw,index:4)
         encoder.setTexture(positions ?? historyPosDepth ?? raw,index:5)
         let warmth = options.whiteBalance
-        var controls = [SIMD4<Float>(options.exposure, options.toneMap, Float(viewportMode), lastPresentationUsedMetalFX ? options.compare : 0),
+        var controls = [SIMD4<Float>(options.exposure, Float(options.toneMap), Float(viewportMode), lastPresentationUsedMetalFX ? options.compare : 0),
                         SIMD4<Float>(exp2(warmth*0.5),1,exp2(-warmth*0.5),1)]
         encoder.setBytes(&controls,length:32,index:0)
         encoder.dispatchThreads(MTLSize(width:output.width,height:output.height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
@@ -10090,7 +10061,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 
         var uniforms = Uniforms(
             cameraPos: SIMD4<Float>(camX, camY, camZ, fov),
-            cameraTarget: SIMD4<Float>(target.x, target.y, target.z, options.depth),
+            cameraTarget: SIMD4<Float>(target.x, target.y, target.z, Float(options.depth)),
             cameraUp: SIMD4<Float>(0, 1, 0, textureFootprintScale),
             sunParams: SIMD4<Float>(sunDir.x, sunDir.y, sunDir.z, sunIntensity),
             currentViewProj: currViewProj,

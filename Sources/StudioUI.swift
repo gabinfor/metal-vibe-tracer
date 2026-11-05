@@ -38,14 +38,17 @@ final class NumberControl: NSStackView {
   var minimum: Float = 0, maximum: Float = 1
   // Typed values may exceed the slider range up to these limits.
   var entryMinimum: Float = 0, entryMaximum: Float = 1
+  // Whole-number controls round typed and slider values and show no decimals.
+  var integral = false
   // Text of the last published value; ending editing with it unchanged commits nothing.
   private(set) var displayed = ""
   var onReject: ((String) -> Void)?
   init(
     _ title: String, value: Float, range: ClosedRange<Float>, defaultValue: Float,
-    entry: ClosedRange<Float>? = nil, _ action: @escaping (Float) -> Void
+    entry: ClosedRange<Float>? = nil, integral: Bool = false, _ action: @escaping (Float) -> Void
   ) {
     super.init(frame: .zero)
+    self.integral = integral
     orientation = .vertical
     alignment = .leading
     spacing = 3
@@ -60,7 +63,7 @@ final class NumberControl: NSStackView {
     let label = NSTextField(labelWithString: title)
     label.font = .systemFont(ofSize: 12)
     label.setContentHuggingPriority(.defaultLow, for: .horizontal)
-    field.stringValue = String(format: "%.8g", value)
+    field.stringValue = format(value)
     displayed = field.stringValue
     field.alignment = .right
     field.widthAnchor.constraint(equalToConstant: 78).isActive = true
@@ -92,12 +95,13 @@ final class NumberControl: NSStackView {
       NSSound.beep()
       return
     }
-    let v = min(entryMaximum, max(entryMinimum, value))
-    field.stringValue = String(format: "%.8g", v)
+    let v = min(entryMaximum, max(entryMinimum, integral ? value.rounded() : value))
+    field.stringValue = format(v)
     displayed = field.stringValue
     slider.floatValue = min(maximum, max(minimum, v))
     update(v)
   }
+  func format(_ value: Float) -> String { String(format: integral ? "%.0f" : "%.8g", value) }
   // Accepts POSIX input, then the current locale (for example "0,25"), ignoring whitespace.
   static func parse(_ text: String, locale: Locale = .current) -> Float? {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -475,10 +479,10 @@ final class StudioController: NSViewController {
   }
   func number(
     _ title: String, _ value: Float, _ range: ClosedRange<Float>, _ fallback: Float,
-    reset: Bool = true, entry: ClosedRange<Float>? = nil, _ set: @escaping (Float) -> Void
+    reset: Bool = true, entry: ClosedRange<Float>? = nil, integral: Bool = false, _ set: @escaping (Float) -> Void
   ) {
     add(
-      NumberControl(title, value: value, range: range, defaultValue: fallback, entry: entry) {
+      NumberControl(title, value: value, range: range, defaultValue: fallback, entry: entry, integral: integral) {
         [weak self] v in
         guard let self, self.acceptsEdits else { return }
         self.checkpoint(title)
@@ -621,11 +625,11 @@ final class StudioController: NSViewController {
     option("White balance, cool → warm", \.whiteBalance, -1...1, 0, reset: false)
     popup(
       ["Tone map: Filmic fit", "Tone map: Reinhard", "Tone map: Linear / clip"],
-      Int(renderer.options.toneMap), label: "Tone map"
+      renderer.options.toneMap, label: "Tone map"
     ) { [weak self] i in
       guard let self else { return }
       self.checkpoint("Tone map")
-      self.renderer.options.toneMap = Float(i)
+      self.renderer.options.toneMap = i
       self.changed(reset: false)
     }
     option("Raw / MetalFX divider (0 = off)", \.compare, 0...1, 0, reset: false)
@@ -749,14 +753,16 @@ final class StudioController: NSViewController {
   func settingsPanel() {
     heading("Render limits")
     number(
-      "Sample limit (0 = unlimited)", Float(renderer.options.maxSamples), 0...16384, 0, reset: false
-    ) { [weak self] in self?.renderer.options.maxSamples = UInt32($0.rounded()) }
+      "Sample limit (0 = unlimited)", Float(renderer.options.maxSamples), 0...16384, 0, reset: false, integral: true
+    ) { [weak self] in self?.renderer.options.maxSamples = UInt32($0) }
     number(
       "Time limit, seconds (0 = unlimited)", Float(renderer.options.timeLimit), 0...3600, 0,
       reset: false
     ) { [weak self] in self?.renderer.options.timeLimit = Double($0) }
     option("Preview resolution scale", \.previewScale, 0.1...1, 0.5)
-    option("Path depth (1 = direct light only)", \.depth, 1...64, 16)
+    number("Path depth (1 = direct light only)", Float(renderer.options.depth), 1...64, 16, integral: true) {
+      [weak self] in self?.renderer.options.depth = Int($0)
+    }
 
     heading("Open Image Denoise")
     popup(["Quality: Fast", "Quality: Balanced", "Quality: High"], Int(renderer.oidnOptions.quality)) {
@@ -813,13 +819,6 @@ final class StudioController: NSViewController {
     text(
       "Drag to orbit. Shift-drag to pan. Scroll to zoom. Click a surface to select its material/object group."
     )
-    popup(["Choose preset…", "Perspective", "Front", "Close-up", "Overhead"], 0, label: "Camera preset") { [weak self] i in
-      guard let self, i > 0, let p = CameraPreset(rawValue: i - 1) else { return }
-      self.checkpoint("Camera preset")
-      self.renderer.applyPreset(p)
-      self.changed()
-      self.rebuild()
-    }
     number("Field of view, degrees", renderer.fov, 5...150, 38) { [weak self] in
       self?.renderer.fov = $0
     }
@@ -1243,14 +1242,14 @@ final class StudioController: NSViewController {
     )
     exampleScenePanel()
     heading("Export")
-    number("Output width", Float(renderer.options.outputWidth), 16...8192, 1920, reset: false) {
-      [weak self] in self?.renderer.options.outputWidth = Int($0.rounded())
+    number("Output width", Float(renderer.options.outputWidth), 16...8192, 1920, reset: false, integral: true) {
+      [weak self] in self?.renderer.options.outputWidth = Int($0)
     }
-    number("Output height", Float(renderer.options.outputHeight), 16...8192, 1080, reset: false) {
-      [weak self] in self?.renderer.options.outputHeight = Int($0.rounded())
+    number("Output height", Float(renderer.options.outputHeight), 16...8192, 1080, reset: false, integral: true) {
+      [weak self] in self?.renderer.options.outputHeight = Int($0)
     }
-    number("Export samples", Float(renderer.options.exportSamples), 1...16384, 128, reset: false) {
-      [weak self] in self?.renderer.options.exportSamples = UInt32($0.rounded())
+    number("Export samples", Float(renderer.options.exportSamples), 1...16384, 128, reset: false, integral: true) {
+      [weak self] in self?.renderer.options.exportSamples = UInt32($0)
     }
     let exportSource = exportDenoise ? 0 : (exportRaw ? 1 : 2)
     popup([

@@ -120,20 +120,6 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 <p align="center"><img src="docs/images/validation-bathroom.jpg" alt="Contemporary Bathroom: Metal Vibe Tracer, Mitsuba 3 and their relative difference"></p>
 <p align="center"><sub><b>Contemporary Bathroom</b> (Bitterli's rendering resources, converted to OpenUSD), Metal Vibe Tracer | Mitsuba 3 | relative difference: within 0.1%. Five of seven Bitterli scenes agree within 2.5%; the remaining gaps are documented model differences, such as OpenPBR's energy-conserving rough metals (<a href="REFERENCES.md">REFERENCES.md</a>, <code>BITTERLI2016</code>).</sub></p>
 
-### Recent improvements
-
-<p align="center"><img src="docs/images/light-tree-before-after.jpg" alt="A lantern-lit colonnade at night: grainy with power light sampling, much cleaner with the light tree at the same render time"></p>
-<p align="center"><sub><b>Light tree</b> (power sampling | light tree, equal render time, not denoised). The <b>Lantern Arcade</b> example has 416 lamps; each point is lit by its few nearest ones, which the light tree finds and power sampling does not. Visible noise falls by about half with the default ReSTIR and by two thirds with Standard MIS.</sub></p>
-
-<p align="center"><img src="docs/images/filtering-before-after.jpg" alt="Sponza floor and arches before and after anisotropic texture filtering"></p>
-<p align="center"><sub><b>Anisotropic ray-cone texture filtering</b> (before | after). Footprints are ellipses fed to the hardware's anisotropic filter (Akenine-Möller et al., JCGT 2021), and the camera footprint shrinks with the sample count as in pbrt-v4, so receding floors, fabric and stone stay sharp.</sub></p>
-
-<p align="center"><img src="docs/images/glass-before-after.jpg" alt="Bistro upper-floor windows rendered as opaque panels before and as glass after"></p>
-<p align="center"><sub><b>MTL glass as thin-walled OpenPBR transmission</b> (before | after). Glass illumination models, and glass written as constant dissolve, now transmit light; panes with <code>Ni 1</code> ("light does not bend") are thin-walled. Since November 4, 2026 they transmit 1 − <code>Tf</code>, as McGuire's archive writes it, so these panes are clearer than shown here.</sub></p>
-
-<p align="center"><img src="docs/images/bump-before-after.jpg" alt="Sponza columns with weak and calibrated bump mapping"></p>
-<p align="center"><sub><b>Calibrated bump mapping</b> (before | after). MTL height maps are converted to normal maps at a strength calibrated on the archive's authored normal maps.</sub></p>
-
 ## Features
 
 | | |

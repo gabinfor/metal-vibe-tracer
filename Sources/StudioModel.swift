@@ -41,10 +41,12 @@ struct StudioOptions: Codable {
   var previewScale: Float = 0.5
   var outputWidth = 1920, outputHeight = 1080
   var exportSamples: UInt32 = 128
-  var depth: Float = 16
+  // Path vertices, 1 (direct light only) to 64.
+  @WholeNumber var depth = 16
   var exposure: Float = 0
   var whiteBalance: Float = 0
-  var toneMap: Float = 0
+  // Display curve: 0 filmic fit, 1 Reinhard, 2 linear / clip.
+  @WholeNumber var toneMap = 0
   var compare: Float = 0
   var sunAzimuth: Float = 133, sunElevation: Float = 27, sunIntensity: Float = 850
   var environmentIntensity: Float = 1, environmentRotation: Float = 0
@@ -64,6 +66,28 @@ struct StudioOptions: Codable {
   // is off, as in projects written before the clamp.
   var indirectClamp: Float?
   static let indirectClampRange: ClosedRange<Float> = 0...100_000
+}
+// An integer option that projects written before it was an integer stored as a float. Such a float
+// decodes truncated toward zero, as the path tracer reads path depth; the option is written as a JSON integer.
+@propertyWrapper struct WholeNumber: Codable, Equatable {
+  var wrappedValue: Int
+  init(wrappedValue: Int) { self.wrappedValue = wrappedValue }
+  init(from decoder: Decoder) throws {
+    let container = try decoder.singleValueContainer()
+    if let value = try? container.decode(Int.self) {
+      wrappedValue = value
+      return
+    }
+    let value = try container.decode(Double.self)
+    guard value.isFinite, abs(value) < 1e9 else {
+      throw DecodingError.dataCorruptedError(in: container, debugDescription: "\(value) is not a whole number.")
+    }
+    wrappedValue = Int(value.rounded(.towardZero))
+  }
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.singleValueContainer()
+    try container.encode(wrappedValue)
+  }
 }
 extension StudioOptions {
   static let sunAngleRange: ClosedRange<Float> = 0.1...90

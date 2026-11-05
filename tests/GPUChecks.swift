@@ -69,7 +69,7 @@ kernel void regression_checks(device uint *results [[buffer(0)]], constant Unifo
     let vp = makePerspective(fovyRadians: r.fov * .pi / 180, aspect: Float(width) / Float(height), near: clip.near, far: clip.far)
         * makeLookAt(eye: eye, target: r.target, up: SIMD3<Float>(0, 1, 0))
     let az = defaults.sunAzimuth * .pi / 180, el = defaults.sunElevation * .pi / 180
-    return Uniforms(cameraPos: SIMD4<Float>(eye, r.fov), cameraTarget: SIMD4<Float>(r.target, defaults.depth),
+    return Uniforms(cameraPos: SIMD4<Float>(eye, r.fov), cameraTarget: SIMD4<Float>(r.target, Float(defaults.depth)),
         cameraUp: SIMD4<Float>(0, 1, 0, 0), sunParams: SIMD4<Float>(sin(az) * cos(el), sin(el), cos(az) * cos(el), defaults.sunIntensity),
         currentViewProj: vp, prevViewProj: vp, frameIndex: 1, sceneIndex: scene, samplingMode: mode,
         enableSMS: 0, skyMode: 0, enableFog: fog, viewportMode: 0, width: UInt32(width), height: UInt32(height))
@@ -155,7 +155,7 @@ let testOutputDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.environme
     r.target = target; r.distance = distance; r.fov = u.cameraPos.w
     r.pitch = asin(offset.y / distance); r.yaw = atan2(offset.x, -offset.z)
     var o = StudioOptions()
-    o.previewScale = 1; o.depth = u.cameraTarget.w
+    o.previewScale = 1; o.depth = Int(u.cameraTarget.w)
     let sun = SIMD3<Float>(u.sunParams.x, u.sunParams.y, u.sunParams.z)
     if simd_length(sun) > 0 {
         o.sunElevation = asin(sun.y / simd_length(sun)) * 180 / .pi

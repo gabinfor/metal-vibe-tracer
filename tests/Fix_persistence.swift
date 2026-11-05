@@ -332,5 +332,20 @@
   controller.rebuild()
   controller.saveTimer?.invalidate()
   print("PASS: fix-persistence USD open association (R-70)")
+
+  // Path depth and the tone map are integers; projects that stored them as floats open at the truncated value
+  // the renderer used, and are written back as JSON integers.
+  var floatOptions = try JSONSerialization.jsonObject(with: JSONEncoder().encode(StudioOptions())) as! [String: Any]
+  floatOptions["depth"] = 12.7; floatOptions["toneMap"] = 1.0
+  let floatProject = try JSONDecoder().decode(
+    StudioOptions.self, from: JSONSerialization.data(withJSONObject: floatOptions))
+  let rewritten = try JSONSerialization.jsonObject(with: JSONEncoder().encode(floatProject)) as! [String: Any]
+  require(floatProject.depth == 12 && floatProject.toneMap == 1 && "\(rewritten["depth"]!)" == "12",
+    "float path depth \(floatProject.depth) and tone map \(floatProject.toneMap) open as integers")
+  floatOptions["depth"] = 1.5e19
+  require((try? JSONDecoder().decode(
+    StudioOptions.self, from: JSONSerialization.data(withJSONObject: floatOptions))) == nil,
+    "an out-of-range float path depth is rejected")
+  print("PASS: fix-persistence integer options from float projects")
 }
 try fixPersistenceChecks()

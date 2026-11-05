@@ -435,7 +435,7 @@ struct ShowcaseShot: Decodable, Sendable {
   var yaw: Float?, pitch: Float?, distance: Float?, fov: Float?
   var target: [Float]?
   var aperture: Float?, focusDistance: Float?
-  var exposure: Float?, toneMap: Float?
+  var exposure: Float?, toneMap: Int?
   var sunAzimuth: Float?, sunElevation: Float?, sunIntensity: Float?
   var environmentIntensity: Float?, environmentRotation: Float?
   var lightIntensity: Float?, lightSize: Float?
@@ -443,7 +443,7 @@ struct ShowcaseShot: Decodable, Sendable {
   var lightColor: [Float]?
   var width: Int?, height: Int?
   var samples: UInt32?
-  var depth: Float?
+  var depth: Int?
   // Raw linear radiance as OpenEXR, without a denoiser (renderer comparisons).
   var raw: Bool?
   // Open Image Denoise for scripts/render_showcase.py's export; off by default, so documentation and test images
