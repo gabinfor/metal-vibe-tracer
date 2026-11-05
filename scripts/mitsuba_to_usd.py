@@ -16,7 +16,8 @@ MITSUBA3, GULBRANDSEN2014, OPENPBR):
                        multiplies base_color instead)
   dielectric/rough...  transmission_weight 1, specular_ior = int_ior / ext_ior, roughness sqrt(alpha);
                        specular_transmittance as transmission_color, and zero as a black reflector
-  thindielectric       as dielectric (thin walls are not represented)
+  thindielectric       as dielectric, with geometry_thin_walled (OpenPBR's window: reflectance 2R / (1 + R)
+                       and unrefracted transmission, as Mitsuba's); specular_transmittance -> transmission_color
   principledthin       geometry_thin_walled; base_color -> base_color and subsurface_color; diff_trans d
                        (0-2) -> subsurface_weight min(d, 1) and subsurface_scatter_anisotropy max(d - 1, 0),
                        which transmit d / 2 and reflect 1 - d / 2 of the diffuse part, as Mitsuba does;
@@ -32,6 +33,7 @@ MITSUBA3, GULBRANDSEN2014, OPENPBR):
   mask                 geometry_opacity (the app renders it as coverage, like Mitsuba's mask)
   area emitter         emission_color x emission_luminance = radiance (one-sided, like Mitsuba's;
                        rectangles and disks keep Mitsuba's side under mirroring transforms)
+  no BSDF              grey diffuse 0.5, or black on an area emitter (Mitsuba's Shape default)
   envmap / constant    a DomeLight: the latlong file (same convention as USD's), scale as intensity
                        and to_world as its transform; a constant's radiance as its colour
 Mitsuba ids are global, so BSDFs nested in others (e.g. inside a bumpmap) resolve by id.
@@ -387,10 +389,20 @@ def material(node, names):
                 m['specular_weight'] = {'value': weight}
         return m
     if kind in ('dielectric', 'roughdielectric', 'thindielectric'):
-        if kind == 'thindielectric':
-            report.append(f'{names}: thindielectric converted to a solid dielectric')
         eta = ior(node, 'int_ior', 1.5046) / ior(node, 'ext_ior', 1.000277)
         m = {'specular_ior': {'value': eta}, 'specular_roughness': {'value': roughness() if kind == 'roughdielectric' else 0.0}}
+        if kind == 'thindielectric':
+            m.update({'transmission_weight': {'value': 1.0}, 'base_color': {'value': [1, 1, 1]}})
+            # Both reflect 2R / (1 + R) of a pane's two interfaces and pass the rest straight through.
+            m['geometry_thin_walled'] = {'value': True}
+            tint = colour_input(node, 'specular_transmittance', [1, 1, 1])
+            if 'texture' in tint:
+                report.append(f'{names}: thindielectric specular_transmittance texture unsupported; white used')
+            elif min(tint['value']) < 1:
+                m['transmission_color'] = {'value': [min(1.0, c) for c in tint['value']]}
+            if 'texture' in colour_input(node, 'specular_reflectance', [1, 1, 1]) or rgb(prop(node, 'specular_reflectance'), [1, 1, 1]) != [1, 1, 1]:
+                report.append(f'{names}: thindielectric specular_reflectance unsupported; dropped')
+            return m
         # specular_transmittance filters the refracted lobe; zero leaves a black reflector (a TV screen).
         t = rgb(prop(node, 'specular_transmittance'), [1, 1, 1])
         if max(t) <= 0:
@@ -526,7 +538,9 @@ def material_prim(key, node, emission, label, geometry=None):
     if key in materials:
         return materials[key]
     name = ident(label, mat_used)
-    inputs = material(node, label) if node is not None else {'base_color': {'value': [0.5] * 3}, 'specular_weight': {'value': 0.0}}
+    # Without a BSDF, Mitsuba gives a shape a diffuse 0.5, or 0 if it is an emitter (Shape::Shape).
+    default = [0.0] * 3 if emission is not None else [0.5] * 3
+    inputs = material(node, label) if node is not None else {'base_color': {'value': default}, 'specular_weight': {'value': 0.0}}
     if 'bump' in inputs:
         bump = inputs.pop('bump')
         if geometry is not None and geometry[1] is not None:
