@@ -8,7 +8,8 @@ Pinned revision: c91aad1d1ce1693e803f039d7c92c2965c4eb013.
 
 The complete license is provided in Vendor/OpenPBR/LICENSE and in the app bundle
 as OpenPBR-LICENSE. Original copyright and attribution comments remain in the
-vendored files. The generated shader adapts two metal energy lookup functions;
+vendored files. The generated shader adapts two metal energy lookup functions
+and, on thin walls, the scales of the dielectric multiple-scattering lobe;
 see Vendor/OpenPBR/UPSTREAM.md and REFERENCES.md. As a modified file under
 Apache-2.0 section 4(b), the bundled OpenPBR.metal keeps the upstream per-file
 copyright and license comments and begins with a "Modified by Metal Vibe

@@ -10,17 +10,19 @@ header trees, README, and license are vendored. Renderer adapters live in main.s
 The build preprocesses the MSL configuration into a bundled shader resource;
 it does not download or execute upstream build scripts.
 
-Local generated-shader adaptation: scripts/prepare_shaders.py replaces only the
+Local generated-shader adaptations: scripts/prepare_shaders.py replaces the
 ideal-metal energy-complement and average-complement lookup bodies with the
 denser checked-in Shaders/MetalEnergy.metal table. It is regenerated with the
-pinned VNDF/Smith functions by scripts/generate_metal_energy.py. No vendored
-header is modified. See REFERENCES.md (ADOBEOPENPBR) for rationale and validation.
+pinned VNDF/Smith functions by scripts/generate_metal_energy.py. It also removes
+a thin wall's subsurface share from the two scales that openpbr_prepare_lobes
+passes to dielectric_mms_lobe (that share's energy already reaches the thin-wall
+diffuse lobes). No vendored header is modified. See REFERENCES.md (ADOBEOPENPBR) for rationale and validation.
 
 Modification notice (Apache-2.0 section 4(b)): the generated
 build/ShaderResources/OpenPBR.metal, bundled as Contents/Resources/OpenPBR.metal,
 is a modified form of these headers. scripts/prepare_shaders.py preprocesses them
 with `clang -E -P -C`, keeping the upstream per-file copyright and license
 comments, and prefixes the file with a "Modified by Metal Vibe Tracer" line that
-names the preprocessing and the energy-lookup substitution. The upstream-only
+names the preprocessing and both substitutions. The upstream-only
 variant (--upstream-only --output) used by the energy-table generator is never
 bundled. tests/Fix_build.py and tests/Fix_build.swift check these notices.

@@ -332,7 +332,18 @@ struct Material {
     // OpenPBR transmission_color (rgb) and geometry_thin_walled (w > 0) of a MaterialX material
     // (slot_transmission).
     float4 transmissionTint;
+    // Thin-walled OpenPBR subsurface of a MaterialX material: subsurface_color (rgb) and
+    // subsurface_weight (w; 0 without subsurface), and subsurface_scatter_anisotropy
+    // (slot_subsurface_anisotropy).
+    float4 subsurface;
+    float subsurfaceAnisotropy;
 };
+
+// Whether the material scatters into the hemisphere below its geometric normal: transmission, or
+// thin-walled subsurface (diffuse translucency).
+bool material_transmits(Material m) {
+    return m.transmission > 0.0f || (m.usesMaterialX && m.transmissionTint.w > 0.0f && m.subsurface.w > 0.0f);
+}
 
 struct HitRecord {
     float t;
@@ -567,7 +578,7 @@ struct MeshVertex { packed_float3 position; packed_float3 normal; float2 uv; };
 struct MeshFace { uint a, b, c, tag; };
 struct MeshWideNode { float4 lox, loy, loz, hix, hiy, hiz; int4 child; int4 count; };
 struct GraphInstruction { int4 code; float4 value, extra, auxiliary; };
-struct GraphHeader { int4 roots0, roots1, roots2, info; };
+struct GraphHeader { int4 roots0, roots1, roots2, info, roots3; };
 // Material slots (SceneLimits.materials) and MaterialX graph images (SceneLimits.graphImages).
 // Slots 0-7 are the procedural scenes' surfaces; imported materials take 8 and up. Object IDs
 // of imported scene-graph nodes start after the slots (MATERIAL_SLOTS + node index).
@@ -593,9 +604,9 @@ struct MaterialResources {
     // Graph-less (legacy) mesh only: per face, its stored uvc.w (low 16 bits) and na.w (high 16).
     device uint *faceExtras [[id(13)]];
     // Per slot, SLOT_PARAMETERS float4 (MaterialLibrary.slotParameters; docs/VOLUME_DESIGN.md §5): the
-    // spectral OpenPBR parameters (SpectralMaterial), the constant specular_color (slot_specular_color),
-    // the constant transmission_color and geometry_thin_walled (slot_transmission), the emitter record,
-    // colour and shaping (slot_emitter, slot_emitter_rgb, emitter_shaping) and the interior medium (slot_medium).
+    // spectral OpenPBR parameters (SpectralMaterial), the constant specular_color (slot_specular_color) and
+    // subsurface_scatter_anisotropy (slot_subsurface_anisotropy), the constant transmission_color and
+    // geometry_thin_walled (slot_transmission), the emitter record, colour and shaping (slot_emitter, slot_emitter_rgb, emitter_shaping) and the interior medium (slot_medium).
     device float4 *spectralMaterials [[id(14)]];
     // Alpha cutouts: per slot the register of MaterialX geometry_opacity (-1: opaque), then at
     // MATERIAL_SLOTS the number of cutout slots (MaterialLibrary.rebuildArguments).
@@ -607,6 +618,10 @@ struct MaterialResources {
 // program sets it): a metal's 82-degree edge tint, a dielectric's specular tint.
 float3 slot_specular_color(uint slot, constant MaterialResources &images) {
     return slot < MATERIAL_SLOTS ? images.spectralMaterials[SLOT_PARAMETERS * slot + 1].rgb : float3(1.0f);
+}
+// OpenPBR subsurface_scatter_anisotropy of a thin-walled slot (0 unless a MaterialX program sets it).
+float slot_subsurface_anisotropy(uint slot, constant MaterialResources &images) {
+    return slot < MATERIAL_SLOTS ? images.spectralMaterials[SLOT_PARAMETERS * slot + 1].w : 0.0f;
 }
 // OpenPBR transmission_color (rgb) and geometry_thin_walled (w: 1 or 0) of a slot; white and solid
 // unless a MaterialX program sets them.
@@ -2268,6 +2283,8 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
     hit.mat.type=OPENPBR;hit.mat.usesMaterialX=1;
     hit.mat.specularColor=slot_specular_color(hit.mat.slot,images);
     hit.mat.transmissionTint=slot_transmission(hit.mat.slot,images);
+    hit.mat.subsurface=h.roots3.x>=0 ? float4(clamp(values[h.roots3.y].rgb,0.0f,1.0f),clamp(values[h.roots3.x].x,0.0f,1.0f)) : float4(0);
+    hit.mat.subsurfaceAnisotropy=slot_subsurface_anisotropy(hit.mat.slot,images);
     hit.mat.diffuseRoughness=h.info.z>=0 ? clamp(values[h.info.z].x,0.0f,1.0f) : 0.0f;
     hit.mat.albedo=clamp(values[h.roots0.x].rgb,0.0f,1.0f);
     hit.mat.roughness=clamp(values[h.roots0.y].x,0.03f,1.0f);
@@ -2408,6 +2425,12 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
     // A thin-walled surface is always entered from the side the ray arrives on (upstream
     // openpbr_bsdf.h: inside = back_facing && !geometry_thin_walled).
     inputs.geometry_thin_walled = mat.usesMaterialX && mat.transmissionTint.w > 0.0f;
+    // Thin-walled subsurface: diffuse reflection and transmission (upstream thin_wall_diffuse_trans_lobe).
+    if (inputs.geometry_thin_walled) {
+        inputs.subsurface_weight = mat.subsurface.w;
+        inputs.subsurface_color = mat.subsurface.rgb;
+        inputs.subsurface_scatter_anisotropy = mat.subsurfaceAnisotropy;
+    }
     float3 outward = mat.transmission > 0.0f && mat.inside && !inputs.geometry_thin_walled ? -n : n;
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
@@ -2420,13 +2443,14 @@ OpenPBR_PreparedBsdf prepare_openpbr(Material mat, float3 n, float3 wo) {
 // wavelengths it is given (its stochastic-RGB-wavelength mode, used for dispersion and thin film), so
 // `a` holds lanes 0-2 (base colour rho(lambda_0..2) at lambda_0..2) and `b` lane 3. Sampling
 // directions, lobe probabilities and PDFs are those of `a`; `b` only evaluates, and is skipped
-// when every lane would equal lane 0 (a grey base colour without thin film or dispersion). At a
+// when every lane would equal lane 0 (grey base, transmission and subsurface colours without thin film
+// or dispersion). At a
 // dispersive material on a hero path, `a` is prepared at the hero wavelength alone (rough dispersive
 // vertices of the shading pass's spectral MIS use spectral_mis_sample / spectral_mis_eval instead).
 #if VIBE_SPECTRAL
 struct PreparedBsdf { OpenPBR_PreparedBsdf a, b; uint hero; bool flat; };
 OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, float3 baseColor, float3 lambda,
-                                           SpectralMaterial sm, float3 transmissionColor) {
+                                           SpectralMaterial sm, float3 transmissionColor, float3 subsurfaceColor) {
     OpenPBR_ResolvedInputs inputs = openpbr_make_default_resolved_inputs();
     inputs.base_color = baseColor;
     inputs.specular_roughness = max(0.03f, mat.roughness);
@@ -2448,6 +2472,11 @@ OpenPBR_PreparedBsdf prepare_openpbr_lanes(Material mat, float3 n, float3 wo, fl
     inputs.thin_film_ior = sm.thinFilmIOR;
     inputs.transmission_color = transmissionColor;
     inputs.geometry_thin_walled = mat.usesMaterialX && mat.transmissionTint.w > 0.0f;
+    if (inputs.geometry_thin_walled) {
+        inputs.subsurface_weight = mat.subsurface.w;
+        inputs.subsurface_color = subsurfaceColor;
+        inputs.subsurface_scatter_anisotropy = mat.subsurfaceAnisotropy;
+    }
     float3 outward = mat.transmission > 0.0f && mat.inside && !inputs.geometry_thin_walled ? -n : n;
     inputs.geometry_basis = dot(mat.tangent, mat.tangent) > 0.5f && abs(dot(mat.tangent, outward)) < 0.99f
         ? openpbr_make_basis(outward, mat.tangent, 1.0f) : openpbr_make_basis(outward);
@@ -2460,25 +2489,32 @@ Spectrum spectral_transmission(Material mat, thread const Wavelengths &wl) {
     float3 t = mat.usesMaterialX ? clamp(mat.transmissionTint.rgb, 0.0f, 1.0f) : float3(1.0f);
     return t.x == t.y && t.y == t.z ? Spectrum(t.x) : spectral_reflectance(t, wl);
 }
+// Thin-walled subsurface_color at the path's wavelengths, uplifted like a reflectance (zero without subsurface).
+Spectrum spectral_subsurface(Material mat, thread const Wavelengths &wl) {
+    float3 c = mat.usesMaterialX && mat.subsurface.w > 0.0f ? clamp(mat.subsurface.rgb, 0.0f, 1.0f) : float3(0.0f);
+    return c.x == c.y && c.y == c.z ? Spectrum(c.x) : spectral_reflectance(c, wl);
+}
 PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavelengths &wl) {
     SpectralMaterial sm = spectral_material(mat, wl);
     float3 albedo = clamp(mat.albedo, 0.0f, 1.0f);
     Spectrum rho = spectral_albedo(mat, albedo, wl);
     Spectrum tau = spectral_transmission(mat, wl);
+    Spectrum sigma = spectral_subsurface(mat, wl);
     PreparedBsdf p;
     p.hero = 4u;
     if (wl.heroOnly && spectral_dispersive(mat, wl)) {
         p.hero = spectral_hero(wl); p.flat = true;
-        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[p.hero]), float3(spectral_lambda(wl, p.hero)), sm, float3(tau[p.hero]));
+        p.a = prepare_openpbr_lanes(mat, n, wo, float3(rho[p.hero]), float3(spectral_lambda(wl, p.hero)), sm, float3(tau[p.hero]),
+                                    float3(sigma[p.hero]));
         return p;
     }
-    p.flat = albedo.x == albedo.y && albedo.y == albedo.z && all(tau == tau.x)
+    p.flat = albedo.x == albedo.y && albedo.y == albedo.z && all(tau == tau.x) && all(sigma == sigma.x)
         && !(sm.thinFilmWeight > 0.0f) && !spectral_dispersive(mat, wl);
     // The upstream BSDF reads wavelengths only for dispersion and thin film.
     float4 lambda = sm.thinFilmWeight > 0.0f || sm.dispersion > 0.0f ? spectral_lambdas(wl)
         : float4(OpenPBR_BaseRgbWavelengths_nm, OpenPBR_BaseRgbWavelengths_nm.x);
-    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm, tau.xyz);
-    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm, float3(tau.w));
+    p.a = prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm, tau.xyz, sigma.xyz);
+    if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm, float3(tau.w), float3(sigma.w));
     return p;
 }
 Spectrum prepared_lanes(thread const PreparedBsdf &p, float3 a, float b) {
@@ -2528,7 +2564,7 @@ float3 openpbr_emission(Material mat, float3 n, float3 wo) {
 }
 
 Spectrum eval_bsdf(Material mat, float3 n, float3 wo, float3 wi, thread const Wavelengths &wl) {
-    if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return Spectrum(0);
+    if (!material_transmits(mat) && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return Spectrum(0);
     float cosine = abs(dot(n, wi));
     if (cosine < 1e-7f || dot(n, wo) <= 0.0f) return Spectrum(0);
     // Uncoated legacy diffuse is the Lambert limit of the OpenPBR inputs.
@@ -2557,7 +2593,7 @@ Spectrum eval_bsdf_with_pdf(Material mat, float3 n, float3 wo, float3 wi, thread
     if (cosine < 1e-7f || dot(n, wo) <= 0.0f) return Spectrum(0);
     PreparedBsdf prepared = prepare_bsdf(mat, n, wo, wl);
     pdf = prepared_pdf(prepared, wi);
-    if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return Spectrum(0);
+    if (!material_transmits(mat) && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(wi, mat.geometricNormal) <= 0.0f) return Spectrum(0);
     return prepared_eval(prepared, wi) / cosine;
 }
 
@@ -3218,7 +3254,7 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
     float3 random = rand_f3(seed);
     prepared_sample(prepared, random, direction, weight, pdf);
     if (pdf <= 0.0f) return false;
-    if (mat.transmission == 0.0f && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(direction, mat.geometricNormal) <= 0.0f) return false;
+    if (!material_transmits(mat) && dot(mat.geometricNormal, mat.geometricNormal) > 0.5f && dot(direction, mat.geometricNormal) <= 0.0f) return false;
     return all(isfinite(weight)) && all(weight >= 0.0f);
 }
 
@@ -3232,7 +3268,7 @@ bool sample_bsdf(Material mat, float3 normal, float3 incoming, bool frontFace,
 #if VIBE_SPECTRAL
 OpenPBR_PreparedBsdf spectral_mis_lane(Material mat, float3 n, float3 wo, float rho, uint k, thread const Wavelengths &wl) {
     return prepare_openpbr_lanes(mat, n, wo, float3(rho), float3(spectral_lambda(wl, k)), spectral_material(mat, wl),
-                                 float3(spectral_transmission(mat, wl)[k]));
+                                 float3(spectral_transmission(mat, wl)[k]), float3(spectral_subsurface(mat, wl)[k]));
 }
 // f (without cosine) of every lane at wi, scaled as above; pdf = the hero lane's.
 Spectrum spectral_mis_eval(Material mat, float3 n, float3 wo, float3 wi, thread float &pdf, thread const Wavelengths &wl,
@@ -3752,8 +3788,9 @@ struct PrimarySurface {
     uint triangle; float error;                   // HitRecord.triangle and position rounding bound
     packed_float3 emission;                       // Material.emission (MaterialX emission for OPENPBR)
     packed_float3 view;                           // primary ray direction (ReSTIR PT shifts into this pixel)
+    uint2 subsurface;                             // Material.subsurface as half4 (thin-walled colour, weight)
 };
-static_assert(sizeof(PrimarySurface) == 128, "Swift allocates 128-byte primary surfaces");
+static_assert(sizeof(PrimarySurface) == 136, "Swift allocates 136-byte primary surfaces");
 
 PrimarySurface store_primary_surface(HitRecord hit, float3 view = float3(0.0f)) {
     PrimarySurface s;
@@ -3767,6 +3804,7 @@ PrimarySurface store_primary_surface(HitRecord hit, float3 view = float3(0.0f)) 
     s.coatRoughness = m.coatRoughness; s.specularWeight = m.specularWeight;
     s.baseWeight = m.baseWeight; s.diffuseRoughness = m.diffuseRoughness;
     s.emission = m.emission; s.view = view;
+    s.subsurface = as_type<uint2>(half4(m.usesMaterialX ? m.subsurface : float4(0.0f)));
     return s;
 }
 
@@ -3787,6 +3825,8 @@ HitRecord load_primary_surface(PrimarySurface s, float4 positionDepth, constant 
     m.usesMaterialX = (s.flags & 512u) != 0 ? 1u : 0u;
     m.specularColor = slot_specular_color(m.slot, images);
     m.transmissionTint = slot_transmission(m.slot, images);
+    m.subsurface = float4(as_type<half4>(s.subsurface));
+    m.subsurfaceAnisotropy = slot_subsurface_anisotropy(m.slot, images);
     m.inside = !hit.front_face; m.geometricNormal = s.geometricNormal;
     hit.mat = m;
     return hit;
@@ -4524,7 +4564,7 @@ Spectrum pt_eval(thread const PTBsdf &b, float3 wi, thread float &pdf, thread co
     if (cosine < 1e-7f || dot(b.normal, b.wo) <= 0.0f) return Spectrum(0.0f);
     pdf = prepared_pdf(b.prepared, wi);
     float3 g = b.mat.geometricNormal;
-    if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(wi, g) <= 0.0f) return Spectrum(0.0f);
+    if (!material_transmits(b.mat) && dot(g, g) > 0.5f && dot(wi, g) <= 0.0f) return Spectrum(0.0f);
     return prepared_eval(b.prepared, wi) / cosine;
 }
 template <typename R>
@@ -4535,7 +4575,7 @@ bool pt_sample(thread const PTBsdf &b, float3 incoming, bool frontFace, thread R
     prepared_sample(b.prepared, random, direction, weight, pdf);
     if (pdf <= 0.0f) return false;
     float3 g = b.mat.geometricNormal;
-    if (b.mat.transmission == 0.0f && dot(g, g) > 0.5f && dot(direction, g) <= 0.0f) return false;
+    if (!material_transmits(b.mat) && dot(g, g) > 0.5f && dot(direction, g) <= 0.0f) return false;
     return all(isfinite(weight)) && all(weight >= 0.0f);
 }
 
@@ -8104,7 +8144,8 @@ final class MaterialLibrary {
     // spectralOverrides replaces a slot's (test scenes).
     var spectralOverrides: [Int: SIMD4<Float>] = [:] { didSet { bindingsDirty = true } }
     // Per slot, MaterialLibrary.slotStride float4 (MSL SLOT_PARAMETERS; docs/VOLUME_DESIGN.md §5): the spectral
-    // OpenPBR parameters (MSL SpectralMaterial), the constant specular_color (rgb; MSL slot_specular_color), the
+    // OpenPBR parameters (MSL SpectralMaterial), the constant specular_color (rgb; MSL slot_specular_color) and thin-walled
+    // subsurface_scatter_anisotropy (w; MSL slot_subsurface_anisotropy), the
     // constant transmission_color (rgb) and geometry_thin_walled (w; MSL slot_transmission), the emitter
     // record, colour and shaping (EmitterLight.slotParameters; MSL slot_emitter, emitter_shaping), and a
     // interior medium (MaterialXProgram.medium: transmission_scatter, depth; then anisotropy and the boundary flag).
@@ -8117,7 +8158,8 @@ final class MaterialLibrary {
             let tint = program?.specularColor ?? SIMD3(repeating: 1)
             let transmission = SIMD4(program?.transmissionColor ?? SIMD3(repeating: 1), program?.thinWalled == true ? 1 : 0)
             let emitter = emitterLights[slot].map { $0.slotParameters(observer: observer) } ?? EmitterLight.noSlotParameters
-            return [spectralOverrides[slot] ?? program?.spectral ?? MaterialXProgram.noSpectral, SIMD4(tint, 0), transmission]
+            return [spectralOverrides[slot] ?? program?.spectral ?? MaterialXProgram.noSpectral,
+                    SIMD4(tint, program?.subsurfaceAnisotropy ?? 0), transmission]
                 + emitter + [program?.medium ?? .zero,
                              SIMD4(program?.mediumAnisotropy ?? 0, program?.mediumBoundary == true ? 1 : 0,
                                    program?.mediumRayleigh == true ? 1 : 0, 0)]
@@ -8563,7 +8605,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
         // Reservoir splatting (HONG2026): per pixel an activation mask (4 B), SplatLayers (48 B) and a
         // splat source (8 B); per deep-domain slot a splat source (8 B) and, in each of two pools,
-        // a SplatDomain (32 B), a PrimarySurface (128 B) and the active reuse's reservoirs (DI 48 B,
+        // a SplatDomain (32 B), a PrimarySurface (136 B) and the active reuse's reservoirs (DI 48 B,
         // GI 64 B, PT 64 B and its 16 B ReSTCV estimate), with one slot per
         // PathTracerRenderer.splatSlotDivisor pixels.
         static func splatBytesPerPixel(_ mode: IndirectReuse) -> UInt64 {
@@ -8864,7 +8906,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var gbufferNormalMat: MTLTexture?
     var gbufferAlbedoRough: MTLTexture?
     // MSL PrimarySurface per pixel: pass 1 writes it; shading and MetalFX guides read it.
-    nonisolated static let primarySurfaceStride: UInt64 = 128
+    nonisolated static let primarySurfaceStride: UInt64 = 136
     private(set) var primarySurfaces: MTLBuffer?
     var accumTexture: MTLTexture?
     var sampleTexture: MTLTexture?

@@ -46,6 +46,7 @@
         m.slot = 5; m.metalness = 0.61f; m.coat = 0.23f; m.anisotropy = 0.71f; m.fuzz = 0.19f;
         m.transmission = 0.43f; m.tangent = hit.tangent; m.coatRoughness = 0.29f; m.specularWeight = 0.83f;
         m.baseWeight = 0.91f; m.diffuseRoughness = 0.13f; m.usesMaterialX = 1; m.inside = true;
+        m.subsurface = float4(0.25f, 0.5f, 0.75f, 0.625f);  // exact in the cache's half precision
         m.geometricNormal = hit.geometricNormal;
         hit.mat = m;
         HitRecord r = load_primary_surface(store_primary_surface(hit), float4(hit.position, hit.t), images);
@@ -57,7 +58,8 @@
             q.fuzz == m.fuzz && q.transmission == m.transmission && all(q.tangent == m.tangent) &&
             q.coatRoughness == m.coatRoughness && q.specularWeight == m.specularWeight &&
             q.baseWeight == m.baseWeight && q.diffuseRoughness == m.diffuseRoughness &&
-            q.usesMaterialX == m.usesMaterialX && q.inside == m.inside && all(q.geometricNormal == m.geometricNormal);
+            q.usesMaterialX == m.usesMaterialX && q.inside == m.inside && all(q.geometricNormal == m.geometricNormal) &&
+            all(q.subsurface == m.subsurface);
         HitRecord light = hit; light.front_face = true;
         light.mat.type = EMISSIVE; light.mat.emission = float3(18, 15, 9); light.mat.usesMaterialX = 0;
         HitRecord e = load_primary_surface(store_primary_surface(light), float4(light.position, light.t), images);

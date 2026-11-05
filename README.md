@@ -128,7 +128,7 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 | **Light sampling** | A light BVH chooses among an imported scene's emitters by their likely contribution at each point, so scenes with many lights converge faster. |
 | **Light transport** | Spectral (default) or RGB. CIE illuminant presets, per-light spectra (blackbody, presets, laser lines), dispersion, and thin film. |
 | **Participating media** | Homogeneous haze and object interiors (OpenPBR `transmission_*`), Henyey-Greenstein scattering, an optional Rayleigh λ⁻⁴ law, and spot and beam lights (UsdLux `ShapingAPI`). |
-| **Materials** | OpenPBR surfaces, image textures with anisotropic filtering, normal and bump maps, alpha cutouts, thin-walled glass, and a subset of MaterialX graphs. |
+| **Materials** | OpenPBR surfaces, image textures with anisotropic filtering, normal and bump maps, alpha cutouts, thin-walled glass and translucency, and a subset of MaterialX graphs. |
 | **Scenes** | Six procedural test scenes, five bundled spectral examples, OBJ import with MTL materials, and OpenUSD import with hierarchy, instances, materials, lights and cameras. Scene size is limited by the Mac's GPU memory, not fixed caps. |
 | **Acceleration** | Two-level instancing on Metal hardware ray tracing, with an exact software 4-wide BVH as a fallback. |
 | **Camera and lighting** | Thin-lens depth of field, procedural skies, HDRI environments, and editable area lights. |

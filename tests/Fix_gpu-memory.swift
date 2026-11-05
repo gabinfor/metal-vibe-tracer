@@ -62,8 +62,9 @@
     ("GraphInstruction", ["code", "value", "extra", "auxiliary"],
      offsets(GraphInstruction.self, [\GraphInstruction.code, \GraphInstruction.value, \GraphInstruction.extra,
       \GraphInstruction.auxiliary])),
-    ("GraphHeader", ["roots0", "roots1", "roots2", "info"],
-     offsets(GraphHeader.self, [\GraphHeader.roots0, \GraphHeader.roots1, \GraphHeader.roots2, \GraphHeader.info])),
+    ("GraphHeader", ["roots0", "roots1", "roots2", "info", "roots3"],
+     offsets(GraphHeader.self, [\GraphHeader.roots0, \GraphHeader.roots1, \GraphHeader.roots2, \GraphHeader.info,
+      \GraphHeader.roots3])),
   ]
   var layoutBody = "", layoutCount = 0
   for (type, fields, _) in layouts {

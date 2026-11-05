@@ -10,7 +10,8 @@ volpath integrator (see the reference render below). A cached reference EXR is r
 after changing the integrator or the scene. Writes metrics like
 scripts/compare_mitsuba.py and a side-by-side image (app | Mitsuba | relative block difference).
 Differences come from the material mapping documented in mitsuba_to_usd.py (OpenPBR's
-energy-compensated rough lobes, Beckmann as GGX, solid thin glass) and from noise; see
+energy-compensated rough lobes, Beckmann as GGX, solid thin glass, Lambertian instead of principledthin's
+Disney diffuse reflection) and from noise; see
 REFERENCES.md BITTERLI2016 and scripts/mitsuba_probes.py for bisecting a difference.
 """
 import argparse

@@ -12,7 +12,7 @@
   // Layout: the mode occupies former padding, within the 336-byte stride (304 before the medium uniforms).
   require(MemoryLayout<Uniforms>.stride == 336 && MemoryLayout<Uniforms>.offset(of: \Uniforms.indirectReuse) == 228
       && MemoryLayout<Uniforms>.offset(of: \Uniforms.jitter) == 232, "Uniforms.indirectReuse sits at offset 228 of the 336-byte uniforms")
-  require(PathTracerRenderer.primarySurfaceStride == 128 && PathTracerRenderer.ptReservoirStride == 64, "128-byte primary surfaces, 64-byte path reservoirs")
+  require(PathTracerRenderer.primarySurfaceStride == 136 && PathTracerRenderer.ptReservoirStride == 64, "136-byte primary surfaces, 64-byte path reservoirs")
   let environmentDefault: IndirectReuse = ["gi": .restirGI, "pt": .restirPT, "unified": .restirPTUnified][
     ProcessInfo.processInfo.environment["VIBE_INDIRECT_REUSE"] ?? ""] ?? .automatic
   require(PathTracerRenderer.defaultIndirectReuse == environmentDefault, "the default indirect reuse follows the VIBE_INDIRECT_REUSE test seam")
@@ -147,7 +147,7 @@
   let layout = gpu.makeBuffer(length: 16, options: .storageModeShared)!
   try run("pt_layout", width: 1) { $0.setBuffer(layout, offset: 0, index: 0) }
   let sizes = (0..<4).map { layout.contents().load(fromByteOffset: $0 * 4, as: UInt32.self) }
-  require(sizes == [336, 228, 64, 128], "MSL Uniforms.indirectReuse, PTReservoir and PrimarySurface match the Swift layout: \(sizes)")
+  require(sizes == [336, 228, 64, 136], "MSL Uniforms.indirectReuse, PTReservoir and PrimarySurface match the Swift layout: \(sizes)")
 
   let units = gpu.makeBuffer(length: 11 * 4, options: .storageModeShared)!
   try run("pt_units", width: 1) { $0.setBuffer(units, offset: 0, index: 0) }
@@ -292,7 +292,7 @@
         && (renderer.ptIndirect?.width == mw) == pt && (renderer.ptDuplication?.width == mw) == pt
         && (renderer.ptReservoirs?.length ?? 0) == (pt ? mw * mh * 64 : 0) && (renderer.ptShifts?.length ?? 0) == (pt ? mw * mh * (renderer.activeSpatialNeighbors == .stochasticPairwise
             ? PathTracerRenderer.spmisShiftBytesPerPixel : 48) : 0)
-        && (renderer.historyPrimarySurfaces?.length ?? 0) == (pt ? mw * mh * 128 : 0)
+        && (renderer.historyPrimarySurfaces?.length ?? 0) == (pt ? mw * mh * 136 : 0)
         && (renderer.ptControls?.length ?? 0) == (pt ? mw * mh * 16 : 0),
       "\(reuse) allocates exactly its reservoir sets; the others are placeholders")
     let plan = PathTracerRenderer.FrameResourcePlan(width: mw, height: mh, usesReSTIR: true, usesMetalFX: false, indirectReuse: reuse)
@@ -300,11 +300,11 @@
     print("\(reuse): resident frame \(Int(resident)) B, plan \(Int(planned)) B")
     require(resident >= 0.95 * planned && resident <= 1.1 * planned, "\(reuse): the resource plan matches the resident frame")
   }
-  // 322 B of ReSTIR PT resources and the 16 B ReSTCV estimate (RESTCV2026).
-  require(PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPT) == 96 + 338
-      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPTUnified) == 338
+  // 330 B of ReSTIR PT resources and the 16 B ReSTCV estimate (RESTCV2026).
+  require(PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPT) == 96 + 346
+      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirPTUnified) == 346
       && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.restirGI) == 208
-      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.automatic) == 338, "reservoir bytes per pixel per mode")
+      && PathTracerRenderer.FrameResourcePlan.reservoirBytesPerPixel(.automatic) == 346, "reservoir bytes per pixel per mode")
   renderer.indirectReuse = .restirGI
   _ = render(makeUniforms(scene: 1, mode: 0, width: mw, height: mh), samples: 1)
   renderer.indirectReuse = .restirPTUnified
