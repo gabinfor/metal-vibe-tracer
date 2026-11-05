@@ -166,7 +166,7 @@
     let capacity = PathTracerRenderer.splatCapacity(width: mw, height: mh)
     let usesDI = reuse != .restirPTUnified, usesGI = reuse == .restirGI, usesPT = reuse != .restirGI
     let pool = renderer.splatCurrent!
-    require(pool.capacity == capacity && pool.domains.length == capacity * 32 && pool.surfaces.length == capacity * 128
+    require(pool.capacity == capacity && pool.domains.length == capacity * 32 && pool.surfaces.length == capacity * 136
         && (pool.di?.length ?? 0) == (usesDI ? capacity * 48 : 0) && (pool.gi?.length ?? 0) == (usesGI ? capacity * 64 : 0)
         && (pool.pt?.length ?? 0) == (usesPT ? capacity * 64 : 0) && (pool.controls?.length ?? 0) == (usesPT ? capacity * 16 : 0)
         && renderer.splatLayers!.length == mw * mh * 48
@@ -178,9 +178,9 @@
     require(resident >= 0.95 * planned && resident <= 1.1 * planned, "\(reuse): the splatting resource plan matches the resident frame")
   }
   // ReSTIR PT pools also hold 16 B ReSTCV estimates (RESTCV2026).
-  require(PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirGI) == 198
-      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPT) == 206
-      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPTUnified) == 182,
+  require(PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirGI) == 202
+      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPT) == 210
+      && PathTracerRenderer.FrameResourcePlan.splatBytesPerPixel(.restirPTUnified) == 186,
     "reservoir-splatting bytes per pixel per mode")
   renderer.temporalReuse = .reprojection
   _ = render(makeUniforms(scene: 1, mode: 0, width: mw, height: mh), samples: 1)

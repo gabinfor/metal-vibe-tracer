@@ -1,6 +1,6 @@
 // Synthetic, locally authored fixtures exercise the actual importer and Metal evaluator.
 require(
-  MemoryLayout<GraphInstruction>.stride == 64 && MemoryLayout<GraphHeader>.stride == 64,
+  MemoryLayout<GraphInstruction>.stride == 64 && MemoryLayout<GraphHeader>.stride == 80,
   "graph CPU/GPU layouts")
 let mxFolder = testOutputDirectory.appendingPathComponent("materialx", isDirectory: true)
 try FileManager.default.createDirectory(at: mxFolder, withIntermediateDirectories: true)

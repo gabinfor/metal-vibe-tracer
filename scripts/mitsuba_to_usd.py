@@ -16,6 +16,15 @@ MITSUBA3, GULBRANDSEN2014, OPENPBR):
                        multiplies base_color instead)
   dielectric/rough...  transmission_weight 1, specular_ior = int_ior / ext_ior, roughness sqrt(alpha)
   thindielectric       as dielectric (thin walls are not represented)
+  principledthin       geometry_thin_walled; base_color -> base_color and subsurface_color; diff_trans d
+                       (0-2) -> subsurface_weight min(d, 1) and subsurface_scatter_anisotropy max(d - 1, 0),
+                       which transmit d / 2 and reflect 1 - d / 2 of the diffuse part, as Mitsuba does;
+                       spec_trans -> transmission_weight and specular_weight (Mitsuba's specular reflection
+                       is weighted by spec_trans; a constant base_color tints the transmission);
+                       roughness -> specular_roughness (alpha = roughness^2 in both); eta -> specular_ior.
+                       Mitsuba's diffuse reflection is Disney's (Schlick retro-reflection), OpenPBR's
+                       Lambertian; the transmission is Lambertian in both. anisotropic, spec_tint, sheen
+                       and flatness are reported and dropped
   twosided             its inner BSDF (the app's meshes are two-sided)
   bumpmap              its inner BSDF; the height texture becomes a tangent-space normal map
                        (bump_normal_map); normalmap passes its texture to geometry_normal
@@ -266,6 +275,42 @@ def colour_input(node, name, default):
 
 # ------------------------------------------------------------------------------------------------
 # BSDF -> OpenPBR inputs.
+def scalar(node, name, default, names):
+    """A constant float property; a texture is reported and replaced by the default."""
+    p = prop(node, name)
+    if p is None:
+        return default
+    if p.tag in ('texture', 'ref'):
+        report.append(f'{names}: {name} texture unsupported; {default} used')
+        return default
+    return float(value(p.get('value')))
+
+
+def principled_thin(node, names):
+    """Mitsuba principledthin as a thin-walled OpenPBR surface (see the module docstring)."""
+    base = colour_input(node, 'base_color', [0.5] * 3)
+    d = min(2.0, max(0.0, scalar(node, 'diff_trans', 0.0, names)))
+    s = min(1.0, max(0.0, scalar(node, 'spec_trans', 0.0, names)))
+    m = {'geometry_thin_walled': {'value': True}, 'base_color': base,
+         'specular_roughness': {'value': scalar(node, 'roughness', 0.5, names)},
+         'specular_ior': {'value': scalar(node, 'eta', 1.5, names)}, 'specular_weight': {'value': s}}
+    if d > 0:
+        m['subsurface_weight'] = {'value': min(d, 1.0)}
+        m['subsurface_color'] = base
+        if d > 1:
+            m['subsurface_scatter_anisotropy'] = {'value': d - 1}
+    if s > 0:
+        m['transmission_weight'] = {'value': s}
+        if 'texture' in base:
+            report.append(f'{names}: principledthin textured base_color does not tint its specular transmission')
+        elif min(base['value']) < 1:
+            m['transmission_color'] = {'value': [min(1.0, c) for c in base['value']]}
+    for name in ('anisotropic', 'spec_tint', 'sheen', 'flatness'):
+        if scalar(node, name, 0.0, names) != 0:
+            report.append(f'{names}: principledthin {name} unsupported; dropped')
+    return m
+
+
 def material(node, names):
     node = resolve(node)
     kind = node.get('type')
@@ -344,6 +389,8 @@ def material(node, names):
         eta = ior(node, 'int_ior', 1.5046) / ior(node, 'ext_ior', 1.000277)
         return {'transmission_weight': {'value': 1.0}, 'base_color': {'value': [1, 1, 1]}, 'specular_ior': {'value': eta},
                 'specular_roughness': {'value': roughness() if kind == 'roughdielectric' else 0.0}}
+    if kind == 'principledthin':
+        return principled_thin(node, names)
     report.append(f'{names}: BSDF {kind} unsupported; grey diffuse used')
     return {'base_color': {'value': [0.5] * 3}, 'specular_weight': {'value': 0.0}}
 
@@ -487,7 +534,8 @@ def material_prim(key, node, emission, label, geometry=None):
     images = []
     normal_maps = []
     for key2, v in inputs.items():
-        typ = 'color3f' if key2 in ('base_color', 'specular_color', 'emission_color') else 'float'
+        typ = ('color3f' if key2 in ('base_color', 'specular_color', 'emission_color', 'subsurface_color', 'transmission_color')
+               else 'bool' if key2 == 'geometry_thin_walled' else 'float')
         if 'normalmap' in v:
             lines.append(f'            float3 inputs:{key2}.connect = </Scene/Materials/{name}/Tex_{key2}_map.outputs:out>')
             normal_maps.append((key2, v['normalmap']))
@@ -501,6 +549,8 @@ def material_prim(key, node, emission, label, geometry=None):
         elif typ == 'color3f':
             c = v['value']
             lines.append(f'            {typ} inputs:{key2} = ({c[0]:.9g}, {c[1]:.9g}, {c[2]:.9g})')
+        elif typ == 'bool':
+            lines.append(f'            bool inputs:{key2} = {int(v["value"])}')
         else:
             lines.append(f'            {typ} inputs:{key2} = {v["value"]:.9g}')
     lines += ['            token outputs:out', '        }']

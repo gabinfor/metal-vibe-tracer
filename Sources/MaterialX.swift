@@ -15,6 +15,8 @@ struct GraphHeader {
   var roots1 = SIMD4<Int32>(repeating: -1)
   var roots2 = SIMD4<Int32>(repeating: -1)
   var info = SIMD4<Int32>(repeating: 0)
+  // Thin-walled subsurface_weight and subsurface_color registers (-1: none), then two unused.
+  var roots3 = SIMD4<Int32>(repeating: -1)
 }
 struct MaterialXImage: Codable {
   var name: String
@@ -53,6 +55,14 @@ struct MaterialXProgram: Codable {
   // stored per slot like specular_color (MaterialLibrary.slotParameters).
   var transmissionColor: SIMD3<Float>?
   var thinWalled: Bool?
+  // Thin-walled OpenPBR subsurface (diffuse translucency; ADOBEOPENPBR thin_wall_diffuse_trans_lobe):
+  // registers holding subsurface_weight and subsurface_color, constant or connected, or nil when the
+  // weight is unauthored or constant 0; and the constant subsurface_scatter_anisotropy, which splits
+  // the scattered light into transmission (anisotropy + 1) / 2 and reflection (nil for 0), stored per
+  // slot (MaterialLibrary.slotParameters). Solid surfaces reject subsurface (no volumetric scattering).
+  var subsurfaceWeight: Int32?
+  var subsurfaceColor: Int32?
+  var subsurfaceAnisotropy: Float?
   // Constant OpenPBR interior-medium inputs (docs/VOLUME_DESIGN.md §4; ADOBEOPENPBR
   // openpbr_create_volume_from_openpbr_params): transmission_scatter (rgb) and transmission_depth (w, metres);
   // nil when transmission_depth is zero (no medium). transmission_scatter_anisotropy, and whether the surface
@@ -84,6 +94,12 @@ struct MaterialXProgram: Codable {
     if let root = opacity, !(0..<instructions.count).contains(Int(root)) {
       throw MaterialLibrary.error("Invalid opacity output.")
     }
+    for root in [subsurfaceWeight, subsurfaceColor] {
+      if let root, !(0..<instructions.count).contains(Int(root)) { throw MaterialLibrary.error("Invalid subsurface output.") }
+    }
+    guard (subsurfaceWeight == nil) == (subsurfaceColor == nil), subsurfaceWeight == nil || thinWalled == true,
+      subsurfaceAnisotropy.map({ $0.isFinite && (-1...1).contains($0) }) ?? true
+    else { throw MaterialLibrary.error("Invalid thin-walled subsurface.") }
     for (i, n) in instructions.enumerated() {
       guard (0...11).contains(n.code.x),
         [n.value, n.extra, n.auxiliary].allSatisfy({ v in
@@ -413,7 +429,7 @@ private final class MXCompiler {
     guard let e = input else {
       return try constant(
         v, name: label,
-        components: label.map { $0.hasSuffix("base_color") || $0.hasSuffix("emission_color") } == true ? 3 : 1)
+        components: label.map { ["base_color", "emission_color", "subsurface_color"].contains(where: $0.hasSuffix) } == true ? 3 : 1)
     }
     if e.attributes["channels"] != nil || e.attributes["unit"] != nil {
       try fail(
@@ -754,6 +770,30 @@ private final class MXCompiler {
     let boundary = constantValue("specular_weight", 1) == 0 && constantValue("transmission_weight", 0) == 1
     return (SIMD4(scatter.x, scatter.y, scatter.z, depth), anisotropy == 0 ? nil : anisotropy, boundary ? true : nil)
   }
+  // Thin-walled subsurface (MaterialXProgram.subsurfaceWeight): subsurface_weight and subsurface_color, constant
+  // or connected, compile to registers unless the weight is unauthored or constant 0; subsurface_scatter_anisotropy
+  // is a constant. subsurface_radius and subsurface_radius_scale have no effect on thin walls and may be constants.
+  func subsurfaceInputs(_ shader: MXElement) throws -> (weight: Int32?, color: Int32?, anisotropy: Float?) {
+    for name in ["subsurface_radius", "subsurface_radius_scale", "subsurface_scatter_anisotropy"] {
+      if let input = shader.input(name), linked(input) { try fail("\(name) must be a constant.") }
+    }
+    var anisotropy: Float?
+    if let input = shader.input("subsurface_scatter_anisotropy") {
+      guard input.attributes["type"] == "float" else { try fail("subsurface_scatter_anisotropy must be a float.") }
+      let g = try numbers(input, fallback: .zero).x
+      guard (-1...1).contains(g) else { try fail("subsurface_scatter_anisotropy must be within -1 to 1.") }
+      if g != 0 { anisotropy = g }
+    }
+    guard let weight = shader.input("subsurface_weight") else { return (nil, nil, anisotropy) }
+    let color = shader.input("subsurface_color")
+    guard weight.attributes["type"] == "float", color.map({ $0.attributes["type"] == "color3" }) ?? true else {
+      try fail("Invalid surface input type for subsurface.")
+    }
+    if !linked(weight), try numbers(weight, fallback: .zero).x == 0 { return (nil, nil, anisotropy) }
+    let w = try value(weight, default: .zero, label: shader.name + "/subsurface_weight")
+    let c = try value(color, default: SIMD4(0.8, 0.8, 0.8, 0), label: shader.name + "/subsurface_color")
+    return (w, c, anisotropy)
+  }
   func compile(_ shader: MXElement, source: String) throws -> MaterialXProgram {
     let inputs: [(String, SIMD4<Float>)] = [
       ("base_color", SIMD4(0.8, 0.8, 0.8, 0)), ("specular_roughness", SIMD4(repeating: 0.3)),
@@ -790,12 +830,24 @@ private final class MXCompiler {
       }
       spectralValues[name] = v
     }
+    var thinWalled: Bool?
+    if let input = shader.input("geometry_thin_walled") {
+      guard input.attributes["type"] == "boolean", !linked(input) else {
+        try fail("geometry_thin_walled must be a constant boolean.")
+      }
+      if try numbers(input, fallback: .zero).x > 0 { thinWalled = true }
+    }
+    // Thin walls turn subsurface into diffuse reflection and transmission (subsurfaceInputs); the radius
+    // inputs only shape the volumetric scattering of solid surfaces, which is not supported.
+    let subsurfaceNames = ["subsurface_weight", "subsurface_color", "subsurface_radius", "subsurface_radius_scale",
+                           "subsurface_scatter_anisotropy"]
     for i in shader.children
     where i.category == "input"
       && !["base_diffuse_roughness", "emission_luminance", "emission_color", "geometry_opacity", "specular_color",
            "transmission_color", "geometry_thin_walled", "transmission_depth", "transmission_scatter",
            "transmission_scatter_anisotropy"].contains(i.name)
       && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
+      && !(thinWalled == true && subsurfaceNames.contains(i.name))
     {
       // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
       let frames = ["geometry_tangent": "Tworld", "geometry_coat_normal": "Nworld", "geometry_coat_tangent": "Tworld"]
@@ -807,13 +859,14 @@ private final class MXCompiler {
         }
         continue
       }
+      let volumetric = "\(i.name) on a solid surface (volumetric subsurface scattering) is not supported; set geometry_thin_walled for diffuse translucency."
       guard let fallback = defaults[i.name], !linked(i) else {
-        try fail("Unsupported surface input \(i.name).")
+        try fail(subsurfaceNames.contains(i.name) ? volumetric : "Unsupported surface input \(i.name).")
       }
       let v = try numbers(i, fallback: fallback)
       let n = i.attributes["type"] == "color3" ? 3 : 1
       guard (0..<n).allSatisfy({ abs(v[$0] - fallback[$0]) < 1e-6 }) else {
-        try fail("Non-default \(i.name) is not supported.")
+        try fail(i.name == "subsurface_weight" ? volumetric : "Non-default \(i.name) is not supported.")
       }
     }
     var roots: [Int32] = []
@@ -868,7 +921,7 @@ private final class MXCompiler {
       guard (0..<3).allSatisfy({ c[$0].isFinite && c[$0] >= 0 && c[$0] <= 1 }) else { try fail("specular_color must be within 0-1.") }
       if (0..<3).contains(where: { abs(c[$0] - 1) > 1e-6 }) { specularColor = SIMD3(c.x, c.y, c.z) }
     }
-    // transmission_color and geometry_thin_walled: constants, stored per slot like specular_color.
+    // transmission_color: a constant, stored per slot like specular_color (as is geometry_thin_walled, read above).
     var transmissionColor: SIMD3<Float>?
     if let input = shader.input("transmission_color") {
       guard input.attributes["type"] == "color3", !linked(input) else {
@@ -878,13 +931,7 @@ private final class MXCompiler {
       guard (0..<3).allSatisfy({ c[$0].isFinite && c[$0] >= 0 && c[$0] <= 1 }) else { try fail("transmission_color must be within 0-1.") }
       if (0..<3).contains(where: { abs(c[$0] - 1) > 1e-6 }) { transmissionColor = SIMD3(c.x, c.y, c.z) }
     }
-    var thinWalled: Bool?
-    if let input = shader.input("geometry_thin_walled") {
-      guard input.attributes["type"] == "boolean", !linked(input) else {
-        try fail("geometry_thin_walled must be a constant boolean.")
-      }
-      if try numbers(input, fallback: .zero).x > 0 { thinWalled = true }
-    }
+    let subsurface: (Int32?, Int32?, Float?) = try thinWalled == true ? subsurfaceInputs(shader) : (nil, nil, nil)
     var program = MaterialXProgram(
       name: shader.name, source: source, instructions: nodes, roots: roots, images: images,
       parameters: parameters, diffuseRoughness: diffuseRoot, emission: emissionRoot)
@@ -892,6 +939,7 @@ private final class MXCompiler {
     program.specularColor = specularColor
     program.transmissionColor = transmissionColor
     program.thinWalled = thinWalled
+    (program.subsurfaceWeight, program.subsurfaceColor, program.subsurfaceAnisotropy) = subsurface
     (program.medium, program.mediumAnisotropy, program.mediumBoundary) = try mediumInputs(shader)
     let scale = spectralValues["transmission_dispersion_scale"] ?? 0
     let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
@@ -1027,6 +1075,7 @@ extension MaterialLibrary {
       header.info = SIMD4(
         Int32(instructions.count), Int32(program.instructions.count), program.diffuseRoughness ?? -1,
         program.emission ?? -1)
+      header.roots3 = SIMD4(program.subsurfaceWeight ?? -1, program.subsurfaceColor ?? -1, -1, -1)
       headers[slot] = header
       for var node in program.instructions {
         if node.code.x == 2 { node.value.x = Float(imageIndices[Int(node.value.x)]) }

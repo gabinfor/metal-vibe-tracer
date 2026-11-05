@@ -32,7 +32,7 @@
     && ControlVariates.automatic.resolved(indirectReuse: .restirGI, spatialNeighbors: .compatibility) == .off,
     "ReSTIR GI runs without ReSTCV")
   require(PathTracerRenderer.ptControlStride == 16
-    && PathTracerRenderer.FrameResourcePlan.ptReservoirBytesPerPixel == 2 * 64 + 3 * 16 + 16 + 128 + 2 + 16,
+    && PathTracerRenderer.FrameResourcePlan.ptReservoirBytesPerPixel == 2 * 64 + 3 * 16 + 16 + 136 + 2 + 16,
     "ReSTCV adds a 16-byte estimate per pixel to the ReSTIR PT resources")
 
   let kernels = """

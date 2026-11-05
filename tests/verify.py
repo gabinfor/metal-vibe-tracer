@@ -56,6 +56,7 @@ PARTS = [
     ('Fix_build.swift', ALL), ('Fix_swift6.swift', ALL),
     ('Fix_renderer-followups.swift', {'full'}),
     ('Fix_shaderball-emission.swift', {'full'}),
+    ('Fix_thin-translucency.swift', {'full'}),
     ('Fix_usd-lighting.swift', {'full', 'usd'}),
     ('Fix_accel.swift', ALL),
     ('Fix_compat-neighbors.swift', {'full'}),

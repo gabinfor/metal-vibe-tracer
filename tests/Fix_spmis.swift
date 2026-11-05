@@ -124,7 +124,8 @@
   let gw = 20, gh = 12
   let diffuseType: Float = 0, glossyType: Float = 1, emissiveType: Float = 3  // MSL MaterialType
   var positions = [SIMD4<Float>](), normals = [SIMD4<Float>](), di = [SIMD4<Float>](), gi = [SIMD4<Float>]()
-  var surfaceWords = [UInt32](repeating: 0, count: gw * gh * 32)
+  let surfaceStride = Int(PathTracerRenderer.primarySurfaceStride) / 4  // PrimarySurface in 32-bit words
+  var surfaceWords = [UInt32](repeating: 0, count: gw * gh * surfaceStride)
   let normalChoices: [SIMD3<Float>] = [SIMD3(0, 0, 1), SIMD3(0.6, 0, 0.8), SIMD3(-0.6, 0, 0.8), SIMD3(0, 1, 0)]
   for i in 0..<(gw * gh) {
     let kind = Int(uniform() * 10)
@@ -132,7 +133,7 @@
     let type: Float = emitter ? emissiveType : kind < 4 ? glossyType : diffuseType
     positions.append(SIMD4(0, 0, 0, miss ? -1 : 1 + uniform()))
     normals.append(SIMD4(normalChoices[Int(uniform() * 4) % 4], miss ? -1 : type))
-    surfaceWords[i * 32 + 3] = UInt32(type) | (UInt32(uniform() < 0.3 ? 7 : 2) << 16)
+    surfaceWords[i * surfaceStride + 3] = UInt32(type) | (UInt32(uniform() < 0.3 ? 7 : 2) << 16)
     let W: Float = uniform() < 0.2 ? 0 : 0.5 + uniform()
     di.append(SIMD4(4 * uniform(), 1 + Float(Int(uniform() * 20)), W, 0))
     gi.append(SIMD4(2 * uniform(), 1 + Float(Int(uniform() * 20)), uniform() < 0.5 ? W : 0, 0))
@@ -189,7 +190,7 @@
     guard positions[i].w > 0, normals[i].w != emissiveType else { return nil }
     let n = SIMD3<Float>(Float(Float16(normals[i].x)), Float(Float16(normals[i].y)), Float(Float16(normals[i].z)))
     let q = (0..<3).map { UInt32(max(-2, min(1, Int((n[$0] * 2).rounded(.down)))) + 2) }
-    return UInt32(normals[i].w) & 15 | q[0] << 4 | q[1] << 6 | q[2] << 8 | (surfaceWords[i * 32 + 3] >> 16) << 10
+    return UInt32(normals[i].w) & 15 | q[0] << 4 | q[1] << 6 | q[2] << 8 | (surfaceWords[i * surfaceStride + 3] >> 16) << 10
   }
   var cellsOK = true, slotsSeen = Set<Int>(), multiPixelCells = 0
   for i in 0..<(gw * gh) {

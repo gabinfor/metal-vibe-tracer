@@ -153,7 +153,7 @@ As implemented, 8 float4 per slot (`SLOT_PARAMETERS`, `MaterialLibrary.slotStrid
 | i | Content |
 | --- | --- |
 | 0 | `SpectralMaterial` (dispersion, thin-film weight, thickness, IOR) |
-| 1 | `specular_color` (rgb) |
+| 1 | `specular_color` (rgb), w = thin-walled `subsurface_scatter_anisotropy` |
 | 2 | `transmission_color` (rgb), w = thin-walled |
 | 3 | emitter spectrum: kind (0 inherit, 1 preset, 2 blackbody, 3 narrow band), a, b, 1 / luminance |
 | 4 | the emitter spectrum's linear sRGB at luminance one (RGB transport) |

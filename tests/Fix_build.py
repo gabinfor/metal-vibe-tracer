@@ -126,14 +126,15 @@ def check_shaders():
         upstream = root / "upstream.metal"
         run([sys.executable, str(root / "scripts/prepare_shaders.py"), "--upstream-only", "--output", str(upstream)])
         assert not (root / "build/ShaderResources/OpenPBR.metal").exists(), "upstream-only output stays private"
-        assert "vibe_metal_energy" not in upstream.read_text()
+        assert "vibe_metal_energy" not in upstream.read_text() and "thin_wall_weight * sss" not in upstream.read_text()
         run([sys.executable, str(root / "scripts/prepare_shaders.py")])
         shipped = (root / "build/ShaderResources/OpenPBR.metal").read_text()
         assert "Modified by Metal Vibe Tracer" in shipped and "{ return vibe_metal_energy(alpha, cos_theta); }" in shipped
+        assert "tinted_trans_including_sss - vec3(thin_wall_weight * sss))" in shipped, "thin-wall multiple-scattering adaptation"
         headers = len(re.findall(r"Licensed under the Apache License", shipped))
         assert headers >= 10, f"upstream per-file license comments retained ({headers})"
         assert not list((root / "build/ShaderResources").glob("*.partial")), "atomic write leaves no temporary"
-    print("PASS: shader preparation keeps upstream notices and never publishes the upstream-only variant")
+    print("PASS: shader preparation keeps upstream notices, applies its adaptations and never publishes the upstream-only variant")
 
 
 check_oidn()

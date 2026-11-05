@@ -6,8 +6,9 @@ Usage:
       MODE flat: every BSDF becomes a two-sided diffuse 0.5; drop:KIND: only BSDFs containing KIND
       (e.g. roughconductor) are flattened. Nested BSDF ids keep a flattened copy, since Mitsuba ids
       are global. A scene that matches when flattened has no transport or emitter error.
-  build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py plate OUTDIR NAME front|back 'BSDF XML'
-      A 1.2 x 1.2 plate with the given BSDF over a grey floor under a large area light.
+  build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py plate OUTDIR NAME front|back|backlit 'BSDF XML'
+      A 1.2 x 1.2 plate with the given BSDF over a grey floor under a large area light; backlit puts the
+      light behind the plate, so the camera sees only light the plate transmits (and the lit floor).
   build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py glint OUTDIR NAME 'BSDF XML'
       The plate reflecting a small, bright disk light in its mirror direction.
 Compare a written scene with: scripts/compare_scene.py SCENE --scale 1 --out build/mitsuba-probes/results.
@@ -68,9 +69,10 @@ HEAD = '''<scene version="3.0.0">
 
 def probe(outdir, name, bsdf, side='front', glint=False):
     out = pathlib.Path(outdir) / name; out.mkdir(parents=True, exist_ok=True)
-    rot = '' if side == 'front' else '<rotate y="1" angle="180"/>'
-    # A mask cannot be nested in twosided (it transmits); write it as given, with the id added.
-    probe_bsdf = (bsdf.replace('<bsdf type="mask"', '<bsdf type="mask" id="probe"', 1) if bsdf.lstrip().startswith('<bsdf type="mask"')
+    rot = '<rotate y="1" angle="180"/>' if side == 'back' else ''
+    # Transmitting BSDFs (mask, principledthin) cannot be nested in twosided; write them as given, with the id added.
+    kind = next((k for k in ('mask', 'principledthin') if bsdf.lstrip().startswith(f'<bsdf type="{k}"')), None)
+    probe_bsdf = (bsdf.replace(f'<bsdf type="{kind}"', f'<bsdf type="{kind}" id="probe"', 1) if kind
                   else f'<bsdf type="twosided" id="probe">{bsdf}</bsdf>')
     body = f'''  {probe_bsdf}
   <shape type="rectangle"><transform name="to_world">{rot}<scale value="1.2"/></transform><ref id="probe"/></shape>
@@ -80,7 +82,10 @@ def probe(outdir, name, bsdf, side='front', glint=False):
     <emitter type="area"><rgb name="radiance" value="200, 200, 200"/></emitter></shape>
 '''
     radiance = '0.5, 0.5, 0.5' if glint else '4, 4, 4'
-    body += f'''  <shape type="rectangle"><transform name="to_world"><scale x="2.5" y="1.2"/><rotate x="1" angle="200"/><translate y="2.2" z="5"/></transform>
+    # The large light faces the plate's front, or, backlit, its back (hidden behind it from the camera).
+    place = '<translate z="-2.5"/>' if side == 'backlit' else '<rotate x="1" angle="200"/><translate y="2.2" z="5"/>'
+    size = '<scale value="0.8"/>' if side == 'backlit' else '<scale x="2.5" y="1.2"/>'
+    body += f'''  <shape type="rectangle"><transform name="to_world">{size}{place}</transform>
     <emitter type="area"><rgb name="radiance" value="{radiance}"/></emitter></shape>
 </scene>'''
     (out / 'scene.xml').write_text(HEAD + body)
