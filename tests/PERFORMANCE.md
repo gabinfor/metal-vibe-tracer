@@ -1,3 +1,15 @@
+# Mitsuba 3 at equal settings — November 5, 2026
+
+Apple M4, 16 GB, macOS 27. Bitterli's Mitsuba 3 versions (`BITTERLI2016`) of the Grey & White Room (the Fireplace Room, sky map `Sky 19.exr` turned 90°) and the White Room (the Living Room, four area lights), each rendered as the same scene by both renderers: Mitsuba 3.9.1 (`metal_ad_rgb`) from the XML, the app from `scripts/mitsuba_to_usd.py`'s USD through `scripts/render_showcase.py` (raw EXR export, Standard MIS, RGB transport, no denoiser). 640×360, 256 spp, path depth 64 and 32 (Mitsuba `max_depth` 65 and 33, the scenes' own). Mitsuba times are the median of three `mi.render` calls after a 1-spp warm-up (kernels compiled, scene loaded); the app's are its export wall time in whole seconds (scene restored, export set-up included). Noise is the luminance MSE weighted by 1/(L_ref² + 0.01), against each renderer's own reference (Mitsuba 16,384 spp `volpath`; the app 2,048 spp, corrected by 8/7 for its 256 samples being the reference's first 256: repeated renders are bit-identical). Bias is the app's 2,048-spp image against Mitsuba's reference.
+
+| Scene | Mitsuba `volpath` | Mitsuba `path` | App | Noise at 256 spp, Mitsuba / app | Mitsuba time to the app's noise | Mean ratio | 8×8-block ratio, 5–50–95th percentile |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Fireplace Room (sky) | 4.7 s (12.4 M samples/s) | 4.0 s | 29 s (2.0 M/s) | 1.40e-2 / 3.09e-2 | 2.2 s (13× less than the app) | 1.002 | 0.976–1.009–1.108 |
+| Living Room (area lights) | 10.1 s (5.8 M/s) | 4.2 s | 31–36 s (1.6–1.9 M/s) | 5.81e-3 / 1.27e-2 | 4.6 s (7× less) | 0.993 | 0.948–0.991–1.010 |
+
+- At equal samples the app's noise is 2.2× Mitsuba's in both scenes, and it traces 3–6× fewer samples per second than `volpath` (6–7× fewer than `path`, which renders `mask` reflections at opacity², see `MITSUBA3`), so Mitsuba reaches the app's 256-spp noise 7–13× sooner. The app's imported-scene defaults (ReSTIR PT, spectral) took 72 and 76 s for the same 256 spp.
+- Bias: the sky is placed as in Mitsuba (dome rotation, `OPENUSD`). Floor and wall patches lit by the sun through the Fireplace Room's window glass are 22–44% brighter in the app at 256 and 2,048 spp alike, so this is not noise; the Living Room agrees to within 5% outside noise once its `specular_transmittance 0` TV screen converts as a black reflector.
+
 # Light tree — November 4, 2026
 
 `python3 scripts/measure_light_sampling.py --sequences 4` (Apple M4, 16 GB, macOS 27; `LightSampling`, [docs/LIGHT_TREE_DESIGN.md](../docs/LIGHT_TREE_DESIGN.md)). Every imported README shot at 320×180, preview scale 1, its own strategy and render modes (ReSTIR PT, spectral): linear MSE of 64 accumulated frames against the average of a 1,024-frame power reference and a 1,024-frame light-tree reference, mean of 4 sequences per selection, alternating; median GPU frame time; equal time = tree MSE × time / (power MSE × time). Emitters counts the emitter triangles; tree nodes 0 is power sampling (no emitters, or the build keeps them all in one leaf).

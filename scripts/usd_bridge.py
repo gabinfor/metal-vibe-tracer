@@ -565,10 +565,17 @@ def import_stage(filename,directory,frame=None):
                 if environment:report.append(path+': additional dome light skipped');continue
                 intensity=float(light.GetIntensityAttr().Get(time))*2**float(light.GetExposureAttr().Get(time))
                 layout=str(light.GetTextureFormatAttr().Get(time) or 'automatic')
+                # The dome's +Y pole and longitude 0 (+Z) in the app's Y-up space: its turn about the pole is
+                # the environment rotation. The app's latlong puts +X at the image centre, USD's +Z, so a dome
+                # turned by a about +Y is the app's rotation a - 90 degrees.
+                world=cache.GetLocalToWorldTransform(prim)*conversion
+                pole=normalize(vec(world.TransformDir(Gf.Vec3d(0,1,0))));front=vec(world.TransformDir(Gf.Vec3d(0,0,1)))
+                rotation=(math.degrees(math.atan2(front[0],front[2]))-90+180)%360-180
                 if asset and asset.path:
+                    if pole[1]<0.999:report.append(path+': dome pole tilted from +Y; only its turn about +Y is applied')
                     if layout not in ('automatic','latlong'):report.append(path+': dome texture format '+layout+' is unsupported (latlong only); dome skipped');continue
-                    environment={'file':MaterialTranslator(stage,time,directory,report).asset(asset),'intensity':intensity}
-                    report.append(path+': dome texture imported; dome transform/color not applied')
+                    environment={'file':MaterialTranslator(stage,time,directory,report).asset(asset),'intensity':intensity,'rotation':rotation}
+                    report.append(path+': dome texture imported, turned %g degrees about +Y; dome color not applied'%rotation)
                 else:
                     environment={'file':constant_environment(directory,vec(light.GetColorAttr().Get(time))),'intensity':intensity}
                     report.append(path+': untextured dome imported as a constant-color environment')
