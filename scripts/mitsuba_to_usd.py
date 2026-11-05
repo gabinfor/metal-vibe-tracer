@@ -14,7 +14,8 @@ MITSUBA3, GULBRANDSEN2014, OPENPBR):
                        (OpenPBR's F82-tint Fresnel), both from Mitsuba's own conductor Fresnel at the
                        named or given (eta, k); specular_reflectance -> specular_weight (a texture
                        multiplies base_color instead)
-  dielectric/rough...  transmission_weight 1, specular_ior = int_ior / ext_ior, roughness sqrt(alpha)
+  dielectric/rough...  transmission_weight 1, specular_ior = int_ior / ext_ior, roughness sqrt(alpha);
+                       specular_transmittance as transmission_color, and zero as a black reflector
   thindielectric       as dielectric (thin walls are not represented)
   principledthin       geometry_thin_walled; base_color -> base_color and subsurface_color; diff_trans d
                        (0-2) -> subsurface_weight min(d, 1) and subsurface_scatter_anisotropy max(d - 1, 0),
@@ -31,6 +32,8 @@ MITSUBA3, GULBRANDSEN2014, OPENPBR):
   mask                 geometry_opacity (the app renders it as coverage, like Mitsuba's mask)
   area emitter         emission_color x emission_luminance = radiance (one-sided, like Mitsuba's;
                        rectangles and disks keep Mitsuba's side under mirroring transforms)
+  envmap / constant    a DomeLight: the latlong file (same convention as USD's), scale as intensity
+                       and to_world as its transform; a constant's radiance as its colour
 Mitsuba ids are global, so BSDFs nested in others (e.g. inside a bumpmap) resolve by id.
 Textures: bitmap files keep their path (sRGB unless raw); checkerboards are baked to PNG.
 """
@@ -387,8 +390,15 @@ def material(node, names):
         if kind == 'thindielectric':
             report.append(f'{names}: thindielectric converted to a solid dielectric')
         eta = ior(node, 'int_ior', 1.5046) / ior(node, 'ext_ior', 1.000277)
-        return {'transmission_weight': {'value': 1.0}, 'base_color': {'value': [1, 1, 1]}, 'specular_ior': {'value': eta},
-                'specular_roughness': {'value': roughness() if kind == 'roughdielectric' else 0.0}}
+        m = {'specular_ior': {'value': eta}, 'specular_roughness': {'value': roughness() if kind == 'roughdielectric' else 0.0}}
+        # specular_transmittance filters the refracted lobe; zero leaves a black reflector (a TV screen).
+        t = rgb(prop(node, 'specular_transmittance'), [1, 1, 1])
+        if max(t) <= 0:
+            return {**m, 'base_color': {'value': [0, 0, 0]}}
+        m.update({'transmission_weight': {'value': 1.0}, 'base_color': {'value': [1, 1, 1]}})
+        if min(t) < 1:
+            m['transmission_color'] = {'value': t}
+        return m
     if kind == 'principledthin':
         return principled_thin(node, names)
     report.append(f'{names}: BSDF {kind} unsupported; grey diffuse used')
@@ -612,6 +622,33 @@ for i, node in enumerate(scene_xml.iter('shape')):
     shapes_out += lines
 
 out += shapes_out
+
+# Scene-level emitters: envmap and constant become a DomeLight. Mitsuba's envmap and USD's latlong
+# dome share their convention (+Y pole, +Z at the image centre, +X at a quarter), so the file and the
+# to_world rotation carry over unchanged; scale is the dome's intensity.
+domes = 0
+for node in scene_xml:
+    if node.tag != 'emitter':
+        continue
+    kind = node.get('type')
+    if kind not in ('envmap', 'constant') or domes:
+        report.append(f'emitter {kind} unsupported; skipped' if kind not in ('envmap', 'constant') else f'additional {kind} skipped')
+        continue
+    domes += 1
+    m = transform(prop(node, 'to_world'))
+    lines = ['    def DomeLight "Environment"', '    {']
+    if kind == 'envmap':
+        file = (root_dir / value(prop(node, 'filename').get('value'))).resolve()
+        scale = float(value(prop(node, 'scale').get('value'))) if prop(node, 'scale') is not None else 1.0
+        lines += [f'        asset inputs:texture:file = @{file}@', '        token inputs:texture:format = "latlong"',
+                  f'        float inputs:intensity = {scale:.9g}']
+    else:
+        c = rgb(prop(node, 'radiance'), [1, 1, 1])
+        lines += [f'        color3f inputs:color = ({c[0]:.9g}, {c[1]:.9g}, {c[2]:.9g})', '        float inputs:intensity = 1']
+    lines += ['        matrix4d xformOp:transform = ' + '(' + ', '.join('(' + ', '.join(f'{m[r][c]:.9g}' for r in range(4)) + ')' for c in range(4)) + ')',
+              '        uniform token[] xformOpOrder = ["xformOp:transform"]', '    }']
+    out += lines
+
 out += ['    def Scope "Materials"', '    {']
 for _, (_, lines) in materials.items():
     out += ['    ' + l for l in lines]

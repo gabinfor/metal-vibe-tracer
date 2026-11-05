@@ -2239,6 +2239,10 @@ float3 tangent_space_normal(thread const HitRecord &hit, float3 m) {
 // each register's coordinates scale with them (1 at texcoord).
 void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, TextureFootprint footprint) {
     GraphHeader h=images.graphHeaders[hit.mat.slot]; if(h.info.y==0) return;
+    // A cutout slot reads its images at mip 0, like its coverage (material_cut): a coarser mip would
+    // average in the colours of cut-out texels (often white or black in foliage maps), which the
+    // surviving texels would then reflect. Diffuse bounces widen the cone to whole-leaf footprints.
+    if(images.opacityRoots[hit.mat.slot]>=0) footprint=TextureFootprint{float2(0),float2(0)};
     float4 values[64]; float2 densities[64];
     for(int i=0;i<h.info.y;++i) {
         GraphInstruction n=images.graphInstructions[h.info.x+i];

@@ -87,7 +87,7 @@ def cross3(t):
  a,b,c=t['a'][:3],t['b'][:3],t['c'][:3];u=[b[i]-a[i] for i in range(3)];v=[c[i]-a[i] for i in range(3)]
  return [u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]]
 def triangle_area(t):return math.sqrt(sum(x*x for x in cross3(t)))/2
-for name in ['many-colors.usda','robust.usda','focus.usda','power.usda','dome-format.usda','colorspace.usda','varname.usda']:(out/name).unlink(missing_ok=True)
+for name in ['many-colors.usda','robust.usda','focus.usda','power.usda','dome-format.usda','dome-plain.usda','dome-turn.usda','colorspace.usda','varname.usda']:(out/name).unlink(missing_ok=True)
 robust=Usd.Stage.CreateNew(str(out/'robust.usda'));UsdGeom.SetStageMetersPerUnit(robust,1)
 g=UsdGeom.Mesh.Define(robust,'/Good');g.CreatePointsAttr([(0,0,0),(1,0,0),(1,1,0),(0,1,0),(2,0,0)]);g.CreateSubdivisionSchemeAttr('none')
 g.CreateFaceVertexCountsAttr([4,4,3,2,4,4]);g.CreateFaceVertexIndicesAttr([0,1,2,3, 1,1,1,1, 0,1,4, 0,1, 0,2,1,3, 0,1,2,2])
@@ -152,6 +152,15 @@ fmt=Usd.Stage.CreateNew(str(out/'dome-format.usda'));quad(fmt,'/Q');d=UsdLux.Dom
 df=bridge.import_stage(str(out/'dome-format.usda'),out);check(df['environment'] is None and any('dome texture format mirroredBall is unsupported' in l for l in df['report']),df['report'])
 # MaterialX image color spaces come from USD metadata; unsupported spaces fall back with the prim path.
 png(out/'texel.png',(128,64,255))
+# A textured dome's turn about +Y becomes the app's environment rotation: USD's latlong centre faces +Z, the app's +X,
+# so an unturned dome is -90 degrees and one turned 90 degrees (as Bitterli's living room sky) is 0. A constant dome
+# looks the same at any turn and keeps 0.
+check(rb['environment'].get('rotation') is None,rb['environment'])
+for name,turn in (('dome-plain.usda',None),('dome-turn.usda',90)):
+    st=Usd.Stage.CreateNew(str(out/name));quad(st,'/Q');d=UsdLux.DomeLight.Define(st,'/Dome');d.CreateTextureFileAttr('texel.png')
+    if turn is not None:d.AddRotateYOp().Set(turn)
+    st.GetRootLayer().Save();dt=bridge.import_stage(str(out/name),out)
+    check(abs(dt['environment']['rotation']-(-90 if turn is None else 0))<1e-6 and not any('tilted' in l for l in dt['report']),dt['environment'])
 cs=Usd.Stage.CreateNew(str(out/'colorspace.usda'));UsdGeom.SetStageMetersPerUnit(cs,1)
 for name,space,x in [('Srgb','srgb_texture',0),('Aces','acescg',2)]:
  mat=UsdShade.Material.Define(cs,'/Looks/'+name);surf=UsdShade.Shader.Define(cs,'/Looks/'+name+'/Surface');surf.CreateIdAttr('ND_open_pbr_surface_surfaceshader')
@@ -184,7 +193,7 @@ if other:
  run=subprocess.run([other,'-I',str(ROOT/'scripts/usd_bridge.py'),str(out/'robust.usda'),str(out/'unused.json')],capture_output=True,text=True)
  check(run.returncode==1 and 'requires /usr/bin/python3 CPython 3.9' in run.stderr and 'Traceback' not in run.stderr,run.stderr)
 else:print('SKIP: no non-3.9 python3 found for the interpreter guard check')
-print('PASS: USD degenerate faces, placeholder meshes, zero-scale subtrees, light APIs/power/clamp, fallback colors, constant dome, focus, color spaces, varname, interpreter guard')
+print('PASS: USD degenerate faces, placeholder meshes, zero-scale subtrees, light APIs/power/clamp, fallback colors, constant dome, dome rotation, focus, color spaces, varname, interpreter guard')
 # Bulk Vt array conversion (rows, indexed vec) gives the same snapshot bytes as converting one Gf
 # value per corner, for float and half primvars, vertex/uniform/faceVarying interpolation, left-handed
 # winding, holes, a concave face, material colors, a camera and a light; and it is much faster.
