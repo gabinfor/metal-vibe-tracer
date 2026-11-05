@@ -41,7 +41,7 @@
     \tNs 10
     \tNi 1.5
     \tmap_Kd -s 2 3 -o 0.5 0 tex\\leaf.png
-    newmtl Stone
+    newmtl DirtyGlass
     \tKd 0.5 0.4 0.3
     \tTr 0.25
     \tillum 1
@@ -75,9 +75,25 @@
     newmtl Case
     \td 0.4
     \tTf 0.25 0.25 0.25
+    newmtl Table
+    \tillum 4
+    \tKd 0.00 0.00 0.00
+    \tTf 1.00 1.00 1.00
+    \tmap_Kd tex/stone.png
+    newmtl Brass
+    \tillum 4
+    \tKd 0.0 0.0 0.00
+    \tTf 1.00 1.00 1.00
+    \tKs 0.85 0.78 0.55
+    \tNs 5
+    newmtl Lampshade
+    \tKd 1 1 1
+    \td 0.5
+    \tmap_Kd tex/stone.png
     """
   let materials = try OBJMaterials.read(mtl, report: &report)
-  require(materials.map(\.name) == ["Leaf", "Stone", "Lamp", "Pane", "Bottle", "Tile", "Mirror", "Case"], "MTL materials: \(materials.map(\.name))")
+  require(materials.map(\.name) == ["Leaf", "DirtyGlass", "Lamp", "Pane", "Bottle", "Tile", "Mirror", "Case", "Table", "Brass", "Lampshade"],
+    "MTL materials: \(materials.map(\.name))")
   require(materials[3].tf == SIMD3(0.2, 0.3, 0.4) && materials[3].transmits && materials[4].transmits && !materials[2].transmits
     && materials[5].transparencyModel && !materials[5].transmits && materials[5].maps["map_kd"]?.range == SIMD2(0.2, 0.5),
     "MTL Tf and transparency models (Tf 1 transmits nothing)")
@@ -97,7 +113,7 @@
     && text.contains("value=\"2.0, 3.0\"") && text.contains("name=\"geometry_opacity\" type=\"float\" nodename=\"m0_alpha\"")
     && text.contains("name=\"emission_color\" type=\"color3\" value=\"2.0, 2.0, 1.0\""),
     "MTL to MaterialX translation:\n\(text)")
-  require(!report.contains { $0.contains("illum 5") || $0.contains("-mm") } && !report.contains { $0.contains("illum 7") || $0.contains("illum 4") }
+  require(!report.contains { $0.contains("illum 5") || $0.contains("-mm") } && !report.contains { $0.contains("illum 7") || $0.contains("illum 4 rendered") }
     && report.contains { $0.contains("alpha channel of tex/leaf.png") },
     "MTL reports illum and alpha coverage: \(report)")
   // Glass (illum 4/6/7/9): smooth transmission filtered by 1 - Tf; Ni 1 ("light does not bend") is thin-walled;
@@ -117,12 +133,27 @@
   require(mirror.contains("name=\"base_metalness\" type=\"float\" value=\"0.95\"")
     && report.contains { $0.contains("Mirror: illum 3 reflection") } && !report.contains { $0.contains("illum 3 rendered") },
     "MTL illum 3 mirror is metal:\n\(mirror)")
-  // Dissolve glass is filtered by 1 - Tf too (Stone, without Tf, stays white).
+  // Opaque illum 4 (Tf 1) keeps its ray-traced reflection: black Kd with a strong, tinted Ks is metal of Ks's
+  // colour. Kd 0 beside map_Kd is the exporters' texture-driven colour: the map alone, not black.
+  let table = shaders.first { $0.hasPrefix("name=\"m8\"") } ?? "", brass = shaders.first { $0.hasPrefix("name=\"m9\"") } ?? ""
+  require(table.contains("name=\"base_color\" type=\"color3\" nodename=\"m8_kd\"") && !text.contains("m8_kd_tint"),
+    "MTL Kd 0 with map_Kd uses the map:\n\(table)")
+  let brassTint = SIMD3<Float>(repeating: 0) * (1 - 0.85) + SIMD3<Float>(0.85, 0.78, 0.55) / 0.85 * 0.85
+  require(brass.contains("name=\"base_metalness\" type=\"float\" value=\"0.85\"")
+    && brass.contains("name=\"base_color\" type=\"color3\" value=\"\(brassTint.x), \(brassTint.y), \(brassTint.z)\"")
+    && report.contains { $0.contains("Brass: illum 4 reflection") },
+    "MTL opaque illum 4 brass is metal:\n\(brass)")
+  // Dissolve glass is filtered by 1 - Tf too (DirtyGlass, without Tf, stays white).
   let glassCase = shaders.first { $0.hasPrefix("name=\"m7\"") } ?? ""
   let stoneShader = shaders.first { $0.hasPrefix("name=\"m1\"") } ?? ""
   require(glassCase.contains("name=\"transmission_color\" type=\"color3\" value=\"0.75, 0.75, 0.75\"")
     && stoneShader.contains("transmission_weight") && !stoneShader.contains("transmission_color"),
     "MTL dissolve glass transmits 1 - Tf:\n\(glassCase)")
+  // Textured dissolve not named glass (the Living Room's paper lampshade) is partial coverage, not glass.
+  let shade = shaders.first { $0.hasPrefix("name=\"m10\"") } ?? ""
+  require(shade.contains("name=\"geometry_opacity\" type=\"float\" value=\"0.5\"") && !shade.contains("transmission")
+    && report.contains { $0.contains("Lampshade: textured constant dissolve d 0.5 rendered as coverage") },
+    "MTL textured dissolve is coverage:\n\(shade)")
   require(pane.contains("name=\"transmission_weight\" type=\"float\" value=\"1.0\"")
     && pane.contains("name=\"transmission_color\" type=\"color3\" value=\"0.8, 0.7, 0.6\"")
     && pane.contains("name=\"geometry_thin_walled\" type=\"boolean\" value=\"true\"")
@@ -170,7 +201,7 @@
     vt 0 1
     usemtl Leaf
     f 1/1 2/2 3/3
-    usemtl Stone
+    usemtl DirtyGlass
     f 1/1 3/3 2/2
     usemtl Missing
     f 2/2 3/3 1/1
@@ -184,11 +215,11 @@
   _ = try document.appendOBJ(Data(obj.utf8), name: "scene.obj", folder: folder, skipped: &skipped, report: &report)
   let graph = document.graph!, state = document.scenes[6]!
   func slot(_ name: String) -> Int { graph.materials.first { $0.name == name }!.slot }
-  let leaf = state.materialX?[slot("Leaf")], stone = state.materialX?[slot("Stone")]
-  // Stone's constant dissolve (Tr 0.25) without a mask is glass, not coverage; Leaf's alpha mask stays coverage.
+  let leaf = state.materialX?[slot("Leaf")], stone = state.materialX?[slot("DirtyGlass")]
+  // DirtyGlass's constant dissolve (Tr 0.25) without a mask is glass, not coverage; Leaf's alpha mask stays coverage.
   require(leaf?.opacity != nil && leaf?.images.count == 1 && stone?.opacity == nil && stone?.thinWalled == true
-    && stone?.images.count == 2 && report.contains { $0.contains("Stone: constant dissolve d 0.75 rendered as glass") }
-    && state.materialX?[slot("Missing")] == nil && state.surfaces[slot("Stone")].color == SIMD4(0.5, 0.4, 0.3, 1),
+    && stone?.images.count == 2 && report.contains { $0.contains("DirtyGlass: constant dissolve d 0.75 rendered as glass") }
+    && state.materialX?[slot("Missing")] == nil && state.surfaces[slot("DirtyGlass")].color == SIMD4(0.5, 0.4, 0.3, 1),
     "OBJ import compiles MTL programs: leaf \(String(describing: leaf?.images.count)), stone \(String(describing: stone?.images.count))")
   let paneProgram = state.materialX?[slot("Pane")], bottleProgram = state.materialX?[slot("Bottle")]
   require(paneProgram?.transmissionColor.map { simd_length($0 - SIMD3(0.8, 0.7, 0.6)) < 1e-6 } == true && paneProgram?.thinWalled == true

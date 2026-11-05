@@ -1163,6 +1163,61 @@ try fixMaterialSlotChecks()
     print("\(mode) partial opacity 0.25: \(stopped) of camera rays and \(shadowed) of shadow rays stop on the quad")
     require(abs(stopped - 0.25) < 0.02 && abs(shadowed - 0.25) < 0.02, "\(mode): partial opacity is unbiased coverage")
   }
-  print("PASS: fix-accel opacity cutouts and partial coverage on \(modes.map { "\($0)" }.joined(separator: ", ")) traversal")
+  // Colour beside a cutout: the base colour map is (white, black), the inverse of the mask, so the
+  // cut-out half is white, like the margins of foliage maps (Bitterli's Grey & White Room leaves).
+  // With a whole-texture footprint (a diffuse bounce's cone), the opaque half of the cutout material
+  // keeps its own black texel, as Mitsuba's mask does, while the same map on an opaque material is
+  // still filtered to the white-black average. Before mip 0 for cutout slots, the black half shaded
+  // at about 0.5, and the plants of that room lit their wall and floor up to 44% too bright.
+  let paint = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 3,
+    hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 6, bitsPerPixel: 24)!
+  for c in 0..<3 { paint.bitmapData![c] = 255; paint.bitmapData![3 + c] = 0 }
+  try paint.representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent("paint.png"))
+  let painted = try MaterialXImporter.read(Data("""
+    <materialx version="1.39">
+     <image name="mask" type="float"><input name="file" type="filename" value="mask.png"/></image>
+     <image name="paint" type="color3"><input name="file" type="filename" value="paint.png"/></image>
+     <open_pbr_surface name="PaintedCut" type="surfaceshader"><input name="base_color" type="color3" nodename="paint"/>
+      <input name="geometry_opacity" type="float" nodename="mask"/></open_pbr_surface>
+     <open_pbr_surface name="Painted" type="surfaceshader"><input name="base_color" type="color3" nodename="paint"/></open_pbr_surface>
+    </materialx>
+    """.utf8), baseURL: folder, source: "Painted.mtlx")
+  let paintedCut = painted.materials.first { $0.name == "PaintedCut" }, paintedSolid = painted.materials.first { $0.name == "Painted" }
+  require(paintedCut?.opacity != nil && paintedSolid != nil && paintedSolid?.opacity == nil, "painted cutout and opaque materials compile")
+  state.materialX = [cutMaterial.slot: paintedCut!, solidMaterial.slot: paintedSolid!]
+  let colorKernels = """
+    kernel void cutout_color(constant Uniforms &u [[buffer(0)]], constant SurfaceSettings *settings [[buffer(1)]],
+        constant MaterialResources &images [[buffer(2)]], device float4 *out [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+        Ray r = {float3(id == 0 ? 0.75f : 0.25f, 3, 0.5f), float3(0, -1, 0)}; HitRecord h;
+        if (!trace_scene(r, 6, h, images, u)) { out[id] = float4(-1); return; }
+        resolve_material(h, r, u, settings, images, 4.0f);
+        out[id] = float4(h.mat.albedo, h.t);
+    }
+    """
+  let colorLibrary = try gpu.makeLibrary(source: metalSource + colorKernels, options: shaderCompileOptions())
+  let colorPipeline = try gpu.makeComputePipelineState(function: colorLibrary.makeFunction(name: "cutout_color")!)
+  for mode in modes {
+    let l = try MaterialLibrary(device: gpu, function: testRenderer.materialFunction)
+    l.acceleration = mode
+    try l.restore(state)
+    try l.setMesh(graph)
+    l.hasSceneGraph = true
+    var u = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
+    u.environment = SIMD4(0, 0, 0, Float(l.nodeCount)); u.lens.z = 1; u.sunParams.w = 0
+    let out = gpu.makeBuffer(length: 32, options: .storageModeShared)!
+    let command = testRenderer.commandQueue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(colorPipeline)
+    require(l.bind(encoder), "cutout colour probe binds scene resources")
+    encoder.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+    encoder.setBuffer(out, offset: 0, index: 3)
+    encoder.dispatchThreads(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 2, height: 1, depth: 1))
+    encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+    require(command.status == .completed, "cutout colour probe GPU command")
+    let v = out.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2)
+    let ok = abs(v[0].w - 2) < 1e-4 && simd_reduce_max(SIMD3(v[0].x, v[0].y, v[0].z)) < 0.02
+      && abs(v[1].w - 3) < 1e-4 && abs(v[1].x - 0.5) < 0.1
+    require(ok, "\(mode): a wide footprint keeps a cutout's colour at its own texel and filters an opaque map (\(v[0]), \(v[1]))")
+  }
+  print("PASS: fix-accel opacity cutouts, partial coverage and cutout colour on \(modes.map { "\($0)" }.joined(separator: ", ")) traversal")
 }
 try fixCutoutChecks()

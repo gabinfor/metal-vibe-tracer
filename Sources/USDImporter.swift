@@ -51,6 +51,8 @@ struct USDImportSnapshot: Decodable {
   struct Environment: Decodable {
     var file: String
     var intensity: Float
+    // Degrees about +Y in the app's convention (Environment rotation).
+    var rotation: Float?
   }
   struct Sun: Decodable {
     var direction: [Float]
@@ -357,6 +359,7 @@ enum USDImporter {
       p.environmentData = try Data(contentsOf: URL(fileURLWithPath: environment.file))
       p.environmentName = URL(fileURLWithPath: environment.file).lastPathComponent
       p.options.environmentIntensity = min(100, max(0, environment.intensity))
+      p.options.environmentRotation = environment.rotation ?? 0
     }
     if let sun = snapshot.sun, sun.direction.count == 3 {
       let d = simd_normalize(SIMD3(sun.direction[0], sun.direction[1], sun.direction[2]))
