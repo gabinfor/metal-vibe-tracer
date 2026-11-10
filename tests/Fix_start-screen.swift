@@ -81,7 +81,7 @@
   func valid(_ selector: Selector) -> Bool {
     controller.validateMenuItem(NSMenuItem(title: "", action: selector, keyEquivalent: ""))
   }
-  require(valid(#selector(StudioController.openAction)) && valid(#selector(StudioController.importOBJAction))
+  require(valid(#selector(StudioController.openAction)) && valid(#selector(StudioController.openSceneFileAction))
     && !valid(#selector(StudioController.saveAction)) && !valid(#selector(StudioController.exportAction))
     && !valid(#selector(StudioController.undoAction)), "the start screen enables only open and import commands")
   testRenderer.options.exposure = 3
@@ -132,6 +132,43 @@
   require((try? Data(contentsOf: controller.previousAutosaveURL)) == lastSession,
     "starting another document keeps the last session as Autosave-previous.vtrace")
 
+  // Open Scene File: an OBJ opens as a new untitled scene; with unsaved changes the prompt comes first.
+  require(["glb", "gltf", "usdz", "usd", "obj"].allSatisfy(SceneFile.extensions.contains)
+    && start.button("start-open-scene")?.title == "Open Scene File…" && start.button("start-import-obj") == nil
+    && StartScreenView.describe(.openScene(URL(fileURLWithPath: "/tmp/Chair.glb"))) == "Opening Chair.glb",
+    "the start screen and SceneFile offer one Open Scene File entry for USD, glTF and OBJ")
+  let sceneObj = folder.appendingPathComponent("quad.obj")
+  try "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n".write(to: sceneObj, atomically: true, encoding: .utf8)
+  let history = controller.history, groupsByEvent = history.groupsByEvent
+  history.groupsByEvent = false
+  defer { history.groupsByEvent = groupsByEvent }
+  func grouped(_ body: () -> Void) { history.beginUndoGrouping(); body(); history.endUndoGrouping() }
+  grouped {
+    controller.performStartAction(.openScene(sceneObj))
+    idle()
+  }
+  require(controller.startScreen == nil && controller.projectURL == nil
+    && controller.project.graph?.assets.map(\.geometry.count) == [2], "Open Scene File opens an OBJ as a new untitled scene")
+  controller.associate(nil, edited: true, replaced: false)
+  var prompts = 0
+  var answer = NSApplication.ModalResponse.alertThirdButtonReturn
+  controller.unsavedChangesAnswer = { respond in prompts += 1; respond(answer) }
+  defer { controller.unsavedChangesAnswer = nil }
+  let sceneObjNodes = controller.project.graph?.nodes.count
+  grouped {
+    controller.beginOpenSceneFile(sceneObj)
+    idle()
+  }
+  require(prompts == 1 && controller.documentEdited && controller.project.graph?.nodes.count == sceneObjNodes
+    && !controller.projectOperationInProgress, "Open Scene File asks before replacing unsaved changes and Cancel keeps them")
+  answer = .alertSecondButtonReturn
+  grouped {
+    controller.beginOpenSceneFile(sceneObj)
+    idle()
+  }
+  require(prompts == 2 && controller.projectURL == nil, "Don't Save lets Open Scene File replace the document")
+  controller.unsavedChangesAnswer = nil
+  controller.associate(nil, edited: false, replaced: false)
   // Saving reports its phase in the activity strip until it finishes.
   var saved = false
   controller.beginSaveProject(folder.appendingPathComponent("strip.vtrace")) { saved = $0 }

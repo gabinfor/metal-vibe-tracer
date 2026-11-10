@@ -470,10 +470,18 @@ extension StudioController {
     alert.accessoryView = scroll
     alert.runModal()
   }
-  func importUSD() {
+  func openSceneFile() {
+    chooseOpen("Open scene file", extensions: SceneFile.extensions) { [weak self] url in self?.beginOpenSceneFile(url) }
+  }
+  // USD and glTF files open as a new scene; an OBJ becomes a new untitled scene holding that model.
+  // Asks first when the current document has unsaved changes.
+  func beginOpenSceneFile(_ url: URL) {
     confirmDiscardingChanges { [weak self] in
-      self?.chooseOpen("Open OpenUSD or glTF scene", extensions: ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions) {
-        [weak self] url in self?.beginImportUSD(from: url)
+      guard let self else { return }
+      if url.pathExtension.lowercased() == "obj" {
+        self.beginOpenOBJScene(url)
+      } else {
+        self.beginImportUSD(from: url)
       }
     }
   }

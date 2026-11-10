@@ -200,14 +200,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("Quit Metal Vibe Tracer", "q", #selector(NSApplication.terminate(_:)), nil),
     ])
     menu("File", [
-      ("Open Project…", "o", #selector(openProjectAction), self), ("Import OBJ…", "", #selector(importOBJAction), self),
-      ("Open USD or glTF Scene…", "", #selector(importUSDAction), self),
+      ("Open Project…", "o", #selector(openProjectAction), self),
+      ("Open Scene File…", "", #selector(openSceneFileAction), self),
       ("Close Window", "w", #selector(NSWindow.performClose(_:)), nil),
     ])
     menu("Window", [("Minimize", "m", #selector(NSWindow.performMiniaturize(_:)), nil)])
     NSApp.mainMenu = main
   }
   @objc func openProjectAction() { queueStartAction(.openProject(nil)) }
-  @objc func importOBJAction() { queueStartAction(.importOBJ(nil)) }
-  @objc func importUSDAction() { queueStartAction(.importUSD(nil)) }
+  @objc func openSceneFileAction() { queueStartAction(.openScene(nil)) }
 }

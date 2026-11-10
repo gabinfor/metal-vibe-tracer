@@ -1,15 +1,20 @@
 import Cocoa
 import UniformTypeIdentifiers
 
+// The scene file formats Open Scene File accepts: OpenUSD, glTF 2.0 and Wavefront OBJ.
+enum SceneFile {
+  static let extensions = ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions + ["obj"]
+}
+
 // What the start screen asks for. A nil URL asks with an open panel first.
 enum StartAction {
-  case openProject(URL?), importOBJ(URL?), importUSD(URL?), restoreSession
+  case openProject(URL?), openScene(URL?), restoreSession
   // The SceneCatalog entry with this id: a download scene that is not installed is downloaded after consent.
   case scene(String)
 }
 
 // The window's empty start state: nothing is loaded and nothing renders until the user opens a
-// project, imports a model, picks a built-in or example scene or restores the last session. While the GPU
+// project, opens a scene file, picks a built-in or example scene or restores the last session. While the GPU
 // shaders compile at launch (AppDelegate) it shows their progress and the action queued until
 // they are ready; afterwards StudioController shows it over the viewport.
 final class StartScreenView: NSView {
@@ -52,8 +57,7 @@ final class StartScreenView: NSView {
     files.spacing = 10
     for (title, id, action) in [
       ("Open Project…", "start-open", StartAction.openProject(nil)),
-      ("Import OBJ…", "start-import-obj", .importOBJ(nil)),
-      ("Open USD or glTF Scene…", "start-import-usd", .importUSD(nil)),
+      ("Open Scene File…", "start-open-scene", .openScene(nil)),
     ] {
       let button = ActionButton(title) { [weak self] in self?.onAction?(action) }
       button.identifier = NSUserInterfaceItemIdentifier(id)
@@ -204,8 +208,7 @@ extension StartScreenView {
     let (title, extensions, make): (String, [String], (URL) -> StartAction)
     switch action {
     case .openProject(nil): (title, extensions, make) = ("Open Metal Vibe Tracer project", ["vtrace", "json"], { .openProject($0) })
-    case .importOBJ(nil): (title, extensions, make) = ("Import OBJ mesh", ["obj"], { .importOBJ($0) })
-    case .importUSD(nil): (title, extensions, make) = ("Open OpenUSD or glTF scene", ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions, { .importUSD($0) })
+    case .openScene(nil): (title, extensions, make) = ("Open scene file", SceneFile.extensions, { .openScene($0) })
     default: return chosen(action)
     }
     let panel = NSOpenPanel()
@@ -220,8 +223,7 @@ extension StartScreenView {
   static func describe(_ action: StartAction) -> String {
     switch action {
     case .openProject(let url): return "Opening \(url?.lastPathComponent ?? "a project")"
-    case .importOBJ(let url): return "Importing \(url?.lastPathComponent ?? "an OBJ mesh")"
-    case .importUSD(let url): return "Opening \(url?.lastPathComponent ?? "a scene")"
+    case .openScene(let url): return "Opening \(url?.lastPathComponent ?? "a scene")"
     case .scene(let id): return "Opening \(SceneCatalog.entry(id)?.title ?? "a scene")"
     case .restoreSession: return "Restoring the last session"
     }

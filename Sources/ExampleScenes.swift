@@ -519,18 +519,41 @@ extension StudioController {
       showError(error.localizedDescription)
       return
     }
-    let record = undoRecord("Open example scene", replacesDocument: true)
-    beginDocumentChange("Importing \(entry.title)…", build: { [weak self] progress -> (ProjectDocument, Int) in
-      guard let self else { throw MaterialLibrary.error("Example scene import cancelled.") }
+    openOBJAsNewDocument(url, activity: "Importing \(entry.title)…", undoName: "Open example scene", adjust: { document in
+      shot.apply(to: &document)
+      // The credit travels with the project in its import report.
+      document.importReport = [attribution] + (document.importReport ?? [])
+    }) { [weak self] in
+      self?.changed()
+      self?.show("Opened \(entry.title) \(credit), \(license). Credits: File > Open Example Scene.")
+    }
+  }
+  // Opens an OBJ chosen with Open Scene File as a new, unsaved, untitled project, framed to the model.
+  func beginOpenOBJScene(_ url: URL) {
+    openOBJAsNewDocument(url, activity: "Importing \(url.lastPathComponent)…", undoName: "Open scene", adjust: { _ in }) {
+      [weak self] in
+      guard let self else { return }
+      self.frameMesh(recordUndo: false)
+      self.changed()
+    }
+  }
+  // Builds a new document from the OBJ off the main thread (`adjust` edits it before its resources are
+  // prepared), replaces the current one with it and runs `finish`.
+  private func openOBJAsNewDocument(
+    _ url: URL, activity: String, undoName: String, adjust: @escaping @Sendable (inout ProjectDocument) -> Void,
+    finish: @escaping @MainActor () -> Void
+  ) {
+    guard !isBusy else { return }
+    let record = undoRecord(undoName, replacesDocument: true)
+    beginDocumentChange(activity, build: { [weak self] progress -> (ProjectDocument, Int) in
+      guard let self else { throw MaterialLibrary.error("Scene import cancelled.") }
       var document = ProjectDocument()
       let objData = try self.readBounded(url, maximum: 1 << 40)
       var skipped = 0
       var report: [String] = []
       _ = try document.appendOBJ(objData, name: url.lastPathComponent, folder: url.deletingLastPathComponent(),
         skipped: &skipped, report: &report, progress: progress)
-      shot.apply(to: &document)
-      // The credit travels with the project in its import report.
-      document.importReport = [attribution] + (document.importReport ?? [])
+      adjust(&document)
       return (document, skipped)
     }) { [weak self] result in
       guard let self else { return }
@@ -540,8 +563,7 @@ extension StudioController {
         self.commit(record)
         self.associate(nil, edited: true, replaced: true)
         self.selectedNode = nil
-        self.changed()
-        self.show("Opened \(entry.title) \(credit), \(license). Credits: File > Open Example Scene.")
+        finish()
       case .failure(let error): self.showError(error.localizedDescription)
       }
     }

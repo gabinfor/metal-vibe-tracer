@@ -163,6 +163,8 @@ final class StudioController: NSViewController {
   private var statusAtEdge: NSLayoutConstraint!, statusAfterActivity: NSLayoutConstraint!
   // The empty start state shown at launch (StartScreenView); nil once a document is loaded.
   fileprivate(set) var startScreen: StartScreenView?
+  // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
+  var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
   // Set while the start screen restores the last session, which keeps its autosave file.
   fileprivate var restoringSession = false
   private(set) var errorMessage: String?
@@ -1207,8 +1209,7 @@ final class StudioController: NSViewController {
     legacyObjectControls()
     heading("Mesh import")
     text(project.meshName)
-    button("Open USD or glTF scene…") { [weak self] in self?.importUSD() }
-    button("Import OBJ…") { [weak self] in self?.importMesh() }
+    button("Add Model…") { [weak self] in self?.addModel() }
     button("Frame imported mesh") { [weak self] in self?.frameMesh() }
     text(
       "OBJ positions, UVs and normals are supported. Object/group hierarchy and named material subsets are preserved. Imports append to the scene. MTL materials are imported. Triangulate concave polygons before import."
@@ -1754,10 +1755,14 @@ final class StudioController: NSViewController {
       self.rebuild()
     }
   }
-  // Standard Save / Don't Save / Cancel prompt before Open, New and USD open replace
-  // an edited document.
+  // Standard Save / Don't Save / Cancel prompt before Open, New and Open Scene File
+  // replace an edited document.
   func confirmDiscardingChanges(_ proceed: @escaping () -> Void) {
     guard !isBusy else { return }
+    if documentEdited, let answer = unsavedChangesAnswer {
+      answer { [weak self] response in self?.resolveUnsavedChanges(response, proceed) }
+      return
+    }
     guard documentEdited, let window = hostWindow else {
       proceed()
       return
@@ -2259,15 +2264,15 @@ final class StudioController: NSViewController {
       )
     }
   }
-  func importMesh() {
-    chooseOpen("Import OBJ mesh", extensions: ["obj"]) { [weak self] url in
+  func addModel() {
+    chooseOpen("Add OBJ model", extensions: ["obj"]) { [weak self] url in
       self?.beginImportOBJ(from: url)
     }
   }
   // Reading, parsing and resource preparation run on projectIOQueue.
   func beginImportOBJ(from url: URL) {
     guard !isBusy else { return }
-    let record = undoRecord("Import OBJ")
+    let record = undoRecord("Add model")
     let document = snapshot()
     beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] progress -> (ProjectDocument, (UUID, Int, Int, [String])) in
       guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
@@ -2418,13 +2423,12 @@ final class StudioController: NSViewController {
       [
         ("Open Project…", "o", #selector(openAction)), ("Save Project", "s", #selector(saveAction)),
         ("Save Project As…", "S", #selector(saveAsAction)),
-        ("Import OBJ…", "", #selector(importOBJAction)),
-        ("Open USD or glTF Scene…", "", #selector(importUSDAction)),
+        ("Open Scene File…", "", #selector(openSceneFileAction)),
         ("Export…", "e", #selector(exportAction)),
       ])
     // Example scenes: downloaded on request (ExampleScenes.swift); titles show the remaining download size.
     if let file = main.items.last?.submenu,
-      let index = file.items.firstIndex(where: { $0.action == #selector(importUSDAction) })
+      let index = file.items.firstIndex(where: { $0.action == #selector(openSceneFileAction) })
     {
       let examples = NSMenu(title: "Open Example Scene")
       // Bundled spectral examples first, then the McGuire archive scenes downloaded on request.
@@ -2533,8 +2537,7 @@ final class StudioController: NSViewController {
     rebuild()
   }
   @objc func saveAsAction() { saveProject(asNew: true) }
-  @objc func importOBJAction() { importMesh() }
-  @objc func importUSDAction() { importUSD() }
+  @objc func openSceneFileAction() { openSceneFile() }
   @objc func frameSelectionAction() { guard !isBusy else { return }; frameMesh() }
   @objc func frameAllAction() { guard !isBusy else { return }; selectedNode = nil; frameMesh() }
   @objc func quit() { NSApp.terminate(nil) }
@@ -2610,14 +2613,13 @@ extension StudioController {
     guard !isBusy else { return }
     switch action {
     case .openProject(let url?): beginOpenProject(url)
-    case .importOBJ(let url?): beginImportOBJ(from: url)
-    case .importUSD(let url?): beginImportUSD(from: url)
+    case .openScene(let url?): beginOpenSceneFile(url)
     case .scene(let id): if let entry = SceneCatalog.entry(id) { openOrDownloadScene(entry) }
     case .restoreSession:
       restoringSession = true
       restoreAutosave()
       if !openInFlight { restoringSession = false }
-    case .openProject(nil), .importOBJ(nil), .importUSD(nil):
+    case .openProject(nil), .openScene(nil):
       guard let window = hostWindow else { return }
       StartScreenView.chooseFile(for: action, window: window) { [weak self] chosen in self?.performStartAction(chosen) }
     }
@@ -2660,7 +2662,7 @@ extension StudioController: NSMenuItemValidation {
     if isBusy { return false }
     // The start screen has no document to save, edit, render or export.
     if startScreen != nil {
-      return [#selector(openAction), #selector(importOBJAction), #selector(importUSDAction), #selector(exampleSceneAction(_:)),
+      return [#selector(openAction), #selector(openSceneFileAction), #selector(exampleSceneAction(_:)),
         #selector(spectralExampleAction(_:))].contains(item.action)
     }
     if item.action == #selector(undoAction) {

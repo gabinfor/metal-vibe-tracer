@@ -245,8 +245,7 @@ extension StudioController {
     }
     button("Frame all imported objects") { [weak self] in self?.frameAllAction() }
     heading("Import")
-    button("Open USD or glTF scene…") { [weak self] in self?.importUSD() }
-    button("Import OBJ…") { [weak self] in self?.importMesh() }
+    button("Add Model…") { [weak self] in self?.addModel() }
     text(
       "OBJ objects, groups and usemtl subsets are preserved. Imports append. Instances share mesh assets and render as instances: moving, hiding or rebinding one keeps every mesh's acceleration structure. MTL materials are imported; triangulate concave polygons before import."
     )
