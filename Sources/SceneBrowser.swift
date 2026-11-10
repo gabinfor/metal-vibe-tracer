@@ -423,9 +423,14 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     }
     return find(self)
   }
-  // The scene's bundled 480 x 270 render (scripts/render_showcase.py --thumbnails), or nil for a scene without one.
-  static func thumbnail(_ entry: SceneEntry) -> NSImage? {
-    SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg").flatMap { NSImage(contentsOf: $0) }
+  // The scene's bundled 480 x 270 render (scripts/render_showcase.py --thumbnails), decoded once, or nil for a scene
+  // without one.
+  @MainActor private static var thumbnails: [String: NSImage] = [:]
+  @MainActor static func thumbnail(_ entry: SceneEntry) -> NSImage? {
+    if let cached = thumbnails[entry.id] { return cached }
+    let image = SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg").flatMap { NSImage(contentsOf: $0) }
+    thumbnails[entry.id] = image
+    return image
   }
 
   // A card's line of specs: "262 k triangles · OBJ", "OpenUSD", or "Built-in" for a built-in scene.

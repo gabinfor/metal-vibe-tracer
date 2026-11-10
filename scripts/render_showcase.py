@@ -19,7 +19,9 @@ driver, so there is no second list here) but the SceneCatalog.thumbnailExempt sc
 scene: its scene index at the default view) at 960 x 540 with at most 256 spp and no denoiser, downsampled to
 480 x 270 and written as JPEG (quality 0.85) to Examples/Thumbnails/<id>.jpg, with the ids in
 Examples/Thumbnails/scene-ids.txt for scripts/check_bundle.py. --only then names catalog ids. A scene whose files are
-not installed is skipped and listed at the end. Each line of progress is samples done / target and elapsed time.
+not installed is skipped, and one whose render fails is reported, and both are listed at the end while the run goes on.
+The run always rewrites scene-ids.txt with every id that has a thumbnail, also with --only.
+Each line of progress is samples done / target and elapsed time.
 """
 import argparse
 import json
@@ -172,7 +174,7 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
   try FileManager.default.createDirectory(at: thumbnailFolder, withIntermediateDirectories: true)
   try (ids.joined(separator: "\n") + "\n").write(to: thumbnailFolder.appendingPathComponent("scene-ids.txt"), atomically: true,
     encoding: .utf8)
-  var skipped: [String] = []
+  var skipped: [String] = [], failed: [String] = []
   for entry in SceneCatalog.entries where ids.contains(entry.id) && (only.isEmpty || only.contains(entry.id)) {
     var shot: ShowcaseShot
     if case .builtIn(let index) = entry.source {
@@ -190,12 +192,18 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
     shot.name = "thumbnail-" + entry.id
     (shot.width, shot.height, shot.samples) = (960, 540, min(shot.samples ?? 256, 256))
     (shot.denoise, shot.raw, shot.keepRaw) = (false, false, nil)
-    let png = try render(shot)
-    try writeThumbnail(png, to: thumbnailFolder.appendingPathComponent(entry.id + ".jpg"))
-    try? FileManager.default.removeItem(at: png)
-    print("\(entry.id): wrote Examples/Thumbnails/\(entry.id).jpg")
+    do {
+      let png = try render(shot)
+      try writeThumbnail(png, to: thumbnailFolder.appendingPathComponent(entry.id + ".jpg"))
+      try? FileManager.default.removeItem(at: png)
+      print("\(entry.id): wrote Examples/Thumbnails/\(entry.id).jpg")
+    } catch {
+      print("\(entry.id): failed, \(error.localizedDescription)")
+      failed.append(entry.id)
+    }
   }
-  print(skipped.isEmpty ? "All thumbnails rendered" : "Skipped (files not installed): " + skipped.joined(separator: ", "))
+  print(skipped.isEmpty && failed.isEmpty ? "All thumbnails rendered"
+    : "Skipped (files not installed): " + skipped.joined(separator: ", ") + "; failed: " + failed.joined(separator: ", "))
 } else {
   for shot in shots { _ = try render(shot) }
 }

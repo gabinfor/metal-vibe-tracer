@@ -12,7 +12,7 @@ at 960 × 540 from the scene's `scripts/showcase.json` shot (a built-in scene: i
 
 ## Built-in and bundled scenes
 
-`pavilion`, `cornell-box`, `veach-mis`, `cornell-glass-mirror`, `cornell-fog` and `reflective-ring` are the application's built-in scenes. `newton-series`, `abbe-row`, `tyndall-tank`, `lamp-spectra` and `lantern-arcade` are the OpenUSD stages of [`Examples/Spectral`](../Spectral/README.md), whose notes give their sources.
+`pavilion`, `cornell-box`, `veach-mis`, `cornell-glass-mirror`, `cornell-fog` and `reflective-ring` are the application's built-in scenes. `newton-series`, `abbe-row`, `tyndall-tank`, `lamp-spectra` and `lantern-arcade` are the OpenUSD stages of [`Examples/Spectral`](../Spectral/README.md), whose notes give their sources. `cornell-fog.jpg` shows the Cornell Fog Study's default state, in which the fog preview is off, so it looks like the Cornell Box with a brighter light.
 
 ## Morgan McGuire's Computer Graphics Archive scenes
 
