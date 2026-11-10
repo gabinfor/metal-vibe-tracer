@@ -113,6 +113,18 @@
   var downloaded: [String] = [], actions: [String] = []
   browser.onDownload = { downloaded.append($0.id) }
   browser.onAction = { if case .scene(let id) = $0 { actions.append(id) } }
+  // The details pane states what Download does; selecting cards and filtering never start it.
+  let named = SceneBrowserView(library: ExampleLibrary(root: folder.appendingPathComponent("Example Scenes")))
+  named.selection = SceneCatalog.entry("sponza")
+  let consent = named.control("scene-download-consent") as? NSTextField
+  let destination = (folder.appendingPathComponent("Example Scenes/sponza").path as NSString).abbreviatingWithTildeInPath
+  require(consent?.isHidden == false && consent?.stringValue.hasPrefix("Downloads 80 MB from casual-effects.com and uses ") == true
+    && consent?.stringValue.hasSuffix(" in \(destination).") == true && destination.hasSuffix("Example Scenes/sponza"),
+    "the consent text above Download: \(consent?.stringValue ?? "")")
+  browser.selection = SceneCatalog.entry("san-miguel")
+  browser.filter = .downloads; browser.filter = .installed; browser.filter = .all
+  browser.selection = SceneCatalog.entry("sponza")
+  require(downloaded.isEmpty, "selecting cards and changing filters never download")
   (browser.control("scene-download") as? NSButton)?.performClick(nil)
   browser.selection = SceneCatalog.entry("cornell-box")
   require(browser.control("scene-open")?.isHidden == false && browser.control("scene-download")?.isHidden == true,
@@ -126,10 +138,42 @@
   browser.onCredits = { credits += 1 }
   (browser.control("scene-credits") as? NSButton)?.performClick(nil)
   require(credits == 1 && browser.control("scene-credits")?.isHidden == false, "Credits and licenses… calls onCredits")
-  browser.setDownload(SceneCatalog.entry("cornell-box"), fraction: 0.5, status: "Downloading")
-  require(browser.control("scene-download-cancel")?.isHidden == false, "a download shows its Cancel button")
+  // A running download replaces Download and the consent text with its progress while its card is selected, which
+  // other cards do not show; reselecting the card shows the same progress again.
+  let sponzaEntry = SceneCatalog.entry("sponza")!
+  var cancels = 0
+  browser.onCancelDownload = { cancels += 1 }
+  browser.selection = sponzaEntry
+  browser.setDownload(sponzaEntry, fraction: 0.5, status: "x")
+  let bar = browser.control("scene-download-cancel")
+  require(bar?.isHidden == false && browser.control("scene-download")?.isHidden == true
+    && browser.control("scene-download-consent")?.isHidden == true, "a download shows its Cancel button instead of Download")
+  (bar as? NSButton)?.performClick(nil)
+  require(cancels == 1, "Cancel calls onCancelDownload")
+  browser.selection = SceneCatalog.entry("san-miguel")
+  require(browser.control("scene-download-cancel")?.isHidden == true && browser.control("scene-download")?.isHidden == false,
+    "another card shows no progress")
+  browser.selection = sponzaEntry
+  require(browser.control("scene-download-cancel")?.isHidden == false && browser.control("scene-download")?.isHidden == true,
+    "the progress shows again when the card is reselected")
+  func progressBars(_ view: NSView) -> [NSProgressIndicator] {
+    view.subviews.flatMap { ($0 as? NSProgressIndicator).map { [$0] } ?? [] } + view.subviews.flatMap(progressBars)
+  }
+  require(progressBars(browser).contains { !$0.isHidden && !$0.isIndeterminate && $0.doubleValue == 0.5 },
+    "the details pane's bar shows the fraction done")
   browser.setDownload(nil, fraction: nil, status: nil)
-  require(browser.control("scene-download-cancel")?.isHidden == true, "no download hides it")
+  require(browser.control("scene-download-cancel")?.isHidden == true && browser.control("scene-download")?.isHidden == false,
+    "no download restores the Download button")
+  browser.showDownloadError(sponzaEntry, "Could not download Crytek Sponza: disk full")
+  let error = browser.control("scene-download-error") as? NSTextField
+  require(error?.isHidden == false && error?.stringValue.contains("disk full") == true
+    && browser.control("scene-download")?.isHidden == false, "a failure shows its text above the Download button")
+  browser.selection = SceneCatalog.entry("san-miguel")
+  require(error?.isHidden == true, "the failure belongs to its scene")
+  browser.selection = sponzaEntry
+  browser.setDownload(sponzaEntry, fraction: nil, status: "Connecting")
+  browser.setDownload(nil, fraction: nil, status: nil)
+  require(error?.isHidden == true, "a new attempt clears the failure")
   browser.setActionsEnabled(false)
   require(browser.control("scene-open")?.isEnabled == false && browser.control("start-open")?.isEnabled == false,
     "busy disables actions")

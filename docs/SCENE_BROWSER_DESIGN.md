@@ -51,7 +51,7 @@ Download size and disk size come from the entry's archives through `ExampleLibra
 
 ## 4. Browser
 
-`SceneBrowserView` replaces `StartScreenView`'s scene sections. `StartAction.scene(id)` replaces `.builtInScene`, `.example` and `.download`. Every open path goes through `StudioController.openScene(_:)`, which confirms discarding changes and dispatches on the entry's source; a download entry that is not installed does nothing there, so the consent and download flow (`openOrDownloadScene`) runs first.
+`SceneBrowserView` replaces `StartScreenView`'s scene sections. `StartAction.scene(id)` replaces `.builtInScene`, `.example` and `.download`. Every open path goes through `StudioController.openScene(_:)`, which confirms discarding changes and dispatches on the entry's source; a download entry that is not installed does nothing there; its details pane's **Download** button (`StudioController.beginSceneDownload`) installs it and then opens it, and `openOrDownloadScene` only selects such an entry in the browser.
 
 Layout, top to bottom and left to right:
 

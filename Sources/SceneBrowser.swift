@@ -9,7 +9,7 @@ enum SceneFile {
 // What the start screen asks for. A nil URL asks with an open panel first.
 enum StartAction {
   case openProject(URL?), openScene(URL?), restoreSession
-  // The SceneCatalog entry with this id: a download scene that is not installed is downloaded after consent.
+  // The SceneCatalog entry with this id: a download scene that is not installed is selected in the browser, whose Download button downloads it.
   case scene(String)
 }
 
@@ -74,6 +74,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   private let creditLabel = NSTextField(wrappingLabelWithString: "")
   private let licenseButton = SceneBrowserView.link("scene-license")
   private let termsLabel = NSTextField(wrappingLabelWithString: "")
+  private let consentLabel = NSTextField(wrappingLabelWithString: "")
+  private let downloadErrorLabel = NSTextField(wrappingLabelWithString: "")
   private let downloadRow = NSStackView()
   private let downloadBar = NSProgressIndicator()
   private let downloadStatus = NSTextField(wrappingLabelWithString: "")
@@ -84,6 +86,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   private let creditsButton = SceneBrowserView.link("scene-credits")
   // The running download (setDownload), shown while its entry is selected.
   private var download: (id: String, fraction: Double?, status: String?)?
+  // The last failed download (showDownloadError), shown under its entry until the next attempt.
+  private var downloadError: (id: String, message: String)?
   private static let cardIdentifier = NSUserInterfaceItemIdentifier("scene-card")
 
   // `library` gives the download scenes' installed state and remaining sizes.
@@ -264,10 +268,14 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     details.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 8, right: 12)
     details.translatesAutoresizingMaskIntoConstraints = false
     titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-    for label in [specsLabel, tagsLabel, collectionLabel, creditLabel, termsLabel, downloadStatus] {
+    for label in [specsLabel, tagsLabel, collectionLabel, creditLabel, termsLabel, downloadStatus, consentLabel] {
       label.font = .systemFont(ofSize: 11)
       label.textColor = .secondaryLabelColor
     }
+    consentLabel.identifier = NSUserInterfaceItemIdentifier("scene-download-consent")
+    downloadErrorLabel.font = .systemFont(ofSize: 11)
+    downloadErrorLabel.textColor = .systemRed
+    downloadErrorLabel.identifier = NSUserInterfaceItemIdentifier("scene-download-error")
     downloadBar.style = .bar
     downloadBar.controlSize = .small
     downloadBar.minValue = 0
@@ -298,7 +306,7 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     creditsButton.isHidden = true
     actionButtons.append(creditsButton)
     for view in [preview, titleLabel, summaryLabel, specsLabel, tagsLabel, collectionLabel, websiteButton, creditLabel,
-                 licenseButton, termsLabel, downloadRow, openButton, downloadButton, finderButton, creditsButton] {
+                 licenseButton, termsLabel, downloadRow, consentLabel, downloadErrorLabel, openButton, downloadButton, finderButton, creditsButton] {
       details.addArrangedSubview(view)
     }
     details.setCustomSpacing(2, after: collectionLabel)
@@ -327,7 +335,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
       downloadRow.widthAnchor.constraint(equalToConstant: width),
       downloadBar.widthAnchor.constraint(equalTo: downloadRow.widthAnchor),
     ])
-    for label in [titleLabel, summaryLabel, specsLabel, tagsLabel, collectionLabel, creditLabel, termsLabel, downloadStatus] {
+    for label in [titleLabel, summaryLabel, specsLabel, tagsLabel, collectionLabel, creditLabel, termsLabel, downloadStatus,
+                  consentLabel, downloadErrorLabel] {
       label.preferredMaxLayoutWidth = width
     }
     return scroll
@@ -387,6 +396,12 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   // is selected in place of its Download button; nil restores the button.
   func setDownload(_ entry: SceneEntry?, fraction: Double?, status: String?) {
     download = entry.map { ($0.id, fraction, status) }
+    if entry != nil { downloadError = nil }
+    fillDetails()
+  }
+  // A failed download of `entry`: the pane shows `message` above its Download button; nil clears it.
+  func showDownloadError(_ entry: SceneEntry, _ message: String?) {
+    downloadError = message.map { (entry.id, $0) }
     fillDetails()
   }
   // The control with this accessibility identifier.
@@ -499,10 +514,24 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
       if running.fraction == nil { downloadBar.startAnimation(nil) } else { downloadBar.stopAnimation(nil) }
       downloadStatus.stringValue = running.status ?? ""
     }
+    consentLabel.isHidden = missing == 0 || running != nil
+    consentLabel.stringValue = consentText(entry)
+    let failed = downloadError.flatMap { $0.id == entry.id && running == nil && missing > 0 ? $0.message : nil }
+    downloadErrorLabel.isHidden = failed == nil
+    downloadErrorLabel.stringValue = failed ?? ""
     openButton.isHidden = missing > 0
     downloadButton.isHidden = missing == 0 || running != nil
     downloadButton.title = "Download \(SceneCatalog.megabytes(missing))"
     finderButton.isHidden = !entry.isDownload || missing > 0
+  }
+
+  // What the Download button does, which is the consent: "Downloads 80 MB from casual-effects.com and uses 120 MB in
+  // ~/Library/Application Support/VibeTracer/Example Scenes/sponza."
+  private func consentText(_ entry: SceneEntry) -> String {
+    guard let host = library.missing(entry).first?.url.host else { return "" }
+    let folder = (library.storage(entry).path as NSString).abbreviatingWithTildeInPath
+    return "Downloads \(SceneCatalog.megabytes(library.downloadBytes(entry))) from \(host) and uses "
+      + "\(SceneCatalog.megabytes(library.diskBytes(entry))) in \(folder)."
   }
 
   // MARK: Actions

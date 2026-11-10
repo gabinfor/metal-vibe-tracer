@@ -3,8 +3,8 @@ import CryptoKit
 
 // REFERENCES.md: MCGUIRE2017, OBJ2026, MTL2026, SHA256FIPS, STANFORD3DSCAN, BITTERLI2016 (the Fireplace and Living
 // Room cameras). The download scenes of SceneCatalog, from Morgan McGuire's Computer Graphics Archive. Nothing is
-// bundled: File > Open Example Scene downloads an archive only after the user agrees to its size and license, checks
-// it against the size and SHA-256 digest pinned in SceneCatalog, extracts it into Application Support and imports it
+// bundled: the scene browser's Download button, whose details pane states the size and source, downloads an archive,
+// checks it against the size and SHA-256 digest pinned in SceneCatalog, extracts it into Application Support and imports it
 // through ProjectDocument.appendOBJ, unchanged, with the camera and lighting of the README image (the
 // scripts/showcase.json shot of the same name, ShowcaseShot). The bundled spectral examples open through the USD
 // importer with their shot (Examples/Spectral).
@@ -412,7 +412,7 @@ extension StudioController {
   // Built-in and bundled scenes are always available; a download scene once every archive is extracted.
   func isInstalled(_ entry: SceneEntry) -> Bool { !entry.isDownload || exampleLibrary.missing(entry).isEmpty }
   // Opens the scene as a new, unsaved, untitled project, after confirming that changes are discarded. A download
-  // scene that is not installed does nothing: openOrDownloadScene asks for consent and downloads it first.
+  // scene that is not installed does nothing: its Download button in the scene browser installs it first.
   func openScene(_ entry: SceneEntry) {
     guard !isBusy, isInstalled(entry) else { return }
     switch entry.source {
@@ -421,87 +421,64 @@ extension StudioController {
     case .download: confirmDiscardingChanges { [weak self] in self?.beginExampleImport(entry) }
     }
   }
-  // openScene, or for a download scene that is not installed the consent sheet and download that end in opening it.
+  // openScene, or for a download scene that is not installed its details in the scene browser, whose Download button is
+  // the only way to start a download. A document without the browser over it shows a hint instead.
   func openOrDownloadScene(_ entry: SceneEntry) {
     guard entry.isDownload, !isInstalled(entry) else { return openScene(entry) }
-    guard !isBusy else { return }
-    confirmDiscardingChanges { [weak self] in self?.confirmExampleDownload(entry) }
+    guard let browser = startScreen else { return show("Download \(entry.title) from the scene browser.") }
+    browser.selection = entry
   }
-  // Nothing is downloaded without this consent sheet, which names the size, source, destination and license.
-  func confirmExampleDownload(_ entry: SceneEntry) {
-    guard !isBusy, let window = hostWindow, let credit = entry.credit, let license = entry.license,
-      let licenseURL = entry.licenseURL, let terms = entry.terms
-    else { return }
-    let library = exampleLibrary
-    let download = library.downloadBytes(entry)
-    guard download > 0 else {
-      beginExampleImport(entry)
+  // The scene browser's Download button: downloads, verifies and extracts the missing archives while the details pane
+  // shows the progress. The download goes on when another card is selected or the browser is dismissed. A finished
+  // download reloads the browser and opens the scene when the browser is showing; a failure or a cancel leaves the
+  // archives that finished installed.
+  func beginSceneDownload(_ entry: SceneEntry) {
+    guard entry.isDownload, !isInstalled(entry) else { return }
+    if let running = downloadingScene {
+      show("Wait for the download of \(running.title) to finish.")
       return
     }
-    let parts = library.missing(entry).count
-    let alert = NSAlert()
-    alert.messageText = "Download \(entry.title)?"
-    alert.informativeText = """
-      This example scene is not included with Metal Vibe Tracer. Opening it downloads \(SceneCatalog.megabytes(download)) \
-      (\(parts) archive\(parts == 1 ? "" : "s")) from Morgan McGuire's Computer Graphics Archive (casual-effects.com) \
-      and uses about \(SceneCatalog.megabytes(library.diskBytes(entry))) of disk space in \
-      \((library.root.path as NSString).abbreviatingWithTildeInPath). Each archive is checked against its expected size \
-      and SHA-256 digest before it is extracted.
-
-      \(entry.title) \(credit). \(license), \(licenseURL.absoluteString). \(terms)
-      """
-    alert.addButton(withTitle: "Download \(SceneCatalog.megabytes(download))")
-    alert.addButton(withTitle: "Cancel")
-    alert.beginSheetModal(for: window) { [weak self] response in
-      guard response == .alertFirstButtonReturn else { return }
-      // Present the progress sheet after this one has been ordered out.
-      DispatchQueue.main.async { self?.beginExampleDownload(entry) }
-    }
-  }
-  func beginExampleDownload(_ entry: SceneEntry) {
-    guard !isBusy, let window = hostWindow else { return }
     let library = exampleLibrary
-    let sheet = NSAlert()
-    sheet.messageText = "Downloading \(entry.title)"
-    sheet.informativeText = "Connecting to casual-effects.com…"
-    let bar = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 320, height: 20))
-    bar.style = .bar
-    bar.isIndeterminate = false
-    bar.minValue = 0
-    bar.maxValue = 1
-    sheet.accessoryView = bar
-    sheet.addButton(withTitle: "Cancel")
-    importInProgress = true
-    let progress = beginProjectActivity("Downloading \(entry.title)…")
-    let job = ExampleSceneDownload { fraction, message in
-      progress.update(message, fraction: fraction)
-      DispatchQueue.main.async {
-        bar.doubleValue = fraction
-        sheet.informativeText = message
-      }
+    let host = library.missing(entry).first?.url.host ?? "the server"
+    let job = ExampleSceneDownload { [weak self] fraction, message in
+      DispatchQueue.main.async { self?.sceneDownloadProgress(entry, fraction, message) }
     }
     exampleDownload = job
-    sheet.beginSheetModal(for: window) { _ in job.cancel() }
+    downloadingScene = entry
+    downloadProgress = (0, "Connecting to \(host)…")
+    startScreen?.setDownload(entry, fraction: 0, status: downloadProgress?.status)
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let result = Result { try job.install(entry, into: library) }
-      DispatchQueue.main.async { [weak self] in
-        guard let self else { return }
-        let cancelled = job.isCancelled
-        window.endSheet(sheet.window)
-        self.importInProgress = false
-        self.exampleDownload = nil
-        if cancelled {
-          self.show("Example scene download cancelled; finished archives are kept.")
-          self.rebuild()
-          return
-        }
-        switch result {
-        case .success: self.beginExampleImport(entry)
-        case .failure(let error):
-          self.showError("Could not download \(entry.title): \(error.localizedDescription)")
-          self.rebuild()
-        }
+      DispatchQueue.main.async { [weak self] in self?.sceneDownloadFinished(entry, job, result) }
+    }
+  }
+  func cancelSceneDownload() { exampleDownload?.cancel() }
+  private func sceneDownloadProgress(_ entry: SceneEntry, _ fraction: Double, _ message: String) {
+    guard downloadingScene?.id == entry.id else { return }
+    downloadProgress = (fraction, message)
+    startScreen?.setDownload(entry, fraction: fraction, status: message)
+  }
+  private func sceneDownloadFinished(_ entry: SceneEntry, _ job: ExampleSceneDownload, _ result: Result<Void, Error>) {
+    exampleDownload = nil
+    downloadingScene = nil
+    downloadProgress = nil
+    startScreen?.setDownload(nil, fraction: nil, status: nil)
+    startScreen?.reload()
+    if job.isCancelled {
+      show("Download of \(entry.title) cancelled; finished archives are kept.")
+      return
+    }
+    switch result {
+    case .success:
+      if startScreen != nil {
+        openScene(entry)
+      } else {
+        show("\(entry.title) is downloaded; open it from the scene browser.")
       }
+    case .failure(let error):
+      let message = "Could not download \(entry.title): \(error.localizedDescription)"
+      startScreen?.showDownloadError(entry, message)
+      showError(message)
     }
   }
   // Opens the extracted scene as a new, unsaved, untitled project with the showcase shot's settings.

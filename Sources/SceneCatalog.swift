@@ -30,7 +30,7 @@ struct SceneEntry: Sendable {
   var credit: String?
   var license: String?
   var licenseURL: URL?
-  // What the license asks of renders, after the license in the consent sheet and the import report.
+  // What the license asks of renders, after the license in the details pane and the import report.
   var terms: String?
   // The scripts/showcase.json shot giving the camera, sky, sun, exposure and emission of the README image.
   var shot: String?

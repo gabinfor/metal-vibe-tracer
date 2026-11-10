@@ -174,8 +174,11 @@ final class StudioController: NSViewController {
   var projectURL: URL? { didSet { updateWindowTitle() } }
   var importInProgress = false { didSet { busyStateChanged() } }
   var usdImportJob: USDImportJob?
-  // File > Open Example Scene's download in progress (ExampleScenes.swift).
+  // The scene browser's download in progress (ExampleScenes.swift): its job, scene and latest progress, which
+  // showStartScreen shows again in a new browser.
   var exampleDownload: ExampleSceneDownload?
+  var downloadingScene: SceneEntry?
+  var downloadProgress: (fraction: Double, status: String)?
   // Opens (including Restore Last Session), saves and off-main document preparation.
   private(set) var openInFlight = false { didSet { busyStateChanged() } }
   private var saveInFlight = false { didSet { busyStateChanged() } }
@@ -2569,12 +2572,13 @@ extension StudioController {
     view.reload()
     view.setRestore(Self.autosaveDate(at: autosaveURL))
     view.onAction = { [weak self] action in self?.performStartAction(action) }
-    // Download asks for consent and shows its progress in sheets (openOrDownloadScene).
-    view.onDownload = { [weak self] entry in self?.openOrDownloadScene(entry) }
+    view.onDownload = { [weak self] entry in self?.beginSceneDownload(entry) }
+    view.onCancelDownload = { [weak self] in self?.cancelSceneDownload() }
     view.onCredits = { [weak self] in self?.showExampleCredits() }
     view.onCancelPending = nil
     view.setPending(nil)
     view.setActionsEnabled(!isBusy)
+    view.setDownload(downloadingScene, fraction: downloadProgress?.fraction, status: downloadProgress?.status)
     view.translatesAutoresizingMaskIntoConstraints = false
     view.removeFromSuperview()
     self.view.addSubview(view)

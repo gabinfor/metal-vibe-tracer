@@ -297,6 +297,59 @@
   waitUntil({ !controller.isBusy }, seconds: 60)
   require(testRenderer.sceneIndex == previousScene && testRenderer.yaw == previousYaw,
     "undo returns to the previous document")
-  print("PASS: example scenes (catalog against showcase.json, archive markers, verification and extraction, shot settings and emission scaling, File > Open Example Scene)")
+
+  // Downloading from the scene browser, from local archives: a digest mismatch ends with the error in the details pane
+  // and the Download button back, a cancel is reported, and a correct archive installs and opens the scene.
+  let downloadLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download", isDirectory: true))
+  controller.exampleLibrary = downloadLibrary
+  let payload = folder.appendingPathComponent("payload", isDirectory: true)
+  try manager.createDirectory(at: payload, withIntermediateDirectories: true)
+  try manager.copyItem(at: source.appendingPathComponent("lamp.obj"), to: payload.appendingPathComponent("interior.obj"))
+  try manager.copyItem(at: source.appendingPathComponent("lamp.mtl"), to: payload.appendingPathComponent("lamp.mtl"))
+  let payloadZip = folder.appendingPathComponent("Interior.zip")
+  let payloadDitto = Process()
+  payloadDitto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+  payloadDitto.arguments = ["-c", "-k", payload.path, payloadZip.path]
+  try payloadDitto.run()
+  payloadDitto.waitUntilExit()
+  let payloadBytes = Int64((try payloadZip.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0)
+  let payloadDigest = SHA256.hash(data: try Data(contentsOf: payloadZip)).map { String(format: "%02x", $0) }.joined()
+  guard case .download(let interiorStorage, let interiorPath, _) = interior.source else { return require(false, "a download scene") }
+  func localInterior(sha256: String) -> SceneEntry {
+    var local = interior
+    local.source = .download(storage: interiorStorage, file: interiorPath, archives: [ExampleArchive(
+      name: "Interior.zip", url: payloadZip, folder: "Interior", bytes: payloadBytes, unpackedBytes: payloadBytes, sha256: sha256)])
+    return local
+  }
+  let mismatched = localInterior(sha256: String(repeating: "0", count: 64)), correct = localInterior(sha256: payloadDigest)
+  controller.showStartScreen()
+  guard let browser = controller.startScreen else { return require(false, "the scene browser is shown") }
+  browser.selection = SceneCatalog.entry(interior.id)
+  controller.beginSceneDownload(mismatched)
+  require(controller.downloadingScene?.id == interior.id && browser.control("scene-download-cancel")?.isHidden == false
+    && browser.control("scene-download")?.isHidden == true, "a download shows its progress in the details pane")
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  let failure = (browser.control("scene-download-error") as? NSTextField)?.stringValue ?? ""
+  require(controller.exampleDownload == nil && !controller.isInstalled(mismatched) && failure.contains("SHA-256")
+    && browser.control("scene-download-error")?.isHidden == false && browser.control("scene-download")?.isHidden == false
+    && browser.control("scene-download-cancel")?.isHidden == true && controller.startScreen != nil,
+    "a digest mismatch shows its error in the pane, restores Download and leaves the scene missing: \(failure)")
+  controller.beginSceneDownload(mismatched)
+  controller.cancelSceneDownload()
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  require(controller.status.stringValue.contains("cancelled") && !controller.isInstalled(mismatched)
+    && browser.control("scene-download")?.isHidden == false, "Cancel ends the download and restores Download")
+  controller.associate(nil, edited: false, replaced: false)
+  grouped {
+    controller.beginSceneDownload(correct)
+    waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(controller.isInstalled(correct) && controller.startScreen == nil && testRenderer.sceneIndex == 6
+    && controller.project.importReport?.first == interior.attribution,
+    "a verified download installs the scene and opens it with its credit")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  print("PASS: example scenes (catalog against showcase.json, archive markers, verification and extraction, shot settings and emission scaling, File > Open Example Scene, downloading from the scene browser)")
 }
 try fixExampleSceneChecks()
