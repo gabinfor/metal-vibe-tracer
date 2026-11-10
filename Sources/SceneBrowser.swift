@@ -1,0 +1,685 @@
+import Cocoa
+import UniformTypeIdentifiers
+
+// The scene file formats Open Scene File accepts: OpenUSD, glTF 2.0 and Wavefront OBJ.
+enum SceneFile {
+  static let extensions = ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions + ["obj"]
+}
+
+// What the start screen asks for. A nil URL asks with an open panel first.
+enum StartAction {
+  case openProject(URL?), openScene(URL?), restoreSession
+  // The SceneCatalog entry with this id: a download scene that is not installed is downloaded after consent.
+  case scene(String)
+}
+
+// The scene browser (docs/SCENE_BROWSER_DESIGN.md §4), the window's empty start state: nothing is loaded and nothing
+// renders until the user opens a project or a scene file, opens a catalog scene or restores the last session. A top row
+// of file actions sits over filters and search, a grid of scene cards and the details pane of the selected card.
+// While the GPU shaders compile at launch (AppDelegate) it shows their progress and the action queued until they are
+// ready; afterwards StudioController shows it over the viewport.
+final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionViewDelegate {
+  enum Filter: Int, CaseIterable { case all, builtIn, included, downloads, installed }
+  var onAction: ((StartAction) -> Void)?
+  // The details pane's Download button for a download scene that is not installed.
+  var onDownload: ((SceneEntry) -> Void)?
+  // The details pane's Cancel button while a download runs (setDownload).
+  var onCancelDownload: (() -> Void)?
+  var onCancelPending: (() -> Void)?
+  // nil hides the Close button (the launch state).
+  var onClose: (() -> Void)? { didSet { closeButton.isHidden = onClose == nil } }
+  var filter: Filter = .all { didSet { applyFilter() } }
+  var search = "" {
+    didSet {
+      if searchField.stringValue != search { searchField.stringValue = search }
+      applyFilter()
+    }
+  }
+  private(set) var visibleEntries: [SceneEntry] = []
+  // Setting it fills the details pane and selects its card; nil empties the pane.
+  var selection: SceneEntry? {
+    didSet {
+      fillDetails()
+      syncGridSelection()
+    }
+  }
+
+  private let library: ExampleLibrary
+  private var actionButtons: [NSButton] = []
+  private var actionsEnabled = true
+  private let restoreRow = NSStackView()
+  private let restoreInfo = NSTextField(labelWithString: "")
+  private let closeButton = ActionButton("Close") {}
+  private let progressRow = NSStackView()
+  private let progressBar = NSProgressIndicator()
+  private let progressLabel = NSTextField(labelWithString: "")
+  private let hint = NSTextField(wrappingLabelWithString: "")
+  private let pendingRow = NSStackView()
+  private let pendingLabel = NSTextField(wrappingLabelWithString: "")
+  private let searchField = NSSearchField()
+  private var filterButtons: [NSButton] = []
+  private let grid = NSCollectionView()
+  private let gridScroll = NSScrollView()
+  private let emptyLabel = NSTextField(labelWithString: "No scenes match")
+  private let details = NSStackView()
+  private let preview = ScenePreviewView()
+  private let titleLabel = NSTextField(wrappingLabelWithString: "")
+  private let summaryLabel = NSTextField(wrappingLabelWithString: "")
+  private let specsLabel = NSTextField(wrappingLabelWithString: "")
+  private let tagsLabel = NSTextField(wrappingLabelWithString: "")
+  private let collectionLabel = NSTextField(wrappingLabelWithString: "")
+  private let websiteButton = SceneBrowserView.link("scene-website")
+  private let creditLabel = NSTextField(wrappingLabelWithString: "")
+  private let licenseButton = SceneBrowserView.link("scene-license")
+  private let termsLabel = NSTextField(wrappingLabelWithString: "")
+  private let downloadRow = NSStackView()
+  private let downloadBar = NSProgressIndicator()
+  private let downloadStatus = NSTextField(wrappingLabelWithString: "")
+  private let cancelDownload = ActionButton("Cancel") {}
+  private let openButton = ActionButton("Open") {}
+  private let downloadButton = ActionButton("Download") {}
+  private let finderButton = ActionButton("Show in Finder") {}
+  // The running download (setDownload), shown while its entry is selected.
+  private var download: (id: String, fraction: Double?, status: String?)?
+  private static let cardIdentifier = NSUserInterfaceItemIdentifier("scene-card")
+
+  // `library` gives the download scenes' installed state and remaining sizes.
+  init(library: ExampleLibrary = ExampleLibrary()) {
+    self.library = library
+    super.init(frame: .zero)
+    wantsLayer = true
+    identifier = NSUserInterfaceItemIdentifier("scene-browser")
+
+    let top = buildTopRow()
+    let filters = buildFilters()
+    buildGrid()
+    let detailsScroll = buildDetails()
+    let columns = NSStackView(views: [filters, gridScroll, detailsScroll])
+    columns.orientation = .horizontal
+    columns.alignment = .top
+    columns.spacing = 16
+    columns.setHuggingPriority(.init(1), for: .vertical)
+    let content = NSStackView(views: [top, progressRow, hint, pendingRow, columns])
+    content.orientation = .vertical
+    content.alignment = .leading
+    content.spacing = 10
+    content.distribution = .fill
+    content.detachesHiddenViews = true
+    content.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(content)
+    emptyLabel.identifier = NSUserInterfaceItemIdentifier("scene-empty")
+    emptyLabel.textColor = .secondaryLabelColor
+    emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+    emptyLabel.isHidden = true
+    addSubview(emptyLabel)
+
+    NSLayoutConstraint.activate([
+      content.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+      content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+      content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
+      top.widthAnchor.constraint(equalTo: content.widthAnchor),
+      columns.widthAnchor.constraint(equalTo: content.widthAnchor),
+      hint.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor),
+      filters.widthAnchor.constraint(equalToConstant: 140),
+      detailsScroll.widthAnchor.constraint(equalToConstant: 260),
+      gridScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: CardGridLayout.minimumWidth),
+      gridScroll.heightAnchor.constraint(equalTo: columns.heightAnchor),
+      detailsScroll.heightAnchor.constraint(equalTo: columns.heightAnchor),
+      emptyLabel.centerXAnchor.constraint(equalTo: gridScroll.centerXAnchor),
+      emptyLabel.topAnchor.constraint(equalTo: gridScroll.topAnchor, constant: 24),
+    ])
+    applyFilter()
+  }
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func updateLayer() {
+    layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+  }
+  override var wantsUpdateLayer: Bool { true }
+
+  // The cards' width follows the grid's (CardGridLayout).
+  private var gridWidth: CGFloat = 0
+  override func layout() {
+    super.layout()
+    if gridScroll.contentSize.width != gridWidth {
+      gridWidth = gridScroll.contentSize.width
+      grid.collectionViewLayout?.invalidateLayout()
+    }
+  }
+
+  // MARK: Building
+
+  private func buildTopRow() -> NSView {
+    let row = NSStackView()
+    row.orientation = .horizontal
+    row.spacing = 10
+    for (title, id, action) in [
+      ("Open Project…", "start-open", StartAction.openProject(nil)),
+      ("Open Scene File…", "start-open-scene", .openScene(nil)),
+    ] {
+      let button = ActionButton(title) { [weak self] in self?.onAction?(action) }
+      button.identifier = NSUserInterfaceItemIdentifier(id)
+      row.addArrangedSubview(button)
+      actionButtons.append(button)
+    }
+    restoreRow.orientation = .horizontal
+    restoreRow.spacing = 8
+    let restore = ActionButton("Restore Last Session") { [weak self] in self?.onAction?(.restoreSession) }
+    restore.identifier = NSUserInterfaceItemIdentifier("start-restore")
+    actionButtons.append(restore)
+    restoreInfo.textColor = .secondaryLabelColor
+    restoreInfo.font = .systemFont(ofSize: 11)
+    restoreInfo.lineBreakMode = .byTruncatingTail
+    restoreInfo.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    restoreRow.addArrangedSubview(restore)
+    restoreRow.addArrangedSubview(restoreInfo)
+    restoreRow.isHidden = true
+    row.addArrangedSubview(restoreRow)
+    let spacer = NSView()
+    spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+    row.addArrangedSubview(spacer)
+    closeButton.actionBlock = { [weak self] in self?.onClose?() }
+    closeButton.identifier = NSUserInterfaceItemIdentifier("scene-close")
+    closeButton.isHidden = true
+    row.addArrangedSubview(closeButton)
+    row.detachesHiddenViews = true
+
+    progressBar.style = .bar
+    progressBar.controlSize = .small
+    progressBar.minValue = 0
+    progressBar.maxValue = 1
+    progressBar.widthAnchor.constraint(equalToConstant: 220).isActive = true
+    progressLabel.font = .systemFont(ofSize: 12)
+    progressLabel.identifier = NSUserInterfaceItemIdentifier("start-progress")
+    progressRow.orientation = .horizontal
+    progressRow.spacing = 10
+    progressRow.addArrangedSubview(progressBar)
+    progressRow.addArrangedSubview(progressLabel)
+    progressRow.isHidden = true
+    hint.textColor = .secondaryLabelColor
+    hint.font = .systemFont(ofSize: 11)
+    hint.isHidden = true
+
+    pendingRow.orientation = .horizontal
+    pendingRow.spacing = 10
+    pendingLabel.font = .systemFont(ofSize: 12)
+    let cancel = ActionButton("Cancel") { [weak self] in self?.onCancelPending?() }
+    cancel.identifier = NSUserInterfaceItemIdentifier("start-cancel-pending")
+    pendingRow.addArrangedSubview(pendingLabel)
+    pendingRow.addArrangedSubview(cancel)
+    pendingRow.isHidden = true
+    return row
+  }
+
+  private func buildFilters() -> NSView {
+    searchField.identifier = NSUserInterfaceItemIdentifier("scene-search")
+    searchField.placeholderString = "Search"
+    searchField.sendsSearchStringImmediately = true
+    searchField.target = self
+    searchField.action = #selector(searchChanged)
+    let column = NSStackView(views: [searchField])
+    column.orientation = .vertical
+    column.alignment = .leading
+    column.spacing = 4
+    column.setCustomSpacing(12, after: searchField)
+    for (filter, title) in zip(Filter.allCases, ["All", "Built-in", "Included", "Downloads", "Installed"]) {
+      let button = NSButton(title: title, target: self, action: #selector(filterClicked(_:)))
+      button.setButtonType(.pushOnPushOff)
+      button.bezelStyle = .recessed
+      button.alignment = .left
+      button.tag = filter.rawValue
+      button.identifier = NSUserInterfaceItemIdentifier("scene-filter-\(filter.rawValue)")
+      column.addArrangedSubview(button)
+      button.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+      filterButtons.append(button)
+    }
+    searchField.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+    return column
+  }
+
+  private func buildGrid() {
+    grid.collectionViewLayout = CardGridLayout()
+    grid.register(SceneCardItem.self, forItemWithIdentifier: Self.cardIdentifier)
+    grid.dataSource = self
+    grid.delegate = self
+    grid.isSelectable = true
+    grid.backgroundColors = [.clear]
+    gridScroll.documentView = grid
+    gridScroll.hasVerticalScroller = true
+    gridScroll.drawsBackground = false
+    gridScroll.borderType = .noBorder
+    gridScroll.setContentHuggingPriority(.init(1), for: .horizontal)
+  }
+
+  private func buildDetails() -> NSScrollView {
+    details.orientation = .vertical
+    details.alignment = .leading
+    details.spacing = 8
+    details.detachesHiddenViews = true
+    details.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 8, right: 12)
+    details.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+    for label in [specsLabel, tagsLabel, collectionLabel, creditLabel, termsLabel, downloadStatus] {
+      label.font = .systemFont(ofSize: 11)
+      label.textColor = .secondaryLabelColor
+    }
+    downloadBar.style = .bar
+    downloadBar.controlSize = .small
+    downloadBar.minValue = 0
+    downloadBar.maxValue = 1
+    cancelDownload.actionBlock = { [weak self] in self?.onCancelDownload?() }
+    cancelDownload.identifier = NSUserInterfaceItemIdentifier("scene-download-cancel")
+    downloadRow.orientation = .vertical
+    downloadRow.alignment = .leading
+    downloadRow.spacing = 4
+    for view in [downloadBar, downloadStatus, cancelDownload] { downloadRow.addArrangedSubview(view) }
+    openButton.identifier = NSUserInterfaceItemIdentifier("scene-open")
+    openButton.actionBlock = { [weak self] in
+      if let id = self?.selection?.id { self?.onAction?(.scene(id)) }
+    }
+    downloadButton.identifier = NSUserInterfaceItemIdentifier("scene-download")
+    downloadButton.actionBlock = { [weak self] in
+      if let entry = self?.selection { self?.onDownload?(entry) }
+    }
+    for button in [openButton, downloadButton] { button.controlSize = .large }
+    actionButtons += [openButton, downloadButton]
+    finderButton.identifier = NSUserInterfaceItemIdentifier("scene-show-in-finder")
+    finderButton.actionBlock = { [weak self] in
+      guard let self, let entry = self.selection else { return }
+      NSWorkspace.shared.activateFileViewerSelecting([self.library.storage(entry)])
+    }
+    let credits = Self.link("scene-credits")
+    credits.title = "Credits and licenses…"
+    credits.actionBlock = { [weak self] in _ = self?.tryToPerform(#selector(StudioController.exampleCreditsAction), with: nil) }
+    for view in [preview, titleLabel, summaryLabel, specsLabel, tagsLabel, collectionLabel, websiteButton, creditLabel,
+                 licenseButton, termsLabel, downloadRow, openButton, downloadButton, finderButton, credits] {
+      details.addArrangedSubview(view)
+    }
+    details.setCustomSpacing(2, after: collectionLabel)
+    details.setCustomSpacing(2, after: creditLabel)
+    details.setCustomSpacing(14, after: termsLabel)
+
+    let document = FlippedView()
+    document.translatesAutoresizingMaskIntoConstraints = false
+    document.addSubview(details)
+    let scroll = NSScrollView()
+    scroll.documentView = document
+    scroll.hasVerticalScroller = true
+    scroll.drawsBackground = false
+    scroll.borderType = .noBorder
+    let width: CGFloat = 260 - 12
+    NSLayoutConstraint.activate([
+      document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+      document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+      document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+      details.topAnchor.constraint(equalTo: document.topAnchor),
+      details.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+      details.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+      details.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+      preview.widthAnchor.constraint(equalToConstant: width),
+      preview.heightAnchor.constraint(equalToConstant: (width * 9 / 16).rounded()),
+      downloadRow.widthAnchor.constraint(equalToConstant: width),
+      downloadBar.widthAnchor.constraint(equalTo: downloadRow.widthAnchor),
+    ])
+    for label in [titleLabel, summaryLabel, specsLabel, tagsLabel, collectionLabel, creditLabel, termsLabel, downloadStatus] {
+      label.preferredMaxLayoutWidth = width
+    }
+    return scroll
+  }
+
+  // A borderless button in the link colour.
+  private static func link(_ id: String) -> ActionButton {
+    let button = ActionButton("") {}
+    button.isBordered = false
+    button.contentTintColor = .linkColor
+    button.identifier = NSUserInterfaceItemIdentifier(id)
+    return button
+  }
+
+  // MARK: State
+
+  // Re-reads the download scenes' installed state from the library.
+  func reload() {
+    applyFilter()
+    grid.reloadData()
+    syncGridSelection()
+    fillDetails()
+  }
+  // The autosave's modification date; nil hides the restore button.
+  func setRestore(_ date: Date?) {
+    restoreRow.isHidden = date == nil
+    if let date { restoreInfo.stringValue = "Autosaved " + date.formatted(date: .abbreviated, time: .shortened) }
+  }
+  // Shader compilation or another launch step; nil hides the progress row.
+  func setProgress(_ snapshot: OperationProgress.Snapshot?, hint text: String? = nil) {
+    progressRow.isHidden = snapshot == nil
+    hint.isHidden = snapshot == nil || text == nil
+    hint.stringValue = text ?? ""
+    guard let snapshot else {
+      progressBar.stopAnimation(nil)
+      return
+    }
+    progressLabel.stringValue = snapshot.text
+    if let fraction = snapshot.fraction {
+      progressBar.isIndeterminate = false
+      progressBar.doubleValue = fraction
+    } else if !progressBar.isIndeterminate {
+      progressBar.isIndeterminate = true
+    }
+    progressBar.startAnimation(nil)
+  }
+  // An action queued until the shaders are ready; nil hides it.
+  func setPending(_ text: String?) {
+    pendingRow.isHidden = text == nil
+    pendingLabel.stringValue = text ?? ""
+  }
+  // Disabled while a queued action or a started operation is in progress: the action buttons and card selection.
+  func setActionsEnabled(_ enabled: Bool) {
+    actionsEnabled = enabled
+    for button in actionButtons { button.isEnabled = enabled }
+    grid.isSelectable = enabled
+  }
+  // A running download of `entry` with its fraction done and status line, shown in the details pane while the entry
+  // is selected in place of its Download button; nil restores the button.
+  func setDownload(_ entry: SceneEntry?, fraction: Double?, status: String?) {
+    download = entry.map { ($0.id, fraction, status) }
+    fillDetails()
+  }
+  // The control with this accessibility identifier.
+  func control(_ id: String) -> NSControl? {
+    func find(_ view: NSView) -> NSControl? {
+      if let control = view as? NSControl, control.identifier?.rawValue == id { return control }
+      for subview in view.subviews { if let found = find(subview) { return found } }
+      return nil
+    }
+    return find(self)
+  }
+  // No scene ships a thumbnail yet: cards and the details pane show a placeholder.
+  static func thumbnail(_ entry: SceneEntry) -> NSImage? { nil }
+
+  // A card's line of specs: "262 k triangles · OBJ", "OpenUSD", or "Built-in" for a built-in scene.
+  static func specLine(_ entry: SceneEntry) -> String {
+    if entry.collection == .builtIn { return SceneEntry.Collection.builtIn.title }
+    guard let triangles = entry.triangles else { return entry.format.title }
+    return "\(count(triangles)) triangles · \(entry.format.title)"
+  }
+  // "262 k" or "2.8 M".
+  private static func count(_ n: Int) -> String {
+    if n >= 10_000_000 { return String(format: "%.0f M", Double(n) / 1e6) }
+    if n >= 1_000_000 { return String(format: "%.1f M", Double(n) / 1e6) }
+    return "\(Int((Double(n) / 1e3).rounded())) k"
+  }
+  // A card's state: "Included", "Download 80 MB" (what is still missing) or "Installed".
+  func stateText(_ entry: SceneEntry) -> String {
+    guard entry.isDownload else { return "Included" }
+    let bytes = library.downloadBytes(entry)
+    return bytes > 0 ? "Download \(SceneCatalog.megabytes(bytes))" : "Installed"
+  }
+
+  private func matches(_ entry: SceneEntry) -> Bool {
+    switch filter {
+    case .all: break
+    case .builtIn: guard entry.collection == .builtIn else { return false }
+    case .included: guard !entry.isDownload else { return false }
+    case .downloads: guard entry.isDownload else { return false }
+    case .installed: guard entry.isDownload, library.missing(entry).isEmpty else { return false }
+    }
+    let query = search.trimmingCharacters(in: .whitespaces)
+    guard !query.isEmpty else { return true }
+    return ([entry.title, entry.credit ?? ""] + entry.tags).contains { $0.localizedCaseInsensitiveContains(query) }
+  }
+  // Recomputes the visible cards; the selection stays when still visible, else moves to the first card.
+  private func applyFilter() {
+    visibleEntries = SceneCatalog.entries.filter(matches)
+    for button in filterButtons { button.state = button.tag == filter.rawValue ? .on : .off }
+    emptyLabel.isHidden = !visibleEntries.isEmpty
+    grid.reloadData()
+    if let current = selection, visibleEntries.contains(where: { $0.id == current.id }) {
+      syncGridSelection()
+    } else {
+      selection = visibleEntries.first
+    }
+  }
+  private func syncGridSelection() {
+    let index = selection.flatMap { current in visibleEntries.firstIndex { $0.id == current.id } }
+    let paths: Set<IndexPath> = index.map { [IndexPath(item: $0, section: 0)] } ?? []
+    if grid.selectionIndexPaths != paths { grid.selectionIndexPaths = paths }
+  }
+  private func fillDetails() {
+    guard let entry = selection else {
+      details.isHidden = true
+      return
+    }
+    details.isHidden = false
+    preview.show(entry)
+    titleLabel.stringValue = entry.title
+    summaryLabel.stringValue = entry.summary
+    var specs: [String] = []
+    if let triangles = entry.triangles { specs.append("Triangles: \(triangles.formatted())") }
+    if let materials = entry.materials { specs.append("Materials: \(materials)") }
+    specs.append("Format: \(entry.format.title)")
+    let missing = library.downloadBytes(entry)
+    if missing > 0 {
+      specs.append("Download: \(SceneCatalog.megabytes(missing))")
+      specs.append("Disk: \(SceneCatalog.megabytes(library.diskBytes(entry)))")
+    }
+    specsLabel.stringValue = specs.joined(separator: "\n")
+    tagsLabel.stringValue = "Tags: " + entry.tags.joined(separator: ", ")
+    tagsLabel.isHidden = entry.tags.isEmpty
+    collectionLabel.stringValue = entry.collection.title
+    websiteButton.isHidden = entry.collection.website == nil
+    if let website = entry.collection.website {
+      websiteButton.title = website.host ?? website.absoluteString
+      websiteButton.actionBlock = { NSWorkspace.shared.open(website) }
+    }
+    creditLabel.stringValue = entry.credit ?? ""
+    creditLabel.isHidden = entry.credit == nil
+    licenseButton.isHidden = entry.license == nil || entry.licenseURL == nil
+    if let license = entry.license, let url = entry.licenseURL {
+      licenseButton.title = license
+      licenseButton.actionBlock = { NSWorkspace.shared.open(url) }
+    }
+    termsLabel.stringValue = entry.terms ?? ""
+    termsLabel.isHidden = entry.terms == nil
+    let running = download.flatMap { $0.id == entry.id ? $0 : nil }
+    downloadRow.isHidden = running == nil
+    cancelDownload.isHidden = running == nil
+    if let running {
+      downloadBar.isIndeterminate = running.fraction == nil
+      downloadBar.doubleValue = running.fraction ?? 0
+      if running.fraction == nil { downloadBar.startAnimation(nil) } else { downloadBar.stopAnimation(nil) }
+      downloadStatus.stringValue = running.status ?? ""
+    }
+    openButton.isHidden = missing > 0
+    downloadButton.isHidden = missing == 0 || running != nil
+    downloadButton.title = "Download \(SceneCatalog.megabytes(missing))"
+    finderButton.isHidden = !entry.isDownload || missing > 0
+  }
+
+  // MARK: Actions
+
+  @objc private func searchChanged() { search = searchField.stringValue }
+  @objc private func filterClicked(_ sender: NSButton) { filter = Filter(rawValue: sender.tag) ?? .all }
+
+  // MARK: Grid
+
+  func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
+    visibleEntries.count
+  }
+  func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath)
+    -> NSCollectionViewItem
+  {
+    let item = collectionView.makeItem(withIdentifier: Self.cardIdentifier, for: indexPath)
+    let entry = visibleEntries[indexPath.item]
+    (item as? SceneCardItem)?.show(entry, state: stateText(entry))
+    return item
+  }
+  func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
+    guard actionsEnabled, let index = indexPaths.first?.item, visibleEntries.indices.contains(index) else { return }
+    selection = visibleEntries[index]
+  }
+}
+
+extension SceneBrowserView {
+  // Asks for the file of an open or import action as a sheet on `window`; other actions need none.
+  static func chooseFile(for action: StartAction, window: NSWindow, _ chosen: @escaping (StartAction) -> Void) {
+    let (title, extensions, make): (String, [String], (URL) -> StartAction)
+    switch action {
+    case .openProject(nil): (title, extensions, make) = ("Open Metal Vibe Tracer project", ["vtrace", "json"], { .openProject($0) })
+    case .openScene(nil): (title, extensions, make) = ("Open scene file", SceneFile.extensions, { .openScene($0) })
+    default: return chosen(action)
+    }
+    let panel = NSOpenPanel()
+    panel.title = title
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = extensions.compactMap { UTType(filenameExtension: $0) }
+    panel.beginSheetModal(for: window) { response in
+      if response == .OK, let url = panel.url { chosen(make(url)) }
+    }
+  }
+  // What a queued action will do, for the start screen ("Opening Sponza.vtrace").
+  static func describe(_ action: StartAction) -> String {
+    switch action {
+    case .openProject(let url): return "Opening \(url?.lastPathComponent ?? "a project")"
+    case .openScene(let url): return "Opening \(url?.lastPathComponent ?? "a scene")"
+    case .scene(let id): return "Opening \(SceneCatalog.entry(id)?.title ?? "a scene")"
+    case .restoreSession: return "Restoring the last session"
+    }
+  }
+}
+
+private extension SceneEntry.Format {
+  var title: String {
+    switch self {
+    case .procedural: return "Procedural"
+    case .usd: return "OpenUSD"
+    case .obj: return "OBJ"
+    }
+  }
+}
+
+// Cards fill the grid's width in columns at least `minimumWidth` wide, with 16:9 previews.
+private final class CardGridLayout: NSCollectionViewFlowLayout {
+  static let minimumWidth: CGFloat = 180, spacing: CGFloat = 12
+  override init() {
+    super.init()
+    minimumInteritemSpacing = Self.spacing
+    minimumLineSpacing = Self.spacing
+  }
+  required init?(coder: NSCoder) { fatalError() }
+  override func prepare() {
+    let width = collectionView?.enclosingScrollView?.contentSize.width ?? 0
+    let columns = max(1, Int((width + Self.spacing) / (Self.minimumWidth + Self.spacing)))
+    let cardWidth = max(Self.minimumWidth, ((width - Self.spacing * CGFloat(columns - 1)) / CGFloat(columns)).rounded(.down))
+    let size = NSSize(width: cardWidth, height: (cardWidth * 9 / 16).rounded() + 62)
+    if itemSize != size { itemSize = size }
+    super.prepare()
+  }
+}
+
+// The details pane's document view, laid out from the top.
+private final class FlippedView: NSView {
+  override var isFlipped: Bool { true }
+}
+
+// A scene's thumbnail, or a flat placeholder naming its format while it has none.
+private final class ScenePreviewView: NSView {
+  private let image = NSImageView()
+  private let label = NSTextField(labelWithString: "")
+
+  init() {
+    super.init(frame: .zero)
+    wantsLayer = true
+    layer?.cornerRadius = 6
+    layer?.masksToBounds = true
+    image.imageScaling = .scaleProportionallyUpOrDown
+    label.textColor = .secondaryLabelColor
+    label.font = .systemFont(ofSize: 12, weight: .medium)
+    for view in [image, label] {
+      view.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(view)
+    }
+    NSLayoutConstraint.activate([
+      image.leadingAnchor.constraint(equalTo: leadingAnchor), image.trailingAnchor.constraint(equalTo: trailingAnchor),
+      image.topAnchor.constraint(equalTo: topAnchor), image.bottomAnchor.constraint(equalTo: bottomAnchor),
+      label.centerXAnchor.constraint(equalTo: centerXAnchor), label.centerYAnchor.constraint(equalTo: centerYAnchor),
+    ])
+  }
+  required init?(coder: NSCoder) { fatalError() }
+  override var wantsUpdateLayer: Bool { true }
+  override func updateLayer() { layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor }
+
+  func show(_ entry: SceneEntry) {
+    let thumbnail = SceneBrowserView.thumbnail(entry)
+    image.image = thumbnail
+    image.isHidden = thumbnail == nil
+    label.isHidden = thumbnail != nil
+    label.stringValue = entry.format.title
+  }
+}
+
+// A card of the grid: preview, title, spec line and state; the selected card has an accent border.
+private final class SceneCardItem: NSCollectionViewItem {
+  private let card = SceneCardView()
+  private let preview = ScenePreviewView()
+  private let titleLabel = NSTextField(labelWithString: "")
+  private let specs = NSTextField(labelWithString: "")
+  private let state = NSTextField(labelWithString: "")
+
+  override func loadView() {
+    titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+    for label in [specs, state] {
+      label.font = .systemFont(ofSize: 11)
+      label.textColor = .secondaryLabelColor
+    }
+    let stack = NSStackView(views: [preview, titleLabel, specs, state])
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 2
+    stack.setCustomSpacing(6, after: preview)
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    for label in [titleLabel, specs, state] { label.lineBreakMode = .byTruncatingTail }
+    card.addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 6),
+      stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 6),
+      stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -6),
+      preview.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      preview.heightAnchor.constraint(equalTo: preview.widthAnchor, multiplier: 9.0 / 16.0),
+      titleLabel.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+      specs.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+    ])
+    view = card
+  }
+  override var isSelected: Bool { didSet { card.isSelected = isSelected } }
+
+  func show(_ entry: SceneEntry, state text: String) {
+    _ = view
+    card.identifier = NSUserInterfaceItemIdentifier("scene-card-\(entry.id)")
+    card.setAccessibilityElement(true)
+    card.setAccessibilityRole(.group)
+    card.setAccessibilityLabel("\(entry.title), \(text)")
+    preview.show(entry)
+    titleLabel.stringValue = entry.title
+    specs.stringValue = SceneBrowserView.specLine(entry)
+    state.stringValue = text
+    card.isSelected = isSelected
+  }
+}
+
+private final class SceneCardView: NSView {
+  var isSelected = false { didSet { needsDisplay = true } }
+  override init(frame: NSRect) {
+    super.init(frame: frame)
+    wantsLayer = true
+    layer?.cornerRadius = 8
+    layer?.borderWidth = 2
+  }
+  required init?(coder: NSCoder) { fatalError() }
+  override var wantsUpdateLayer: Bool { true }
+  override func updateLayer() {
+    layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+    layer?.borderColor = (isSelected ? NSColor.controlAccentColor : NSColor.separatorColor).cgColor
+  }
+}

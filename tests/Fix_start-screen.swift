@@ -1,6 +1,6 @@
-// Launch start state (AppDelegate, StartScreenView): background shader compilation with on-demand
-// kernel groups, the empty start screen, the kept and restorable last-session autosave, and the
-// activity strip of project operations.
+// Launch start state (AppDelegate, SceneBrowserView): background shader compilation with on-demand
+// kernel groups, the scene browser of the empty start screen, the kept and restorable last-session
+// autosave, and the activity strip of project operations.
 @MainActor func fixStartScreenChecks() throws {
   let folder = studioDirectory.absoluteURL.appendingPathComponent("fix-start-screen", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -66,18 +66,68 @@
     controller.view.cacheDisplay(in: controller.view.bounds, to: rep)
     try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("start-screen.png"))
   }
-  require(start.button("start-restore")?.superview?.isHidden == false && start.button("start-open")?.isEnabled == true
-    && start.button("start-scene-1")?.title == StudioController.sceneNames[1],
-    "the start screen offers open, import, built-in scenes and restoring the autosaved session")
-  // Example scenes: every bundled example, and every download example with its remaining download size.
-  let spectral = SceneCatalog.entries(.spectral), mcguire = SceneCatalog.entries(.mcguire)
-  let downloads = mcguire.indices.map { start.button("start-download-\($0)")?.title ?? "" }
-  require(spectral.indices.allSatisfy { start.button("start-example-\($0)")?.title == spectral[$0].title }
-    && zip(downloads, mcguire).allSatisfy { title, scene in
-      title == StartScreenView.downloadTitle(scene, controller.exampleLibrary)
-        && title.hasPrefix(scene.title.replacingOccurrences(of: "Amazon Lumberyard ", with: "")) }
-    && StartScreenView.describe(.scene("lantern-arcade")) == "Opening Lantern Arcade",
-    "the start screen offers the bundled and downloadable example scenes (\(downloads))")
+  require(start.control("start-restore")?.superview?.isHidden == false && start.control("start-open")?.isEnabled == true
+    && start.visibleEntries.count == SceneCatalog.entries.count && start.selection?.id == SceneCatalog.entries.first?.id
+    && SceneBrowserView.describe(.scene("lantern-arcade")) == "Opening Lantern Arcade",
+    "the start screen offers open, restoring the autosaved session and the scene browser with every catalog scene")
+
+  // The browser: filters, search, the details pane's primary button, the busy state and the minimum window size.
+  let browser = SceneBrowserView(library: ExampleLibrary(root: folder.appendingPathComponent("library")))
+  require(browser.visibleEntries.count == 21 && browser.selection?.id == "pavilion", "all scenes, first selected")
+  browser.filter = .downloads
+  require(browser.visibleEntries.count == 10 && browser.visibleEntries.allSatisfy(\.isDownload), "downloads filter")
+  browser.filter = .installed
+  require(browser.visibleEntries.isEmpty && browser.selection == nil && browser.control("scene-empty")?.isHidden == false,
+    "nothing installed")
+  browser.filter = .builtIn
+  require(browser.visibleEntries.map(\.id) == SceneCatalog.entries(.builtIn).map(\.id)
+    && browser.control("scene-empty")?.isHidden == true, "built-in filter")
+  browser.filter = .included
+  require(browser.visibleEntries.count == 11 && !browser.visibleEntries.contains(where: \.isDownload), "included filter")
+  browser.filter = .all; browser.search = "bistro"
+  require(browser.visibleEntries.map(\.id) == ["bistro-exterior", "bistro-interior"], "search by title")
+  browser.search = "spectral"
+  require(browser.visibleEntries.count == 5, "search by tag")
+  browser.search = "STANFORD"
+  require(browser.visibleEntries.map(\.id) == ["buddha", "chinese-dragon"], "search by credit, ignoring case")
+  browser.search = "no such scene"
+  require(browser.visibleEntries.isEmpty && browser.selection == nil
+    && (browser.control("scene-empty") as? NSTextField)?.stringValue == "No scenes match", "an empty search")
+  browser.search = ""; browser.selection = SceneCatalog.entry("sponza")
+  require(browser.control("scene-download")?.isHidden == false && browser.control("scene-open")?.isHidden == true
+    && (browser.control("scene-download") as? NSButton)?.title == "Download 80 MB", "a missing download offers Download")
+  require(SceneBrowserView.specLine(SceneCatalog.entry("sponza")!) == "262 k triangles · OBJ"
+    && SceneBrowserView.specLine(SceneCatalog.entry("cornell-box")!) == "Built-in"
+    && browser.stateText(SceneCatalog.entry("sponza")!) == "Download 80 MB"
+    && browser.stateText(SceneCatalog.entry("abbe-row")!) == "Included"
+    && SceneBrowserView.thumbnail(SceneCatalog.entry("sponza")!) == nil, "card spec lines and states")
+  var downloaded: [String] = [], actions: [String] = []
+  browser.onDownload = { downloaded.append($0.id) }
+  browser.onAction = { if case .scene(let id) = $0 { actions.append(id) } }
+  (browser.control("scene-download") as? NSButton)?.performClick(nil)
+  browser.selection = SceneCatalog.entry("cornell-box")
+  require(browser.control("scene-open")?.isHidden == false && browser.control("scene-download")?.isHidden == true,
+    "included scenes open")
+  (browser.control("scene-open") as? NSButton)?.performClick(nil)
+  require(downloaded == ["sponza"] && actions == ["cornell-box"], "Download asks onDownload and Open sends .scene(id)")
+  require(browser.control("scene-close")?.isHidden == true && browser.control("scene-download-cancel")?.isHidden == true,
+    "without onClose there is no Close button, and no download progress until one is set")
+  browser.setDownload(SceneCatalog.entry("cornell-box"), fraction: 0.5, status: "Downloading")
+  require(browser.control("scene-download-cancel")?.isHidden == false, "a download shows its Cancel button")
+  browser.setDownload(nil, fraction: nil, status: nil)
+  require(browser.control("scene-download-cancel")?.isHidden == true, "no download hides it")
+  browser.setActionsEnabled(false)
+  require(browser.control("scene-open")?.isEnabled == false && browser.control("start-open")?.isEnabled == false,
+    "busy disables actions")
+  browser.setActionsEnabled(true)
+  browser.frame = NSRect(x: 0, y: 0, width: 700, height: 440); browser.layoutSubtreeIfNeeded()
+  require(browser.control("scene-open").map {
+      browser.bounds.contains($0.convert($0.bounds, to: browser).origin) || $0.enclosingScrollView != nil } == true,
+    "at the minimum window size the primary button is reachable")
+  if let rep = browser.bitmapImageRepForCachingDisplay(in: browser.bounds) {
+    browser.cacheDisplay(in: browser.bounds, to: rep)
+    try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("scene-browser-700x440.png"))
+  }
   func valid(_ selector: Selector) -> Bool {
     controller.validateMenuItem(NSMenuItem(title: "", action: selector, keyEquivalent: ""))
   }
@@ -134,8 +184,8 @@
 
   // Open Scene File: an OBJ opens as a new untitled scene; with unsaved changes the prompt comes first.
   require(["glb", "gltf", "usdz", "usd", "obj"].allSatisfy(SceneFile.extensions.contains)
-    && start.button("start-open-scene")?.title == "Open Scene File…" && start.button("start-import-obj") == nil
-    && StartScreenView.describe(.openScene(URL(fileURLWithPath: "/tmp/Chair.glb"))) == "Opening Chair.glb",
+    && (start.control("start-open-scene") as? NSButton)?.title == "Open Scene File…" && start.control("start-import-obj") == nil
+    && SceneBrowserView.describe(.openScene(URL(fileURLWithPath: "/tmp/Chair.glb"))) == "Opening Chair.glb",
     "the start screen and SceneFile offer one Open Scene File entry for USD, glTF and OBJ")
   let sceneObj = folder.appendingPathComponent("quad.obj")
   try "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n".write(to: sceneObj, atomically: true, encoding: .utf8)
@@ -149,24 +199,26 @@
   }
   require(controller.startScreen == nil && controller.projectURL == nil
     && controller.project.graph?.assets.map(\.geometry.count) == [2], "Open Scene File opens an OBJ as a new untitled scene")
+  // Unsaved changes to an empty document, so that only a replacement brings the OBJ's graph back.
+  try controller.restore(ProjectDocument())
   controller.associate(nil, edited: true, replaced: false)
   var prompts = 0
   var answer = NSApplication.ModalResponse.alertThirdButtonReturn
   controller.unsavedChangesAnswer = { respond in prompts += 1; respond(answer) }
   defer { controller.unsavedChangesAnswer = nil }
-  let sceneObjNodes = controller.project.graph?.nodes.count
   grouped {
     controller.beginOpenSceneFile(sceneObj)
     idle()
   }
-  require(prompts == 1 && controller.documentEdited && controller.project.graph?.nodes.count == sceneObjNodes
+  require(prompts == 1 && controller.documentEdited && controller.project.graph == nil
     && !controller.projectOperationInProgress, "Open Scene File asks before replacing unsaved changes and Cancel keeps them")
   answer = .alertSecondButtonReturn
   grouped {
     controller.beginOpenSceneFile(sceneObj)
     idle()
   }
-  require(prompts == 2 && controller.projectURL == nil, "Don't Save lets Open Scene File replace the document")
+  require(prompts == 2 && controller.projectURL == nil
+    && controller.project.graph?.assets.map(\.geometry.count) == [2], "Don't Save lets Open Scene File replace the document")
   controller.unsavedChangesAnswer = nil
   controller.associate(nil, edited: false, replaced: false)
   // Saving reports its phase in the activity strip until it finishes.

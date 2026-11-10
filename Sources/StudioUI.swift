@@ -161,8 +161,8 @@ final class StudioController: NSViewController {
   private var activityCancelHandler: (() -> Void)?
   private var activityTimer: Timer?
   private var statusAtEdge: NSLayoutConstraint!, statusAfterActivity: NSLayoutConstraint!
-  // The empty start state shown at launch (StartScreenView); nil once a document is loaded.
-  fileprivate(set) var startScreen: StartScreenView?
+  // The empty start state shown at launch (SceneBrowserView); nil once a document is loaded.
+  fileprivate(set) var startScreen: SceneBrowserView?
   // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
   var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
   // Set while the start screen restores the last session, which keeps its autosave file.
@@ -464,8 +464,12 @@ final class StudioController: NSViewController {
     for (index, example) in SceneCatalog.entries(.spectral).enumerated() { add(example.title, tag: Self.exampleTag + index) }
     menu.addItem(.separator())
     menu.addItem(.sectionHeader(title: "Download examples"))
+    // A download scene's title without the publisher ("Bistro (exterior)") with the size still to download
+    // ("Crytek Sponza · 80 MB"), or the title alone.
     for (index, entry) in SceneCatalog.entries(.mcguire).enumerated() {
-      add(StartScreenView.downloadTitle(entry, exampleLibrary), tag: Self.downloadTag + index)
+      let title = entry.title.replacingOccurrences(of: "Amazon Lumberyard ", with: "")
+      let bytes = exampleLibrary.downloadBytes(entry)
+      add(bytes > 0 ? "\(title) · \(SceneCatalog.megabytes(bytes))" : title, tag: Self.downloadTag + index)
     }
     popup.menu = menu
     popup.selectItem(withTag: Int(renderer.sceneIndex))
@@ -2556,14 +2560,17 @@ final class StudioController: NSViewController {
   @objc func restartAction() { restart() }
 }
 
-// The start screen (StartScreenView): the empty state at launch.
+// The start screen (SceneBrowserView): the empty state at launch.
 extension StudioController {
   // Covers the viewport and inspector with `view` (the launch screen, reused) until a document loads.
   // Nothing renders meanwhile, and no autosave is written, so the last session stays restorable.
-  func showStartScreen(_ given: StartScreenView? = nil) {
-    let view = given ?? StartScreenView(library: exampleLibrary)
+  func showStartScreen(_ given: SceneBrowserView? = nil) {
+    let view = given ?? SceneBrowserView(library: exampleLibrary)
+    view.reload()
     view.setRestore(Self.autosaveDate(at: autosaveURL))
     view.onAction = { [weak self] action in self?.performStartAction(action) }
+    // Download asks for consent and shows its progress in sheets (openOrDownloadScene).
+    view.onDownload = { [weak self] entry in self?.openOrDownloadScene(entry) }
     view.onCancelPending = nil
     view.setPending(nil)
     view.setActionsEnabled(!isBusy)
@@ -2621,11 +2628,11 @@ extension StudioController {
       if !openInFlight { restoringSession = false }
     case .openProject(nil), .openScene(nil):
       guard let window = hostWindow else { return }
-      StartScreenView.chooseFile(for: action, window: window) { [weak self] chosen in self?.performStartAction(chosen) }
+      SceneBrowserView.chooseFile(for: action, window: window) { [weak self] chosen in self?.performStartAction(chosen) }
     }
   }
   // A new untitled project of built-in scene `index`, with that scene's default camera.
-  private func startBuiltInScene(_ index: Int) {
+  func startBuiltInScene(_ index: Int) {
     var p = ProjectDocument()
     p.scene = UInt32(index)
     let oldCamera = CameraState(renderer), oldScene = renderer.sceneIndex

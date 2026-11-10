@@ -15,7 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   var studio: StudioController!
   // Until the launch shader compilation finishes: the start screen, the compilation's progress and
   // the start action the user chose meanwhile, performed once the renderer exists.
-  private(set) var startScreen: StartScreenView?
+  private(set) var startScreen: SceneBrowserView?
   private var launchProgress: OperationProgress?
   private var launchTimer: Timer?
   private var launchStarted = Date()
@@ -89,9 +89,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     window.delegate = self
     window.contentMinSize = NSSize(width: 700, height: 440)
     window.center()
-    let start = StartScreenView()
+    let start = SceneBrowserView()
     start.setRestore(StudioController.autosaveDate(at: StudioController.defaultAutosaveURL))
     start.onAction = { [weak self] action in self?.queueStartAction(action) }
+    start.onDownload = { [weak self] entry in self?.queueStartAction(.scene(entry.id)) }
     start.onCancelPending = { [weak self] in self?.cancelPendingStart() }
     startScreen = start
     window.contentView = start
@@ -139,7 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       let studio = StudioController(renderer: renderer, window: window)
       self.studio = studio
       window.contentView = studio.view
-      let start = startScreen ?? StartScreenView()
+      let start = startScreen ?? SceneBrowserView()
       startScreen = nil
       start.setProgress(nil)
       studio.showStartScreen(start)
@@ -165,13 +166,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       return
     }
     guard pendingStart == nil, let window else { return }
-    StartScreenView.chooseFile(for: action, window: window) { [weak self] chosen in
+    SceneBrowserView.chooseFile(for: action, window: window) { [weak self] chosen in
       guard let self, self.studio == nil else {
         self?.studio?.performStartAction(chosen)
         return
       }
       self.pendingStart = chosen
-      self.startScreen?.setPending(StartScreenView.describe(chosen) + " once the shaders are ready.")
+      self.startScreen?.setPending(SceneBrowserView.describe(chosen) + " once the shaders are ready.")
       self.startScreen?.setActionsEnabled(false)
     }
   }
