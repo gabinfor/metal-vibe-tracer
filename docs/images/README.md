@@ -41,4 +41,4 @@ Renders of scenes from Morgan McGuire's Computer Graphics Archive (https://casua
 - **San Miguel 2.0** © Guillermo M. Leal Llaguno. Creative Commons Attribution 3.0 (https://creativecommons.org/licenses/by/3.0/).
 - **Amazon Lumberyard Bistro** © 2017 Amazon Lumberyard. Creative Commons Attribution 4.0 (https://creativecommons.org/licenses/by/4.0/).
 
-Changes: the scenes were rendered by Metal Vibe Tracer with its own MTL-to-OpenPBR translation, cameras, procedural sky and sun; the renders are adapted works. See `REFERENCES.md` (`MCGUIRE2017`, `MTL2026`). The app does not bundle these scenes; the scene browser (**File › Browse Scenes…**) downloads them from the archive on request and shows these credits.
+Changes: the scenes were rendered by Metal Vibe Tracer with its own MTL-to-OpenPBR translation, cameras, procedural sky and sun; the renders are adapted works. See `REFERENCES.md` (`MCGUIRE2017`, `MTL2026`). The app does not bundle these scenes (only 480 × 270 thumbnails of them, credited in `Examples/Thumbnails/README.md`); the scene browser (**File › Browse Scenes…**) downloads them from the archive on request and shows these credits.
