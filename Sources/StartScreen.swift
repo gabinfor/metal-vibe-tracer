@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 // What the start screen asks for. A nil URL asks with an open panel first.
 enum StartAction {
   case openProject(URL?), importOBJ(URL?), importUSD(URL?), builtInScene(Int), restoreSession
-  // A bundled example (SpectralExamples.catalog) or a downloadable one (ExampleScenes.catalog, after consent).
+  // A bundled example (SceneCatalog's spectral collection) or a downloadable one (its McGuire collection, after consent).
   case example(Int), download(Int)
 }
 
@@ -95,10 +95,10 @@ final class StartScreenView: NSView {
       content.setCustomSpacing(22, after: grid)
     }
     section("Built-in scenes", Self.builtInScenes.enumerated().map { ($1, "start-scene-\($0)", .builtInScene($0)) })
-    section("Example scenes", SpectralExamples.catalog.enumerated().map { ($1.title, "start-example-\($0)", .example($0)) })
+    section("Example scenes", SceneCatalog.entries(.spectral).enumerated().map { ($1.title, "start-example-\($0)", .example($0)) })
     section("Download examples", note: "From Morgan McGuire's archive; downloaded once, after you agree.", perRow: 2,
-            ExampleScenes.catalog.enumerated().map { index, scene in
-              (Self.downloadTitle(scene, library), "start-download-\(index)", .download(index))
+            SceneCatalog.entries(.mcguire).enumerated().map { index, entry in
+              (Self.downloadTitle(entry, library), "start-download-\(index)", .download(index))
             })
 
     restoreRow.orientation = .horizontal
@@ -192,10 +192,11 @@ final class StartScreenView: NSView {
     for button in actionButtons { button.isEnabled = enabled }
   }
   func button(_ id: String) -> NSButton? { actionButtons.first { $0.identifier?.rawValue == id } }
-  // A download example's short title with the size still to download ("Crytek Sponza · 80 MB"), or the title alone.
-  static func downloadTitle(_ scene: ExampleScene, _ library: ExampleLibrary) -> String {
-    let bytes = library.downloadBytes(scene)
-    return bytes > 0 ? "\(scene.shortTitle) · \(ExampleScenes.megabytes(bytes))" : scene.shortTitle
+  // A download example's title without the publisher ("Bistro (exterior)") with the size still to download ("Crytek Sponza · 80 MB"), or the title alone.
+  static func downloadTitle(_ entry: SceneEntry, _ library: ExampleLibrary) -> String {
+    let title = entry.title.replacingOccurrences(of: "Amazon Lumberyard ", with: "")
+    let bytes = library.downloadBytes(entry)
+    return bytes > 0 ? "\(title) · \(SceneCatalog.megabytes(bytes))" : title
   }
 }
 
@@ -224,8 +225,8 @@ extension StartScreenView {
     case .importOBJ(let url): return "Importing \(url?.lastPathComponent ?? "an OBJ mesh")"
     case .importUSD(let url): return "Opening \(url?.lastPathComponent ?? "a scene")"
     case .builtInScene(let index): return "Loading \(builtInScenes[index])"
-    case .example(let index): return "Opening \(SpectralExamples.catalog[index].title)"
-    case .download(let index): return "Opening \(ExampleScenes.catalog[index].title)"
+    case .example(let index): return "Opening \(SceneCatalog.entries(.spectral)[index].title)"
+    case .download(let index): return "Opening \(SceneCatalog.entries(.mcguire)[index].title)"
     case .restoreSession: return "Restoring the last session"
     }
   }

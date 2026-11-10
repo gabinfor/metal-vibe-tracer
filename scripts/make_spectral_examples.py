@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Writes the bundled spectral example stages, Examples/Spectral/*.usda (SpectralExamples in
-Sources/ExampleScenes.swift; REFERENCES.md SCHOTTGLASS, DIAMANTI2014, OPENPBR, BUCHOLTZ1995, PLANCK, CIEDATA;
+"""Writes the bundled spectral example stages, Examples/Spectral/*.usda (the spectral entries of
+Sources/SceneCatalog.swift; REFERENCES.md SCHOTTGLASS, DIAMANTI2014, OPENPBR, BUCHOLTZ1995, PLANCK, CIEDATA;
 docs/VOLUME_DESIGN.md for the media, light spectra and spot cones).
 
 Usage: python3 scripts/make_spectral_examples.py [OUTPUT_DIR]   (default Examples/Spectral)

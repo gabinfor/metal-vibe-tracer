@@ -70,10 +70,12 @@
     && start.button("start-scene-1")?.title == StudioController.sceneNames[1],
     "the start screen offers open, import, built-in scenes and restoring the autosaved session")
   // Example scenes: every bundled example, and every download example with its remaining download size.
-  let downloads = ExampleScenes.catalog.indices.map { start.button("start-download-\($0)")?.title ?? "" }
-  require(SpectralExamples.catalog.indices.allSatisfy { start.button("start-example-\($0)")?.title == SpectralExamples.catalog[$0].title }
-    && zip(downloads, ExampleScenes.catalog).allSatisfy { title, scene in
-      title == StartScreenView.downloadTitle(scene, controller.exampleLibrary) && title.hasPrefix(scene.shortTitle) }
+  let spectral = SceneCatalog.entries(.spectral), mcguire = SceneCatalog.entries(.mcguire)
+  let downloads = mcguire.indices.map { start.button("start-download-\($0)")?.title ?? "" }
+  require(spectral.indices.allSatisfy { start.button("start-example-\($0)")?.title == spectral[$0].title }
+    && zip(downloads, mcguire).allSatisfy { title, scene in
+      title == StartScreenView.downloadTitle(scene, controller.exampleLibrary)
+        && title.hasPrefix(scene.title.replacingOccurrences(of: "Amazon Lumberyard ", with: "")) }
     && StartScreenView.describe(.example(4)) == "Opening Lantern Arcade",
     "the start screen offers the bundled and downloadable example scenes (\(downloads))")
   func valid(_ selector: Selector) -> Bool {
@@ -120,7 +122,7 @@
   let captions = views(NSTextField.self, in: controller.stack).map(\.stringValue)
   require(picker?.selectedTag() == 1 && headers == ["Built-in scenes", "Example scenes", "Download examples"]
     && picker?.menu?.items.filter { $0.tag >= StudioController.exampleTag && !$0.isSectionHeader }.count
-      == SpectralExamples.catalog.count + ExampleScenes.catalog.count
+      == SceneCatalog.entries(.spectral).count + SceneCatalog.entries(.mcguire).count
     && captions.prefix(2).contains("Scene"), "the inspector's Scene selector is labelled and groups built-in, example and download scenes")
   if let rep = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) {
     controller.view.cacheDisplay(in: controller.view.bounds, to: rep)

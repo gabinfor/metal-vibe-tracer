@@ -228,7 +228,7 @@ final class StudioController: NSViewController {
   var previewDenoiseJob: OIDNProgress? { didSet { busyStateChanged() } }
   var oidnPreviewWasPaused = false
   var messageUntil = Date.distantPast
-  static let sceneNames = [
+  nonisolated static let sceneNames = [
     "Architectural Pavilion", "Cornell Box", "Veach MIS Benchmark", "Cornell Glass & Mirror",
     "Cornell Fog Study", "Reflective Ring Study", "Imported Mesh Studio",
   ]
@@ -459,11 +459,11 @@ final class StudioController: NSViewController {
     for (index, name) in Self.sceneNames.enumerated() { add(name, tag: index) }
     menu.addItem(.separator())
     menu.addItem(.sectionHeader(title: "Example scenes"))
-    for (index, example) in SpectralExamples.catalog.enumerated() { add(example.title, tag: Self.exampleTag + index) }
+    for (index, example) in SceneCatalog.entries(.spectral).enumerated() { add(example.title, tag: Self.exampleTag + index) }
     menu.addItem(.separator())
     menu.addItem(.sectionHeader(title: "Download examples"))
-    for (index, scene) in ExampleScenes.catalog.enumerated() {
-      add(StartScreenView.downloadTitle(scene, exampleLibrary), tag: Self.downloadTag + index)
+    for (index, entry) in SceneCatalog.entries(.mcguire).enumerated() {
+      add(StartScreenView.downloadTitle(entry, exampleLibrary), tag: Self.downloadTag + index)
     }
     popup.menu = menu
     popup.selectItem(withTag: Int(renderer.sceneIndex))
@@ -2428,7 +2428,7 @@ final class StudioController: NSViewController {
     {
       let examples = NSMenu(title: "Open Example Scene")
       // Bundled spectral examples first, then the McGuire archive scenes downloaded on request.
-      for (tag, example) in SpectralExamples.catalog.enumerated() {
+      for (tag, example) in SceneCatalog.entries(.spectral).enumerated() {
         let item = NSMenuItem(title: example.title, action: #selector(spectralExampleAction(_:)), keyEquivalent: "")
         item.tag = tag
         item.target = self
@@ -2436,8 +2436,8 @@ final class StudioController: NSViewController {
         examples.addItem(item)
       }
       examples.addItem(.separator())
-      for (tag, scene) in ExampleScenes.catalog.enumerated() {
-        let item = NSMenuItem(title: scene.title, action: #selector(exampleSceneAction(_:)), keyEquivalent: "")
+      for (tag, entry) in SceneCatalog.entries(.mcguire).enumerated() {
+        let item = NSMenuItem(title: entry.title, action: #selector(exampleSceneAction(_:)), keyEquivalent: "")
         item.tag = tag
         item.target = self
         examples.addItem(item)
@@ -2653,8 +2653,8 @@ extension StudioController: NSMenuItemValidation {
     if item.action == #selector(exampleCreditsAction) || item.action == #selector(revealExampleScenesAction) {
       return true
     }
-    if item.action == #selector(exampleSceneAction(_:)), ExampleScenes.catalog.indices.contains(item.tag) {
-      item.title = exampleSceneTitle(ExampleScenes.catalog[item.tag])
+    if item.action == #selector(exampleSceneAction(_:)), SceneCatalog.entries(.mcguire).indices.contains(item.tag) {
+      item.title = exampleSceneTitle(SceneCatalog.entries(.mcguire)[item.tag])
     }
     if item.action == #selector(viewportAction(_:)) {
       item.state = Int(renderer.viewportMode) == item.tag ? .on : .off

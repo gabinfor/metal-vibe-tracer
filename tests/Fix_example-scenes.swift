@@ -1,4 +1,4 @@
-// Example scenes (File > Open Example Scene, Sources/ExampleScenes.swift), without the network or the archive's
+// Example scenes (File > Open Example Scene, Sources/ExampleScenes.swift and SceneCatalog.swift), without the network or the archive's
 // OBJ files: the catalog against scripts/showcase.json, which archives a scene still needs, archive verification
 // and extraction from a locally made zip, and the showcase shot's camera, lighting and emission scaling applied to
 // a synthetic emissive OBJ imported through ProjectDocument.appendOBJ, then opened through the studio controller.
@@ -14,19 +14,39 @@
     guard let found = shots.first(where: { $0.name == name }) else { throw MaterialLibrary.error("no \(name) shot") }
     return found
   }
-  let catalog = ExampleScenes.catalog
-  require(catalog.map(\.shot) == ["sponza-noon", "san-miguel-golden", "bistro-exterior-golden", "bistro-interior",
-    "bedroom", "breakfast-room", "buddha", "chinese-dragon", "fireplace-room", "living-room"],
-    "example catalog lists Sponza, San Miguel, both Bistro shots and the six research models: \(catalog.map(\.shot))")
+  let entries = SceneCatalog.entries
+  require(Set(entries.map(\.id)).count == entries.count && entries.count == 21, "catalog ids are unique")
+  require(entries.filter(\.isDownload).compactMap(\.shot) == ["sponza-noon", "san-miguel-golden",
+    "bistro-exterior-golden", "bistro-interior", "bedroom", "breakfast-room", "buddha", "chinese-dragon",
+    "fireplace-room", "living-room"], "download entries keep their shots")
+  for entry in entries {
+    if case .builtIn(let index) = entry.source {
+      require(entry.shot == nil && StudioController.sceneNames.indices.contains(index) && index < 6
+        && entry.title == StudioController.sceneNames[index], "\(entry.id) is a built-in scene")
+    } else {
+      require(shots.contains { $0.name == entry.shot }, "\(entry.id) has its showcase shot")
+    }
+    require(entry.id.allSatisfy { $0.isLowercase || $0.isNumber || $0 == "-" }, "\(entry.id) is a file-safe id")
+  }
+  require(SceneCatalog.entry("sponza")?.triangles == 262_266 && SceneCatalog.entry("nope") == nil, "lookup by id")
+  let catalog = SceneCatalog.entries(.mcguire)
+  require(catalog.map(\.id) == ["sponza", "san-miguel", "bistro-exterior", "bistro-interior", "bedroom",
+    "breakfast-room", "buddha", "chinese-dragon", "fireplace-room", "living-room"]
+    && catalog.map(\.triangles) == [262_266, 9_963_375, 2_833_329, 1_020_903, 383_504, 269_764, 1_087_304, 871_198,
+      142_983, 580_592]
+    && catalog.map(\.materials) == [25, 287, 132, 66, 7, 14, nil, nil, 22, 42],
+    "the download entries list Sponza, San Miguel, both Bistro shots and the six research models with their specs")
   for scene in catalog {
-    guard let shot = shots.first(where: { $0.name == scene.shot }) else {
-      require(false, "showcase.json has the \(scene.shot) shot")
+    guard let shot = shots.first(where: { $0.name == scene.shot }), case .download(let storage, let file, _) = scene.source,
+      let credit = scene.credit, let licenseURL = scene.licenseURL, let terms = scene.terms, let attribution = scene.attribution
+    else {
+      require(false, "\(scene.id) is a download with a showcase shot, credit, license and terms")
       continue
     }
-    require(shot.obj?.hasSuffix("/\(scene.storage)/\(scene.obj)") == true,
-      "\(scene.shot) frames the catalog's OBJ (\(shot.obj ?? "none") vs \(scene.storage)/\(scene.obj))")
+    require(scene.format == .obj && shot.obj?.hasSuffix("/\(storage)/\(file)") == true,
+      "\(scene.id) frames the catalog's OBJ (\(shot.obj ?? "none") vs \(storage)/\(file))")
     require(shot.yaw != nil && shot.distance != nil && shot.target?.count == 3 && shot.exposure != nil
-      && shot.sky != nil, "\(scene.shot) sets the camera, sky and exposure")
+      && shot.sky != nil, "\(scene.id) sets the camera, sky and exposure")
     require(!scene.archives.isEmpty && Set(scene.archives.map(\.name)).count == scene.archives.count,
       "\(scene.title) has distinct archives")
     for archive in scene.archives {
@@ -37,49 +57,69 @@
       require(archive.bytes > 0 && archive.unpackedBytes >= archive.bytes, "\(archive.name) sizes")
       require(!archive.folder.contains("..") && !archive.folder.hasPrefix("/"), "\(archive.name) extracts inside its scene")
     }
-    require(scene.attribution.contains(scene.credit) && scene.attribution.contains(scene.licenseURL.absoluteString)
-      && scene.attribution.hasSuffix(scene.terms), "\(scene.title) attribution names the author, links the license and gives its terms")
+    require(attribution.contains(credit) && attribution.contains(licenseURL.absoluteString)
+      && attribution.hasSuffix(terms), "\(scene.title) attribution names the author, links the license and gives its terms")
   }
-  let credits = ExampleScenes.credits
+  require(entries.filter { !$0.isDownload }.allSatisfy { $0.attribution == nil && $0.archives.isEmpty && $0.credit == nil },
+    "built-in and bundled scenes carry no credit and need no archive")
+  let credits = SceneCatalog.credits
   require(credits.count == 9 && credits.contains { $0.hasPrefix("Amazon Lumberyard Bistro © 2017") }
     && credits.filter { $0.contains("creativecommons.org/licenses/by/") }.count == 6
     && credits.contains { $0.hasPrefix("Bedroom") && $0.contains("creativecommons.org/licenses/by-sa/4.0/") }
     && credits.filter { $0.contains("graphics.stanford.edu/data/3Dscanrep/") }.count == 2,
     "credits list each work once with its license: \(credits)")
   // The Stanford scans carry the repository's non-commercial and good-taste terms; the Bedroom's ShareAlike.
-  require(catalog.filter { $0.terms == ExampleScenes.stanfordTerms }.map(\.shot) == ["buddha", "chinese-dragon"]
-    && catalog[4].terms.contains("CC BY-SA 4.0"), "per-scene terms: the Stanford scans' and the Bedroom's ShareAlike")
+  require(catalog.filter { $0.terms == SceneCatalog.stanfordTerms }.map(\.shot) == ["buddha", "chinese-dragon"]
+    && catalog[4].terms?.contains("CC BY-SA 4.0") == true, "per-scene terms: the Stanford scans' and the Bedroom's ShareAlike")
   let exterior = catalog[2], interior = catalog[3]
-  require(exterior.storage == interior.storage
+  let root = ExampleLibrary(root: folder)
+  require(root.storage(exterior) == root.storage(interior)
     && Array(exterior.archives.dropFirst()) == Array(interior.archives.dropFirst())
     && exterior.archives.dropFirst().map(\.name) == ["BuildingTextures.zip", "OtherTextures.zip", "PropTextures.zip"],
     "the Bistro exterior and interior share one folder and its three texture archives")
+  require(SceneEntry.Collection.allCases.map(\.title) == ["Built-in", "Spectral examples", "McGuire Computer Graphics Archive"]
+    && SceneEntry.Collection.mcguire.website?.absoluteString == "https://casual-effects.com/data/"
+    && SceneEntry.Collection.spectral.website == nil && interior.work == "Amazon Lumberyard Bistro",
+    "collections name themselves and the archive's website")
+  // Tags: the spectral scenes name their effect, textured downloads say so.
+  require(SceneCatalog.entries(.spectral).map(\.tags) == [["spectral", "thin film"], ["spectral", "dispersion"],
+    ["spectral", "fog"], ["spectral", "light spectra"], ["spectral", "many lights"]]
+    && SceneCatalog.entry("cornell-fog")?.tags == ["fog"] && SceneCatalog.entry("cornell-glass-mirror")?.tags == ["glass"]
+    && SceneCatalog.entry("sponza")?.tags == ["textures"] && SceneCatalog.entry("buddha")?.tags.isEmpty == true,
+    "entries carry their feature tags")
   // Bundled spectral examples: a showcase shot each, whose stage is under Examples/Spectral and resolves.
-  require(SpectralExamples.catalog.map(\.shot) == ["spectral-newton-series", "spectral-abbe-row", "spectral-tyndall-tank",
+  let spectral = SceneCatalog.entries(.spectral)
+  require(spectral.map(\.shot) == ["spectral-newton-series", "spectral-abbe-row", "spectral-tyndall-tank",
     "spectral-lamp-spectra", "spectral-lantern-arcade"],
     "spectral examples list Newton's colour series, the Abbe row, the Tyndall tank, the lamp spectra and the lantern arcade")
-  for example in SpectralExamples.catalog {
-    let stage = try shot(example.shot).usd
-    require(stage?.hasPrefix("Examples/Spectral/") == true && stage.flatMap(SpectralExamples.url) != nil,
-      "\(example.shot) opens a bundled stage (\(stage ?? "none"))")
+  for example in spectral {
+    let stage = try shot(example.shot ?? "").usd
+    guard case .bundled(let path) = example.source else {
+      require(false, "\(example.id) is bundled")
+      continue
+    }
+    require(example.format == .usd && stage == path && stage?.hasPrefix("Examples/Spectral/") == true
+      && SceneCatalog.bundledURL(path) != nil, "\(example.id) opens a bundled stage (\(stage ?? "none"))")
   }
-  require(ExampleScenes.megabytes(80_113_441) == "80 MB" && ExampleScenes.megabytes(1_438_403_029) == "1.4 GB",
+  require(SceneCatalog.megabytes(80_113_441) == "80 MB" && SceneCatalog.megabytes(1_438_403_029) == "1.4 GB",
     "download sizes read in MB and GB")
 
   // Installed archives: a marker holding the archive's digest; a stale marker does not count.
   let library = ExampleLibrary(root: folder.appendingPathComponent("library", isDirectory: true))
-  let textures = ExampleScenes.bistroTextures.reduce(Int64(0)) { $0 + $1.bytes }
+  let textures = interior.archives.dropFirst().reduce(Int64(0)) { $0 + $1.bytes }
   require(library.downloadBytes(catalog[0]) == 80_113_441 && library.missing(interior).count == 4
     && library.downloadBytes(interior) == 21_293_389 + textures, "a fresh library needs every archive")
   try manager.createDirectory(at: library.storage(interior), withIntermediateDirectories: true)
   for archive in interior.archives {
-    try Data((archive.sha256 + "\n").utf8).write(to: library.marker(archive, storage: interior.storage))
+    try Data((archive.sha256 + "\n").utf8).write(to: library.marker(archive, storage: "bistro"))
   }
   require(library.missing(interior).isEmpty && library.downloadBytes(exterior) == 64_186_766
     && library.diskBytes(exterior) == 311_371_057, "after the interior, the exterior needs only Exterior.zip")
-  try Data("0\n".utf8).write(to: library.marker(interior.archives[1], storage: interior.storage))
+  try Data("0\n".utf8).write(to: library.marker(interior.archives[1], storage: "bistro"))
   require(library.missing(interior).map(\.name) == ["BuildingTextures.zip"], "a marker with another digest is stale")
-  require(library.objURL(interior).path.hasSuffix("library/bistro/Interior/interior.obj"), "OBJ location")
+  require(library.sceneFileURL(interior)?.path.hasSuffix("library/bistro/Interior/interior.obj") == true
+    && library.sceneFileURL(spectral[0]) == nil && library.downloadBytes(spectral[0]) == 0
+    && library.missing(SceneCatalog.entries[0]).isEmpty, "OBJ location; scenes that are not downloads need nothing")
 
   // A local archive in the same layout as Interior.zip: an emissive lamp and a plain floor.
   let source = folder.appendingPathComponent("source", isDirectory: true)
@@ -199,28 +239,29 @@
   // as a new untitled project with its shot and credit, undoably. The lamp stands in for the Bistro interior.
   let examples = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu?.items
     .first { $0.title == "Open Example Scene" }?.submenu
-  let entries = examples?.items.filter { $0.action == #selector(StudioController.exampleSceneAction(_:)) } ?? []
+  let items = examples?.items.filter { $0.action == #selector(StudioController.exampleSceneAction(_:)) } ?? []
   let previousLibrary = controller.exampleLibrary
   controller.exampleLibrary = ExampleLibrary(root: folder.appendingPathComponent("controller", isDirectory: true))
   defer { controller.exampleLibrary = previousLibrary }
-  for item in entries { _ = controller.validateMenuItem(item) }
-  require(entries.map(\.tag) == Array(catalog.indices) && entries.first?.title == "Crytek Sponza — 80 MB download…"
-    && entries[3].title == "Amazon Lumberyard Bistro (interior) — 1.4 GB download…"
-    && entries.last?.title == "Living Room — 15 MB download…"
+  for item in items { _ = controller.validateMenuItem(item) }
+  require(items.map(\.tag) == Array(catalog.indices) && items.first?.title == "Crytek Sponza — 80 MB download…"
+    && items[3].title == "Amazon Lumberyard Bistro (interior) — 1.4 GB download…"
+    && items.last?.title == "Living Room — 15 MB download…"
     && examples?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true,
-    "File > Open Example Scene lists the scenes with their download sizes: \(entries.map(\.title))")
+    "File > Open Example Scene lists the scenes with their download sizes: \(items.map(\.title))")
   let installed = controller.exampleLibrary
   try manager.createDirectory(at: installed.storage(interior), withIntermediateDirectories: true)
-  try manager.createDirectory(at: installed.objURL(interior).deletingLastPathComponent(), withIntermediateDirectories: true)
+  let interiorFile = installed.sceneFileURL(interior)!
+  try manager.createDirectory(at: interiorFile.deletingLastPathComponent(), withIntermediateDirectories: true)
   for name in ["lamp.mtl", "lamp.obj"] {
     try manager.copyItem(at: storage.appendingPathComponent("Lamp/" + name),
-      to: installed.objURL(interior).deletingLastPathComponent().appendingPathComponent(name == "lamp.obj" ? "interior.obj" : name))
+      to: interiorFile.deletingLastPathComponent().appendingPathComponent(name == "lamp.obj" ? "interior.obj" : name))
   }
   for archive in interior.archives {
-    try Data((archive.sha256 + "\n").utf8).write(to: installed.marker(archive, storage: interior.storage))
+    try Data((archive.sha256 + "\n").utf8).write(to: installed.marker(archive, storage: "bistro"))
   }
-  _ = controller.validateMenuItem(entries[3])
-  require(entries[3].title == interior.title, "an installed scene's menu entry shows no download")
+  _ = controller.validateMenuItem(items[3])
+  require(items[3].title == interior.title, "an installed scene's menu entry shows no download")
   waitUntil({ !controller.isBusy }, seconds: 60)
   // Without an event loop, undo registrations need an explicit group (as in Fix_persistence.swift).
   let history = controller.history, groupsByEvent = history.groupsByEvent

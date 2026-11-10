@@ -30,7 +30,7 @@ for path in [executable, contents / "Info.plist", resources / "OpenPBR.metal", r
     if not path.is_file():
         problems.append(f"missing {path.relative_to(app)}")
 
-# Bundled spectral examples (SpectralExamples): every showcase stage under Examples/ is in the bundle at the
+# Bundled spectral examples (the spectral entries of SceneCatalog): every showcase stage under Examples/ is in the bundle at the
 # same path, unchanged.
 try:
     for shot in json.loads((resources / "showcase.json").read_text()):

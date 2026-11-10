@@ -2,10 +2,12 @@ import Cocoa
 import CryptoKit
 
 // REFERENCES.md: MCGUIRE2017, OBJ2026, MTL2026, SHA256FIPS, STANFORD3DSCAN, BITTERLI2016 (the Fireplace and Living
-// Room cameras). Example scenes from Morgan McGuire's Computer Graphics Archive. Nothing is bundled: File > Open Example Scene downloads an archive only after the user
-// agrees to its size and license, checks it against the size and SHA-256 digest pinned below, extracts it
-// into Application Support and imports it through ProjectDocument.appendOBJ, unchanged, with the camera and
-// lighting of the README image (the scripts/showcase.json shot of the same name, ShowcaseShot).
+// Room cameras). The download scenes of SceneCatalog, from Morgan McGuire's Computer Graphics Archive. Nothing is
+// bundled: File > Open Example Scene downloads an archive only after the user agrees to its size and license, checks
+// it against the size and SHA-256 digest pinned in SceneCatalog, extracts it into Application Support and imports it
+// through ProjectDocument.appendOBJ, unchanged, with the camera and lighting of the README image (the
+// scripts/showcase.json shot of the same name, ShowcaseShot). The bundled spectral examples open through the USD
+// importer with their shot (Examples/Spectral).
 
 // One archive of the McGuire archive and the folder it extracts into, relative to its scene's storage folder.
 struct ExampleArchive: Sendable, Equatable {
@@ -17,168 +19,6 @@ struct ExampleArchive: Sendable, Equatable {
   var sha256: String
 }
 
-struct ExampleScene: Sendable {
-  // The scripts/showcase.json shot giving the camera, sky, sun, exposure and emission of the README image.
-  var shot: String
-  var title: String
-  var summary: String
-  // Folder under ExampleLibrary.root; Bistro's exterior and interior share theirs, and its texture archives.
-  var storage: String
-  var obj: String
-  var archives: [ExampleArchive]
-  var credit: String
-  var license: String
-  var licenseURL: URL
-  // What the license asks of renders, after the license in the consent sheet and the import report.
-  var terms = "Images rendered from it are adapted works and must credit it."
-
-  // The credited work: Bistro's exterior and interior are one scene.
-  var work: String { title.components(separatedBy: " (")[0] }
-  // The title on buttons and in the scene selector, without the publisher ("Bistro (exterior)"); the credits,
-  // menu and consent sheet keep the full title.
-  var shortTitle: String { title.replacingOccurrences(of: "Amazon Lumberyard ", with: "") }
-  var attribution: String {
-    "\(title): \(credit), from Morgan McGuire's Computer Graphics Archive (casual-effects.com/data). "
-      + "\(license) (\(licenseURL.absoluteString)). \(terms)"
-  }
-}
-
-enum ExampleScenes {
-  static let archiveURL = URL(string: "https://casual-effects.com/data/")!
-  private static let base = "https://casual-effects.com/g3d/data10/"
-  private static func archive(_ name: String, _ path: String, folder: String, _ bytes: Int64, unpacked: Int64,
-                              _ sha256: String) -> ExampleArchive {
-    ExampleArchive(name: name, url: URL(string: base + path)!, folder: folder, bytes: bytes, unpackedBytes: unpacked,
-                   sha256: sha256)
-  }
-  // Sizes and digests of the archives downloaded on 2026-10-20 (REFERENCES.md MCGUIRE2017).
-  static let bistroTextures = [
-    archive("BuildingTextures.zip", "research/model/bistro/BuildingTextures", folder: "BuildingTextures", 507_671_451,
-            unpacked: 508_329_182, "16538a37f34cadec5665d97e5b77ef3581d67ab674b33b9caeef1d277cbde6bf"),
-    archive("OtherTextures.zip", "research/model/bistro/OtherTextures", folder: "OtherTextures", 431_016_313,
-            unpacked: 431_592_637, "0806fee3eeb0e14cd501582edbd2d5caf33c5416a62a871e0f126391096f5c58"),
-    archive("PropTextures.zip", "research/model/bistro/PropTextures", folder: "PropTextures", 415_421_476,
-            unpacked: 416_385_050, "a179e4ee6367d2b518c4978d7e2e690c59503861634d67d0da8bacfa7196571a"),
-  ]
-  static let cc30 = URL(string: "https://creativecommons.org/licenses/by/3.0/")!
-  static let cc40 = URL(string: "https://creativecommons.org/licenses/by/4.0/")!
-  static let bistroCredit = "© 2017 Amazon Lumberyard"
-  static let ccBySA40 = URL(string: "https://creativecommons.org/licenses/by-sa/4.0/")!
-  static let stanford = URL(string: "https://graphics.stanford.edu/data/3Dscanrep/")!
-  static let stanfordTerms = "For research and non-commercial use; images must credit the Stanford Computer Graphics "
-    + "Laboratory. The model has religious and cultural significance: keep renderings in good taste."
-  // A single-archive research model extracted into a folder of its own name (sizes and digests of 2026-11-04).
-  private static func research(_ model: String, _ bytes: Int64, unpacked: Int64, _ sha256: String) -> [ExampleArchive] {
-    [archive("\(model).zip", "research/model/\(model)/\(model).zip", folder: "", bytes, unpacked: unpacked, sha256)]
-  }
-  static let catalog = [
-    ExampleScene(
-      shot: "sponza-noon", title: "Crytek Sponza", summary: "262 k triangles, at noon", storage: "sponza",
-      obj: "sponza.obj",
-      archives: [archive("sponza.zip", "common/model/crytek_sponza/sponza.zip", folder: "", 80_113_441,
-                         unpacked: 95_882_276, "da005cbee0be2df2abc8513f3ceb61bcb6f69aac112babcd9c00169a27c2770c")],
-      credit: "© 2010 Frank Meinl, Crytek", license: "CC BY 3.0", licenseURL: cc30),
-    ExampleScene(
-      shot: "san-miguel-golden", title: "San Miguel 2.0", summary: "10 M triangles, at golden hour",
-      storage: "San_Miguel", obj: "san-miguel.obj",
-      archives: [archive("San_Miguel.zip", "research/model/San_Miguel/San_Miguel.zip", folder: "", 535_519_642,
-                         unpacked: 1_910_092_684, "85874077735808150e679b3c71d70a37a270cb8833f4911325aa1099da3f7d4a")],
-      credit: "© Guillermo M. Leal Llaguno", license: "CC BY 3.0", licenseURL: cc30),
-    ExampleScene(
-      shot: "bistro-exterior-golden", title: "Amazon Lumberyard Bistro (exterior)",
-      summary: "2.8 M triangles, in daylight", storage: "bistro", obj: "Exterior/exterior.obj",
-      archives: [archive("Exterior.zip", "research/model/bistro/Exterior.zip", folder: "Exterior", 64_186_766,
-                         unpacked: 311_371_057, "f612ba0d8a65811afe0d48a023d31e5b43ac40b78e9b12d15e2b7dc8923c29d4")]
-        + bistroTextures,
-      credit: bistroCredit, license: "CC BY 4.0", licenseURL: cc40),
-    ExampleScene(
-      shot: "bistro-interior", title: "Amazon Lumberyard Bistro (interior)",
-      summary: "1.0 M triangles, in the evening", storage: "bistro", obj: "Interior/interior.obj",
-      archives: [archive("Interior.zip", "research/model/bistro/Interior.zip", folder: "Interior", 21_293_389,
-                         unpacked: 108_416_959, "3faa41f8d6860d1267268348d44d2b74c64a8bfb55dd4b03c562a70ab83b1062")]
-        + bistroTextures,
-      credit: bistroCredit, license: "CC BY 4.0", licenseURL: cc40),
-    ExampleScene(
-      shot: "bedroom", title: "Bedroom", summary: "383 k triangles, a photogrammetry scan", storage: "bedroom",
-      obj: "iscv2.obj",
-      archives: research("bedroom", 34_180_493, unpacked: 64_565_388,
-                         "90834c4336ec1b6f8331175b5600e5f7ce2b863ea7b345ef1b9545f209c4ef94"),
-      credit: "© 2017 fhernand", license: "CC BY-SA 4.0", licenseURL: ccBySA40,
-      terms: "Images rendered from it are adapted works: credit it and share them under CC BY-SA 4.0."),
-    ExampleScene(
-      shot: "breakfast-room", title: "Breakfast Room", summary: "270 k triangles, sunlight through blinds",
-      storage: "breakfast_room", obj: "breakfast_room.obj",
-      archives: research("breakfast_room", 6_446_862, unpacked: 23_472_999,
-                         "e56ff9b4c89b680cfd5c4c00390533ae28fff7a122d6fc8c92c273a9066c0ca8"),
-      credit: "© Wig42", license: "CC BY 3.0", licenseURL: cc30),
-    ExampleScene(
-      shot: "buddha", title: "Happy Buddha", summary: "1.1 M triangles, a Stanford scan", storage: "buddha",
-      obj: "buddha.obj",
-      archives: research("buddha", 22_519_689, unpacked: 93_037_212,
-                         "c14c098ce8d8caaf05696c54396197bf16a22837ef1275cca04d42fd6ab9a6a8"),
-      credit: "© 1996 Stanford University", license: "Stanford 3D Scanning Repository terms", licenseURL: stanford,
-      terms: stanfordTerms),
-    ExampleScene(
-      shot: "chinese-dragon", title: "Chinese Dragon", summary: "871 k triangles, a Stanford scan", storage: "dragon",
-      obj: "dragon.obj",
-      archives: research("dragon", 17_847_685, unpacked: 74_094_075,
-                         "111124359a31e4d6b2eeb5398e5bc96a5d9e2d2a130afb10bb4cfbc011bdb797"),
-      credit: "© 1996 Stanford University", license: "Stanford 3D Scanning Repository terms", licenseURL: stanford,
-      terms: stanfordTerms),
-    ExampleScene(
-      shot: "fireplace-room", title: "Fireplace Room", summary: "143 k triangles, Bitterli's camera",
-      storage: "fireplace_room", obj: "fireplace_room.obj",
-      archives: research("fireplace_room", 9_107_724, unpacked: 32_691_058,
-                         "9d7be47b9f2065e13a57c1831072d1599bb10ac4740582d6fc0f94efd80ff724"),
-      credit: "© Wig42", license: "CC BY 3.0", licenseURL: cc30),
-    ExampleScene(
-      shot: "living-room", title: "Living Room", summary: "581 k triangles, Bitterli's camera",
-      storage: "living_room", obj: "living_room.obj",
-      archives: research("living_room", 14_547_906, unpacked: 60_888_828,
-                         "f14daf4f566871e18c262a450db9ae0285b7124e93e05b3a8bfbcbf674a21aeb"),
-      credit: "© 2012 Jay-Artist", license: "CC BY 3.0", licenseURL: cc30),
-  ]
-  // One line per credited work, for the credits sheet and the File inspector.
-  static var credits: [String] {
-    var seen = Set<String>()
-    return catalog.filter { seen.insert($0.work).inserted }.map {
-      "\($0.work) \($0.credit). \($0.license), \($0.licenseURL.absoluteString)."
-    }
-  }
-  static func megabytes(_ bytes: Int64) -> String {
-    bytes >= 1_000_000_000 ? String(format: "%.1f GB", Double(bytes) / 1e9) : "\(Int((Double(bytes) / 1e6).rounded())) MB"
-  }
-}
-
-// Spectral example scenes (Examples/Spectral), bundled with the application: small OpenUSD stages that show
-// wavelength-dependent effects, opened through the USD importer with the scripts/showcase.json shot of the same
-// name. The shot's `usd` path is the stage's path in the repository and under Contents/Resources in the bundle.
-// REFERENCES.md: OPENPBR (thin film, dispersion), SCHOTTGLASS, DIAMANTI2014, OPENUSD (implicit prims, ShapingAPI),
-// BUCHOLTZ1995, PLANCK, CIEDATA (docs/VOLUME_DESIGN.md: media, light spectra, spot cones).
-struct SpectralExample: Sendable {
-  var shot: String
-  var title: String
-  var summary: String
-}
-
-enum SpectralExamples {
-  static let catalog = [
-    SpectralExample(shot: "spectral-newton-series", title: "Newton's Colour Series",
-                    summary: "Thin-film interference: soap films and anodized titanium"),
-    SpectralExample(shot: "spectral-abbe-row", title: "Abbe Row",
-                    summary: "Dispersion: one slit seen through four optical glasses"),
-    SpectralExample(shot: "spectral-tyndall-tank", title: "Tyndall Tank",
-                    summary: "Rayleigh scattering: a white beam turns blue to the side and orange through a medium"),
-    SpectralExample(shot: "spectral-lamp-spectra", title: "Lamp Spectra",
-                    summary: "The same colours under blackbody, daylight, fluorescent, sodium and LED spots in haze"),
-    SpectralExample(shot: "spectral-lantern-arcade", title: "Lantern Arcade",
-                    summary: "Many lights: 416 lamps from 2000 K to 6500 K over polished stone, where the light tree shines"),
-  ]
-  static func url(_ path: String) -> URL? {
-    runtimeResourceURL(bundled: Bundle.main.resourceURL?.appendingPathComponent(path), repositoryPath: path)
-  }
-}
-
 // The extracted scenes: <root>/<storage>/<folder>, with one marker per installed archive holding its digest.
 struct ExampleLibrary: Sendable {
   var root: URL
@@ -188,8 +28,16 @@ struct ExampleLibrary: Sendable {
       .appendingPathComponent("VibeTracer/Example Scenes", isDirectory: true)
   }
   init(root: URL = ExampleLibrary.defaultRoot) { self.root = root }
-  func storage(_ scene: ExampleScene) -> URL { root.appendingPathComponent(scene.storage, isDirectory: true) }
-  func objURL(_ scene: ExampleScene) -> URL { storage(scene).appendingPathComponent(scene.obj) }
+  // The scene's folder; the library's root for a scene that is not a download.
+  func storage(_ entry: SceneEntry) -> URL {
+    guard case .download(let storage, _, _) = entry.source else { return root }
+    return root.appendingPathComponent(storage, isDirectory: true)
+  }
+  // The downloaded scene's file in its folder; nil for a scene that is not a download.
+  func sceneFileURL(_ entry: SceneEntry) -> URL? {
+    guard case .download(_, let file, _) = entry.source else { return nil }
+    return storage(entry).appendingPathComponent(file)
+  }
   func marker(_ archive: ExampleArchive, storage: String) -> URL {
     root.appendingPathComponent(storage, isDirectory: true).appendingPathComponent(".\(archive.name).installed")
   }
@@ -197,11 +45,12 @@ struct ExampleLibrary: Sendable {
     (try? String(contentsOf: marker(archive, storage: storage), encoding: .utf8))?
       .trimmingCharacters(in: .whitespacesAndNewlines) == archive.sha256
   }
-  func missing(_ scene: ExampleScene) -> [ExampleArchive] {
-    scene.archives.filter { !isInstalled($0, storage: scene.storage) }
+  func missing(_ entry: SceneEntry) -> [ExampleArchive] {
+    let storage = storage(entry).lastPathComponent
+    return entry.archives.filter { !isInstalled($0, storage: storage) }
   }
-  func downloadBytes(_ scene: ExampleScene) -> Int64 { missing(scene).reduce(0) { $0 + $1.bytes } }
-  func diskBytes(_ scene: ExampleScene) -> Int64 { missing(scene).reduce(0) { $0 + $1.unpackedBytes } }
+  func downloadBytes(_ entry: SceneEntry) -> Int64 { missing(entry).reduce(0) { $0 + $1.bytes } }
+  func diskBytes(_ entry: SceneEntry) -> Int64 { missing(entry).reduce(0) { $0 + $1.unpackedBytes } }
 }
 
 // Downloads, verifies and extracts a scene's missing archives on the calling (background) thread.
@@ -237,23 +86,23 @@ final class ExampleSceneDownload: NSObject, URLSessionDownloadDelegate, @uncheck
     if isCancelled { throw Self.failure("Example scene download cancelled.") }
   }
 
-  func install(_ scene: ExampleScene, into library: ExampleLibrary) throws {
-    let archives = library.missing(scene)
+  func install(_ entry: SceneEntry, into library: ExampleLibrary) throws {
+    let archives = library.missing(entry)
     lock.lock()
     total = archives.reduce(0) { $0 + $1.bytes }
     completed = 0
     lock.unlock()
-    let storage = library.storage(scene)
+    let storage = library.storage(entry)
     let downloads = library.root.appendingPathComponent(".downloads", isDirectory: true)
     try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
-    let needed = library.downloadBytes(scene) + library.diskBytes(scene)
+    let needed = library.downloadBytes(entry) + library.diskBytes(entry)
     if let free = try? library.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
       .volumeAvailableCapacityForImportantUsage, free < needed
     {
       throw Self.failure(
-        "\(scene.title) needs \(ExampleScenes.megabytes(needed)) of free disk space while it downloads and extracts; "
-          + "\(ExampleScenes.megabytes(free)) is available.")
+        "\(entry.title) needs \(SceneCatalog.megabytes(needed)) of free disk space while it downloads and extracts; "
+          + "\(SceneCatalog.megabytes(free)) is available.")
     }
     let session = URLSession(configuration: Self.configuration, delegate: self, delegateQueue: nil)
     defer { session.invalidateAndCancel() }
@@ -405,8 +254,8 @@ final class ExampleSceneDownload: NSObject, URLSessionDownloadDelegate, @uncheck
     if due { lastReport = now }
     lock.unlock()
     guard due else { return }
-    report("Downloading \(label): \(ExampleScenes.megabytes(totalBytesWritten)) of "
-      + "\(ExampleScenes.megabytes(max(totalBytesExpectedToWrite, totalBytesWritten)))", received: totalBytesWritten)
+    report("Downloading \(label): \(SceneCatalog.megabytes(totalBytesWritten)) of "
+      + "\(SceneCatalog.megabytes(max(totalBytesExpectedToWrite, totalBytesWritten)))", received: totalBytesWritten)
   }
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     lock.lock()
@@ -556,48 +405,51 @@ extension ProjectDocument {
 
 // File > Open Example Scene and the File inspector's Example scenes section.
 extension StudioController {
-  func exampleSceneTitle(_ scene: ExampleScene) -> String {
-    let download = exampleLibrary.downloadBytes(scene)
-    return download > 0 ? "\(scene.title) — \(ExampleScenes.megabytes(download)) download…" : "\(scene.title)"
+  func exampleSceneTitle(_ entry: SceneEntry) -> String {
+    let download = exampleLibrary.downloadBytes(entry)
+    return download > 0 ? "\(entry.title) — \(SceneCatalog.megabytes(download)) download…" : "\(entry.title)"
   }
   func openExampleScene(_ index: Int) {
-    guard !isBusy, ExampleScenes.catalog.indices.contains(index) else { return }
-    confirmDiscardingChanges { [weak self] in self?.confirmExampleDownload(ExampleScenes.catalog[index]) }
+    let downloads = SceneCatalog.entries(.mcguire)
+    guard !isBusy, downloads.indices.contains(index) else { return }
+    confirmDiscardingChanges { [weak self] in self?.confirmExampleDownload(downloads[index]) }
   }
   // Nothing is downloaded without this consent sheet, which names the size, source, destination and license.
-  func confirmExampleDownload(_ scene: ExampleScene) {
-    guard !isBusy, let window = hostWindow else { return }
+  func confirmExampleDownload(_ entry: SceneEntry) {
+    guard !isBusy, let window = hostWindow, let credit = entry.credit, let license = entry.license,
+      let licenseURL = entry.licenseURL, let terms = entry.terms
+    else { return }
     let library = exampleLibrary
-    let download = library.downloadBytes(scene)
+    let download = library.downloadBytes(entry)
     guard download > 0 else {
-      beginExampleImport(scene)
+      beginExampleImport(entry)
       return
     }
-    let parts = library.missing(scene).count
+    let parts = library.missing(entry).count
     let alert = NSAlert()
-    alert.messageText = "Download \(scene.title)?"
+    alert.messageText = "Download \(entry.title)?"
     alert.informativeText = """
-      This example scene is not included with Metal Vibe Tracer. Opening it downloads \(ExampleScenes.megabytes(download)) \
+      This example scene is not included with Metal Vibe Tracer. Opening it downloads \(SceneCatalog.megabytes(download)) \
       (\(parts) archive\(parts == 1 ? "" : "s")) from Morgan McGuire's Computer Graphics Archive (casual-effects.com) \
-      and uses about \(ExampleScenes.megabytes(library.diskBytes(scene))) of disk space in \
+      and uses about \(SceneCatalog.megabytes(library.diskBytes(entry))) of disk space in \
       \((library.root.path as NSString).abbreviatingWithTildeInPath). Each archive is checked against its expected size \
       and SHA-256 digest before it is extracted.
 
-      \(scene.title) \(scene.credit). \(scene.license), \(scene.licenseURL.absoluteString). \(scene.terms)
+      \(entry.title) \(credit). \(license), \(licenseURL.absoluteString). \(terms)
       """
-    alert.addButton(withTitle: "Download \(ExampleScenes.megabytes(download))")
+    alert.addButton(withTitle: "Download \(SceneCatalog.megabytes(download))")
     alert.addButton(withTitle: "Cancel")
     alert.beginSheetModal(for: window) { [weak self] response in
       guard response == .alertFirstButtonReturn else { return }
       // Present the progress sheet after this one has been ordered out.
-      DispatchQueue.main.async { self?.beginExampleDownload(scene) }
+      DispatchQueue.main.async { self?.beginExampleDownload(entry) }
     }
   }
-  func beginExampleDownload(_ scene: ExampleScene) {
+  func beginExampleDownload(_ entry: SceneEntry) {
     guard !isBusy, let window = hostWindow else { return }
     let library = exampleLibrary
     let sheet = NSAlert()
-    sheet.messageText = "Downloading \(scene.title)"
+    sheet.messageText = "Downloading \(entry.title)"
     sheet.informativeText = "Connecting to casual-effects.com…"
     let bar = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 320, height: 20))
     bar.style = .bar
@@ -607,7 +459,7 @@ extension StudioController {
     sheet.accessoryView = bar
     sheet.addButton(withTitle: "Cancel")
     importInProgress = true
-    let progress = beginProjectActivity("Downloading \(scene.title)…")
+    let progress = beginProjectActivity("Downloading \(entry.title)…")
     let job = ExampleSceneDownload { fraction, message in
       progress.update(message, fraction: fraction)
       DispatchQueue.main.async {
@@ -618,7 +470,7 @@ extension StudioController {
     exampleDownload = job
     sheet.beginSheetModal(for: window) { _ in job.cancel() }
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-      let result = Result { try job.install(scene, into: library) }
+      let result = Result { try job.install(entry, into: library) }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         let cancelled = job.isCancelled
@@ -631,30 +483,31 @@ extension StudioController {
           return
         }
         switch result {
-        case .success: self.beginExampleImport(scene)
+        case .success: self.beginExampleImport(entry)
         case .failure(let error):
-          self.showError("Could not download \(scene.title): \(error.localizedDescription)")
+          self.showError("Could not download \(entry.title): \(error.localizedDescription)")
           self.rebuild()
         }
       }
     }
   }
   // Opens the extracted scene as a new, unsaved, untitled project with the showcase shot's settings.
-  func beginExampleImport(_ scene: ExampleScene) {
-    guard !isBusy else { return }
+  func beginExampleImport(_ entry: SceneEntry) {
+    guard !isBusy, let shotName = entry.shot, let url = exampleLibrary.sceneFileURL(entry),
+      let attribution = entry.attribution, let credit = entry.credit, let license = entry.license
+    else { return }
     let shot: ShowcaseShot
     do {
-      guard let found = try ShowcaseShot.bundled().first(where: { $0.name == scene.shot }) else {
-        throw MaterialLibrary.error("showcase.json has no shot named \(scene.shot).")
+      guard let found = try ShowcaseShot.bundled().first(where: { $0.name == shotName }) else {
+        throw MaterialLibrary.error("showcase.json has no shot named \(shotName).")
       }
       shot = found
     } catch {
       showError(error.localizedDescription)
       return
     }
-    let url = exampleLibrary.objURL(scene)
     let record = undoRecord("Open example scene", replacesDocument: true)
-    beginDocumentChange("Importing \(scene.title)…", build: { [weak self] progress -> (ProjectDocument, Int) in
+    beginDocumentChange("Importing \(entry.title)…", build: { [weak self] progress -> (ProjectDocument, Int) in
       guard let self else { throw MaterialLibrary.error("Example scene import cancelled.") }
       var document = ProjectDocument()
       let objData = try self.readBounded(url, maximum: 1 << 40)
@@ -664,7 +517,7 @@ extension StudioController {
         skipped: &skipped, report: &report, progress: progress)
       shot.apply(to: &document)
       // The credit travels with the project in its import report.
-      document.importReport = [scene.attribution] + (document.importReport ?? [])
+      document.importReport = [attribution] + (document.importReport ?? [])
       return (document, skipped)
     }) { [weak self] result in
       guard let self else { return }
@@ -675,7 +528,7 @@ extension StudioController {
         self.associate(nil, edited: true, replaced: true)
         self.selectedNode = nil
         self.changed()
-        self.show("Opened \(scene.title) \(scene.credit), \(scene.license). Credits: File > Open Example Scene.")
+        self.show("Opened \(entry.title) \(credit), \(license). Credits: File > Open Example Scene.")
       case .failure(let error): self.showError(error.localizedDescription)
       }
     }
@@ -685,14 +538,16 @@ extension StudioController {
     let alert = NSAlert()
     alert.messageText = "Example scene credits"
     alert.informativeText =
-      ExampleScenes.credits.joined(separator: "\n\n")
+      SceneCatalog.credits.joined(separator: "\n\n")
       + "\n\nFrom Morgan McGuire's Computer Graphics Archive, July 2017, downloaded on request and imported unchanged. "
       + "Metal Vibe Tracer translates their MTL materials and sets its own camera, sky and sun; renders are adapted "
       + "works and must keep this credit and the license link."
     alert.addButton(withTitle: "OK")
     alert.addButton(withTitle: "Open Archive Website")
     alert.beginSheetModal(for: window) { response in
-      if response == .alertSecondButtonReturn { NSWorkspace.shared.open(ExampleScenes.archiveURL) }
+      if response == .alertSecondButtonReturn, let website = SceneEntry.Collection.mcguire.website {
+        NSWorkspace.shared.open(website)
+      }
     }
   }
   func revealExampleScenes() {
@@ -702,13 +557,14 @@ extension StudioController {
   }
   // Opens a bundled spectral example as a new, unsaved, untitled project with its showcase shot's settings.
   func openSpectralExample(_ index: Int) {
-    guard !isBusy, SpectralExamples.catalog.indices.contains(index) else { return }
-    let example = SpectralExamples.catalog[index]
+    let examples = SceneCatalog.entries(.spectral)
+    guard !isBusy, examples.indices.contains(index) else { return }
+    let example = examples[index]
     let shot: ShowcaseShot
     let url: URL
     do {
       guard let found = try ShowcaseShot.bundled().first(where: { $0.name == example.shot }), let path = found.usd,
-        let stage = SpectralExamples.url(path)
+        let stage = SceneCatalog.bundledURL(path)
       else { throw MaterialLibrary.error("\(example.title) is missing from the application bundle.") }
       (shot, url) = (found, stage)
     } catch {
@@ -723,19 +579,19 @@ extension StudioController {
   }
   func exampleScenePanel() {
     heading("Spectral examples")
-    for (index, example) in SpectralExamples.catalog.enumerated() {
+    for (index, example) in SceneCatalog.entries(.spectral).enumerated() {
       button(example.title) { [weak self] in self?.openSpectralExample(index) }
     }
     text("Small OpenUSD scenes included with Metal Vibe Tracer. "
-      + SpectralExamples.catalog.map { "\($0.title): \($0.summary)." }.joined(separator: " ")
+      + SceneCatalog.entries(.spectral).map { "\($0.title): \($0.summary)." }.joined(separator: " ")
       + " Thin film, dispersion, lamp spectra and Rayleigh scattering render fully in spectral light transport (the default).")
     heading("Example scenes")
-    for (index, scene) in ExampleScenes.catalog.enumerated() {
-      button(exampleSceneTitle(scene)) { [weak self] in self?.openExampleScene(index) }
+    for (index, entry) in SceneCatalog.entries(.mcguire).enumerated() {
+      button(exampleSceneTitle(entry)) { [weak self] in self?.openExampleScene(index) }
     }
     text(
       "Production scenes from Morgan McGuire's Computer Graphics Archive, opened with the camera and lighting of the README images. They are not bundled: each is downloaded once, after you agree, into Application Support.\n"
-        + ExampleScenes.credits.joined(separator: "\n"))
+        + SceneCatalog.credits.joined(separator: "\n"))
     button("Credits and licenses…") { [weak self] in self?.showExampleCredits() }
     button("Show downloaded scenes in Finder") { [weak self] in self?.revealExampleScenes() }
   }
