@@ -51,7 +51,7 @@ Download size and disk size come from the entry's archives through `ExampleLibra
 
 ## 4. Browser
 
-`SceneBrowserView` replaces `StartScreenView`'s scene sections. `StartAction.scene(id)` replaces `.builtInScene`, `.example` and `.download`. Every open path goes through `StudioController.openScene(_:)`, which confirms discarding changes and dispatches on the entry's source; a download entry that is not installed does nothing there; its details pane's **Download** button (`StudioController.beginSceneDownload`) installs it and then opens it, and `openOrDownloadScene` only selects such an entry in the browser.
+`SceneBrowserView` replaces `StartScreenView`'s scene sections. `StartAction.scene(id)` replaces `.builtInScene`, `.example` and `.download`. Every open path goes through `StudioController.openScene(_:)`, which confirms discarding changes and dispatches on the entry's source; a download entry that is not installed does nothing there; its details pane's **Download** button (`StudioController.beginSceneDownload`) installs it and then opens it, and the browser offers no **Open** for it.
 
 Layout, top to bottom and left to right:
 
@@ -65,7 +65,7 @@ Behaviour:
 - **Consent.** The details pane states the download size, disk use, source host, destination folder and license, which is what the consent sheet states today. The **Download** button is the consent and replaces the sheet. Nothing is requested from the network before that click.
 - **Progress.** The details pane shows the download bar, the status line and **Cancel**, in place of the progress sheet. A failed or cancelled download leaves finished archives in place, as today.
 - **Opening.** **Open** runs the existing paths: a built-in scene, a bundled stage with its shot, or an installed download with its shot and attribution line in the import report.
-- **Reopening.** With a scene loaded, **File › Browse Scenes…** and the inspector's **Browse…** button show the browser over the viewport; Esc or **Close** dismisses it and the render resumes. Opening a scene from it asks before discarding unsaved changes.
+- **Reopening.** With a scene loaded, **File › Browse Scenes…** (⇧⌘O, `StudioController.browseScenes`) and the inspector's **Browse…** button show the browser over the viewport; Esc or **Close** (`closeSceneBrowser`) dismisses it and the render resumes. The document stays loaded and autosave keeps running, the last session is not retired and **Restore Last Session** is not offered. Opening a scene, project or file from it asks before discarding unsaved changes; Cancel keeps the browser open. A running download is unaffected by closing it. Esc does nothing at launch.
 - **Busy state.** While shaders compile or a project operation runs, cards and buttons are disabled as the start screen's buttons are today.
 
 ## 5. What is replaced

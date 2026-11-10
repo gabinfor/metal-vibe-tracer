@@ -1,4 +1,4 @@
-// Example scenes (File > Open Example Scene, Sources/ExampleScenes.swift and SceneCatalog.swift), without the network or the archive's
+// Example scenes (the scene browser, Sources/ExampleScenes.swift and SceneCatalog.swift), without the network or the archive's
 // OBJ files: the catalog against scripts/showcase.json, which archives a scene still needs, archive verification
 // and extraction from a locally made zip, and the showcase shot's camera, lighting and emission scaling applied to
 // a synthetic emissive OBJ imported through ProjectDocument.appendOBJ, then opened through the studio controller.
@@ -235,20 +235,15 @@
   var empty = ProjectDocument()
   require(empty.scaleImportedEmission(by: 0) == 0 && empty.scenes[6] == nil, "no imported scene, nothing to scale")
 
-  // Controller: File > Open Example Scene lists the catalog with download sizes, and an installed scene opens
-  // as a new untitled project with its shot and credit, undoably. The lamp stands in for the Bistro interior.
-  let examples = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu?.items
-    .first { $0.title == "Open Example Scene" }?.submenu
-  let items = examples?.items.filter { $0.action == #selector(StudioController.exampleSceneAction(_:)) } ?? []
+  // Controller: File > Credits and Licenses… stays, and an installed scene opens as a new untitled project with its
+  // shot and credit, undoably. The lamp stands in for the Bistro interior.
+  let fileMenu = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu
   let previousLibrary = controller.exampleLibrary
   controller.exampleLibrary = ExampleLibrary(root: folder.appendingPathComponent("controller", isDirectory: true))
   defer { controller.exampleLibrary = previousLibrary }
-  for item in items { _ = controller.validateMenuItem(item) }
-  require(items.map(\.tag) == Array(catalog.indices) && items.first?.title == "Crytek Sponza — 80 MB download…"
-    && items[3].title == "Amazon Lumberyard Bistro (interior) — 1.4 GB download…"
-    && items.last?.title == "Living Room — 15 MB download…"
-    && examples?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true,
-    "File > Open Example Scene lists the scenes with their download sizes: \(items.map(\.title))")
+  require(fileMenu?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true
+    && fileMenu?.items.contains { $0.action == #selector(StudioController.revealExampleScenesAction) } == true,
+    "File lists Credits and Licenses… and Show Downloaded Scenes in Finder")
   let installed = controller.exampleLibrary
   // A download scene that is not installed opens nothing: the consent and download flow is the caller's.
   let encoder = JSONEncoder()
@@ -270,8 +265,6 @@
   for archive in interior.archives {
     try Data((archive.sha256 + "\n").utf8).write(to: installed.marker(archive, storage: "bistro"))
   }
-  _ = controller.validateMenuItem(items[3])
-  require(items[3].title == interior.title, "an installed scene's menu entry shows no download")
   waitUntil({ !controller.isBusy }, seconds: 60)
   // Without an event loop, undo registrations need an explicit group (as in Fix_persistence.swift).
   let history = controller.history, groupsByEvent = history.groupsByEvent
@@ -376,6 +369,6 @@
     "a verified download installs the scene and opens it with its credit")
   history.undo()
   waitUntil({ !controller.isBusy }, seconds: 60)
-  print("PASS: example scenes (catalog against showcase.json, archive markers, verification and extraction, shot settings and emission scaling, File > Open Example Scene, downloading from the scene browser)")
+  print("PASS: example scenes (catalog against showcase.json, archive markers, verification and extraction, shot settings and emission scaling, the File menu's credits, downloading from the scene browser)")
 }
 try fixExampleSceneChecks()

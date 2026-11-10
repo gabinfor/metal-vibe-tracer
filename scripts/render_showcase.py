@@ -46,7 +46,7 @@ for shot in shots:
 arguments.out.mkdir(parents=True, exist_ok=True)
 
 # The shot schema and its settings (ShowcaseShot, with the emission scaling) are production code in
-# Sources/ExampleScenes.swift, which File > Open Example Scene applies to the same shots.
+# Sources/ExampleScenes.swift, which the scene browser applies to the same shots.
 driver = r'''
 // Every `every` seconds while waiting, `report` prints a progress line (flushed, so it shows while running).
 func waitFor(_ condition: () -> Bool, seconds: Double, every: Double = 0, report: () -> Void = {}) -> Bool {

@@ -46,7 +46,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 
 <p align="center"><sub>Imported from Morgan McGuire's Computer Graphics Archive (OBJ with MTL materials translated to OpenPBR MaterialX), 1600×900, 128 spp, denoised with Open Image Denoise, on a 16 GB Apple M4. The daylight Bistro exterior has the scene's lamps and emissive signs switched off; the evening interior brightens its lamps 60×.</sub></p>
 
-To open these scenes in the app, choose them in the start screen's scene browser (the **Downloads** filter lists them) or the inspector's **Scene** selector, or from **File › Open Example Scene**. They are not bundled. A scene is downloaded once from the archive when you click **Download** in its details pane, which states the size and source above the button (Sponza 80 MB, San Miguel 536 MB, Bistro 1.4 GB), with the license beside it. The download is checked against a pinned SHA-256 digest, extracted into Application Support and opened with the camera and lighting shown above. The same lists offer six smaller models from the archive: the **Bedroom** photogrammetry scan (34 MB, CC BY-SA 4.0), the **Breakfast Room** (6 MB), **Fireplace Room** (9 MB) and **Living Room** (15 MB) interiors (CC BY 3.0; the last two open with Benedikt Bitterli's reference cameras), and Stanford's **Happy Buddha** (23 MB) and **Chinese Dragon** (18 MB) scans, which are for research and non-commercial use. **Credits and Licenses…** in the same menu lists the attributions.
+To open these scenes in the app, choose them in the scene browser (the **Downloads** filter lists them), which opens at launch and again from **File › Browse Scenes…** or the inspector's **Browse…** button. They are not bundled. A scene is downloaded once from the archive when you click **Download** in its details pane, which states the size and source above the button (Sponza 80 MB, San Miguel 536 MB, Bistro 1.4 GB), with the license beside it. The download is checked against a pinned SHA-256 digest, extracted into Application Support and opened with the camera and lighting shown above. The browser offers six smaller models from the archive: the **Bedroom** photogrammetry scan (34 MB, CC BY-SA 4.0), the **Breakfast Room** (6 MB), **Fireplace Room** (9 MB) and **Living Room** (15 MB) interiors (CC BY 3.0; the last two open with Benedikt Bitterli's reference cameras), and Stanford's **Happy Buddha** (23 MB) and **Chinese Dragon** (18 MB) scans, which are for research and non-commercial use. **Credits and Licenses…** (in the browser and the File menu) lists the attributions.
 
 ## Gallery
 
@@ -95,7 +95,7 @@ To open these scenes in the app, choose them in the start screen's scene browser
   </tr>
 </table>
 
-<p align="center"><sub><b>Spectral examples</b>, included with the app (<b>File › Open Example Scene</b>). These effects need spectral transport.</sub></p>
+<p align="center"><sub><b>Spectral examples</b>, included with the app (<b>File › Browse Scenes…</b>, <b>Included</b> filter). These effects need spectral transport.</sub></p>
 
 <table>
   <tr>
@@ -209,8 +209,8 @@ Projects embed imported assets and can be reopened without the original files. E
 
 - [MaterialX examples](Examples/MaterialX/README.md)
 - [OpenUSD examples and reference scenes](Examples/OpenUSD/README.md)
-- [Spectral example scenes](Examples/Spectral/README.md): thin-film interference (Newton's colour series), dispersion (the Abbe row), Rayleigh scattering (the Tyndall tank) and lamp spectra in haze, included with the app under **File › Open Example Scene**.
-- McGuire's Sponza, San Miguel, Bistro, Bedroom, Breakfast Room, Fireplace Room, Living Room, Happy Buddha and Chinese Dragon: **File › Open Example Scene** downloads them on request (see [Production scenes](#production-scenes)).
+- [Spectral example scenes](Examples/Spectral/README.md): thin-film interference (Newton's colour series), dispersion (the Abbe row), Rayleigh scattering (the Tyndall tank) and lamp spectra in haze, included with the app, in the scene browser (**File › Browse Scenes…**).
+- McGuire's Sponza, San Miguel, Bistro, Bedroom, Breakfast Room, Fireplace Room, Living Room, Happy Buddha and Chinese Dragon: the scene browser (**File › Browse Scenes…**) downloads them on request (see [Production scenes](#production-scenes)).
 - [Poly Haven HDRI test selection](Examples/HDRI/README.md). Download it with `python3 scripts/fetch_test_hdris.py`. `scripts/render_showcase.py` needs it to render the README images.
 
 ## Development

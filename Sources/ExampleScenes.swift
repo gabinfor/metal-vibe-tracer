@@ -266,7 +266,7 @@ final class ExampleSceneDownload: NSObject, URLSessionDownloadDelegate, @uncheck
 }
 
 // A shot of scripts/showcase.json: the README images' scene, camera, lens, lighting and output settings.
-// scripts/render_showcase.py renders them; File > Open Example Scene opens the McGuire archive ones.
+// scripts/render_showcase.py renders them; the scene browser opens the McGuire archive ones.
 struct ShowcaseShot: Decodable, Sendable {
   var name: String
   var scene: UInt32?
@@ -403,12 +403,8 @@ extension ProjectDocument {
   }
 }
 
-// File > Open Example Scene and the File inspector's Example scenes section.
+// Opening, downloading and crediting the catalog's scenes for the scene browser and the File menu.
 extension StudioController {
-  func exampleSceneTitle(_ entry: SceneEntry) -> String {
-    let download = exampleLibrary.downloadBytes(entry)
-    return download > 0 ? "\(entry.title) — \(SceneCatalog.megabytes(download)) download…" : "\(entry.title)"
-  }
   // Built-in and bundled scenes are always available; a download scene once every archive is extracted.
   func isInstalled(_ entry: SceneEntry) -> Bool { !entry.isDownload || exampleLibrary.missing(entry).isEmpty }
   // Opens the scene as a new, unsaved, untitled project, after confirming that changes are discarded. A download
@@ -420,13 +416,6 @@ extension StudioController {
     case .bundled: openBundledScene(entry)
     case .download: confirmDiscardingChanges { [weak self] in self?.beginExampleImport(entry) }
     }
-  }
-  // openScene, or for a download scene that is not installed its details in the scene browser, whose Download button is
-  // the only way to start a download. A document without the browser over it shows a hint instead.
-  func openOrDownloadScene(_ entry: SceneEntry) {
-    guard entry.isDownload, !isInstalled(entry) else { return openScene(entry) }
-    guard let browser = startScreen else { return show("Download \(entry.title) from the scene browser.") }
-    browser.selection = entry
   }
   // The scene browser's Download button: downloads, verifies and extracts the missing archives while the details pane
   // shows the progress. The download goes on when another card is selected or the browser is dismissed. A finished
@@ -446,7 +435,7 @@ extension StudioController {
     exampleDownload = job
     downloadingScene = entry
     downloadProgress = (0, "Connecting to \(host)…")
-    startScreen?.setDownload(entry, fraction: 0, status: downloadProgress?.status)
+    visibleBrowser?.setDownload(entry, fraction: 0, status: downloadProgress?.status)
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let result = Result { try job.install(entry, into: library) }
       DispatchQueue.main.async { [weak self] in self?.sceneDownloadFinished(entry, job, result) }
@@ -456,17 +445,17 @@ extension StudioController {
   private func sceneDownloadProgress(_ entry: SceneEntry, _ fraction: Double, _ message: String) {
     guard downloadingScene?.id == entry.id else { return }
     downloadProgress = (fraction, message)
-    startScreen?.setDownload(entry, fraction: fraction, status: message)
+    visibleBrowser?.setDownload(entry, fraction: fraction, status: message)
   }
   private func sceneDownloadFinished(_ entry: SceneEntry, _ job: ExampleSceneDownload, _ result: Result<Void, Error>) {
     exampleDownload = nil
     downloadingScene = nil
     downloadProgress = nil
-    startScreen?.setDownload(nil, fraction: nil, status: nil)
-    startScreen?.reload()
+    visibleBrowser?.setDownload(nil, fraction: nil, status: nil)
+    visibleBrowser?.reload()
     switch result {
     case .success:
-      if startScreen != nil && !isBusy {
+      if visibleBrowser != nil && !isBusy {
         openScene(entry)
       } else {
         show("\(entry.title) is downloaded; open it from the scene browser.")
@@ -475,7 +464,7 @@ extension StudioController {
       show("Download of \(entry.title) cancelled; finished archives are kept.")
     case .failure(let error):
       let message = "Could not download \(entry.title): \(error.localizedDescription)"
-      startScreen?.showDownloadError(entry, message)
+      visibleBrowser?.showDownloadError(entry, message)
       showError(message)
     }
   }
@@ -500,7 +489,7 @@ extension StudioController {
       document.importReport = [attribution] + (document.importReport ?? [])
     }) { [weak self] in
       self?.changed()
-      self?.show("Opened \(entry.title) \(credit), \(license). Credits: File > Open Example Scene.")
+      self?.show("Opened \(entry.title) \(credit), \(license). Credits: File > Credits and Licenses….")
     }
   }
   // Opens an OBJ chosen with Open Scene File as a new, unsaved, untitled project, framed to the model.
@@ -584,32 +573,6 @@ extension StudioController {
         shot.apply(to: &$0)
       }
     }
-  }
-  func exampleScenePanel() {
-    heading("Spectral examples")
-    for example in SceneCatalog.entries(.spectral) {
-      button(example.title) { [weak self] in self?.openScene(example) }
-    }
-    text("Small OpenUSD scenes included with Metal Vibe Tracer. "
-      + SceneCatalog.entries(.spectral).map { "\($0.title): \($0.summary)." }.joined(separator: " ")
-      + " Thin film, dispersion, lamp spectra and Rayleigh scattering render fully in spectral light transport (the default).")
-    heading("Example scenes")
-    for entry in SceneCatalog.entries(.mcguire) {
-      button(exampleSceneTitle(entry)) { [weak self] in self?.openOrDownloadScene(entry) }
-    }
-    text(
-      "Production scenes from Morgan McGuire's Computer Graphics Archive, opened with the camera and lighting of the README images. They are not bundled: each is downloaded once, after you agree, into Application Support.\n"
-        + SceneCatalog.credits.joined(separator: "\n"))
-    button("Credits and licenses…") { [weak self] in self?.showExampleCredits() }
-    button("Show downloaded scenes in Finder") { [weak self] in self?.revealExampleScenes() }
-  }
-  @objc func exampleSceneAction(_ sender: NSMenuItem) {
-    let entries = SceneCatalog.entries(.mcguire)
-    if entries.indices.contains(sender.tag) { openOrDownloadScene(entries[sender.tag]) }
-  }
-  @objc func spectralExampleAction(_ sender: NSMenuItem) {
-    let entries = SceneCatalog.entries(.spectral)
-    if entries.indices.contains(sender.tag) { openScene(entries[sender.tag]) }
   }
   @objc func exampleCreditsAction() { showExampleCredits() }
   @objc func revealExampleScenesAction() { revealExampleScenes() }

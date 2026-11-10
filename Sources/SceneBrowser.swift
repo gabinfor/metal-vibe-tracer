@@ -18,7 +18,7 @@ enum StartAction {
 // renders until the user opens a project or a scene file, opens a catalog scene or restores the last session. A top row
 // of file actions sits over filters and search, a grid of scene cards and the details pane of the selected card.
 // While the GPU shaders compile at launch (AppDelegate) it shows their progress and the action queued until they are
-// ready; afterwards StudioController shows it over the viewport.
+// ready; afterwards StudioController shows it over the viewport, and again over a loaded document with a Close button.
 final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionViewDelegate {
   enum Filter: Int, CaseIterable { case all, builtIn, included, downloads, installed }
   var onAction: ((StartAction) -> Void)?
@@ -30,7 +30,7 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   var onCancelPending: (() -> Void)?
   // The Credits and licenses… link; nil hides it (the launch state, before the studio can show the credits sheet).
   var onCredits: (() -> Void)? { didSet { creditsButton.isHidden = onCredits == nil } }
-  // nil hides the Close button (the launch state).
+  // The Close button and Esc; nil hides the button and ignores Esc (the launch state, where there is nothing to return to).
   var onClose: (() -> Void)? { didSet { closeButton.isHidden = onClose == nil } }
   var filter: Filter = .all { didSet { applyFilter() } }
   var search = "" {
@@ -142,6 +142,10 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   }
   required init?(coder: NSCoder) { fatalError() }
 
+  override var acceptsFirstResponder: Bool { true }
+  override func cancelOperation(_ sender: Any?) {
+    onClose?()
+  }
   override func updateLayer() {
     layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
   }

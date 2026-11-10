@@ -163,6 +163,11 @@ final class StudioController: NSViewController {
   private var statusAtEdge: NSLayoutConstraint!, statusAfterActivity: NSLayoutConstraint!
   // The empty start state shown at launch (SceneBrowserView); nil once a document is loaded.
   fileprivate(set) var startScreen: SceneBrowserView?
+  // The browser reopened over the loaded document (browseScenes); nil when it is not shown.
+  fileprivate(set) var sceneBrowser: SceneBrowserView?
+  var isBrowsingScenes: Bool { sceneBrowser != nil }
+  // Whichever browser is on screen, for the download and busy state it shows.
+  var visibleBrowser: SceneBrowserView? { startScreen ?? sceneBrowser }
   // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
   var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
   // Set while the start screen restores the last session, which keeps its autosave file.
@@ -175,7 +180,7 @@ final class StudioController: NSViewController {
   var importInProgress = false { didSet { busyStateChanged() } }
   var usdImportJob: USDImportJob?
   // The scene browser's download in progress (ExampleScenes.swift): its job, scene and latest progress, which
-  // showStartScreen shows again in a new browser.
+  // a browser shows again when it is next presented.
   var exampleDownload: ExampleSceneDownload?
   var downloadingScene: SceneEntry?
   var downloadProgress: (fraction: Double, status: String)?
@@ -333,9 +338,11 @@ final class StudioController: NSViewController {
       return
     }
     hostWindow?.representedURL = projectURL
-    hostWindow?.title = projectURL?.lastPathComponent ?? "Untitled"
+    hostWindow?.title = documentName
     hostWindow?.subtitle = "Metal Vibe Tracer"
   }
+  // The project file's name, or Untitled.
+  var documentName: String { projectURL?.lastPathComponent ?? "Untitled" }
   required init?(coder: NSCoder) { fatalError() }
   override func loadView() {
     let root = NSView()
@@ -449,52 +456,29 @@ final class StudioController: NSViewController {
     label.textColor = .secondaryLabelColor
     add(label)
   }
-  // The scene selector: built-in scenes, the bundled examples and the downloadable ones (with their download size),
-  // in labelled groups. Choosing an example opens it like File > Open Example Scene; the selector keeps showing the
-  // current scene.
-  func scenePicker() {
-    let popup = ActionPopup([], selected: 0, label: "Scene") { _ in }
-    let menu = NSMenu()
-    func add(_ title: String, tag: Int) {
-      let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-      item.tag = tag
-      menu.addItem(item)
+  // The title of the current scene: the catalog's for a built-in scene, the document's name for imported or opened
+  // content (the imported-mesh studio, which has no catalog entry).
+  var currentSceneTitle: String {
+    let builtIn = SceneCatalog.entries.first { entry in
+      if case .builtIn(let index) = entry.source { return index == Int(renderer.sceneIndex) }
+      return false
     }
-    menu.addItem(.sectionHeader(title: "Built-in scenes"))
-    for (index, name) in Self.sceneNames.enumerated() { add(name, tag: index) }
-    menu.addItem(.separator())
-    menu.addItem(.sectionHeader(title: "Example scenes"))
-    for (index, example) in SceneCatalog.entries(.spectral).enumerated() { add(example.title, tag: Self.exampleTag + index) }
-    menu.addItem(.separator())
-    menu.addItem(.sectionHeader(title: "Download examples"))
-    // A download scene's title without the publisher ("Bistro (exterior)") with the size still to download
-    // ("Crytek Sponza · 80 MB"), or the title alone.
-    for (index, entry) in SceneCatalog.entries(.mcguire).enumerated() {
-      let title = entry.title.replacingOccurrences(of: "Amazon Lumberyard ", with: "")
-      let bytes = exampleLibrary.downloadBytes(entry)
-      add(bytes > 0 ? "\(title) · \(SceneCatalog.megabytes(bytes))" : title, tag: Self.downloadTag + index)
-    }
-    popup.menu = menu
-    popup.selectItem(withTag: Int(renderer.sceneIndex))
-    popup.actionBlock = { [weak self, weak popup] _ in
-      guard let self, let tag = popup?.selectedTag() else { return }
-      // While edits are refused (an export, project I/O) the selector goes back to the current scene.
-      guard self.acceptsEdits else {
-        popup?.selectItem(withTag: Int(self.renderer.sceneIndex))
-        return
-      }
-      switch tag {
-      case Self.downloadTag...: self.openOrDownloadScene(SceneCatalog.entries(.mcguire)[tag - Self.downloadTag])
-      case Self.exampleTag...: self.openScene(SceneCatalog.entries(.spectral)[tag - Self.exampleTag])
-      default: self.switchScene(tag)
-      }
-      // An example opens asynchronously (or after a sheet); until then the selector shows the current scene.
-      popup?.selectItem(withTag: Int(self.renderer.sceneIndex))
-    }
-    stack.addArrangedSubview(popup)
-    popup.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
+    return builtIn?.title ?? documentName
   }
-  static let exampleTag = 100, downloadTag = 200
+  // The inspector's scene control: the current scene's title and a button that opens the scene browser.
+  func sceneControl() {
+    let title = NSTextField(labelWithString: currentSceneTitle)
+    title.font = .systemFont(ofSize: 13, weight: .medium)
+    title.lineBreakMode = .byTruncatingTail
+    title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    let browse = ActionButton("Browse…") { [weak self] in self?.browseScenes() }
+    browse.identifier = NSUserInterfaceItemIdentifier("scene-browse")
+    let spacer = NSView()
+    spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+    let row = NSStackView(views: [title, spacer, browse])
+    row.orientation = .horizontal
+    add(row)
+  }
   func heading(_ value: String) {
     let l = NSTextField(labelWithString: value)
     l.font = .systemFont(ofSize: 14, weight: .semibold)
@@ -559,7 +543,7 @@ final class StudioController: NSViewController {
       heading("Settings")
     } else {
       caption("Scene")
-      scenePicker()
+      sceneControl()
       caption("Inspector page")
       popup(
         ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page,
@@ -1268,7 +1252,6 @@ final class StudioController: NSViewController {
     text(
       "Projects embed textures, the environment image, and imported geometry. Changes are also autosaved locally; the start screen offers to restore them at the next launch."
     )
-    exampleScenePanel()
     heading("Export")
     number("Output width", Float(renderer.options.outputWidth), 16...8192, 1920, reset: false, integral: true) {
       [weak self] in self?.renderer.options.outputWidth = Int($0)
@@ -1468,7 +1451,7 @@ final class StudioController: NSViewController {
       activityCancelHandler = nil
       refreshActivity()
     }
-    startScreen?.setActionsEnabled(enabled)
+    visibleBrowser?.setActionsEnabled(enabled)
     for button in busyButtons { button.isEnabled = enabled }
     pauseButton?.isEnabled = enabled
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
@@ -1516,8 +1499,8 @@ final class StudioController: NSViewController {
     } else {
       activityBar.stopAnimation(nil)
     }
-    // A load started from the start screen shows its progress there too.
-    startScreen?.setProgress(activity?.snapshot)
+    // A load started from the scene browser shows its progress there too.
+    visibleBrowser?.setProgress(activity?.snapshot)
     if visible, activityTimer == nil {
       let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
         MainActor.assumeIsolated { self?.refreshActivity() }
@@ -1582,6 +1565,7 @@ final class StudioController: NSViewController {
   // export settings, saved views) keeps the accumulated samples and OIDN preview.
   func applyProject(_ p: ProjectDocument, resources: MaterialLibrary?, resourcesChanged: Bool = true) {
     if startScreen != nil { dismissStartScreen() }
+    closeSceneBrowser()
     isRestoring = true
     defer { isRestoring = false }
     let r = renderer
@@ -2431,41 +2415,11 @@ final class StudioController: NSViewController {
         ("Open Project…", "o", #selector(openAction)), ("Save Project", "s", #selector(saveAction)),
         ("Save Project As…", "S", #selector(saveAsAction)),
         ("Open Scene File…", "", #selector(openSceneFileAction)),
+        ("Browse Scenes…", "O", #selector(browseScenesAction)),
+        ("Credits and Licenses…", "", #selector(exampleCreditsAction)),
+        ("Show Downloaded Scenes in Finder", "", #selector(revealExampleScenesAction)),
         ("Export…", "e", #selector(exportAction)),
       ])
-    // Example scenes: downloaded on request (ExampleScenes.swift); titles show the remaining download size.
-    if let file = main.items.last?.submenu,
-      let index = file.items.firstIndex(where: { $0.action == #selector(openSceneFileAction) })
-    {
-      let examples = NSMenu(title: "Open Example Scene")
-      // Bundled spectral examples first, then the McGuire archive scenes downloaded on request.
-      for (tag, example) in SceneCatalog.entries(.spectral).enumerated() {
-        let item = NSMenuItem(title: example.title, action: #selector(spectralExampleAction(_:)), keyEquivalent: "")
-        item.tag = tag
-        item.target = self
-        item.toolTip = example.summary
-        examples.addItem(item)
-      }
-      examples.addItem(.separator())
-      for (tag, entry) in SceneCatalog.entries(.mcguire).enumerated() {
-        let item = NSMenuItem(title: entry.title, action: #selector(exampleSceneAction(_:)), keyEquivalent: "")
-        item.tag = tag
-        item.target = self
-        examples.addItem(item)
-      }
-      examples.addItem(.separator())
-      for (title, selector) in [
-        ("Credits and Licenses…", #selector(exampleCreditsAction)),
-        ("Show Downloaded Scenes in Finder", #selector(revealExampleScenesAction)),
-      ] {
-        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-        item.target = self
-        examples.addItem(item)
-      }
-      let item = NSMenuItem(title: "Open Example Scene", action: nil, keyEquivalent: "")
-      item.submenu = examples
-      file.insertItem(item, at: index + 1)
-    }
     // Standard application and window commands go to NSApp and the key window.
     if let app = main.items.first?.submenu {
       let hide = NSMenuItem(title: "Hide Metal Vibe Tracer", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
@@ -2545,6 +2499,7 @@ final class StudioController: NSViewController {
   }
   @objc func saveAsAction() { saveProject(asNew: true) }
   @objc func openSceneFileAction() { openSceneFile() }
+  @objc func browseScenesAction() { browseScenes() }
   @objc func frameSelectionAction() { guard !isBusy else { return }; frameMesh() }
   @objc func frameAllAction() { guard !isBusy else { return }; selectedNode = nil; frameMesh() }
   @objc func quit() { NSApp.terminate(nil) }
@@ -2563,14 +2518,11 @@ final class StudioController: NSViewController {
   @objc func restartAction() { restart() }
 }
 
-// The start screen (SceneBrowserView): the empty state at launch.
+// The scene browser (SceneBrowserView): the empty start state at launch, and reopened over a loaded document.
 extension StudioController {
-  // Covers the viewport and inspector with `view` (the launch screen, reused) until a document loads.
-  // Nothing renders meanwhile, and no autosave is written, so the last session stays restorable.
-  func showStartScreen(_ given: SceneBrowserView? = nil) {
-    let view = given ?? SceneBrowserView(library: exampleLibrary)
+  // Covers the viewport and inspector with `view` and pauses the viewport.
+  private func present(_ view: SceneBrowserView) {
     view.reload()
-    view.setRestore(Self.autosaveDate(at: autosaveURL))
     view.onAction = { [weak self] action in self?.performStartAction(action) }
     view.onDownload = { [weak self] entry in self?.beginSceneDownload(entry) }
     view.onCancelDownload = { [weak self] in self?.cancelSceneDownload() }
@@ -2588,11 +2540,25 @@ extension StudioController {
       view.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
       view.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
     ])
-    startScreen = view
     viewport.isPaused = true
     viewport.isHidden = true
     updateWindowTitle()
     refreshActivity()
+  }
+  private func resumeViewport() {
+    viewport.isHidden = false
+    viewport.isPaused = false
+    renderer.lastTick = awakeSeconds()
+    updateWindowTitle()
+    refreshActivity()
+  }
+  // The launch state: `given` (the launch screen, reused) covers the viewport and inspector until a document loads.
+  // Nothing renders meanwhile, and no autosave is written, so the last session stays restorable.
+  func showStartScreen(_ given: SceneBrowserView? = nil) {
+    let view = given ?? SceneBrowserView(library: exampleLibrary)
+    view.setRestore(Self.autosaveDate(at: autosaveURL))
+    startScreen = view
+    present(view)
   }
   // A loaded document (applyProject) replaces the start screen. Unless the last session was
   // restored, its autosave becomes the recovery copy (Autosave-previous.vtrace) before this
@@ -2602,11 +2568,24 @@ extension StudioController {
     view.removeFromSuperview()
     startScreen = nil
     if !restoringSession { retireLastSessionAutosave() }
-    viewport.isHidden = false
-    viewport.isPaused = false
-    renderer.lastTick = awakeSeconds()
-    updateWindowTitle()
-    refreshActivity()
+    resumeViewport()
+  }
+  // Shows the browser over the loaded document, with a Close button; Esc closes it too. The document stays loaded and
+  // autosave keeps running; the last session is not offered for restoring.
+  func browseScenes() {
+    guard !isBusy, startScreen == nil, sceneBrowser == nil else { return }
+    let view = SceneBrowserView(library: exampleLibrary)
+    view.onClose = { [weak self] in self?.closeSceneBrowser() }
+    sceneBrowser = view
+    present(view)
+    hostWindow?.makeFirstResponder(view)
+  }
+  // Removes the browser and resumes the viewport; the document is untouched.
+  func closeSceneBrowser() {
+    guard let view = sceneBrowser else { return }
+    view.removeFromSuperview()
+    sceneBrowser = nil
+    resumeViewport()
   }
   private func retireLastSessionAutosave() {
     let current = autosaveURL, previous = previousAutosaveURL
@@ -2624,9 +2603,9 @@ extension StudioController {
   func performStartAction(_ action: StartAction) {
     guard !isBusy else { return }
     switch action {
-    case .openProject(let url?): beginOpenProject(url)
+    case .openProject(let url?): confirmDiscardingChanges { [weak self] in self?.beginOpenProject(url) }
     case .openScene(let url?): beginOpenSceneFile(url)
-    case .scene(let id): if let entry = SceneCatalog.entry(id) { openOrDownloadScene(entry) }
+    case .scene(let id): if let entry = SceneCatalog.entry(id) { openScene(entry) }
     case .restoreSession:
       restoringSession = true
       restoreAutosave()
@@ -2665,17 +2644,13 @@ extension StudioController: NSMenuItemValidation {
     if item.action == #selector(exampleCreditsAction) || item.action == #selector(revealExampleScenesAction) {
       return true
     }
-    if item.action == #selector(exampleSceneAction(_:)), SceneCatalog.entries(.mcguire).indices.contains(item.tag) {
-      item.title = exampleSceneTitle(SceneCatalog.entries(.mcguire)[item.tag])
-    }
     if item.action == #selector(viewportAction(_:)) {
       item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
     }
     if isBusy { return false }
-    // The start screen has no document to save, edit, render or export.
-    if startScreen != nil {
-      return [#selector(openAction), #selector(openSceneFileAction), #selector(exampleSceneAction(_:)),
-        #selector(spectralExampleAction(_:))].contains(item.action)
+    // The browser covers the document: only the commands that open one apply.
+    if startScreen != nil || sceneBrowser != nil {
+      return [#selector(openAction), #selector(openSceneFileAction), #selector(browseScenesAction)].contains(item.action)
     }
     if item.action == #selector(undoAction) {
       item.title = history.undoMenuItemTitle

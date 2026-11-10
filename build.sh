@@ -34,7 +34,7 @@ cp Vendor/OpenUSD/UPSTREAM.md "$stage/Contents/Resources/OpenUSD-UPSTREAM.md"
 cp -RH build/OIDN "$stage/Contents/Frameworks/OIDN"
 cp Vendor/OIDN/UPSTREAM.md "$stage/Contents/Resources/OIDN-UPSTREAM.md"
 cp REFERENCES.md "$stage/Contents/Resources/REFERENCES.md"
-# Camera and lighting of File > Open Example Scene (ShowcaseShot). The spectral examples are bundled at their
+# Camera and lighting of the scene browser's example scenes (ShowcaseShot). The spectral examples are bundled at their
 # repository paths (SceneCatalog's spectral entries); the McGuire archive scenes are downloaded on request.
 cp scripts/showcase.json "$stage/Contents/Resources/showcase.json"
 mkdir -p "$stage/Contents/Resources/Examples"
