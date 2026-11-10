@@ -81,7 +81,7 @@
   require(scratch().subtracting(before).isEmpty, "quit removes the USD scratch folder")
   controller.usdImportJob = nil
 
-  // Bundled spectral examples (SceneCatalog.entries(.spectral)): implicit spheres and cylinders are tessellated and instanced,
+  // Bundled spectral examples (the catalog's .spectral entries): implicit spheres and cylinders are tessellated and instanced,
   // and the OpenPBR thin-film and dispersion constants reach MaterialXProgram.spectral.
   func example(_ shot: String) throws -> ProjectDocument {
     guard let path = try ShowcaseShot.bundled().first(where: { $0.name == shot })?.usd, let url = SceneCatalog.bundledURL(path)

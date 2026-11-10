@@ -165,6 +165,8 @@ final class StudioController: NSViewController {
   fileprivate(set) var startScreen: SceneBrowserView?
   // The browser reopened over the loaded document (browseScenes); nil when it is not shown.
   fileprivate(set) var sceneBrowser: SceneBrowserView?
+  // The inspector's scene title, refreshed when the document's name changes.
+  private weak var sceneTitleLabel: NSTextField?
   var isBrowsingScenes: Bool { sceneBrowser != nil }
   // Whichever browser is on screen, for the download and busy state it shows.
   var visibleBrowser: SceneBrowserView? { startScreen ?? sceneBrowser }
@@ -331,6 +333,7 @@ final class StudioController: NSViewController {
   }
   // The window names the project file (with its proxy icon); the app name is the subtitle.
   func updateWindowTitle() {
+    sceneTitleLabel?.stringValue = currentSceneTitle
     if startScreen != nil {
       hostWindow?.representedURL = nil
       hostWindow?.title = "Metal Vibe Tracer"
@@ -470,6 +473,7 @@ final class StudioController: NSViewController {
     let title = NSTextField(labelWithString: currentSceneTitle)
     title.font = .systemFont(ofSize: 13, weight: .medium)
     title.lineBreakMode = .byTruncatingTail
+    sceneTitleLabel = title
     title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     let browse = ActionButton("Browse…") { [weak self] in self?.browseScenes() }
     browse.identifier = NSUserInterfaceItemIdentifier("scene-browse")
@@ -2648,9 +2652,10 @@ extension StudioController: NSMenuItemValidation {
       item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
     }
     if isBusy { return false }
-    // The browser covers the document: only the commands that open one apply.
+    // A browser covers the document: only the commands that open one apply.
     if startScreen != nil || sceneBrowser != nil {
-      return [#selector(openAction), #selector(openSceneFileAction), #selector(browseScenesAction)].contains(item.action)
+      // Browse Scenes is off while a browser is already showing.
+      return [#selector(openAction), #selector(openSceneFileAction)].contains(item.action)
     }
     if item.action == #selector(undoAction) {
       item.title = history.undoMenuItemTitle

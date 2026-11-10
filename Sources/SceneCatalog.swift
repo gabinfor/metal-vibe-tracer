@@ -198,8 +198,6 @@ enum SceneCatalog {
   ]
 
   static func entry(_ id: String) -> SceneEntry? { entries.first { $0.id == id } }
-  // The entries of one collection, in catalog order.
-  static func entries(_ collection: SceneEntry.Collection) -> [SceneEntry] { entries.filter { $0.collection == collection } }
   // One line per credited work, for the credits sheet.
   static var credits: [String] {
     var seen = Set<String>()

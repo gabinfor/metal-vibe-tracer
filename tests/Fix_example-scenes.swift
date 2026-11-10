@@ -29,7 +29,7 @@
     require(entry.id.allSatisfy { $0.isLowercase || $0.isNumber || $0 == "-" }, "\(entry.id) is a file-safe id")
   }
   require(SceneCatalog.entry("sponza")?.triangles == 262_266 && SceneCatalog.entry("nope") == nil, "lookup by id")
-  let catalog = SceneCatalog.entries(.mcguire)
+  let catalog = SceneCatalog.entries.filter { $0.collection == .mcguire }
   require(catalog.map(\.id) == ["sponza", "san-miguel", "bistro-exterior", "bistro-interior", "bedroom",
     "breakfast-room", "buddha", "chinese-dragon", "fireplace-room", "living-room"]
     && catalog.map(\.triangles) == [262_266, 9_963_375, 2_833_329, 1_020_903, 383_504, 269_764, 1_087_304, 871_198,
@@ -82,13 +82,13 @@
     && SceneEntry.Collection.spectral.website == nil && interior.work == "Amazon Lumberyard Bistro",
     "collections name themselves and the archive's website")
   // Tags: the spectral scenes name their effect, textured downloads say so.
-  require(SceneCatalog.entries(.spectral).map(\.tags) == [["spectral", "thin film"], ["spectral", "dispersion"],
+  require(SceneCatalog.entries.filter { $0.collection == .spectral }.map(\.tags) == [["spectral", "thin film"], ["spectral", "dispersion"],
     ["spectral", "fog"], ["spectral", "light spectra"], ["spectral", "many lights"]]
     && SceneCatalog.entry("cornell-fog")?.tags == ["fog"] && SceneCatalog.entry("cornell-glass-mirror")?.tags == ["glass"]
     && SceneCatalog.entry("sponza")?.tags == ["textures"] && SceneCatalog.entry("buddha")?.tags.isEmpty == true,
     "entries carry their feature tags")
   // Bundled spectral examples: a showcase shot each, whose stage is under Examples/Spectral and resolves.
-  let spectral = SceneCatalog.entries(.spectral)
+  let spectral = SceneCatalog.entries.filter { $0.collection == .spectral }
   require(spectral.map(\.shot) == ["spectral-newton-series", "spectral-abbe-row", "spectral-tyndall-tank",
     "spectral-lamp-spectra", "spectral-lantern-arcade"],
     "spectral examples list Newton's colour series, the Abbe row, the Tyndall tank, the lamp spectra and the lantern arcade")

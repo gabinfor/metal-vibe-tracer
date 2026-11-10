@@ -85,7 +85,7 @@
   require(browser.visibleEntries.isEmpty && browser.selection == nil && browser.control("scene-empty")?.isHidden == false,
     "nothing installed")
   browser.filter = .builtIn
-  require(browser.visibleEntries.map(\.id) == SceneCatalog.entries(.builtIn).map(\.id)
+  require(browser.visibleEntries.map(\.id) == SceneCatalog.entries.filter { $0.collection == .builtIn }.map(\.id)
     && browser.control("scene-empty")?.isHidden == true, "built-in filter")
   browser.filter = .included
   require(browser.visibleEntries.count == 11 && !browser.visibleEntries.contains(where: \.isDownload), "included filter")
@@ -205,6 +205,7 @@
   func valid(_ selector: Selector) -> Bool {
     controller.validateMenuItem(NSMenuItem(title: "", action: selector, keyEquivalent: ""))
   }
+  require(!valid(#selector(StudioController.browseScenesAction)), "Browse Scenes is off at launch, where the browser shows")
   require(valid(#selector(StudioController.openAction)) && valid(#selector(StudioController.openSceneFileAction))
     && !valid(#selector(StudioController.saveAction)) && !valid(#selector(StudioController.exportAction))
     && !valid(#selector(StudioController.undoAction)), "the start screen enables only open and import commands")
@@ -268,7 +269,10 @@
   let autosaved = StudioController.autosaveDate(at: controller.autosaveURL)
   let before = try encoder.encode(controller.project)
   func sameDocument() -> Bool { (try? encoder.encode(controller.project)) == before }
+  let browseValid = NSMenuItem(title: "", action: #selector(StudioController.browseScenesAction), keyEquivalent: "")
+  require(controller.validateMenuItem(browseValid), "Browse Scenes is available over a document")
   controller.browseScenes()
+  require(!controller.validateMenuItem(browseValid), "Browse Scenes is off while the browser shows")
   require(controller.isBrowsingScenes && controller.startScreen == nil && controller.viewport.isPaused
     && controller.viewport.isHidden && sameDocument(),
     "browseScenes shows the browser over the loaded document and pauses the viewport")
