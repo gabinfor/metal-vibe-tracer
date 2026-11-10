@@ -81,10 +81,10 @@ Behaviour:
 
 ## 6. Thumbnails
 
-- `scripts/render_showcase.py` gets a thumbnail mode: for each catalog entry it renders the entry's shot (or the built-in scene's default view) at 960 × 540, without the denoiser, and writes a 480 × 270 JPEG named `<id>.jpg` into a `SceneThumbnails` resource folder. The build copies the folder into the bundle and `scripts/check_bundle.py` checks one file per entry.
-- Download scenes must be installed locally to render their thumbnails; the mode skips and lists the ones that are missing.
+- `scripts/render_showcase.py` gets a thumbnail mode: for each catalog entry it renders the entry's shot (or the built-in scene's default view) at 960 × 540, without the denoiser, and writes a 480 × 270 JPEG (quality 0.85) named `<id>.jpg` into `Examples/Thumbnails`, with the ids that have one in `scene-ids.txt`. The build copies the folder into the bundle and `scripts/check_bundle.py` checks one file per id of that list.
+- Download scenes render from the `obj` paths of their shots (`build/scenes/…`); the mode skips and lists the ones whose files are missing.
 - A thumbnail of a licensed scene is an adapted work. The card and the details pane show the credit; `REFERENCES.md` lists the thumbnails under `MCGUIRE2017` with author and license. The Bedroom's thumbnail is shared under CC BY-SA 4.0.
-- **Open question (user to confirm before implementation):** whether shipping renders of the Happy Buddha and Chinese Dragon in the app fits the Stanford 3D Scanning Repository terms (`STANFORD3DSCAN`). Until confirmed, those two entries have no thumbnail and their cards show a neutral placeholder with the specs; the bundle check exempts them explicitly.
+- **Open question (user to confirm before implementation):** whether shipping renders of the Happy Buddha and Chinese Dragon in the app fits the Stanford 3D Scanning Repository terms (`STANFORD3DSCAN`). Until confirmed, those two entries (`SceneCatalog.thumbnailExempt`) have no thumbnail and their cards show a neutral placeholder with the specs; they are not in `scene-ids.txt`.
 
 ## 7. Errors
 

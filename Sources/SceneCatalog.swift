@@ -197,6 +197,8 @@ enum SceneCatalog {
             licenseURL: cc30),
   ]
 
+  // The Stanford scans ship no thumbnail until their repository terms are confirmed for redistributed renders.
+  static let thumbnailExempt: Set<String> = ["buddha", "chinese-dragon"]
   static func entry(_ id: String) -> SceneEntry? { entries.first { $0.id == id } }
   // One line per credited work, for the credits sheet.
   static var credits: [String] {

@@ -39,6 +39,8 @@ cp REFERENCES.md "$stage/Contents/Resources/REFERENCES.md"
 cp scripts/showcase.json "$stage/Contents/Resources/showcase.json"
 mkdir -p "$stage/Contents/Resources/Examples"
 cp -R Examples/Spectral "$stage/Contents/Resources/Examples/Spectral"
+# The scene browser's thumbnails (scripts/render_showcase.py --thumbnails).
+cp -R Examples/Thumbnails "$stage/Contents/Resources/Examples/Thumbnails"
 cat > "$stage/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

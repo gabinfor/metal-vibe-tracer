@@ -1,6 +1,7 @@
 """Renders the README showcase images through the production export path.
 
 Usage: python3 scripts/render_showcase.py [--shots FILE] [--only NAME ...] [--scale S] [--samples N] [--out DIR]
+       python3 scripts/render_showcase.py --thumbnails [--only ID ...]
 
 Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD
 or glTF file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera
@@ -12,6 +13,13 @@ firefly control that the image notes must state; "raw": true exports linear radi
 "keepRaw": true with "denoise": true also saves the undenoised image of the same render as NAME-raw.png.
 --scale and --samples override every shot for quick framing previews. Images go to --out
 (default build/showcase); copy the chosen ones to docs/images by hand.
+
+--thumbnails renders the scene browser's thumbnails instead: for each entry of SceneCatalog.entries (read by the Swift
+driver, so there is no second list here) but the SceneCatalog.thumbnailExempt scenes, the entry's shot (a built-in
+scene: its scene index at the default view) at 960 x 540 with at most 256 spp and no denoiser, downsampled to
+480 x 270 and written as JPEG (quality 0.85) to Examples/Thumbnails/<id>.jpg, with the ids in
+Examples/Thumbnails/scene-ids.txt for scripts/check_bundle.py. --only then names catalog ids. A scene whose files are
+not installed is skipped and listed at the end. Each line of progress is samples done / target and elapsed time.
 """
 import argparse
 import json
@@ -31,14 +39,16 @@ parser.add_argument('--only', nargs='*', default=[])
 parser.add_argument('--scale', type=float, default=1.0)
 parser.add_argument('--samples', type=int, default=0)
 parser.add_argument('--out', type=Path, default=harness.ROOT / 'build/showcase')
+parser.add_argument('--thumbnails', action='store_true')
 arguments = parser.parse_args()
+thumbnail_folder = harness.ROOT / 'Examples/Thumbnails'
 
 shots = json.loads(arguments.shots.read_text())
-if arguments.only:
+if arguments.only and not arguments.thumbnails:
     shots = [s for s in shots if s['name'] in arguments.only]
     if not shots:
         raise SystemExit('render_showcase.py: no shot matches --only')
-for shot in shots:
+for shot in ([] if arguments.thumbnails else shots):
     shot['width'] = max(16, int(shot.get('width', 1920) * arguments.scale))
     shot['height'] = max(16, int(shot.get('height', 1080) * arguments.scale))
     if arguments.samples:
@@ -60,7 +70,8 @@ func waitFor(_ condition: () -> Bool, seconds: Double, every: Double = 0, report
 }
 let shotData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
 let outputFolder = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-for shot in try JSONDecoder().decode([ShowcaseShot].self, from: shotData) {
+// Imports the shot's scene, applies its settings and exports it to outputFolder (PNG, or EXR for a raw shot).
+@MainActor func render(_ shot: ShowcaseShot) throws -> URL {
   var p: ProjectDocument
   if let path = shot.usd {
     p = try USDImporter.load(URL(fileURLWithPath: path), into: ProjectDocument()).document
@@ -135,6 +146,58 @@ for shot in try JSONDecoder().decode([ShowcaseShot].self, from: shotData) {
   print("\(shot.name): \(p.options.outputWidth)x\(p.options.outputHeight), \(p.options.exportSamples) spp, "
     + "\(Int(Date().timeIntervalSince(start))) s, camera yaw \(p.camera.yaw) pitch \(p.camera.pitch) "
     + "distance \(p.camera.distance) fov \(p.camera.fov) target \(p.camera.target)")
+  return url
+}
+
+// Averages a 960 x 540 render down to 480 x 270 and writes it as a JPEG of quality 0.85.
+func writeThumbnail(_ png: URL, to jpeg: URL) throws {
+  guard let source = CGImageSourceCreateWithURL(png as CFURL, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+    let context = CGContext(data: nil, width: 480, height: 270, bitsPerComponent: 8, bytesPerRow: 0,
+      space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+  else { throw MaterialLibrary.error("\(png.lastPathComponent) cannot be read") }
+  context.interpolationQuality = .high
+  context.draw(image, in: CGRect(x: 0, y: 0, width: 480, height: 270))
+  guard let small = context.makeImage(),
+    let destination = CGImageDestinationCreateWithURL(jpeg as CFURL, "public.jpeg" as CFString, 1, nil)
+  else { throw MaterialLibrary.error("\(jpeg.lastPathComponent) cannot be written") }
+  CGImageDestinationAddImage(destination, small, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
+  guard CGImageDestinationFinalize(destination) else { throw MaterialLibrary.error("\(jpeg.lastPathComponent) cannot be written") }
+}
+
+let shots = try JSONDecoder().decode([ShowcaseShot].self, from: shotData)
+if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
+  let thumbnailFolder = URL(fileURLWithPath: CommandLine.arguments[4], isDirectory: true)
+  let only = Set(CommandLine.arguments.dropFirst(5))
+  let ids = SceneCatalog.entries.map(\.id).filter { !SceneCatalog.thumbnailExempt.contains($0) }
+  try FileManager.default.createDirectory(at: thumbnailFolder, withIntermediateDirectories: true)
+  try (ids.joined(separator: "\n") + "\n").write(to: thumbnailFolder.appendingPathComponent("scene-ids.txt"), atomically: true,
+    encoding: .utf8)
+  var skipped: [String] = []
+  for entry in SceneCatalog.entries where ids.contains(entry.id) && (only.isEmpty || only.contains(entry.id)) {
+    var shot: ShowcaseShot
+    if case .builtIn(let index) = entry.source {
+      shot = try JSONDecoder().decode(ShowcaseShot.self, from: Data("{\"name\": \"\(entry.id)\", \"scene\": \(index)}".utf8))
+    } else if let found = shots.first(where: { $0.name == entry.shot }) {
+      shot = found
+    } else {
+      fputs("FAIL: \(entry.id) names no shot in showcase.json\n", stderr); exit(1)
+    }
+    if let path = shot.usd ?? shot.obj, !FileManager.default.fileExists(atPath: path) {
+      print("\(entry.id): skipped, \(path) is missing")
+      skipped.append(entry.id)
+      continue
+    }
+    shot.name = "thumbnail-" + entry.id
+    (shot.width, shot.height, shot.samples) = (960, 540, min(shot.samples ?? 256, 256))
+    (shot.denoise, shot.raw, shot.keepRaw) = (false, false, nil)
+    let png = try render(shot)
+    try writeThumbnail(png, to: thumbnailFolder.appendingPathComponent(entry.id + ".jpg"))
+    try? FileManager.default.removeItem(at: png)
+    print("\(entry.id): wrote Examples/Thumbnails/\(entry.id).jpg")
+  }
+  print(skipped.isEmpty ? "All thumbnails rendered" : "Skipped (files not installed): " + skipped.joined(separator: ", "))
+} else {
+  for shot in shots { _ = try render(shot) }
 }
 '''
 
@@ -149,5 +212,6 @@ with tempfile.TemporaryDirectory(prefix='vibe-tracer-showcase-') as directory:
     shot_file.write_text(json.dumps(shots))
     environment = {**os.environ, 'VIBE_TRACER_REPOSITORY': str(harness.ROOT),
                    harness.OUTPUT_VARIABLE: str(Path(directory) / 'output')}
-    sys.exit(subprocess.run([str(binary), str(shot_file), str(arguments.out.resolve())],
+    mode = ['--thumbnails', str(thumbnail_folder), *arguments.only] if arguments.thumbnails else []
+    sys.exit(subprocess.run([str(binary), str(shot_file), str(arguments.out.resolve()), *mode],
                             cwd=harness.ROOT, env=environment).returncode)

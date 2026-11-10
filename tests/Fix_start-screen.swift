@@ -112,7 +112,8 @@
     && SceneBrowserView.specLine(SceneCatalog.entry("cornell-box")!) == "Built-in"
     && browser.stateText(SceneCatalog.entry("sponza")!) == "Download 80 MB"
     && browser.stateText(SceneCatalog.entry("abbe-row")!) == "Included"
-    && SceneBrowserView.thumbnail(SceneCatalog.entry("sponza")!) == nil, "card spec lines and states")
+    && SceneBrowserView.thumbnail(SceneCatalog.entry("sponza")!) != nil
+    && SceneBrowserView.thumbnail(SceneCatalog.entry("buddha")!) == nil, "card spec lines, states and thumbnails")
   require(SceneBrowserView(library: ExampleLibrary(root: folder.appendingPathComponent("library"))).control("scene-download")?.isEnabled == false,
     "Download is disabled until the studio owns the browser")
   var downloaded: [String] = [], actions: [String] = []

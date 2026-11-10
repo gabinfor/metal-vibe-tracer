@@ -369,6 +369,23 @@
     "a verified download installs the scene and opens it with its credit")
   history.undo()
   waitUntil({ !controller.isBusy }, seconds: 60)
+  // Bundled thumbnails: one 480 x 270 image per scene but the exempt Stanford scans, listed in scene-ids.txt.
+  require(SceneCatalog.thumbnailExempt == ["buddha", "chinese-dragon"], "the Stanford scans are exempt from thumbnails")
+  let thumbnailIDs = SceneCatalog.entries.map(\.id).filter { !SceneCatalog.thumbnailExempt.contains($0) }
+  let listed = SceneCatalog.bundledURL("Examples/Thumbnails/scene-ids.txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+  require(listed?.split(separator: "\n").map(String.init) == thumbnailIDs && thumbnailIDs.count == 19,
+    "scene-ids.txt lists the scenes with a thumbnail")
+  for entry in SceneCatalog.entries {
+    let url = SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg")
+    let size = url.flatMap { CGImageSourceCreateWithURL($0 as CFURL, nil) }.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+      .map { ($0.width, $0.height) }
+    if SceneCatalog.thumbnailExempt.contains(entry.id) {
+      require(size == nil && SceneBrowserView.thumbnail(entry) == nil, "\(entry.id) ships no thumbnail")
+    } else {
+      require(size?.0 == 480 && size?.1 == 270, "\(entry.id) has a 480 x 270 thumbnail (\(String(describing: size)))")
+      require(SceneBrowserView.thumbnail(entry) != nil, "\(entry.id) shows its thumbnail")
+    }
+  }
   print("PASS: example scenes (catalog against showcase.json, archive markers, verification and extraction, shot settings and emission scaling, the File menu's credits, downloading from the scene browser)")
 }
 try fixExampleSceneChecks()

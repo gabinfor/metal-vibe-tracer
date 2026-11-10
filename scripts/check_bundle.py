@@ -44,6 +44,21 @@ try:
 except (OSError, ValueError) as error:
     problems.append(f"showcase.json unreadable: {error}")
 
+# Scene browser thumbnails: one JPEG per id of scene-ids.txt, which the thumbnail run writes from SceneCatalog.entries
+# without the scenes in SceneCatalog.thumbnailExempt, identical to the repository's.
+try:
+    thumbnails = resources / "Examples/Thumbnails"
+    for scene_id in (thumbnails / "scene-ids.txt").read_text().split():
+        image = thumbnails / f"{scene_id}.jpg"
+        if not image.is_file():
+            problems.append(f"missing thumbnail Examples/Thumbnails/{scene_id}.jpg")
+        elif image.read_bytes()[:3] != b"\xff\xd8\xff":
+            problems.append(f"Examples/Thumbnails/{scene_id}.jpg is not a JPEG")
+        elif sha256_file(image) != sha256_file(app.parents[1] / "Examples/Thumbnails" / image.name):
+            problems.append(f"bundled thumbnail {scene_id}.jpg differs from the repository")
+except OSError as error:
+    problems.append(f"thumbnail list unreadable: {error}")
+
 # Spectral transport's tables: exactly the generator's outputs (their manifest's SHA-256), the
 # licences that cover them, and not the opt-in 96 MiB test table.
 try:

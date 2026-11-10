@@ -423,8 +423,10 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     }
     return find(self)
   }
-  // No scene ships a thumbnail yet: cards and the details pane show a placeholder.
-  static func thumbnail(_ entry: SceneEntry) -> NSImage? { nil }
+  // The scene's bundled 480 x 270 render (scripts/render_showcase.py --thumbnails), or nil for a scene without one.
+  static func thumbnail(_ entry: SceneEntry) -> NSImage? {
+    SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg").flatMap { NSImage(contentsOf: $0) }
+  }
 
   // A card's line of specs: "262 k triangles · OBJ", "OpenUSD", or "Built-in" for a built-in scene.
   static func specLine(_ entry: SceneEntry) -> String {
@@ -642,7 +644,7 @@ private final class ScenePreviewView: NSView {
     wantsLayer = true
     layer?.cornerRadius = 6
     layer?.masksToBounds = true
-    image.imageScaling = .scaleProportionallyUpOrDown
+    image.imageScaling = .scaleAxesIndependently
     label.textColor = .secondaryLabelColor
     label.font = .systemFont(ofSize: 12, weight: .medium)
     for view in [image, label] {
