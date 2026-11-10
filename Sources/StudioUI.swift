@@ -475,8 +475,8 @@ final class StudioController: NSViewController {
         return
       }
       switch tag {
-      case Self.downloadTag...: self.openExampleScene(tag - Self.downloadTag)
-      case Self.exampleTag...: self.openSpectralExample(tag - Self.exampleTag)
+      case Self.downloadTag...: self.openOrDownloadScene(SceneCatalog.entries(.mcguire)[tag - Self.downloadTag])
+      case Self.exampleTag...: self.openScene(SceneCatalog.entries(.spectral)[tag - Self.exampleTag])
       default: self.switchScene(tag)
       }
       // An example opens asynchronously (or after a sheet); until then the selector shows the current scene.
@@ -2612,9 +2612,7 @@ extension StudioController {
     case .openProject(let url?): beginOpenProject(url)
     case .importOBJ(let url?): beginImportOBJ(from: url)
     case .importUSD(let url?): beginImportUSD(from: url)
-    case .builtInScene(let index): startBuiltInScene(index)
-    case .example(let index): openSpectralExample(index)
-    case .download(let index): openExampleScene(index)
+    case .scene(let id): if let entry = SceneCatalog.entry(id) { openOrDownloadScene(entry) }
     case .restoreSession:
       restoringSession = true
       restoreAutosave()
@@ -2625,7 +2623,7 @@ extension StudioController {
     }
   }
   // A new untitled project of built-in scene `index`, with that scene's default camera.
-  func startBuiltInScene(_ index: Int) {
+  private func startBuiltInScene(_ index: Int) {
     var p = ProjectDocument()
     p.scene = UInt32(index)
     let oldCamera = CameraState(renderer), oldScene = renderer.sceneIndex

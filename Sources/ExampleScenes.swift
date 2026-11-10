@@ -409,10 +409,23 @@ extension StudioController {
     let download = exampleLibrary.downloadBytes(entry)
     return download > 0 ? "\(entry.title) — \(SceneCatalog.megabytes(download)) download…" : "\(entry.title)"
   }
-  func openExampleScene(_ index: Int) {
-    let downloads = SceneCatalog.entries(.mcguire)
-    guard !isBusy, downloads.indices.contains(index) else { return }
-    confirmDiscardingChanges { [weak self] in self?.confirmExampleDownload(downloads[index]) }
+  // Built-in and bundled scenes are always available; a download scene once every archive is extracted.
+  func isInstalled(_ entry: SceneEntry) -> Bool { !entry.isDownload || exampleLibrary.missing(entry).isEmpty }
+  // Opens the scene as a new, unsaved, untitled project, after confirming that changes are discarded. A download
+  // scene that is not installed does nothing: openOrDownloadScene asks for consent and downloads it first.
+  func openScene(_ entry: SceneEntry) {
+    guard !isBusy, isInstalled(entry) else { return }
+    switch entry.source {
+    case .builtIn(let index): confirmDiscardingChanges { [weak self] in self?.startBuiltInScene(index) }
+    case .bundled: openBundledScene(entry)
+    case .download: confirmDiscardingChanges { [weak self] in self?.beginExampleImport(entry) }
+    }
+  }
+  // openScene, or for a download scene that is not installed the consent sheet and download that end in opening it.
+  func openOrDownloadScene(_ entry: SceneEntry) {
+    guard entry.isDownload, !isInstalled(entry) else { return openScene(entry) }
+    guard !isBusy else { return }
+    confirmDiscardingChanges { [weak self] in self?.confirmExampleDownload(entry) }
   }
   // Nothing is downloaded without this consent sheet, which names the size, source, destination and license.
   func confirmExampleDownload(_ entry: SceneEntry) {
@@ -555,15 +568,13 @@ extension StudioController {
     try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     NSWorkspace.shared.activateFileViewerSelecting([root])
   }
-  // Opens a bundled spectral example as a new, unsaved, untitled project with its showcase shot's settings.
-  func openSpectralExample(_ index: Int) {
-    let examples = SceneCatalog.entries(.spectral)
-    guard !isBusy, examples.indices.contains(index) else { return }
-    let example = examples[index]
+  // Opens a bundled spectral example with its showcase shot's settings.
+  private func openBundledScene(_ example: SceneEntry) {
+    guard case .bundled(let path) = example.source else { return }
     let shot: ShowcaseShot
     let url: URL
     do {
-      guard let found = try ShowcaseShot.bundled().first(where: { $0.name == example.shot }), let path = found.usd,
+      guard let found = try ShowcaseShot.bundled().first(where: { $0.name == example.shot }),
         let stage = SceneCatalog.bundledURL(path)
       else { throw MaterialLibrary.error("\(example.title) is missing from the application bundle.") }
       (shot, url) = (found, stage)
@@ -579,15 +590,15 @@ extension StudioController {
   }
   func exampleScenePanel() {
     heading("Spectral examples")
-    for (index, example) in SceneCatalog.entries(.spectral).enumerated() {
-      button(example.title) { [weak self] in self?.openSpectralExample(index) }
+    for example in SceneCatalog.entries(.spectral) {
+      button(example.title) { [weak self] in self?.openScene(example) }
     }
     text("Small OpenUSD scenes included with Metal Vibe Tracer. "
       + SceneCatalog.entries(.spectral).map { "\($0.title): \($0.summary)." }.joined(separator: " ")
       + " Thin film, dispersion, lamp spectra and Rayleigh scattering render fully in spectral light transport (the default).")
     heading("Example scenes")
-    for (index, entry) in SceneCatalog.entries(.mcguire).enumerated() {
-      button(exampleSceneTitle(entry)) { [weak self] in self?.openExampleScene(index) }
+    for entry in SceneCatalog.entries(.mcguire) {
+      button(exampleSceneTitle(entry)) { [weak self] in self?.openOrDownloadScene(entry) }
     }
     text(
       "Production scenes from Morgan McGuire's Computer Graphics Archive, opened with the camera and lighting of the README images. They are not bundled: each is downloaded once, after you agree, into Application Support.\n"
@@ -595,8 +606,14 @@ extension StudioController {
     button("Credits and licenses…") { [weak self] in self?.showExampleCredits() }
     button("Show downloaded scenes in Finder") { [weak self] in self?.revealExampleScenes() }
   }
-  @objc func exampleSceneAction(_ sender: NSMenuItem) { openExampleScene(sender.tag) }
-  @objc func spectralExampleAction(_ sender: NSMenuItem) { openSpectralExample(sender.tag) }
+  @objc func exampleSceneAction(_ sender: NSMenuItem) {
+    let entries = SceneCatalog.entries(.mcguire)
+    if entries.indices.contains(sender.tag) { openOrDownloadScene(entries[sender.tag]) }
+  }
+  @objc func spectralExampleAction(_ sender: NSMenuItem) {
+    let entries = SceneCatalog.entries(.spectral)
+    if entries.indices.contains(sender.tag) { openScene(entries[sender.tag]) }
+  }
   @objc func exampleCreditsAction() { showExampleCredits() }
   @objc func revealExampleScenesAction() { revealExampleScenes() }
 }

@@ -250,6 +250,16 @@
     && examples?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true,
     "File > Open Example Scene lists the scenes with their download sizes: \(items.map(\.title))")
   let installed = controller.exampleLibrary
+  // A download scene that is not installed opens nothing: the consent and download flow is the caller's.
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = .sortedKeys
+  let untouched = try encoder.encode(controller.project)
+  require(!controller.isInstalled(interior) && controller.isInstalled(SceneCatalog.entries[0])
+    && controller.isInstalled(spectral[0]), "built-in and bundled scenes are installed; a missing download is not")
+  controller.openScene(interior)
+  let afterwards = try encoder.encode(controller.project)
+  require(!controller.isBusy && controller.exampleDownload == nil && afterwards == untouched,
+    "opening a download scene that is not installed does nothing")
   try manager.createDirectory(at: installed.storage(interior), withIntermediateDirectories: true)
   let interiorFile = installed.sceneFileURL(interior)!
   try manager.createDirectory(at: interiorFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -270,7 +280,10 @@
   func grouped(_ body: () -> Void) { history.beginUndoGrouping(); body(); history.endUndoGrouping() }
   let previousScene = testRenderer.sceneIndex, previousYaw = testRenderer.yaw
   grouped {
-    controller.confirmExampleDownload(interior)
+    require(controller.isInstalled(interior), "the scene is installed once its archives are present")
+    // Opening asks before discarding edits; this document has none to lose.
+    controller.associate(nil, edited: false, replaced: false)
+    controller.openScene(interior)
     waitUntil({ !controller.isBusy }, seconds: 60)
   }
   require(testRenderer.sceneIndex == 6 && testRenderer.yaw == -1.967 && testRenderer.distance == 1064.002

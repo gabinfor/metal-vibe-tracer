@@ -3,9 +3,9 @@ import UniformTypeIdentifiers
 
 // What the start screen asks for. A nil URL asks with an open panel first.
 enum StartAction {
-  case openProject(URL?), importOBJ(URL?), importUSD(URL?), builtInScene(Int), restoreSession
-  // A bundled example (SceneCatalog's spectral collection) or a downloadable one (its McGuire collection, after consent).
-  case example(Int), download(Int)
+  case openProject(URL?), importOBJ(URL?), importUSD(URL?), restoreSession
+  // The SceneCatalog entry with this id: a download scene that is not installed is downloaded after consent.
+  case scene(String)
 }
 
 // The window's empty start state: nothing is loaded and nothing renders until the user opens a
@@ -25,8 +25,6 @@ final class StartScreenView: NSView {
   private let hint = NSTextField(wrappingLabelWithString: "")
   private let pendingRow = NSStackView()
   let pendingLabel = NSTextField(wrappingLabelWithString: "")
-  // Built-in scene titles (StudioController.sceneNames without the imported-mesh studio).
-  static let builtInScenes = Array(StudioController.sceneNames.prefix(6))
 
   // `library` gives the download examples' remaining sizes.
   init(library: ExampleLibrary = ExampleLibrary()) {
@@ -94,11 +92,11 @@ final class StartScreenView: NSView {
       content.addArrangedSubview(grid)
       content.setCustomSpacing(22, after: grid)
     }
-    section("Built-in scenes", Self.builtInScenes.enumerated().map { ($1, "start-scene-\($0)", .builtInScene($0)) })
-    section("Example scenes", SceneCatalog.entries(.spectral).enumerated().map { ($1.title, "start-example-\($0)", .example($0)) })
+    section("Built-in scenes", SceneCatalog.entries(.builtIn).enumerated().map { ($1.title, "start-scene-\($0)", .scene($1.id)) })
+    section("Example scenes", SceneCatalog.entries(.spectral).enumerated().map { ($1.title, "start-example-\($0)", .scene($1.id)) })
     section("Download examples", note: "From Morgan McGuire's archive; downloaded once, after you agree.", perRow: 2,
             SceneCatalog.entries(.mcguire).enumerated().map { index, entry in
-              (Self.downloadTitle(entry, library), "start-download-\(index)", .download(index))
+              (Self.downloadTitle(entry, library), "start-download-\(index)", .scene(entry.id))
             })
 
     restoreRow.orientation = .horizontal
@@ -224,9 +222,7 @@ extension StartScreenView {
     case .openProject(let url): return "Opening \(url?.lastPathComponent ?? "a project")"
     case .importOBJ(let url): return "Importing \(url?.lastPathComponent ?? "an OBJ mesh")"
     case .importUSD(let url): return "Opening \(url?.lastPathComponent ?? "a scene")"
-    case .builtInScene(let index): return "Loading \(builtInScenes[index])"
-    case .example(let index): return "Opening \(SceneCatalog.entries(.spectral)[index].title)"
-    case .download(let index): return "Opening \(SceneCatalog.entries(.mcguire)[index].title)"
+    case .scene(let id): return "Opening \(SceneCatalog.entry(id)?.title ?? "a scene")"
     case .restoreSession: return "Restoring the last session"
     }
   }

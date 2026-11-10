@@ -76,7 +76,7 @@
     && zip(downloads, mcguire).allSatisfy { title, scene in
       title == StartScreenView.downloadTitle(scene, controller.exampleLibrary)
         && title.hasPrefix(scene.title.replacingOccurrences(of: "Amazon Lumberyard ", with: "")) }
-    && StartScreenView.describe(.example(4)) == "Opening Lantern Arcade",
+    && StartScreenView.describe(.scene("lantern-arcade")) == "Opening Lantern Arcade",
     "the start screen offers the bundled and downloadable example scenes (\(downloads))")
   func valid(_ selector: Selector) -> Bool {
     controller.validateMenuItem(NSMenuItem(title: "", action: selector, keyEquivalent: ""))
@@ -105,7 +105,8 @@
 
   // Another start action keeps the last session as the recovery copy before autosaving anew.
   controller.showStartScreen()
-  controller.performStartAction(.builtInScene(1))
+  controller.associate(nil, edited: false, replaced: false)  // The start screen opens with nothing to discard.
+  controller.performStartAction(.scene("cornell-box"))
   idle()
   controller.autosaveQueue.sync {}
   require(controller.startScreen == nil && testRenderer.sceneIndex == 1 && controller.projectURL == nil
