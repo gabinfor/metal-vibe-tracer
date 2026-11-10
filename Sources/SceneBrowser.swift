@@ -26,6 +26,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   // The details pane's Cancel button while a download runs (setDownload).
   var onCancelDownload: (() -> Void)?
   var onCancelPending: (() -> Void)?
+  // The Credits and licenses… link; nil hides it (the launch state, before the studio can show the credits sheet).
+  var onCredits: (() -> Void)? { didSet { creditsButton.isHidden = onCredits == nil } }
   // nil hides the Close button (the launch state).
   var onClose: (() -> Void)? { didSet { closeButton.isHidden = onClose == nil } }
   var filter: Filter = .all { didSet { applyFilter() } }
@@ -79,6 +81,7 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   private let openButton = ActionButton("Open") {}
   private let downloadButton = ActionButton("Download") {}
   private let finderButton = ActionButton("Show in Finder") {}
+  private let creditsButton = SceneBrowserView.link("scene-credits")
   // The running download (setDownload), shown while its entry is selected.
   private var download: (id: String, fraction: Double?, status: String?)?
   private static let cardIdentifier = NSUserInterfaceItemIdentifier("scene-card")
@@ -244,6 +247,7 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     grid.dataSource = self
     grid.delegate = self
     grid.isSelectable = true
+    grid.allowsEmptySelection = false
     grid.backgroundColors = [.clear]
     gridScroll.documentView = grid
     gridScroll.hasVerticalScroller = true
@@ -289,11 +293,12 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
       guard let self, let entry = self.selection else { return }
       NSWorkspace.shared.activateFileViewerSelecting([self.library.storage(entry)])
     }
-    let credits = Self.link("scene-credits")
-    credits.title = "Credits and licenses…"
-    credits.actionBlock = { [weak self] in _ = self?.tryToPerform(#selector(StudioController.exampleCreditsAction), with: nil) }
+    creditsButton.title = "Credits and licenses…"
+    creditsButton.actionBlock = { [weak self] in self?.onCredits?() }
+    creditsButton.isHidden = true
+    actionButtons.append(creditsButton)
     for view in [preview, titleLabel, summaryLabel, specsLabel, tagsLabel, collectionLabel, websiteButton, creditLabel,
-                 licenseButton, termsLabel, downloadRow, openButton, downloadButton, finderButton, credits] {
+                 licenseButton, termsLabel, downloadRow, openButton, downloadButton, finderButton, creditsButton] {
       details.addArrangedSubview(view)
     }
     details.setCustomSpacing(2, after: collectionLabel)
@@ -342,8 +347,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   // Re-reads the download scenes' installed state from the library.
   func reload() {
     applyFilter()
-    grid.reloadData()
-    syncGridSelection()
     fillDetails()
   }
   // The autosave's modification date; nil hides the restore button.
@@ -432,7 +435,12 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   // Recomputes the visible cards; the selection stays when still visible, else moves to the first card.
   private func applyFilter() {
     visibleEntries = SceneCatalog.entries.filter(matches)
-    for button in filterButtons { button.state = button.tag == filter.rawValue ? .on : .off }
+    // The selected filter is also set in semibold, which shows in an inactive window too.
+    for button in filterButtons {
+      let selected = button.tag == filter.rawValue
+      button.state = selected ? .on : .off
+      button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: selected ? .semibold : .regular)
+    }
     emptyLabel.isHidden = !visibleEntries.isEmpty
     grid.reloadData()
     if let current = selection, visibleEntries.contains(where: { $0.id == current.id }) {
@@ -571,7 +579,9 @@ private final class CardGridLayout: NSCollectionViewFlowLayout {
   override func prepare() {
     let width = collectionView?.enclosingScrollView?.contentSize.width ?? 0
     let columns = max(1, Int((width + Self.spacing) / (Self.minimumWidth + Self.spacing)))
-    let cardWidth = max(Self.minimumWidth, ((width - Self.spacing * CGFloat(columns - 1)) / CGFloat(columns)).rounded(.down))
+    // Narrower than one minimum-width card (only before the grid is laid out), a card takes the available width.
+    let cardWidth = width < Self.minimumWidth ? max(1, width.rounded(.down))
+      : ((width - Self.spacing * CGFloat(columns - 1)) / CGFloat(columns)).rounded(.down)
     let size = NSSize(width: cardWidth, height: (cardWidth * 9 / 16).rounded() + 62)
     if itemSize != size { itemSize = size }
     super.prepare()

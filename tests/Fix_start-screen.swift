@@ -67,6 +67,8 @@
     try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("start-screen.png"))
   }
   require(start.control("start-restore")?.superview?.isHidden == false && start.control("start-open")?.isEnabled == true
+    && (start.control("scene-filter-0") as? NSButton)?.state == .on && (start.control("scene-filter-1") as? NSButton)?.state == .off
+    && start.control("scene-credits")?.isHidden == false
     && start.visibleEntries.count == SceneCatalog.entries.count && start.selection?.id == SceneCatalog.entries.first?.id
     && SceneBrowserView.describe(.scene("lantern-arcade")) == "Opening Lantern Arcade",
     "the start screen offers open, restoring the autosaved session and the scene browser with every catalog scene")
@@ -91,8 +93,15 @@
   browser.search = "STANFORD"
   require(browser.visibleEntries.map(\.id) == ["buddha", "chinese-dragon"], "search by credit, ignoring case")
   browser.search = "no such scene"
-  require(browser.visibleEntries.isEmpty && browser.selection == nil
-    && (browser.control("scene-empty") as? NSTextField)?.stringValue == "No scenes match", "an empty search")
+  func shown(_ id: String) -> Bool {
+    guard let control = browser.control(id) else { return false }
+    var view: NSView? = control
+    while let current = view, current !== browser { if current.isHidden { return false }; view = current.superview }
+    return true
+  }
+  require(browser.visibleEntries.isEmpty && browser.selection == nil && browser.control("scene-empty")?.isHidden == false
+    && (browser.control("scene-empty") as? NSTextField)?.stringValue == "No scenes match"
+    && !shown("scene-open") && !shown("scene-download"), "an empty search")
   browser.search = ""; browser.selection = SceneCatalog.entry("sponza")
   require(browser.control("scene-download")?.isHidden == false && browser.control("scene-open")?.isHidden == true
     && (browser.control("scene-download") as? NSButton)?.title == "Download 80 MB", "a missing download offers Download")
@@ -110,8 +119,13 @@
     "included scenes open")
   (browser.control("scene-open") as? NSButton)?.performClick(nil)
   require(downloaded == ["sponza"] && actions == ["cornell-box"], "Download asks onDownload and Open sends .scene(id)")
-  require(browser.control("scene-close")?.isHidden == true && browser.control("scene-download-cancel")?.isHidden == true,
-    "without onClose there is no Close button, and no download progress until one is set")
+  require(browser.control("scene-close")?.isHidden == true && browser.control("scene-download-cancel")?.isHidden == true
+    && browser.control("scene-credits")?.isHidden == true,
+    "without onClose and onCredits there is no Close button or credits link, and no download progress until one is set")
+  var credits = 0
+  browser.onCredits = { credits += 1 }
+  (browser.control("scene-credits") as? NSButton)?.performClick(nil)
+  require(credits == 1 && browser.control("scene-credits")?.isHidden == false, "Credits and licenses… calls onCredits")
   browser.setDownload(SceneCatalog.entry("cornell-box"), fraction: 0.5, status: "Downloading")
   require(browser.control("scene-download-cancel")?.isHidden == false, "a download shows its Cancel button")
   browser.setDownload(nil, fraction: nil, status: nil)
@@ -121,9 +135,20 @@
     "busy disables actions")
   browser.setActionsEnabled(true)
   browser.frame = NSRect(x: 0, y: 0, width: 700, height: 440); browser.layoutSubtreeIfNeeded()
-  require(browser.control("scene-open").map {
-      browser.bounds.contains($0.convert($0.bounds, to: browser).origin) || $0.enclosingScrollView != nil } == true,
-    "at the minimum window size the primary button is reachable")
+  func scrollViews(_ view: NSView) -> [NSScrollView] {
+    view.subviews.flatMap { ($0 as? NSScrollView).map { [$0] } ?? [] } + view.subviews.flatMap(scrollViews)
+  }
+  let gridScroll = scrollViews(browser).first { $0.documentView is NSCollectionView }
+  guard let open = browser.control("scene-open"), let detailsScroll = open.enclosingScrollView,
+    let detailsDocument = detailsScroll.documentView
+  else { return require(false, "the primary button sits in the details pane's scroll view") }
+  let openFrame = open.convert(open.bounds, to: detailsDocument)
+  require(browser.bounds.contains(detailsScroll.convert(detailsScroll.bounds, to: browser))
+    && detailsDocument.bounds.contains(openFrame) && (gridScroll?.frame.width ?? 0) >= 180,
+    "at the minimum window size the details pane fits the browser, holds the primary button, and cards keep 180 pt")
+  open.scrollToVisible(open.bounds)
+  require(open.convert(open.bounds, to: detailsDocument).intersects(detailsScroll.contentView.documentVisibleRect),
+    "at the minimum window size the primary button scrolls into view")
   if let rep = browser.bitmapImageRepForCachingDisplay(in: browser.bounds) {
     browser.cacheDisplay(in: browser.bounds, to: rep)
     try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("scene-browser-700x440.png"))

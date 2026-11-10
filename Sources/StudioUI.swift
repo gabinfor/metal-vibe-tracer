@@ -2571,6 +2571,7 @@ extension StudioController {
     view.onAction = { [weak self] action in self?.performStartAction(action) }
     // Download asks for consent and shows its progress in sheets (openOrDownloadScene).
     view.onDownload = { [weak self] entry in self?.openOrDownloadScene(entry) }
+    view.onCredits = { [weak self] in self?.showExampleCredits() }
     view.onCancelPending = nil
     view.setPending(nil)
     view.setActionsEnabled(!isBusy)
