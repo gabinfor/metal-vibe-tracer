@@ -110,6 +110,8 @@
     && browser.stateText(SceneCatalog.entry("sponza")!) == "Download 80 MB"
     && browser.stateText(SceneCatalog.entry("abbe-row")!) == "Included"
     && SceneBrowserView.thumbnail(SceneCatalog.entry("sponza")!) == nil, "card spec lines and states")
+  require(SceneBrowserView(library: ExampleLibrary(root: folder.appendingPathComponent("library"))).control("scene-download")?.isEnabled == false,
+    "Download is disabled until the studio owns the browser")
   var downloaded: [String] = [], actions: [String] = []
   browser.onDownload = { downloaded.append($0.id) }
   browser.onAction = { if case .scene(let id) = $0 { actions.append(id) } }

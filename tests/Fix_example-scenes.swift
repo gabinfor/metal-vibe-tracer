@@ -334,11 +334,37 @@
     && browser.control("scene-download-error")?.isHidden == false && browser.control("scene-download")?.isHidden == false
     && browser.control("scene-download-cancel")?.isHidden == true && controller.startScreen != nil,
     "a digest mismatch shows its error in the pane, restores Download and leaves the scene missing: \(failure)")
+  // A download goes on when the browser is shown again, and the new browser shows its progress for its card.
   controller.beginSceneDownload(mismatched)
+  controller.showStartScreen()
+  guard let again = controller.startScreen else { return require(false, "the scene browser is shown again") }
+  again.selection = SceneCatalog.entry(interior.id)
+  require(controller.downloadingScene?.id == interior.id && controller.exampleDownload?.isCancelled == false
+    && again.control("scene-download-cancel")?.isHidden == false && again.control("scene-download")?.isHidden == true,
+    "a download keeps running and shows its progress when the browser is shown again")
   controller.cancelSceneDownload()
   waitUntil({ controller.downloadingScene == nil }, seconds: 60)
   require(controller.status.stringValue.contains("cancelled") && !controller.isInstalled(mismatched)
-    && browser.control("scene-download")?.isHidden == false, "Cancel ends the download and restores Download")
+    && again.control("scene-download")?.isHidden == false, "Cancel ends the download and restores Download")
+  // A failure on the second archive keeps the first installed; the scene is missing only the second.
+  let partialLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-partial", isDirectory: true))
+  controller.exampleLibrary = partialLibrary
+  var partial = mismatched
+  let first = ExampleArchive(name: "Interior.zip", url: payloadZip, folder: "Interior", bytes: payloadBytes,
+    unpackedBytes: payloadBytes, sha256: payloadDigest)
+  var second = first
+  (second.name, second.folder, second.sha256) = ("Textures.zip", "Textures", String(repeating: "0", count: 64))
+  partial.source = .download(storage: interiorStorage, file: interiorPath, archives: [first, second])
+  again.reload()
+  controller.beginSceneDownload(partial)
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  let partialError = (again.control("scene-download-error") as? NSTextField)?.stringValue ?? ""
+  require(partialLibrary.isInstalled(first, storage: interiorStorage) && !partialLibrary.isInstalled(second, storage: interiorStorage)
+    && partialLibrary.missing(partial).map(\.name) == ["Textures.zip"] && partialLibrary.downloadBytes(partial) == second.bytes
+    && partialError.contains("SHA-256") && again.control("scene-download")?.isHidden == false
+    && (again.control("scene-download") as? NSButton)?.title == "Download \(SceneCatalog.megabytes(partialLibrary.downloadBytes(interior)))",
+    "a failed second archive leaves the first installed, shows its error and restores Download: \(partialError)")
+  controller.exampleLibrary = downloadLibrary
   controller.associate(nil, edited: false, replaced: false)
   grouped {
     controller.beginSceneDownload(correct)

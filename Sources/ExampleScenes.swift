@@ -464,17 +464,15 @@ extension StudioController {
     downloadProgress = nil
     startScreen?.setDownload(nil, fraction: nil, status: nil)
     startScreen?.reload()
-    if job.isCancelled {
-      show("Download of \(entry.title) cancelled; finished archives are kept.")
-      return
-    }
     switch result {
     case .success:
-      if startScreen != nil {
+      if startScreen != nil && !isBusy {
         openScene(entry)
       } else {
         show("\(entry.title) is downloaded; open it from the scene browser.")
       }
+    case .failure where job.isCancelled:
+      show("Download of \(entry.title) cancelled; finished archives are kept.")
     case .failure(let error):
       let message = "Could not download \(entry.title): \(error.localizedDescription)"
       startScreen?.showDownloadError(entry, message)

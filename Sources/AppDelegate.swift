@@ -92,7 +92,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let start = SceneBrowserView()
     start.setRestore(StudioController.autosaveDate(at: StudioController.defaultAutosaveURL))
     start.onAction = { [weak self] action in self?.queueStartAction(action) }
-    start.onDownload = { [weak self] entry in self?.queueStartAction(.scene(entry.id)) }
     start.onCancelPending = { [weak self] in self?.cancelPendingStart() }
     startScreen = start
     window.contentView = start

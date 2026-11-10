@@ -9,7 +9,8 @@ enum SceneFile {
 // What the start screen asks for. A nil URL asks with an open panel first.
 enum StartAction {
   case openProject(URL?), openScene(URL?), restoreSession
-  // The SceneCatalog entry with this id: a download scene that is not installed is selected in the browser, whose Download button downloads it.
+  // The SceneCatalog entry with this id. A download scene that is not installed is only selected in the browser,
+  // whose Download button downloads it.
   case scene(String)
 }
 
@@ -22,7 +23,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   enum Filter: Int, CaseIterable { case all, builtIn, included, downloads, installed }
   var onAction: ((StartAction) -> Void)?
   // The details pane's Download button for a download scene that is not installed.
-  var onDownload: ((SceneEntry) -> Void)?
+  // Nil disables the button, as at launch, before the studio can download.
+  var onDownload: ((SceneEntry) -> Void)? { didSet { updateDownloadEnabled() } }
   // The details pane's Cancel button while a download runs (setDownload).
   var onCancelDownload: (() -> Void)?
   var onCancelPending: (() -> Void)?
@@ -295,6 +297,7 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
       if let entry = self?.selection { self?.onDownload?(entry) }
     }
     for button in [openButton, downloadButton] { button.controlSize = .large }
+    updateDownloadEnabled()
     actionButtons += [openButton, downloadButton]
     finderButton.identifier = NSUserInterfaceItemIdentifier("scene-show-in-finder")
     finderButton.actionBlock = { [weak self] in
@@ -306,7 +309,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     creditsButton.isHidden = true
     actionButtons.append(creditsButton)
     for view in [preview, titleLabel, summaryLabel, specsLabel, tagsLabel, collectionLabel, websiteButton, creditLabel,
-                 licenseButton, termsLabel, downloadRow, consentLabel, downloadErrorLabel, openButton, downloadButton, finderButton, creditsButton] {
+                 licenseButton, termsLabel, downloadRow, consentLabel, downloadErrorLabel, openButton, downloadButton,
+                 finderButton, creditsButton] {
       details.addArrangedSubview(view)
     }
     details.setCustomSpacing(2, after: collectionLabel)
@@ -390,8 +394,10 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   func setActionsEnabled(_ enabled: Bool) {
     actionsEnabled = enabled
     for button in actionButtons { button.isEnabled = enabled }
+    updateDownloadEnabled()
     grid.isSelectable = enabled
   }
+  private func updateDownloadEnabled() { downloadButton.isEnabled = actionsEnabled && onDownload != nil }
   // A running download of `entry` with its fraction done and status line, shown in the details pane while the entry
   // is selected in place of its Download button; nil restores the button.
   func setDownload(_ entry: SceneEntry?, fraction: Double?, status: String?) {
