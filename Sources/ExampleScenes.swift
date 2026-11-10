@@ -46,8 +46,8 @@ struct ExampleLibrary: Sendable {
       .trimmingCharacters(in: .whitespacesAndNewlines) == archive.sha256
   }
   func missing(_ entry: SceneEntry) -> [ExampleArchive] {
-    let storage = storage(entry).lastPathComponent
-    return entry.archives.filter { !isInstalled($0, storage: storage) }
+    guard case .download(let storage, _, let archives) = entry.source else { return [] }
+    return archives.filter { !isInstalled($0, storage: storage) }
   }
   func downloadBytes(_ entry: SceneEntry) -> Int64 { missing(entry).reduce(0) { $0 + $1.bytes } }
   func diskBytes(_ entry: SceneEntry) -> Int64 { missing(entry).reduce(0) { $0 + $1.unpackedBytes } }
