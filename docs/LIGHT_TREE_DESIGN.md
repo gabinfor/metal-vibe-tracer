@@ -24,7 +24,7 @@ The tree follows the emitter list in the same buffer (`MaterialLibrary.lightTree
 
 **Leaves of several emitters.** `LightTree.build` (Sources/LightTree.swift) follows pbrt-v4's build: at each node, 12 centroid buckets per axis and the split with the lowest surface area orientation heuristic (SAOH, pbrt's `EvaluateCost`). pbrt always splits down to one light. Here a range of at most eight emitters stays one leaf when its best split would cost at least 75% of the unsplit range's SAOH, which is what happens for emitters sharing their place and facing: the triangles of one lamp or panel. They gain nothing from separate importance tests, and choosing among them by power saves the walk's last levels. Separate lights, or triangles facing different ways, still split, because their split costs far less (smaller bounds or narrower normal cones).
 
-**No tree where it cannot help.** With at most eight emitters the whole tree would be one leaf, which is power sampling, so the list is built without a tree and the GPU takes the power path without walking. A tree deeper than the 64 levels the GPU walks, or with more nodes than the 27-bit parent field holds, also falls back to power sampling.
+**No tree where it cannot help.** When the build keeps every emitter in one leaf (at most eight emitters sharing their place and facing), the tree would be power sampling, so the list is built without a tree and the GPU takes the power path without walking. A tree deeper than the 64 levels the GPU walks, or with more nodes than the 27-bit parent field holds, also falls back to power sampling.
 
 The build is iterative and runs when the emitter list is rebuilt: on emission, emitter-light, geometry and transform changes, and when the mode changes.
 

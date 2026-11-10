@@ -15,8 +15,10 @@ extension StudioController {
       selectedSlot = 1
     }
     var ordered: [(SceneNode, Int)] = []
+    var children: [UUID?: [SceneNode]] = [:]
+    for n in graph.nodes { children[n.parent, default: []].append(n) }
     func visit(_ parent: UUID?, _ depth: Int) {
-      for n in graph.nodes where n.parent == parent {
+      for n in children[parent] ?? [] {
         ordered.append((n, depth))
         visit(n.id, depth + 1)
       }
@@ -235,7 +237,7 @@ extension StudioController {
       }
       if let mesh = node.mesh, let asset = graph.assets.first(where: { $0.id == mesh }) {
         text(
-          "\(asset.triangles.count) triangles · \(asset.subsets.count) material subsets · \(graph.nodes.filter{$0.mesh==mesh}.count) instances"
+          "\(asset.geometry.count) triangles · \(asset.subsets.count) material subsets · \(graph.nodes.filter{$0.mesh==mesh}.count) instances"
         )
       }
     } else {
@@ -243,10 +245,10 @@ extension StudioController {
     }
     button("Frame all imported objects") { [weak self] in self?.frameAllAction() }
     heading("Import")
-    button("Open USD scene…") { [weak self] in self?.importUSD() }
+    button("Open USD or glTF scene…") { [weak self] in self?.importUSD() }
     button("Import OBJ…") { [weak self] in self?.importMesh() }
     text(
-      "OBJ objects, groups and usemtl subsets are preserved. Imports append. Instances share mesh assets and render as instances: moving, hiding or rebinding one keeps every mesh's acceleration structure. MTL shading and concave polygon triangulation are not supported."
+      "OBJ objects, groups and usemtl subsets are preserved. Imports append. Instances share mesh assets and render as instances: moving, hiding or rebinding one keeps every mesh's acceleration structure. MTL materials are imported; triangulate concave polygons before import."
     )
   }
   func showMaterialXReport() {
@@ -322,7 +324,7 @@ extension StudioController {
       case .failure(let empty as NoMaterials):
         self.materialXReport = empty.report
       case .failure(let error):
-        self.materialXReport += "\nImport failed: " + error.localizedDescription
+        self.materialXReport = "Import failed: " + error.localizedDescription
       }
       self.showMaterialXReport()
     }

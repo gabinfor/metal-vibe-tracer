@@ -423,6 +423,7 @@ struct ShowcaseShot: Decodable, Sendable {
   var scene: UInt32?
   var project: String?
   var usd: String?
+  var gltf: String?
   var obj: String?
   var hdri: String?
   var sky: UInt32?
@@ -432,6 +433,8 @@ struct ShowcaseShot: Decodable, Sendable {
   var lightTransport: UInt32?
   // LightSampling raw value (0 power, 1 light tree); nil keeps the project's choice.
   var lightSampling: UInt32?
+  // CausticMode raw value (0 off, 1 light tracing, 3 light tracing + photons); nil keeps the project's choice.
+  var caustics: UInt32?
   var yaw: Float?, pitch: Float?, distance: Float?, fov: Float?
   var target: [Float]?
   var aperture: Float?, focusDistance: Float?
@@ -449,6 +452,8 @@ struct ShowcaseShot: Decodable, Sendable {
   // Open Image Denoise for scripts/render_showcase.py's export; off by default, so documentation and test images
   // show the raw accumulation.
   var denoise: Bool?
+  // With denoise: also write the raw accumulation as <name>-raw.png, from the same render, before OIDN runs.
+  var keepRaw: Bool?
   // StudioOptions.indirectClamp: a biased per-sample cap of indirect light that removes fireflies.
   var indirectClamp: Float?
   // Scales the imported scene's emission (lamps, signs, emissive glass): 0 switches it off for a daylight
@@ -457,6 +462,9 @@ struct ShowcaseShot: Decodable, Sendable {
   // Rotation of the imported scene's top-level objects, X, Y, Z in degrees (as in the Objects inspector):
   // [-90, 0, 0] stands a Z-up OBJ upright, since the camera's up is +Y.
   var rotation: [Float]?
+  // A saved view of the imported scene ("glTF: camera_front") as the camera, before yaw, pitch and the
+  // other camera fields adjust it.
+  var view: String?
 
   static func load(_ url: URL) throws -> [ShowcaseShot] {
     try JSONDecoder().decode([ShowcaseShot].self, from: Data(contentsOf: url))
@@ -469,7 +477,7 @@ struct ShowcaseShot: Decodable, Sendable {
     return try load(url)
   }
 
-  // Everything but the scene source (scene, usd, obj, project, hdri) and the export mode (raw).
+  // Everything but the scene source (scene, usd, gltf, obj, project, hdri) and the export mode (raw).
   func apply(to p: inout ProjectDocument) {
     if let k = emissionScale { p.scaleImportedEmission(by: k) }
     if let r = rotation, r.count == 3, var graph = p.graph {
@@ -486,6 +494,11 @@ struct ShowcaseShot: Decodable, Sendable {
     if let v = strategy { p.strategy = v }
     if let v = lightTransport { p.lightTransport = v }
     if let v = lightSampling { p.lightSampling = v }
+    if let v = caustics { p.caustics = v }
+    if let v = view, let c = p.views[v] {
+      p.camera = c
+      p.options.focusDistance = c.distance
+    }
     if let v = yaw { p.camera.yaw = v }
     if let v = pitch { p.camera.pitch = v }
     if let v = distance { p.camera.distance = v }

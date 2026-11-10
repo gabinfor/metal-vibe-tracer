@@ -106,6 +106,7 @@ extension StudioController {
       r.sampler = p.restirModes.sampler
       r.lightTransport = p.restirModes.lightTransport
       r.lightSampling = p.restirModes.lightSampling
+      r.caustics = p.restirModes.caustics
       r.zTemporal = renderer.zTemporal
       r.ptDecorrelation = renderer.ptDecorrelation
       r.ptTemporalWhileAccumulating = renderer.ptTemporalWhileAccumulating
@@ -129,8 +130,9 @@ extension StudioController {
         // OIDN runs after the render while the export and preview frames stay resident.
         let frames = PathTracerRenderer.FrameResourcePlan(
           width: p.options.outputWidth, height: p.options.outputHeight,
-          usesReSTIR: r.samplingMode == 0, usesMetalFX: false, indirectReuse: r.activeIndirectReuse,
-          splatting: r.activeTemporalReuse == .splatting).bytes
+          usesReSTIR: r.activeSamplingMode == 0, usesMetalFX: false, indirectReuse: r.activeIndirectReuse,
+          splatting: r.activeTemporalReuse == .splatting,
+          stochasticPairwise: r.activeSpatialNeighbors == .stochasticPairwise).bytes
         let resident = frames.map { $0.addingReportingOverflow(r.concurrentRenderBytes) }
         if let message = OIDNDenoiser.memoryError(
           width: p.options.outputWidth, height: p.options.outputHeight,
@@ -473,13 +475,14 @@ enum RenderImage {
       // Radiance is nonnegative, as presentation shows it: a raw ReSTCV accumulation (RESTCV2026)
       // can hold small negative values before it converges, which the file would otherwise keep.
       for index in pixels.indices { pixels[index] = simd_max(pixels[index], .zero) }
-      try OpenEXRFloat.encode(pixels, width: width, height: height).write(to: temporary)
+      // Atomic replacement, including existing destinations chosen by NSSavePanel.
+      try OpenEXRFloat.encode(pixels, width: width, height: height).write(to: url, options: .atomic)
     } else {
+      // Core Image writes to a file, which then replaces the destination atomically.
       try context.writePNGRepresentation(
         of: image, to: temporary, format: .RGBA8, colorSpace: srgb, options: [:])
+      try Data(contentsOf: temporary).write(to: url, options: .atomic)
     }
-    // Atomic replacement, including existing destinations chosen by NSSavePanel.
-    try Data(contentsOf: temporary).write(to: url, options: .atomic)
   }
 }
 

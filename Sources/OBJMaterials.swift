@@ -348,7 +348,9 @@ struct MaterialXWriter {
     func url(_ map: MTLMap) -> URL? {
       let u = URL(fileURLWithPath: map.file, relativeTo: folder).standardizedFileURL
       if FileManager.default.fileExists(atPath: u.path) { return u }
-      report.append("\(m.name): texture \(map.file) not found; ignored.")
+      // Once per texture: map_Kd is resolved for its colour, its coverage and its opacity.
+      let line = "\(m.name): texture \(map.file) not found; ignored."
+      if !report.contains(line) { report.append(line) }
       return nil
     }
     // A scalar from a map's channel: alpha when asked (-imfchan m) or as the default for map_d on an

@@ -55,7 +55,7 @@ final class StartScreenView: NSView {
     for (title, id, action) in [
       ("Open Project…", "start-open", StartAction.openProject(nil)),
       ("Import OBJ…", "start-import-obj", .importOBJ(nil)),
-      ("Open USD Scene…", "start-import-usd", .importUSD(nil)),
+      ("Open USD or glTF Scene…", "start-import-usd", .importUSD(nil)),
     ] {
       let button = ActionButton(title) { [weak self] in self?.onAction?(action) }
       button.identifier = NSUserInterfaceItemIdentifier(id)
@@ -206,7 +206,7 @@ extension StartScreenView {
     switch action {
     case .openProject(nil): (title, extensions, make) = ("Open Metal Vibe Tracer project", ["vtrace", "json"], { .openProject($0) })
     case .importOBJ(nil): (title, extensions, make) = ("Import OBJ mesh", ["obj"], { .importOBJ($0) })
-    case .importUSD(nil): (title, extensions, make) = ("Open OpenUSD scene", ["usd", "usda", "usdc", "usdz"], { .importUSD($0) })
+    case .importUSD(nil): (title, extensions, make) = ("Open OpenUSD or glTF scene", ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions, { .importUSD($0) })
     default: return chosen(action)
     }
     let panel = NSOpenPanel()
@@ -217,12 +217,12 @@ extension StartScreenView {
       if response == .OK, let url = panel.url { chosen(make(url)) }
     }
   }
-  // What a queued action will do, for the start screen ("Opens Sponza.vtrace…").
+  // What a queued action will do, for the start screen ("Opening Sponza.vtrace").
   static func describe(_ action: StartAction) -> String {
     switch action {
     case .openProject(let url): return "Opening \(url?.lastPathComponent ?? "a project")"
     case .importOBJ(let url): return "Importing \(url?.lastPathComponent ?? "an OBJ mesh")"
-    case .importUSD(let url): return "Opening \(url?.lastPathComponent ?? "a USD scene")"
+    case .importUSD(let url): return "Opening \(url?.lastPathComponent ?? "a scene")"
     case .builtInScene(let index): return "Loading \(builtInScenes[index])"
     case .example(let index): return "Opening \(SpectralExamples.catalog[index].title)"
     case .download(let index): return "Opening \(ExampleScenes.catalog[index].title)"

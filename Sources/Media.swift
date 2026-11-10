@@ -21,8 +21,8 @@ extension PathTracerRenderer {
   var hasMedia: Bool {
     (medium?.density ?? 0) > 0 || (sceneIndex == 6 && materials.hasInteriorMedia)
   }
-  // The strategy the frame runs: media render with Standard MIS (MSL volume_path), never ReSTIR.
-  var activeSamplingMode: UInt32 { hasMedia && samplingMode == 0 ? 1 : samplingMode }
+  // The strategy the frame runs: media (MSL volume_path) and caustic light tracing render with Standard MIS, never ReSTIR.
+  var activeSamplingMode: UInt32 { (hasMedia || activeCaustics) && samplingMode == 0 ? 1 : samplingMode }
   // Uniforms.mediumScatter (albedo, density) and pathOptions (anisotropy, Rayleigh, media present, indirect clamp).
   var mediumUniforms: (scatter: SIMD4<Float>, options: SIMD4<Float>) {
     let m = medium ?? SceneMedium(density: 0)

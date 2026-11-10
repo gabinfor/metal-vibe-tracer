@@ -100,7 +100,7 @@ Transmission section):
 - σ_t = −ln(transmission_color) / transmission_depth;
 - σ_s = transmission_scatter / transmission_depth;
 - σ_a = σ_t − σ_s, shifted by grey if any channel is negative;
-- Henyey–Greenstein anisotropy g = `transmission_scatter_anisotropy` (`HG1941`).
+- Henyey–Greenstein anisotropy g = `transmission_scatter_anisotropy` (`HG1941`), limited to ±0.99 in `slot_medium` as the scene medium's is.
 
 In spectral transport the colours are upsampled like other bounded colours (`docs/SPECTRAL_DESIGN.md`
 §2), so σ(λ) = −ln ρ_color(λ) / depth.
@@ -141,7 +141,7 @@ dominant wavelengths. Authoring:
 - Surface vertices behave exactly as in the existing path loop (BSDF sampling, NEE, Russian roulette,
   dispersion hero lanes), with media tracked across refractive and boundary surfaces.
 - When media are present, the host resolves the strategy to **Standard MIS** for the frame and skips
-  the ReSTIR passes; the inspector says so. The G-buffer pass still runs for MetalFX's guides.
+  the ReSTIR passes; the inspector says so. MetalFX, which accompanies ReSTIR, is off for such frames: they display raw accumulation.
 - The preview camera fog (`apply_camera_fog`) is skipped when a scene medium is set.
 
 ## 5. GPU data
@@ -159,7 +159,7 @@ As implemented, 8 float4 per slot (`SLOT_PARAMETERS`, `MaterialLibrary.slotStrid
 | 4 | the emitter spectrum's linear sRGB at luminance one (RGB transport) |
 | 5 | emitter shaping: cone angle and smooth start in radians, focus, 1 when shaped |
 | 6 | interior medium: `transmission_scatter` (rgb), w = `transmission_depth` (0 when none) |
-| 7 | interior medium: anisotropy, index-matched boundary flag, Rayleigh flag, 0 |
+| 7 | interior medium: anisotropy, index-matched boundary flag, Rayleigh flag; specular anisotropy rotation in radians (`MaterialXProgram.anisotropyRotation`, MSL `slot_anisotropy_rotation`) |
 
 `Uniforms` gains `float4 mediumScatter` (rgb albedo, w = density) and `float4 pathOptions` (named `mediumOptions` until the indirect clamp used its w)
 (anisotropy, Rayleigh, media present, 0); it grows from 304 to 336 bytes. The scene medium's box is not a

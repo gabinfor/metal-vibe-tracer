@@ -3,11 +3,13 @@
 Usage: python3 scripts/render_showcase.py [--shots FILE] [--only NAME ...] [--scale S] [--samples N] [--out DIR]
 
 Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD
-file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera, lens and render modes, and exports
+or glTF file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera
+(or picks an imported camera's saved view with "view"), lens and render modes, and exports
 through StudioController.startExport, exactly like Export in the app, from the raw accumulation: documentation
 and test images are not denoised. A shot with "denoise": true uses Open Image Denoise instead (on request, or
 for a high-sample showcase render); "indirectClamp": c caps each sample's indirect luminance at c, a biased
-firefly control that the image notes must state; "raw": true exports linear radiance as OpenEXR (renderer comparisons).
+firefly control that the image notes must state; "raw": true exports linear radiance as OpenEXR (renderer comparisons);
+"keepRaw": true with "denoise": true also saves the undenoised image of the same render as NAME-raw.png.
 --scale and --samples override every shot for quick framing previews. Images go to --out
 (default build/showcase); copy the chosen ones to docs/images by hand.
 """
@@ -62,6 +64,14 @@ for shot in try JSONDecoder().decode([ShowcaseShot].self, from: shotData) {
   var p: ProjectDocument
   if let path = shot.usd {
     p = try USDImporter.load(URL(fileURLWithPath: path), into: ProjectDocument()).document
+  } else if let path = shot.gltf {
+    let start = Date()
+    let imported = try GLTFImporter.load(URL(fileURLWithPath: path), into: ProjectDocument())
+    p = imported.document
+    print("\(URL(fileURLWithPath: path).lastPathComponent): imported in \(String(format: "%.1f", Date().timeIntervalSince(start))) s, "
+      + "\(p.graph?.assets.reduce(0) { $0 + $1.geometry.count } ?? 0) triangles, \(p.scenes[6]?.materialX?.count ?? 0) MaterialX materials, "
+      + "views: \(p.views.keys.sorted().joined(separator: ", "))")
+    for line in imported.report { print("  " + line) }
   } else if let path = shot.obj {
     let url = URL(fileURLWithPath: path)
     var skipped = 0, report: [String] = []
@@ -106,10 +116,20 @@ for shot in try JSONDecoder().decode([ShowcaseShot].self, from: shotData) {
   let start = Date()
   controller.startExport(url: url, hdr: raw)
   // Progress every 30 s: samples over the target and elapsed time.
-  guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600, every: 30, report: {
+  let report = {
     let done = controller.exportRenderer?.completedSamples ?? p.options.exportSamples
     print("\(shot.name): \(done) / \(p.options.exportSamples) spp, \(Int(Date().timeIntervalSince(start))) s elapsed")
-  }),
+  }
+  // keepRaw: once sampling ends and OIDN starts, the export output still holds the raw display image.
+  if denoise && shot.keepRaw == true {
+    guard waitFor({ controller.exportDenoiseJob != nil || controller.exportRenderer == nil }, seconds: 3600, every: 30, report: report),
+      let display = controller.exportOutput
+    else { fputs("FAIL: \(shot.name) did not reach denoising\n", stderr); exit(1) }
+    let rawURL = outputFolder.appendingPathComponent(shot.name + "-raw.png")
+    try RenderImage.write(texture: display, url: rawURL, hdr: false)
+    print("\(shot.name): raw accumulation saved as \(rawURL.lastPathComponent)")
+  }
+  guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600, every: 30, report: report),
     FileManager.default.fileExists(atPath: url.path)
   else { fputs("FAIL: \(shot.name) did not export\n", stderr); exit(1) }
   print("\(shot.name): \(p.options.outputWidth)x\(p.options.outputHeight), \(p.options.exportSamples) spp, "

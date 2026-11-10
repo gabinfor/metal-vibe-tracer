@@ -1,3 +1,44 @@
+# Caustic light tracing — November 9, 2026 (re-measured November 10)
+
+Cornell Box 2026 (`CORNELLBOX2026`), its `camera_caustics` view at 480×270 (the showcase driver, `--scale 0.25`), spectral transport, Standard MIS, the mirrored environment; Apple M4, 16 GB, macOS 27; raw OpenEXR exports. Reference: light tracing at 4,096 spp (710 s, unbiased like both estimators compared; `tests/Fix_caustics.swift`). Relative MSE of luminance, (x − r)² / (r² + 0.01), at 256 spp; efficiency is the inverse of MSE × time.
+
+| Region | Path tracing (38 s) | + light tracing, 2²⁰ paths per sample (55 s) | Equal-time efficiency |
+| --- | --- | --- | --- |
+| Whole image | 0.365 | 0.181 | 1.39× |
+| Lower 60% (the floor and its caustics) | 0.498 | 0.216 | 1.59× |
+| Upper 40% (glass block, ribbon, wall) | 0.164 | 0.127 | 0.89× |
+
+- November 10: light paths also start from the environment, in a share that follows each source's contribution (`caustic_source_share`). Light tracing now costs 45% more time per sample than path tracing (29% on November 9, at 45 s against 35 s, before the environment paths, the guide and the photon features were added to the light-path kernel); the floor's equal-time gain fell from 1.82× to 1.59×. With lamp paths only the same build took 61 s and the floor's error was 0.229, so the environment paths are cheaper than the lamp's and help. Starting each source's paths in a non-inlined function did not help (59 s).
+- Most lamp paths end on the pendant's fins before reaching the glass; emission guiding does not change that here (below).
+- Counting rougher glossy surfaces as caustic-forming (`CAUSTIC_ROUGHNESS` 0.4 instead of 0.1, which adds the anodized ribbon) left the floor's error unchanged (0.210 against 0.213), so the cutoff stays at 0.1.
+- The floor keeps a fine sparkle even in the 4,096-spp reference, light the path tracer still reaches only by chance; the ceramic glaze's sharp reflection of the 12 mm emitter (a dielectric, so not caustic-forming under the material-level rule) is the likely source, not yet isolated.
+
+# Emission guiding — November 10, 2026
+
+Light tracing's noise alone, from two renders that differ only in the light paths' random numbers (the camera paths repeat theirs, so their noise cancels in the difference): relative MSE between the pair, spectral, Standard MIS, 2²⁰ light paths per sample, guided against unguided light tracing (docs/CAUSTICS_DESIGN.md §5). Training on 1 path or photon in 16 rather than all of them did not change the time (98 s against 82 s with every path training, on a weaker guide), so the cost is the guided paths' own work, not the atomic adds.
+
+| Scene | Unguided | Guided | Observation |
+| --- | --- | --- | --- |
+| Glass of Water (`BITTERLI2016`), 640×360, 128 spp | lower 60%: 0.098, 27 s | 0.0225, 98 s | 4.4× less noise per sample; guided paths reach the glass and bounce through it where unguided ones mostly end after one ray, so each sample takes 3.6 times as long. |
+| Cornell Box 2026 `camera_caustics`, 480×270, 256 spp | lower 60%: 0.0277, 55 s | 0.0276, 88 s | No change: the slats between the emitter and the glass are finer than the guide's 3.5° cells. |
+
+At equal time guiding does not win in either scene with a fixed path count, so it is a choice (*guided*) rather than the default.
+
+# Spectral safe math — November 10, 2026
+
+Compiling both spectral libraries with `MTLMathMode.safe` instead of `.relaxed` (the only modes besides `.fast` with which `volume_path` can record caustic photon requests without crashing the Metal backend compiler): Cornell Box 2026 `camera_front` 960×540, 96 spp, 22 s → 25 s; Water Caustic 512×512, 128 spp, 28 s → 32 s (12–14%). Only the spectral `shading_kernel` used for photons in scenes with media is therefore compiled with safe math (docs/CAUSTICS_DESIGN.md §6). Cornell Box 2026 `camera_front` at 960×540 and 512 spp: light tracing 168 s, light tracing and photons through its absorbing glass 209 s.
+
+## Bitterli caustic scenes at equal time — November 9, 2026
+
+Four `BITTERLI2016` scenes converted with `scripts/mitsuba_to_usd.py`, half resolution, each scene's Mitsuba path depth, Standard MIS on every side, spectral transport, no denoiser; visual comparison at about equal time (the light-traced side had the shorter time where they differ).
+
+| Scene | Path tracing | + light tracing | + light tracing and photons | Observation |
+| --- | --- | --- | --- | --- |
+| Water Caustic (5 mm light, water volume) | 256 spp, 62 s | 170 spp, 69 s | 128 spp, 68 s | Path tracing and light tracing leave the region seen through the water nearly black (light tracing adds the ceiling's reflected caustics); photons, gathered at up to two receivers per pixel, render the caustic web on the walls and boxes and its interreflection. At 1,024 spp (449 s, spectral photons at shared wavelengths, November 10) the mean luminance of each tenth of the image height is 0.89 to 1.10 times that of Bitterli's Tungsten EXR (0.99 on average, leaving out the top tenth, which holds the lamp). |
+| Veach Bidir Room (light in a glass egg) | 256 spp, 31 s | 205 spp, 30 s | — | Walls and ceiling visibly less grainy with light tracing. |
+| Glass of Water (large area light) | 256 spp, 35 s | 170 spp, 30 s | — | Little difference. |
+| Little Lamp | 256 spp, 21 s | 170 spp, 16 s | — | No visible difference: its bulb sphere is not converted, and its caustics are slight. |
+
 # Mitsuba 3 at equal settings — November 5, 2026
 
 Apple M4, 16 GB, macOS 27. Bitterli's Mitsuba 3 versions (`BITTERLI2016`) of the Grey & White Room (the Fireplace Room, sky map `Sky 19.exr` turned 90°) and the White Room (the Living Room, four area lights), each rendered as the same scene by both renderers: Mitsuba 3.9.1 (`metal_ad_rgb`) from the XML, the app from `scripts/mitsuba_to_usd.py`'s USD through `scripts/render_showcase.py` (raw EXR export, Standard MIS, RGB transport, no denoiser). 640×360, 256 spp, path depth 64 and 32 (Mitsuba `max_depth` 65 and 33, the scenes' own). Mitsuba times are the median of three `mi.render` calls after a 1-spp warm-up (kernels compiled, scene loaded); the app's are its export wall time in whole seconds (scene restored, export set-up included). Noise is the luminance MSE weighted by 1/(L_ref² + 0.01), against each renderer's own reference (Mitsuba 16,384 spp `volpath`; the app 2,048 spp, corrected by 8/7 for its 256 samples being the reference's first 256: repeated renders are bit-identical). Bias is the app's 2,048-spp image against Mitsuba's reference.

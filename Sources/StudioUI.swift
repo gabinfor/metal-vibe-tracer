@@ -23,7 +23,9 @@ final class ActionPopup: NSPopUpButton {
     _ titles: [String], selected: Int, label: String? = nil, _ action: @escaping (Int) -> Void
   ) {
     self.init(frame: .zero, pullsDown: false)
-    addItems(withTitles: titles)
+    // Menu items rather than addItems(withTitles:), which drops an earlier item of the same title: the action
+    // indexes `titles` (two nodes or materials can share a name).
+    for title in titles { menu?.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: "")) }
     if let label { setAccessibilityLabel(label) }
     selectItem(at: selected)
     target = self
@@ -172,7 +174,7 @@ final class StudioController: NSViewController {
   var usdImportJob: USDImportJob?
   // File > Open Example Scene's download in progress (ExampleScenes.swift).
   var exampleDownload: ExampleSceneDownload?
-  // Opens (including the launch restore), saves and off-main document preparation.
+  // Opens (including Restore Last Session), saves and off-main document preparation.
   private(set) var openInFlight = false { didSet { busyStateChanged() } }
   private var saveInFlight = false { didSet { busyStateChanged() } }
   private var preparationInFlight: UInt64? { didSet { busyStateChanged() } }
@@ -270,6 +272,13 @@ final class StudioController: NSViewController {
   static let lightSamplingChoices: [(mode: LightSampling, title: String)] = [
     (.automatic, "Automatic"), (.tree, "Light tree"), (.power, "Power"),
   ]
+  static let causticChoices: [(mode: CausticMode, title: String)] = [
+    (.automatic, "Automatic"), (.lightTracing, "Light tracing"), (.lightTracingGuided, "Light tracing, guided"),
+    (.photons, "Light tracing + photons"), (.photonsGuided, "Light tracing + photons, guided"), (.off, "Off"),
+  ]
+  // Figures from tests/PERFORMANCE.md (Caustic light tracing, Emission guiding).
+  static let causticHelp =
+    "Light tracing renders the caustics you see directly, light focused through glass or off polished metal onto other surfaces, by tracing paths from the imported scene's emitters, sky and sun and connecting them to the camera. It is unbiased and resolves small lights faster than path tracing alone. Light tracing + photons also renders the caustics seen through glass, water or a mirror, caustic light that bounces on to other surfaces, and light focused into fog: the same light paths leave photons that camera paths gather at up to two surfaces or points in a medium after the first, slightly blurred at first and converging as samples accumulate. Guided learns, as samples accumulate, which directions from each light lead to caustics the camera sees, and sends half the light paths there: less noise per sample, but each sample takes longer, so it pays only where few light paths find the glass and the rest are costly. All render with Standard MIS. Automatic is Off."
   static let lightSamplingHelp =
     "How imported scenes choose an emitter for each light sample. Light tree picks emitters by how much light they can send to the point being shaded (a light BVH), so scenes with many lights spread over a large space need fewer samples. Power picks them in proportion to their power alone, wherever they are. Both are unbiased; procedural scenes, the sky and the environment are unaffected."
   // Emitter spectra (StudioOptions.lightSpectrum / sunSpectrum): nil is the RGB colour.
@@ -459,7 +468,12 @@ final class StudioController: NSViewController {
     popup.menu = menu
     popup.selectItem(withTag: Int(renderer.sceneIndex))
     popup.actionBlock = { [weak self, weak popup] _ in
-      guard let self, self.acceptsEdits, let tag = popup?.selectedTag() else { return }
+      guard let self, let tag = popup?.selectedTag() else { return }
+      // While edits are refused (an export, project I/O) the selector goes back to the current scene.
+      guard self.acceptsEdits else {
+        popup?.selectItem(withTag: Int(self.renderer.sceneIndex))
+        return
+      }
       switch tag {
       case Self.downloadTag...: self.openExampleScene(tag - Self.downloadTag)
       case Self.exampleTag...: self.openSpectralExample(tag - Self.exampleTag)
@@ -561,7 +575,7 @@ final class StudioController: NSViewController {
     if projectOperationInProgress || importInProgress {
       heading(projectActivity.isEmpty ? "Working…" : projectActivity)
       text("Editing resumes when the project operation finishes. The progress bar below the viewport shows each step.")
-      if let job = usdImportJob { button("Cancel Import") { [weak self] in job.cancel(); self?.show("Cancelling the USD import…") } }
+      if let job = usdImportJob { button("Cancel Import") { [weak self] in job.cancel(); self?.show("Cancelling the import…") } }
       return
     }
     switch page {
@@ -602,7 +616,7 @@ final class StudioController: NSViewController {
     metalFX.setButtonType(.switch)
     metalFX.state = renderer.denoiserEnabled ? .on : .off
     add(metalFX)
-    if renderer.samplingMode != 0 {
+    if renderer.activeSamplingMode != 0 {
       text("MetalFX is available with ReSTIR Direct + Indirect. This strategy displays raw accumulation.")
     }
     if !renderer.supportsMetalFX { text("MetalFX is not supported by this GPU.") }
@@ -639,8 +653,8 @@ final class StudioController: NSViewController {
     text("Inspection views bypass tone mapping and denoising, and do not reset the progressive render.")
   }
 
-  // The sampler popup (every strategy) and the four ReSTIR reuse popups, which apply only to
-  // ReSTIR Direct + Indirect and are disabled (with a note) for the other strategies.
+  // The sampler, light transport, light sampling and caustics popups (every strategy) and the four ReSTIR reuse
+  // popups, which apply only to ReSTIR Direct + Indirect and are disabled (with a note) for the other strategies.
   func restirModeControls() {
     let r = renderer, restir = r.samplingMode == 0
     func choice<Mode: Equatable>(
@@ -684,6 +698,12 @@ final class StudioController: NSViewController {
       automatic: name(LightSampling.automatic.resolved(), Self.lightSamplingChoices),
       help: Self.lightSamplingHelp, enabled: true
     ) { $0.lightSampling = $1 }
+    // Caustic light tracing applies to imported scenes, whatever the strategy (it renders Standard MIS).
+    choice(
+      "Caustics", Self.causticChoices, current: r.caustics,
+      automatic: name(CausticMode.automatic.resolved(), Self.causticChoices),
+      help: Self.causticHelp, enabled: true
+    ) { $0.caustics = $1 }
     if r.activeLightTransport == .spectral && !r.spectralShaders.compiling && r.spectralShaders.kernels == nil,
       let failure = r.spectralShaders.failure
     {
@@ -1187,11 +1207,11 @@ final class StudioController: NSViewController {
     legacyObjectControls()
     heading("Mesh import")
     text(project.meshName)
-    button("Open USD scene…") { [weak self] in self?.importUSD() }
+    button("Open USD or glTF scene…") { [weak self] in self?.importUSD() }
     button("Import OBJ…") { [weak self] in self?.importMesh() }
     button("Frame imported mesh") { [weak self] in self?.frameMesh() }
     text(
-      "OBJ positions, UVs and normals are supported. Object/group hierarchy and named material subsets are preserved. Imports append to the scene. Triangulate concave polygons before import; MTL shading is not imported."
+      "OBJ positions, UVs and normals are supported. Object/group hierarchy and named material subsets are preserved. Imports append to the scene. MTL materials are imported. Triangulate concave polygons before import."
     )
   }
   func legacyObjectControls() {
@@ -1383,7 +1403,10 @@ final class StudioController: NSViewController {
   }
   func checkpoint(_ name: String, coalesce: Bool = false) {
     guard !isRestoring, !isBusy else { return }
-    if coalesce && Date().timeIntervalSince(lastCheckpoint) < 0.5 { return }
+    if coalesce && Date().timeIntervalSince(lastCheckpoint) < 0.5 {
+      lastCheckpoint = Date()  // A continuing burst (a long colour-panel drag) stays one undo step.
+      return
+    }
     commit(undoRecord(name))
   }
   func applyUndo(_ record: UndoRecord) {
@@ -1488,8 +1511,8 @@ final class StudioController: NSViewController {
     // A load started from the start screen shows its progress there too.
     startScreen?.setProgress(activity?.snapshot)
     if visible, activityTimer == nil {
-      let timer = Timer(timeInterval: 0.1, repeats: true) { _ in
-        MainActor.assumeIsolated { [weak self] in self?.refreshActivity() }
+      let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        MainActor.assumeIsolated { self?.refreshActivity() }
       }
       RunLoop.main.add(timer, forMode: .common)
       activityTimer = timer
@@ -2396,7 +2419,7 @@ final class StudioController: NSViewController {
         ("Open Project…", "o", #selector(openAction)), ("Save Project", "s", #selector(saveAction)),
         ("Save Project As…", "S", #selector(saveAsAction)),
         ("Import OBJ…", "", #selector(importOBJAction)),
-        ("Open USD Scene…", "", #selector(importUSDAction)),
+        ("Open USD or glTF Scene…", "", #selector(importUSDAction)),
         ("Export…", "e", #selector(exportAction)),
       ])
     // Example scenes: downloaded on request (ExampleScenes.swift); titles show the remaining download size.

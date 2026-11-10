@@ -10,7 +10,7 @@ func launchTrace(_ event: String) {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   var window: NSWindow!
   var studio: StudioController!
   // Until the launch shader compilation finishes: the start screen, the compilation's progress and
@@ -22,6 +22,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private(set) var pendingStart: StartAction?
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+  // Closing the window asks to quit, so the window is still there when the quit is cancelled
+  // (a failed final save): without it the document could no longer be saved.
+  func windowShouldClose(_ sender: NSWindow) -> Bool {
+    NSApp.terminate(nil)
+    return false
+  }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard let studio else { return .terminateNow }
@@ -78,6 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered,
       defer: false)
     window.title = "Metal Vibe Tracer"
+    window.isReleasedWhenClosed = false
+    window.delegate = self
     window.contentMinSize = NSSize(width: 700, height: 440)
     window.center()
     let start = StartScreenView()
@@ -98,8 +107,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     launchProgress = progress
     launchStarted = Date()
     let source = metalSource, mathMode = shaderCompileOptions().mathMode
-    let timer = Timer(timeInterval: 0.1, repeats: true) { _ in
-      MainActor.assumeIsolated { [weak self] in self?.refreshLaunchProgress() }
+    let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.refreshLaunchProgress() }
     }
     RunLoop.main.add(timer, forMode: .common)
     launchTimer = timer
@@ -192,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ])
     menu("File", [
       ("Open Project…", "o", #selector(openProjectAction), self), ("Import OBJ…", "", #selector(importOBJAction), self),
-      ("Open USD Scene…", "", #selector(importUSDAction), self),
+      ("Open USD or glTF Scene…", "", #selector(importUSDAction), self),
       ("Close Window", "w", #selector(NSWindow.performClose(_:)), nil),
     ])
     menu("Window", [("Minimize", "m", #selector(NSWindow.performMiniaturize(_:)), nil)])

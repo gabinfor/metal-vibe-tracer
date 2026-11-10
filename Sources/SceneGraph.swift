@@ -7,7 +7,7 @@ enum SceneLimits {
   // GPU capacities (MSL MATERIAL_SLOTS and GRAPH_IMAGES; docs/SCENE_STORAGE_DESIGN.md phase 2).
   static let materials = 1024
   static let graphImages = 4096
-  // Slots a new SceneState stores; states grow to the slot they use (SceneState.reserve).
+  // The fewest slots a project file stores per scene (SceneState.trimmed); decoding pads back to `materials`.
   static let storedMaterials = 64
   // Object IDs of imported nodes start at `materials` and are 32-bit.
   static let nodes = 65_535
@@ -224,6 +224,9 @@ struct SceneGraph: Codable {
       return
     }
     let materialIDs = Set(materials.map(\.id))
+    // Unique by the test above.
+    let parentOf = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.parent) })
+    let assetsByID = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) })
     var triangles = 0
     var storedTriangles = 0
     for asset in assets {
@@ -264,25 +267,21 @@ struct SceneGraph: Codable {
         try fail("invalid transform.")
         return
       }
-      var current: SceneNode? = node
-      var visited = Set<UUID>()
-      while let n = current {
-        guard visited.insert(n.id).inserted else {
+      var current = node.parent
+      var visited: Set<UUID> = [node.id]
+      while let p = current {
+        guard visited.insert(p).inserted else {
           try fail("parent cycle.")
           return
         }
-        if let p = n.parent {
-          guard let next = nodes.first(where: { $0.id == p }) else {
-            try fail("missing parent.")
-            return
-          }
-          current = next
-        } else {
-          current = nil
+        guard let next = parentOf[p] else {
+          try fail("missing parent.")
+          return
         }
+        current = next
       }
       if let mesh = node.mesh {
-        guard let asset = assets.first(where: { $0.id == mesh }),
+        guard let asset = assetsByID[mesh],
           node.bindings.count == asset.subsets.count,
           node.bindings.allSatisfy({ materialIDs.contains($0) })
         else {

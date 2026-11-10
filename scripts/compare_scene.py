@@ -35,7 +35,8 @@ parser.add_argument('--strategy', type=int, default=1, help='app strategy: 1 Sta
 parser.add_argument('--out', type=pathlib.Path, default=ROOT / 'build/scene-compare')
 args = parser.parse_args()
 name = args.name or args.scene.parent.name
-out = args.out / name
+# Absolute: render_showcase.py resolves shot paths against the repository root.
+out = (args.out / name).resolve()
 out.mkdir(parents=True, exist_ok=True)
 
 defaults = {d.get('name'): d.get('value') for d in ET.parse(args.scene).getroot().iter('default')}

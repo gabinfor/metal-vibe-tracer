@@ -113,8 +113,8 @@ extension StudioOptions {
       && (indirectClamp ?? 0) == (o.indirectClamp ?? 0)
   }
 }
-// The ReSTIR strategy's reuse modes, the sampler and the light transport (Render inspector; the
-// sampler and the light transport apply to every strategy). Each one changes the image, so a
+// The ReSTIR strategy's reuse modes, the sampler, the light transport, the light sampling and the caustic mode
+// (Render inspector; the last four apply to every strategy). Each one changes the image, so a
 // difference restarts accumulation like a radiance-affecting option (StudioController.applyProject).
 struct ReSTIRModes: Equatable, Sendable {
   var indirectReuse: IndirectReuse
@@ -124,9 +124,10 @@ struct ReSTIRModes: Equatable, Sendable {
   var sampler: SamplerMode
   var lightTransport: LightTransport
   var lightSampling: LightSampling
+  var caustics: CausticMode
   // Projects without a stored choice use these: .automatic, or in -D VIBE_TESTING builds the
   // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE / VIBE_CONTROL_VARIATES /
-  // VIBE_SAMPLER / VIBE_LIGHT_TRANSPORT / VIBE_LIGHT_SAMPLING override. A stored choice wins.
+  // VIBE_SAMPLER / VIBE_LIGHT_TRANSPORT / VIBE_LIGHT_SAMPLING / VIBE_CAUSTICS override. A stored choice wins.
   static var defaults: ReSTIRModes {
     ReSTIRModes(
       indirectReuse: PathTracerRenderer.defaultIndirectReuse,
@@ -135,13 +136,15 @@ struct ReSTIRModes: Equatable, Sendable {
       controlVariates: PathTracerRenderer.defaultControlVariates,
       sampler: PathTracerRenderer.defaultSampler,
       lightTransport: PathTracerRenderer.defaultLightTransport,
-      lightSampling: PathTracerRenderer.defaultLightSampling)
+      lightSampling: PathTracerRenderer.defaultLightSampling,
+      caustics: PathTracerRenderer.defaultCaustics)
   }
   init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse,
        controlVariates: ControlVariates = PathTracerRenderer.defaultControlVariates,
        sampler: SamplerMode = PathTracerRenderer.defaultSampler,
        lightTransport: LightTransport = PathTracerRenderer.defaultLightTransport,
-       lightSampling: LightSampling = PathTracerRenderer.defaultLightSampling) {
+       lightSampling: LightSampling = PathTracerRenderer.defaultLightSampling,
+       caustics: CausticMode = PathTracerRenderer.defaultCaustics) {
     self.indirectReuse = indirectReuse
     self.spatialNeighbors = spatialNeighbors
     self.temporalReuse = temporalReuse
@@ -149,11 +152,12 @@ struct ReSTIRModes: Equatable, Sendable {
     self.sampler = sampler
     self.lightTransport = lightTransport
     self.lightSampling = lightSampling
+    self.caustics = caustics
   }
   @MainActor init(_ r: PathTracerRenderer) {
     self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse,
               controlVariates: r.controlVariates, sampler: r.sampler, lightTransport: r.lightTransport,
-              lightSampling: r.lightSampling)
+              lightSampling: r.lightSampling, caustics: r.caustics)
   }
   @MainActor func apply(_ r: PathTracerRenderer) {
     r.indirectReuse = indirectReuse
@@ -163,6 +167,7 @@ struct ReSTIRModes: Equatable, Sendable {
     r.sampler = sampler
     r.lightTransport = lightTransport
     r.lightSampling = lightSampling
+    r.caustics = caustics
   }
 }
 struct OIDNOptions: Codable, Equatable {
@@ -217,6 +222,8 @@ struct ProjectDocument: Codable {
   var sampler: UInt32?
   var lightTransport: UInt32?
   var lightSampling: UInt32?
+  // CausticMode raw value; nil (projects before caustic light tracing) is the default.
+  var caustics: UInt32?
   // The scene medium (SceneMedium); nil is clear air, as in projects written before media.
   var medium: SceneMedium?
   // Written only into autosaves: the document's file association and unsaved state.
@@ -233,7 +240,8 @@ struct ProjectDocument: Codable {
         controlVariates: controlVariates.flatMap(ControlVariates.init(rawValue:)) ?? fallback.controlVariates,
         sampler: sampler.flatMap(SamplerMode.init(rawValue:)) ?? fallback.sampler,
         lightTransport: lightTransport.flatMap(LightTransport.init(rawValue:)) ?? fallback.lightTransport,
-        lightSampling: lightSampling.flatMap(LightSampling.init(rawValue:)) ?? fallback.lightSampling)
+        lightSampling: lightSampling.flatMap(LightSampling.init(rawValue:)) ?? fallback.lightSampling,
+        caustics: caustics.flatMap(CausticMode.init(rawValue:)) ?? fallback.caustics)
     }
     set {
       indirectReuse = newValue.indirectReuse.rawValue
@@ -243,6 +251,7 @@ struct ProjectDocument: Codable {
       sampler = newValue.sampler.rawValue
       lightTransport = newValue.lightTransport.rawValue
       lightSampling = newValue.lightSampling.rawValue
+      caustics = newValue.caustics.rawValue
     }
   }
 
@@ -328,6 +337,7 @@ struct ProjectDocument: Codable {
       sampler.map({ SamplerMode(rawValue: $0) != nil }) ?? true,
       lightTransport.map({ LightTransport(rawValue: $0) != nil }) ?? true,
       lightSampling.map({ LightSampling(rawValue: $0) != nil }) ?? true,
+      caustics.map({ CausticMode(rawValue: $0) != nil }) ?? true,
       options.lightSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true,
       options.sunSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true
     else { try bad(); return }
@@ -852,6 +862,7 @@ extension MaterialXProgram {
       thinWalled == other.thinWalled, subsurfaceWeight == other.subsurfaceWeight,
       subsurfaceColor == other.subsurfaceColor, subsurfaceAnisotropy == other.subsurfaceAnisotropy, medium == other.medium, mediumAnisotropy == other.mediumAnisotropy,
       mediumBoundary == other.mediumBoundary, mediumRayleigh == other.mediumRayleigh,
+      anisotropyRotation == other.anisotropyRotation,
       sameBytes(instructions, other.instructions),
       images.count == other.images.count, parameters.count == other.parameters.count,
       zip(images, other.images).allSatisfy({ $0.name == $1.name && $0.srgb == $1.srgb && $0.data == $1.data })

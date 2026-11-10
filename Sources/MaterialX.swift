@@ -73,6 +73,10 @@ struct MaterialXProgram: Codable {
   // Scattering by the Rayleigh law, (550 nm / lambda)^4 times transmission_scatter's luminance per depth, with
   // transmission_color adding absorption on top (USD vibe:medium:rayleigh on the material; not an OpenPBR input).
   var mediumRayleigh: Bool?
+  // Constant rotation of the specular anisotropy direction about the shading normal, in radians from the
+  // tangent (dP/du) toward the bitangent (dP/dv), stored per slot (MaterialLibrary.slotParameters); nil for
+  // none. From geometry_tangent as MaterialX gltf_pbr writes anisotropy_rotation (tangentRotation).
+  var anisotropyRotation: Float?
   static let noSpectral = SIMD4<Float>(0, 0, 0.5, 1.4)
   func validate() throws {
     guard !instructions.isEmpty, instructions.count <= 64, roots.count == 12,
@@ -90,6 +94,9 @@ struct MaterialXProgram: Codable {
     }
     if let g = mediumAnisotropy, !(g.isFinite && (-1...1).contains(g)) {
       throw MaterialLibrary.error("Invalid interior medium anisotropy.")
+    }
+    if let r = anisotropyRotation, !(r.isFinite && abs(r) <= 2 * .pi) {
+      throw MaterialLibrary.error("Invalid anisotropy rotation.")
     }
     if let root = opacity, !(0..<instructions.count).contains(Int(root)) {
       throw MaterialLibrary.error("Invalid opacity output.")
@@ -747,6 +754,42 @@ private final class MXCompiler {
     cache[e.path] = result
     return result
   }
+  // geometry_tangent connected to the world tangent rotated about the world normal by a constant angle
+  // (rotate3d, optionally normalized), as MaterialX's gltf_pbr writes anisotropy_rotation; returns the
+  // rotation from the tangent toward the bitangent in radians (MaterialXProgram.anisotropyRotation).
+  // rotate3d turns a positive amount clockwise about its axis (MaterialX's mx_rotate_vector3, which
+  // gltf_pbr compensates by negating glTF's counter-clockwise radians), so the rotation is -amount.
+  func tangentRotation(_ input: MXElement) throws -> Float {
+    let unsupported = "geometry_tangent must keep its geometric default or rotate the tangent about the normal by a constant angle (rotate3d)."
+    func source(_ e: MXElement?, _ category: String) throws -> MXElement {
+      guard let e, e.attributes["type"] == "vector3", let name = e.attributes["nodename"] else { try fail(unsupported) }
+      let node = try resolve(name, from: e)
+      guard node.category == category, node.attributes["type"] == "vector3" else { try fail(unsupported) }
+      return node
+    }
+    func geometric(_ e: MXElement?, _ category: String) throws {
+      let node = try source(e, category)
+      try allowed(node, ["space"])
+      if let space = node.input("space") {
+        guard !linked(space), (space.attributes["value"] ?? "world") == "world" else { try fail(unsupported) }
+      }
+    }
+    guard input.attributes["type"] == "vector3", let name = input.attributes["nodename"] else { try fail(unsupported) }
+    var rotate = try resolve(name, from: input)
+    if rotate.category == "normalize" {
+      guard rotate.attributes["type"] == "vector3" else { try fail(unsupported) }
+      try allowed(rotate, ["in"])
+      rotate = try source(rotate.input("in"), "rotate3d")
+    }
+    guard rotate.category == "rotate3d", rotate.attributes["type"] == "vector3" else { try fail(unsupported) }
+    try allowed(rotate, ["in", "amount", "axis"])
+    try geometric(rotate.input("in"), "tangent")
+    try geometric(rotate.input("axis"), "normal")
+    guard rotate.input("amount")?.attributes["type"] ?? "float" == "float" else { try fail(unsupported) }
+    let degrees = try literal(rotate.input("amount"), .zero).x
+    guard degrees.isFinite, abs(degrees) <= 360 else { try fail("geometry_tangent rotation must be within -360 to 360 degrees.") }
+    return -degrees * .pi / 180
+  }
   // The interior medium's constants (MaterialXProgram.medium): scatter, depth, anisotropy and the boundary flag.
   func mediumInputs(_ shader: MXElement) throws -> (medium: SIMD4<Float>?, anisotropy: Float?, boundary: Bool?) {
     func constant(_ name: String, _ type: String, _ fallback: SIMD4<Float>) throws -> SIMD4<Float> {
@@ -849,8 +892,10 @@ private final class MXCompiler {
       && !inputs.contains(where: { $0.0 == i.name }) && !spectralNames.contains(i.name)
       && !(thinWalled == true && subsurfaceNames.contains(i.name))
     {
-      // These default to geometric frames (Tworld/Nworld), which the renderer already uses.
+      // These default to geometric frames (Tworld/Nworld), which the renderer already uses; a rotated
+      // geometry_tangent is read below (tangentRotation).
       let frames = ["geometry_tangent": "Tworld", "geometry_coat_normal": "Nworld", "geometry_coat_tangent": "Tworld"]
+      if i.name == "geometry_tangent", linked(i) { continue }
       if let frame = frames[i.name] {
         guard !linked(i), i.attributes["value"] == nil,
           (i.attributes["defaultgeomprop"] ?? frame) == frame
@@ -941,6 +986,10 @@ private final class MXCompiler {
     program.thinWalled = thinWalled
     (program.subsurfaceWeight, program.subsurfaceColor, program.subsurfaceAnisotropy) = subsurface
     (program.medium, program.mediumAnisotropy, program.mediumBoundary) = try mediumInputs(shader)
+    if let tangent = shader.input("geometry_tangent"), linked(tangent) {
+      let rotation = try tangentRotation(tangent)
+      if rotation != 0 { program.anisotropyRotation = rotation }
+    }
     let scale = spectralValues["transmission_dispersion_scale"] ?? 0
     let abbe = spectralValues["transmission_dispersion_abbe_number"] ?? 20
     let spectral = SIMD4<Float>(
