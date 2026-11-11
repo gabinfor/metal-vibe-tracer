@@ -161,18 +161,16 @@ final class StudioController: NSViewController {
   private var activityCancelHandler: (() -> Void)?
   private var activityTimer: Timer?
   private var statusAtEdge: NSLayoutConstraint!, statusAfterActivity: NSLayoutConstraint!
-  // The empty start state shown at launch (SceneBrowserView); nil once a document is loaded.
-  fileprivate(set) var startScreen: SceneBrowserView?
-  // The browser reopened over the loaded document (browseScenes); nil when it is not shown.
-  fileprivate(set) var sceneBrowser: SceneBrowserView?
+  // The "No scene loaded" placeholder (NoSceneView) covering the content until a document is loaded; nil once one is.
+  fileprivate(set) var startScreen: NoSceneView?
+  // The Scenes window with the app's scene browser, created by AppDelegate at launch.
+  let scenes: ScenesWindowController
   // The inspector's scene title, refreshed when the document's name changes.
   private weak var sceneTitleLabel: NSTextField?
-  var isBrowsingScenes: Bool { sceneBrowser != nil }
-  // Whichever browser is on screen, for the download and busy state it shows.
-  var visibleBrowser: SceneBrowserView? { startScreen ?? sceneBrowser }
+  var isBrowsingScenes: Bool { scenes.isVisible }
   // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
   var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
-  // Set while the start screen restores the last session, which keeps its autosave file.
+  // Set while Restore Last Session restores the last session, which keeps its autosave file.
   fileprivate var restoringSession = false
   private(set) var errorMessage: String?
   private(set) lazy var errorButton = ActionButton("") { [weak self] in self?.showErrorDetails() }
@@ -182,7 +180,7 @@ final class StudioController: NSViewController {
   var importInProgress = false { didSet { busyStateChanged() } }
   var usdImportJob: USDImportJob?
   // The scene browser's download in progress (ExampleScenes.swift): its job, scene and latest progress, which
-  // a browser shows again when it is next presented.
+  // the browser shows while the scene's card is selected.
   var exampleDownload: ExampleSceneDownload?
   var downloadingScene: SceneEntry?
   var downloadProgress: (fraction: Double, status: String)?
@@ -213,7 +211,7 @@ final class StudioController: NSViewController {
   // Tests redirect the recovery files; production uses Application Support.
   var autosaveURL = StudioController.defaultAutosaveURL
   // Downloaded example scenes (ExampleScenes.swift); tests redirect them too.
-  var exampleLibrary = ExampleLibrary()
+  var exampleLibrary = ExampleLibrary() { didSet { scenes.browser.library = exampleLibrary } }
   private(set) var autosaveSuppressed = false
   // Shared with autosaveQueue: the newest queued snapshot and the revision last written.
   private struct AutosaveState {
@@ -301,9 +299,10 @@ final class StudioController: NSViewController {
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 
-  init(renderer: PathTracerRenderer, window: NSWindow) {
+  init(renderer: PathTracerRenderer, window: NSWindow, scenes: ScenesWindowController) {
     self.renderer = renderer
     hostWindow = window
+    self.scenes = scenes
     viewport = InteractiveMTKView(frame: .zero, device: renderer.device)
     super.init(nibName: nil, bundle: nil)
     viewport.renderer = renderer
@@ -328,6 +327,7 @@ final class StudioController: NSViewController {
     renderer.onSpectralShadersReady = { [weak self] in self?.rebuild(); self?.refreshActivity() }
     renderer.onKernelsReady = { [weak self] in self?.rebuild(); self?.refreshActivity() }
     installMenus()
+    connectSceneBrowser()
     updateWindowTitle()
     rebuild()
   }
@@ -1455,7 +1455,7 @@ final class StudioController: NSViewController {
       activityCancelHandler = nil
       refreshActivity()
     }
-    visibleBrowser?.setActionsEnabled(enabled)
+    scenes.browser.setActionsEnabled(enabled)
     for button in busyButtons { button.isEnabled = enabled }
     pauseButton?.isEnabled = enabled
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
@@ -1504,7 +1504,7 @@ final class StudioController: NSViewController {
       activityBar.stopAnimation(nil)
     }
     // A load started from the scene browser shows its progress there too.
-    visibleBrowser?.setProgress(activity?.snapshot)
+    scenes.browser.setProgress(activity?.snapshot)
     if visible, activityTimer == nil {
       let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
         MainActor.assumeIsolated { self?.refreshActivity() }
@@ -1569,7 +1569,7 @@ final class StudioController: NSViewController {
   // export settings, saved views) keeps the accumulated samples and OIDN preview.
   func applyProject(_ p: ProjectDocument, resources: MaterialLibrary?, resourcesChanged: Bool = true) {
     if startScreen != nil { dismissStartScreen() }
-    closeSceneBrowser()
+    scenes.hide()
     isRestoring = true
     defer { isRestoring = false }
     let r = renderer
@@ -1751,14 +1751,14 @@ final class StudioController: NSViewController {
     }
   }
   // Standard Save / Don't Save / Cancel prompt before Open, New and Open Scene File
-  // replace an edited document.
+  // replace an edited document, as a sheet on sheetWindow.
   func confirmDiscardingChanges(_ proceed: @escaping () -> Void) {
     guard !isBusy else { return }
     if documentEdited, let answer = unsavedChangesAnswer {
       answer { [weak self] response in self?.resolveUnsavedChanges(response, proceed) }
       return
     }
-    guard documentEdited, let window = hostWindow else {
+    guard documentEdited, let window = sheetWindow else {
       proceed()
       return
     }
@@ -1947,7 +1947,7 @@ final class StudioController: NSViewController {
         // The file on disk (or its preserved copy) already holds this state.
         self.markAutosaved()
         self.restoringSession = false
-        self.startScreen?.setRestore(Self.autosaveDate(at: url))
+        if self.startScreen != nil { self.scenes.browser.setRestore(Self.autosaveDate(at: url)) }
         self.rebuild()
         self.finishProjectOperation()
       }
@@ -2522,74 +2522,64 @@ final class StudioController: NSViewController {
   @objc func restartAction() { restart() }
 }
 
-// The scene browser (SceneBrowserView): the empty start state at launch, and reopened over a loaded document.
+// The "No scene loaded" state and the Scenes window (ScenesWindowController) with the scene browser.
 extension StudioController {
-  // Covers the viewport and inspector with `view` and pauses the viewport.
-  private func present(_ view: SceneBrowserView) {
-    view.reload()
-    view.onAction = { [weak self] action in self?.performStartAction(action) }
-    view.onDownload = { [weak self] entry in self?.beginSceneDownload(entry) }
-    view.onCancelDownload = { [weak self] in self?.cancelSceneDownload() }
-    view.onCredits = { [weak self] in self?.showExampleCredits() }
-    view.onCancelPending = nil
-    view.setPending(nil)
-    view.setActionsEnabled(!isBusy)
-    view.setDownload(downloadingScene, fraction: downloadProgress?.fraction, status: downloadProgress?.status)
-    view.translatesAutoresizingMaskIntoConstraints = false
-    view.removeFromSuperview()
-    self.view.addSubview(view)
+  // The Scenes window while it is the key window, else the main window: where the scene browser's sheets and open
+  // panels attach.
+  var sheetWindow: NSWindow? { scenes.window?.isKeyWindow == true ? scenes.window : hostWindow }
+  // Takes over the browser from the launch state (AppDelegate): its actions, downloads and credits now go through the
+  // studio.
+  private func connectSceneBrowser() {
+    let browser = scenes.browser
+    browser.library = exampleLibrary
+    browser.onAction = { [weak self] action in self?.performStartAction(action) }
+    browser.onDownload = { [weak self] entry in self?.beginSceneDownload(entry) }
+    browser.onCancelDownload = { [weak self] in self?.cancelSceneDownload() }
+    browser.onCredits = { [weak self] in self?.showExampleCredits() }
+    browser.onCancelPending = nil
+    browser.setPending(nil)
+    browser.setActionsEnabled(!isBusy)
+    browser.setDownload(downloadingScene, fraction: downloadProgress?.fraction, status: downloadProgress?.status)
+  }
+  // No document loaded: the No scene loaded placeholder covers the viewport and inspector until a document loads, and
+  // the browser offers the last session. Nothing renders meanwhile, and no autosave is written, so the last session
+  // stays restorable.
+  func showStartScreen() {
+    scenes.browser.setRestore(Self.autosaveDate(at: autosaveURL))
+    guard startScreen == nil else { return }
+    let placeholder = NoSceneView { [weak self] in self?.browseScenes() }
+    placeholder.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(placeholder)
     NSLayoutConstraint.activate([
-      view.topAnchor.constraint(equalTo: self.view.topAnchor),
-      view.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
-      view.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
-      view.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
+      placeholder.topAnchor.constraint(equalTo: view.topAnchor),
+      placeholder.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      placeholder.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      placeholder.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
     ])
+    startScreen = placeholder
     viewport.isPaused = true
     viewport.isHidden = true
     updateWindowTitle()
-    refreshActivity()
   }
-  private func resumeViewport() {
+  // A loaded document (applyProject) removes the placeholder and resumes the viewport. Unless the last session was
+  // restored, its autosave becomes the recovery copy (Autosave-previous.vtrace) before this session's first autosave
+  // can replace it.
+  func dismissStartScreen() {
+    guard let placeholder = startScreen else { return }
+    placeholder.removeFromSuperview()
+    startScreen = nil
+    scenes.browser.setRestore(nil)
+    if !restoringSession { retireLastSessionAutosave() }
     viewport.isHidden = false
     viewport.isPaused = false
     renderer.lastTick = awakeSeconds()
     updateWindowTitle()
-    refreshActivity()
   }
-  // The launch state: `given` (the launch screen, reused) covers the viewport and inspector until a document loads.
-  // Nothing renders meanwhile, and no autosave is written, so the last session stays restorable.
-  func showStartScreen(_ given: SceneBrowserView? = nil) {
-    let view = given ?? SceneBrowserView(library: exampleLibrary)
-    view.setRestore(Self.autosaveDate(at: autosaveURL))
-    startScreen = view
-    present(view)
-  }
-  // A loaded document (applyProject) replaces the start screen. Unless the last session was
-  // restored, its autosave becomes the recovery copy (Autosave-previous.vtrace) before this
-  // session's first autosave can replace it.
-  func dismissStartScreen() {
-    guard let view = startScreen else { return }
-    view.removeFromSuperview()
-    startScreen = nil
-    if !restoringSession { retireLastSessionAutosave() }
-    resumeViewport()
-  }
-  // Shows the browser over the loaded document, with a Close button; Esc closes it too. The document stays loaded and
-  // autosave keeps running; the last session is not offered for restoring.
+  // Shows the Scenes window, or brings it to the front, whether or not a document is loaded. The viewport keeps
+  // rendering and the document is untouched; applyProject hides the window again.
   func browseScenes() {
-    guard !isBusy, startScreen == nil, sceneBrowser == nil else { return }
-    let view = SceneBrowserView(library: exampleLibrary)
-    view.onClose = { [weak self] in self?.closeSceneBrowser() }
-    sceneBrowser = view
-    present(view)
-    hostWindow?.makeFirstResponder(view)
-  }
-  // Removes the browser and resumes the viewport; the document is untouched.
-  func closeSceneBrowser() {
-    guard let view = sceneBrowser else { return }
-    view.removeFromSuperview()
-    sceneBrowser = nil
-    resumeViewport()
+    guard !isBusy else { return }
+    scenes.show()
   }
   private func retireLastSessionAutosave() {
     let current = autosaveURL, previous = previousAutosaveURL
@@ -2615,7 +2605,7 @@ extension StudioController {
       restoreAutosave()
       if !openInFlight { restoringSession = false }
     case .openProject(nil), .openScene(nil):
-      guard let window = hostWindow else { return }
+      guard let window = sheetWindow else { return }
       SceneBrowserView.chooseFile(for: action, window: window) { [weak self] chosen in self?.performStartAction(chosen) }
     }
   }
@@ -2652,10 +2642,9 @@ extension StudioController: NSMenuItemValidation {
       item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
     }
     if isBusy { return false }
-    // A browser covers the document: only the commands that open one apply.
-    if startScreen != nil || sceneBrowser != nil {
-      // Browse Scenes is off while a browser is already showing.
-      return [#selector(openAction), #selector(openSceneFileAction)].contains(item.action)
+    // With no document loaded only the commands that open one apply.
+    if startScreen != nil {
+      return [#selector(openAction), #selector(openSceneFileAction), #selector(browseScenesAction)].contains(item.action)
     }
     if item.action == #selector(undoAction) {
       item.title = history.undoMenuItemTitle

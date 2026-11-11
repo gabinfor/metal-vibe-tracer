@@ -6,7 +6,7 @@ enum SceneFile {
   static let extensions = ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions + ["obj"]
 }
 
-// What the start screen asks for. A nil URL asks with an open panel first.
+// What the scene browser asks for. A nil URL asks with an open panel first.
 enum StartAction {
   case openProject(URL?), openScene(URL?), restoreSession
   // The SceneCatalog entry with this id. A download scene that is not installed does nothing (its Download button in
@@ -14,11 +14,10 @@ enum StartAction {
   case scene(String)
 }
 
-// The scene browser (docs/SCENE_BROWSER_DESIGN.md §4), the window's empty start state: nothing is loaded and nothing
-// renders until the user opens a project or a scene file, opens a catalog scene or restores the last session. A top row
-// of file actions sits over filters and search, a grid of scene cards and the details pane of the selected card.
-// While the GPU shaders compile at launch (AppDelegate) it shows their progress and the action queued until they are
-// ready; afterwards StudioController shows it over the viewport, and again over a loaded document with a Close button.
+// The scene browser (docs/SCENE_BROWSER_DESIGN.md §4), the content of the Scenes window (ScenesWindowController): a top
+// row of file actions (open a project or a scene file, restore the last session) over filters and search, a grid of
+// scene cards and the details pane of the selected card. While the GPU shaders compile at launch (AppDelegate) it shows
+// their progress and the action queued until they are ready; afterwards StudioController drives it.
 final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionViewDelegate {
   enum Filter: Int, CaseIterable { case all, builtIn, included, downloads, installed }
   var onAction: ((StartAction) -> Void)?
@@ -30,8 +29,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   var onCancelPending: (() -> Void)?
   // The Credits and licenses… link; nil hides it (the launch state, before the studio can show the credits sheet).
   var onCredits: (() -> Void)? { didSet { creditsButton.isHidden = onCredits == nil } }
-  // The Close button and Esc; nil hides the button and ignores Esc (the launch state, where there is nothing to return to).
-  var onClose: (() -> Void)? { didSet { closeButton.isHidden = onClose == nil } }
   var filter: Filter = .all { didSet { applyFilter() } }
   var search = "" {
     didSet {
@@ -48,12 +45,12 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     }
   }
 
-  private let library: ExampleLibrary
+  // Gives the download scenes' installed state and remaining sizes; setting it reloads the cards and details.
+  var library: ExampleLibrary { didSet { reload() } }
   private var actionButtons: [NSButton] = []
   private var actionsEnabled = true
   private let restoreRow = NSStackView()
   private let restoreInfo = NSTextField(labelWithString: "")
-  private let closeButton = ActionButton("Close") {}
   private let progressRow = NSStackView()
   private let progressBar = NSProgressIndicator()
   private let progressLabel = NSTextField(labelWithString: "")
@@ -92,7 +89,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   private var downloadError: (id: String, message: String)?
   private static let cardIdentifier = NSUserInterfaceItemIdentifier("scene-card")
 
-  // `library` gives the download scenes' installed state and remaining sizes.
   init(library: ExampleLibrary = ExampleLibrary()) {
     self.library = library
     super.init(frame: .zero)
@@ -143,8 +139,9 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   required init?(coder: NSCoder) { fatalError() }
 
   override var acceptsFirstResponder: Bool { true }
+  // Esc hides the Scenes window.
   override func cancelOperation(_ sender: Any?) {
-    onClose?()
+    (window?.windowController as? ScenesWindowController)?.hide()
   }
   override func updateLayer() {
     layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
@@ -192,10 +189,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     let spacer = NSView()
     spacer.setContentHuggingPriority(.init(1), for: .horizontal)
     row.addArrangedSubview(spacer)
-    closeButton.actionBlock = { [weak self] in self?.onClose?() }
-    closeButton.identifier = NSUserInterfaceItemIdentifier("scene-close")
-    closeButton.isHidden = true
-    row.addArrangedSubview(closeButton)
     row.detachesHiddenViews = true
 
     progressBar.style = .bar
@@ -598,7 +591,7 @@ extension SceneBrowserView {
       if response == .OK, let url = panel.url { chosen(make(url)) }
     }
   }
-  // What a queued action will do, for the start screen ("Opening Sponza.vtrace").
+  // What a queued action will do, for the browser's pending row ("Opening Sponza.vtrace").
   static func describe(_ action: StartAction) -> String {
     switch action {
     case .openProject(let url): return "Opening \(url?.lastPathComponent ?? "a project")"
@@ -607,6 +600,93 @@ extension SceneBrowserView {
     case .restoreSession: return "Restoring the last session"
     }
   }
+}
+
+// The Scenes window: the app's one scene browser in its own window, which opens at launch in front of the main window
+// and is shown again by File › Browse Scenes… and the Browse buttons. Its close button and Esc hide it; it is never
+// released. `ordersOnScreen` false keeps the window off screen and only tracks `isVisible` (the test suite).
+final class ScenesWindowController: NSWindowController, NSWindowDelegate {
+  let browser: SceneBrowserView
+  // Whether the window is shown: set by show() and hide().
+  private(set) var isVisible = false
+  private let ordersOnScreen: Bool
+  private weak var parent: NSWindow?
+  // Until the window is first shown without a remembered frame, when it is centred over `parent`.
+  private var needsPlacement: Bool
+
+  init(browser: SceneBrowserView = SceneBrowserView(), over parent: NSWindow? = nil, ordersOnScreen: Bool = true) {
+    self.browser = browser
+    self.parent = parent
+    self.ordersOnScreen = ordersOnScreen
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700), styleMask: [.titled, .closable, .resizable],
+      backing: .buffered, defer: false)
+    window.title = "Scenes"
+    window.identifier = NSUserInterfaceItemIdentifier("scenes-window")
+    window.isReleasedWhenClosed = false
+    window.contentMinSize = NSSize(width: 700, height: 440)
+    window.contentView = browser
+    window.initialFirstResponder = browser
+    needsPlacement = true
+    if ordersOnScreen {
+      needsPlacement = !window.setFrameUsingName("ScenesWindow")
+      window.setFrameAutosaveName("ScenesWindow")
+    }
+    super.init(window: window)
+    window.delegate = self
+  }
+  required init?(coder: NSCoder) { fatalError() }
+
+  // Shows the window and makes it key, or brings it to the front when it is already shown.
+  func show() {
+    isVisible = true
+    guard ordersOnScreen, let window else { return }
+    if needsPlacement {
+      needsPlacement = false
+      if let parent {
+        let frame = window.frame, around = parent.frame
+        window.setFrameOrigin(NSPoint(x: around.midX - frame.width / 2, y: around.midY - frame.height / 2))
+      } else {
+        window.center()
+      }
+    }
+    window.makeKeyAndOrderFront(nil)
+  }
+  func hide() {
+    isVisible = false
+    window?.orderOut(nil)
+  }
+  // The close button (and Close Window) hides the window instead of closing it.
+  func windowShouldClose(_ sender: NSWindow) -> Bool {
+    hide()
+    return false
+  }
+}
+
+// The main window's content while no document is loaded: a grey "No scene loaded" placeholder with a Browse Scenes…
+// button that shows the Scenes window.
+final class NoSceneView: NSView {
+  init(browse: @escaping () -> Void) {
+    super.init(frame: .zero)
+    wantsLayer = true
+    identifier = NSUserInterfaceItemIdentifier("no-scene")
+    let label = NSTextField(labelWithString: "No scene loaded")
+    label.font = .systemFont(ofSize: 17, weight: .medium)
+    label.textColor = .secondaryLabelColor
+    let button = ActionButton("Browse Scenes…", browse)
+    button.identifier = NSUserInterfaceItemIdentifier("no-scene-browse")
+    let stack = NSStackView(views: [label, button])
+    stack.orientation = .vertical
+    stack.spacing = 12
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.centerXAnchor.constraint(equalTo: centerXAnchor), stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+    ])
+  }
+  required init?(coder: NSCoder) { fatalError() }
+  override var wantsUpdateLayer: Bool { true }
+  override func updateLayer() { layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor }
 }
 
 private extension SceneEntry.Format {

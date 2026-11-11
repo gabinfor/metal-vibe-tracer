@@ -1,6 +1,6 @@
-// Launch start state (AppDelegate, SceneBrowserView): background shader compilation with on-demand
-// kernel groups, the scene browser of the empty start screen, the kept and restorable last-session
-// autosave, and the activity strip of project operations.
+// Launch state (AppDelegate, SceneBrowserView, ScenesWindowController): background shader compilation with
+// on-demand kernel groups, the "No scene loaded" placeholder and the Scenes window, the kept and restorable
+// last-session autosave, and the activity strip of project operations.
 @MainActor func fixStartScreenChecks() throws {
   let folder = studioDirectory.absoluteURL.appendingPathComponent("fix-start-screen", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -56,25 +56,47 @@
   let lastSession = try Data(contentsOf: controller.autosaveURL)
   try? FileManager.default.removeItem(at: controller.previousAutosaveURL)
 
-  // The start screen: nothing renders, only open and import commands apply, quitting keeps the autosave.
+  func views<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
+    view.subviews.flatMap { ($0 as? T).map { [$0] } ?? [] } + view.subviews.flatMap { views(type, in: $0) }
+  }
+  // The Scenes window holds the app's one scene browser.
+  let scenes = controller.scenes, start = scenes.browser
+  require(scenes.window?.contentView === start && scenes.window?.title == "Scenes"
+    && scenes.window?.identifier?.rawValue == "scenes-window" && scenes.window?.styleMask.contains(.resizable) == true
+    && scenes.window?.contentMinSize == NSSize(width: 700, height: 440) && scenes.window?.isReleasedWhenClosed == false,
+    "the scene browser lives in the resizable Scenes window, which is kept when closed")
+  scenes.hide()
+
+  // No document loaded: the No scene loaded placeholder covers the paused viewport and the inspector; nothing renders,
+  // only open and import commands apply, quitting keeps the autosave.
   controller.showStartScreen()
   controller.view.layoutSubtreeIfNeeded()
-  guard let start = controller.startScreen else { return require(false, "the start screen is shown") }
-  require(controller.viewport.isPaused && controller.viewport.isHidden && start.frame.width > 300,
-    "the start screen covers the paused viewport")
+  guard let placeholder = controller.startScreen, placeholder.superview === controller.view,
+    placeholder.identifier?.rawValue == "no-scene"
+  else { return require(false, "the no-scene placeholder is in the controller's view") }
+  require(controller.viewport.isPaused && controller.viewport.isHidden && placeholder.frame.width > 300
+    && views(NSTextField.self, in: placeholder).contains { $0.stringValue == "No scene loaded" },
+    "with no document the No scene loaded placeholder covers the paused, hidden viewport")
+  controller.browseScenes()
+  require(scenes.isVisible && controller.isBrowsingScenes, "Browse Scenes shows the Scenes window with no document loaded")
   start.cancelOperation(nil)
-  require(controller.startScreen === start && start.control("scene-close")?.isHidden == true && !controller.isBrowsingScenes,
-    "Esc does nothing at launch, where the browser has no Close button")
+  require(!scenes.isVisible && controller.startScreen === placeholder && controller.viewport.isHidden,
+    "Esc hides the Scenes window with no document loaded, and the placeholder stays")
+  let placeholderBrowse = views(NSButton.self, in: placeholder).first { $0.identifier?.rawValue == "no-scene-browse" }
+  require(placeholderBrowse?.title == "Browse Scenes…", "the placeholder has a Browse Scenes… button")
+  placeholderBrowse?.performClick(nil)
+  require(scenes.isVisible, "the placeholder's Browse Scenes… shows the Scenes window after it was hidden")
   if let rep = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) {
     controller.view.cacheDisplay(in: controller.view.bounds, to: rep)
     try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("start-screen.png"))
   }
+  start.filter = .all; start.search = ""
   require(start.control("start-restore")?.superview?.isHidden == false && start.control("start-open")?.isEnabled == true
     && (start.control("scene-filter-0") as? NSButton)?.state == .on && (start.control("scene-filter-1") as? NSButton)?.state == .off
-    && start.control("scene-credits")?.isHidden == false
-    && start.visibleEntries.count == SceneCatalog.entries.count && start.selection?.id == SceneCatalog.entries.first?.id
+    && start.control("scene-credits")?.isHidden == false && start.control("scene-close") == nil
+    && start.visibleEntries.count == SceneCatalog.entries.count
     && SceneBrowserView.describe(.scene("lantern-arcade")) == "Opening Lantern Arcade",
-    "the start screen offers open, restoring the autosaved session and the scene browser with every catalog scene")
+    "the Scenes window offers open, restoring the autosaved session and every catalog scene, and has no Close button")
 
   // The browser: filters, search, the details pane's primary button, the busy state and the minimum window size.
   let browser = SceneBrowserView(library: ExampleLibrary(root: folder.appendingPathComponent("library")))
@@ -137,9 +159,9 @@
     "included scenes open")
   (browser.control("scene-open") as? NSButton)?.performClick(nil)
   require(downloaded == ["sponza"] && actions == ["cornell-box"], "Download asks onDownload and Open sends .scene(id)")
-  require(browser.control("scene-close")?.isHidden == true && browser.control("scene-download-cancel")?.isHidden == true
+  require(browser.control("scene-close") == nil && browser.control("scene-download-cancel")?.isHidden == true
     && browser.control("scene-credits")?.isHidden == true,
-    "without onClose and onCredits there is no Close button or credits link, and no download progress until one is set")
+    "the browser has no Close button, no credits link without onCredits, and no download progress until one is set")
   var credits = 0
   browser.onCredits = { credits += 1 }
   (browser.control("scene-credits") as? NSButton)?.performClick(nil)
@@ -206,24 +228,30 @@
   func valid(_ selector: Selector) -> Bool {
     controller.validateMenuItem(NSMenuItem(title: "", action: selector, keyEquivalent: ""))
   }
-  require(!valid(#selector(StudioController.browseScenesAction)), "Browse Scenes is off at launch, where the browser shows")
+  require(scenes.isVisible && valid(#selector(StudioController.browseScenesAction)),
+    "Browse Scenes is available with no document loaded while the Scenes window shows (it brings it forward)")
+  scenes.hide()
+  require(valid(#selector(StudioController.browseScenesAction)), "Browse Scenes is available with no document loaded")
   require(valid(#selector(StudioController.openAction)) && valid(#selector(StudioController.openSceneFileAction))
     && !valid(#selector(StudioController.saveAction)) && !valid(#selector(StudioController.exportAction))
-    && !valid(#selector(StudioController.undoAction)), "the start screen enables only open and import commands")
+    && !valid(#selector(StudioController.undoAction)), "with no document only open, import and browse commands apply")
   testRenderer.options.exposure = 3
   controller.changed(reset: false)
   controller.saveTimer?.invalidate()
   try controller.flushAutosave()
   require((try? Data(contentsOf: controller.autosaveURL)) == lastSession,
-    "quitting from the start screen keeps the last session's autosave")
+    "quitting with no document loaded keeps the last session's autosave")
 
-  // Restore Last Session loads the autosave and keeps the file.
+  // Restore Last Session loads the autosave, keeps the file and hides the Scenes window.
+  controller.browseScenes()
   controller.performStartAction(.restoreSession)
   require(controller.projectOperationInProgress && !controller.activityStrip.isHidden,
     "restoring runs off the main thread with the activity strip shown")
   idle()
-  require(controller.startScreen == nil && testRenderer.options.exposure == 1.75 && !controller.viewport.isPaused
-    && controller.activityStrip.isHidden, "restoring the last session dismisses the start screen")
+  require(controller.startScreen == nil && placeholder.superview == nil && testRenderer.options.exposure == 1.75
+    && !controller.viewport.isPaused && !controller.viewport.isHidden && controller.activityStrip.isHidden && !scenes.isVisible
+    && start.control("start-restore")?.superview?.isHidden == true,
+    "restoring the last session removes the placeholder, hides the Scenes window and no longer offers Restore")
   controller.autosaveQueue.sync {}
   require(FileManager.default.fileExists(atPath: controller.autosaveURL.path)
     && !FileManager.default.fileExists(atPath: controller.previousAutosaveURL.path),
@@ -231,16 +259,14 @@
 
   // Another start action keeps the last session as the recovery copy before autosaving anew.
   controller.showStartScreen()
-  controller.associate(nil, edited: false, replaced: false)  // The start screen opens with nothing to discard.
+  controller.associate(nil, edited: false, replaced: false)  // No document loaded: nothing to discard.
+  controller.browseScenes()
   controller.performStartAction(.scene("cornell-box"))
   idle()
   controller.autosaveQueue.sync {}
   require(controller.startScreen == nil && testRenderer.sceneIndex == 1 && controller.projectURL == nil
-    && !controller.documentEdited, "a built-in scene opens as a new untitled project")
+    && !controller.documentEdited && !scenes.isVisible, "a built-in scene opens as a new untitled project and hides the Scenes window")
   require(!testRenderer.denoiserEnabled, "MetalFX is off in a new project")
-  func views<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
-    view.subviews.flatMap { ($0 as? T).map { [$0] } ?? [] } + view.subviews.flatMap { views(type, in: $0) }
-  }
   // The inspector's scene control names the current scene and opens the browser; the scene lists are gone.
   controller.page = 0
   controller.rebuild()
@@ -262,7 +288,8 @@
   require((try? Data(contentsOf: controller.previousAutosaveURL)) == lastSession,
     "starting another document keeps the last session as Autosave-previous.vtrace")
 
-  // Browsing over the loaded document: it stays loaded, autosave is untouched and Close resumes the render.
+  // The Scenes window over a loaded document: the document stays loaded, the render keeps running and the autosave is
+  // untouched while it is shown and hidden.
   let encoder = JSONEncoder()
   encoder.outputFormatting = .sortedKeys
   try controller.flushAutosave()
@@ -271,74 +298,83 @@
   let before = try encoder.encode(controller.project)
   func sameDocument() -> Bool { (try? encoder.encode(controller.project)) == before }
   let browseValid = NSMenuItem(title: "", action: #selector(StudioController.browseScenesAction), keyEquivalent: "")
-  require(controller.validateMenuItem(browseValid), "Browse Scenes is available over a document")
+  let saveValid = NSMenuItem(title: "", action: #selector(StudioController.saveAction), keyEquivalent: "")
+  require(!scenes.isVisible && controller.validateMenuItem(browseValid), "Browse Scenes is available over a document")
   controller.browseScenes()
-  require(!controller.validateMenuItem(browseValid), "Browse Scenes is off while the browser shows")
-  require(controller.isBrowsingScenes && controller.startScreen == nil && controller.viewport.isPaused
-    && controller.viewport.isHidden && sameDocument(),
-    "browseScenes shows the browser over the loaded document and pauses the viewport")
-  controller.view.layoutSubtreeIfNeeded()
-  guard let over = controller.sceneBrowser else { return require(false, "the browser is shown over the document") }
-  require(over.control("scene-close")?.isHidden == false && over.control("start-restore")?.superview?.isHidden == true
-    && over.control("scene-credits")?.isHidden == false && over.frame.width > 300,
-    "the browser over a document has Close and Credits and does not offer Restore Last Session")
-  // A card is found by its identifier scene-card-<id>, and selecting it fills the details pane.
-  guard let cards = views(NSCollectionView.self, in: over).first,
-    let index = over.visibleEntries.firstIndex(where: { $0.id == "abbe-row" }),
-    let card = views(NSView.self, in: over).first(where: { $0.identifier?.rawValue == "scene-card-abbe-row" })
+  require(controller.validateMenuItem(browseValid) && controller.validateMenuItem(saveValid),
+    "Browse Scenes stays available while the Scenes window shows (it brings it forward), and the document's commands too")
+  require(controller.isBrowsingScenes && scenes.isVisible && controller.startScreen == nil && !controller.viewport.isPaused
+    && !controller.viewport.isHidden && sameDocument(),
+    "browseScenes shows the Scenes window and the viewport is neither paused nor hidden")
+  require(start.control("start-restore")?.superview?.isHidden == true && start.control("scene-credits")?.isHidden == false,
+    "over a document the Scenes window has Credits and does not offer Restore Last Session")
+  // A card is found by its identifier scene-card-<id> once scrolled into view, and selecting it fills the details pane.
+  start.layoutSubtreeIfNeeded()
+  guard let cards = views(NSCollectionView.self, in: start).first,
+    let index = start.visibleEntries.firstIndex(where: { $0.id == "abbe-row" })
+  else { return require(false, "the browser's grid lists abbe-row") }
+  cards.scrollToItems(at: [IndexPath(item: index, section: 0)], scrollPosition: .top)
+  start.layoutSubtreeIfNeeded()
+  guard let card = views(NSView.self, in: start).first(where: { $0.identifier?.rawValue == "scene-card-abbe-row" })
   else { return require(false, "the browser shows a card with the identifier scene-card-abbe-row") }
   require(card.accessibilityLabel()?.hasSuffix(", Included") == true, "the card is labelled with its title and state")
   cards.selectionIndexPaths = [IndexPath(item: index, section: 0)]
   cards.delegate?.collectionView?(cards, didSelectItemsAt: cards.selectionIndexPaths)
-  require(over.selection?.id == "abbe-row" && over.control("scene-open")?.isHidden == false,
+  require(start.selection?.id == "abbe-row" && start.control("scene-open")?.isHidden == false,
     "selecting the card selects its scene and shows Open")
   controller.browseScenes()
-  require(controller.sceneBrowser === over, "browsing again keeps the open browser")
+  require(scenes.isVisible && scenes.browser === start && start.selection?.id == "abbe-row",
+    "browsing again brings the same window forward")
   controller.saveTimer?.invalidate()
   controller.autosaveQueue.sync {}
   require(StudioController.autosaveDate(at: controller.autosaveURL) == autosaved,
-    "browsing does not rewrite the autosave")
-  over.cancelOperation(nil)
-  require(!controller.isBrowsingScenes && over.superview == nil && !controller.viewport.isPaused
+    "showing the Scenes window does not rewrite the autosave")
+  start.cancelOperation(nil)
+  require(!controller.isBrowsingScenes && !scenes.isVisible && !controller.viewport.isPaused
     && !controller.viewport.isHidden && sameDocument(),
-    "Esc closes the browser, resumes the viewport and leaves the document untouched")
+    "Esc hides the Scenes window over a document, and the viewport and the document are untouched")
   controller.browseScenes()
-  (controller.sceneBrowser?.control("scene-close") as? NSButton)?.performClick(nil)
-  require(!controller.isBrowsingScenes && !controller.viewport.isPaused
+  scenes.hide()
+  controller.saveTimer?.invalidate()
+  controller.autosaveQueue.sync {}
+  require(!controller.isBrowsingScenes && !controller.viewport.isPaused && sameDocument()
     && StudioController.autosaveDate(at: controller.autosaveURL) == autosaved,
-    "Close resumes the viewport and the autosave is unchanged across browse and close")
-  // Opening a scene from the browser asks before discarding unsaved changes: Cancel keeps the browser, Don't Save
-  // opens the scene and dismisses it. The last session stays the recovery copy.
+    "hiding the Scenes window changes nothing, and the autosave is unchanged across show and hide")
+  // Opening a scene from the Scenes window asks before discarding unsaved changes: Cancel keeps the window, Don't Save
+  // opens the scene and hides it. The last session stays the recovery copy.
   controller.associate(nil, edited: true, replaced: false)
   var browsePrompts = 0
   var browseAnswer = NSApplication.ModalResponse.alertThirdButtonReturn
   controller.unsavedChangesAnswer = { respond in browsePrompts += 1; respond(browseAnswer) }
+  let editedBefore = try encoder.encode(controller.project)
   controller.browseScenes()
   controller.performStartAction(.scene("cornell-box"))
-  require(browsePrompts == 1 && controller.isBrowsingScenes && controller.documentEdited,
-    "cancelling the unsaved-changes prompt keeps the browser open and the document")
+  require(browsePrompts == 1 && scenes.isVisible && controller.documentEdited
+    && (try? encoder.encode(controller.project)) == editedBefore,
+    "cancelling the unsaved-changes prompt keeps the Scenes window open and the document unchanged")
   browseAnswer = .alertSecondButtonReturn
   controller.performStartAction(.scene("cornell-box"))
   idle()
   controller.autosaveQueue.sync {}
-  require(browsePrompts == 2 && !controller.isBrowsingScenes && !controller.viewport.isPaused && !controller.documentEdited
+  require(browsePrompts == 2 && !scenes.isVisible && !controller.viewport.isPaused && !controller.documentEdited
     && (try? Data(contentsOf: controller.previousAutosaveURL)) == lastSession,
-    "opening a scene from the browser discards the changes, dismisses it and keeps the recovery copy")
-  // Opening a project file or a bundled scene from the browser over an edited document asks first too; Cancel keeps both.
+    "opening a scene from the Scenes window discards the changes, hides the window once the document is applied and keeps the recovery copy")
+  // Opening a project file or a bundled scene from the Scenes window over an edited document asks first too; Cancel
+  // keeps both.
   let editedProject = try encoder.encode(controller.project)
   controller.associate(nil, edited: true, replaced: false)
   browseAnswer = .alertThirdButtonReturn
   controller.browseScenes()
   controller.performStartAction(.openProject(folder.appendingPathComponent("never-opened.vtrace")))
-  require(browsePrompts == 3 && controller.isBrowsingScenes && controller.documentEdited
+  require(browsePrompts == 3 && scenes.isVisible && controller.documentEdited
     && (try? encoder.encode(controller.project)) == editedProject && controller.projectURL == nil,
-    "opening a project from the browser asks first, and Cancel keeps the browser open and the document unchanged")
+    "opening a project from the Scenes window asks first, and Cancel keeps it open and the document unchanged")
   controller.performStartAction(.scene("abbe-row"))
   idle()
-  require(browsePrompts == 4 && controller.isBrowsingScenes && controller.documentEdited
+  require(browsePrompts == 4 && scenes.isVisible && controller.documentEdited
     && (try? encoder.encode(controller.project)) == editedProject,
-    "opening a bundled scene from the browser asks first, and Cancel keeps the browser open and the document unchanged")
-  controller.closeSceneBrowser()
+    "opening a bundled scene from the Scenes window asks first, and Cancel keeps it open and the document unchanged")
+  scenes.hide()
   controller.associate(nil, edited: false, replaced: false)
   controller.unsavedChangesAnswer = nil
 
@@ -346,7 +382,7 @@
   require(["glb", "gltf", "usdz", "usd", "obj"].allSatisfy(SceneFile.extensions.contains)
     && (start.control("start-open-scene") as? NSButton)?.title == "Open Scene File…" && start.control("start-import-obj") == nil
     && SceneBrowserView.describe(.openScene(URL(fileURLWithPath: "/tmp/Chair.glb"))) == "Opening Chair.glb",
-    "the start screen and SceneFile offer one Open Scene File entry for USD, glTF and OBJ")
+    "the Scenes window and SceneFile offer one Open Scene File entry for USD, glTF and OBJ")
   let sceneObj = folder.appendingPathComponent("quad.obj")
   try "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n".write(to: sceneObj, atomically: true, encoding: .utf8)
   let history = controller.history, groupsByEvent = history.groupsByEvent
@@ -395,6 +431,6 @@
   controller.associate(nil, edited: false, replaced: true)
   controller.saveTimer?.invalidate()
   controller.history.removeAllActions()
-  print("PASS: fix-start-screen empty start state, kept and restored autosave, activity strip")
+  print("PASS: fix-start-screen no-scene placeholder and Scenes window, kept and restored autosave, activity strip")
 }
 try fixStartScreenChecks()

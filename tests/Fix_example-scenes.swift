@@ -315,8 +315,10 @@
     return local
   }
   let mismatched = localInterior(sha256: String(repeating: "0", count: 64)), correct = localInterior(sha256: payloadDigest)
+  let scenes = controller.scenes, browser = scenes.browser
   controller.showStartScreen()
-  guard let browser = controller.startScreen else { return require(false, "the scene browser is shown") }
+  controller.browseScenes()
+  browser.filter = .all; browser.search = ""
   browser.selection = SceneCatalog.entry(interior.id)
   controller.beginSceneDownload(mismatched)
   require(controller.downloadingScene?.id == interior.id && browser.control("scene-download-cancel")?.isHidden == false
@@ -325,16 +327,18 @@
   let failure = (browser.control("scene-download-error") as? NSTextField)?.stringValue ?? ""
   require(controller.exampleDownload == nil && !controller.isInstalled(mismatched) && failure.contains("SHA-256")
     && browser.control("scene-download-error")?.isHidden == false && browser.control("scene-download")?.isHidden == false
-    && browser.control("scene-download-cancel")?.isHidden == true && controller.startScreen != nil,
+    && browser.control("scene-download-cancel")?.isHidden == true && controller.startScreen != nil && scenes.isVisible,
     "a digest mismatch shows its error in the pane, restores Download and leaves the scene missing: \(failure)")
-  // A download goes on when the browser is shown again, and the new browser shows its progress for its card.
+  // A download goes on while the Scenes window is hidden, and shows its progress for its card when it is shown again.
   controller.beginSceneDownload(mismatched)
-  controller.showStartScreen()
-  guard let again = controller.startScreen else { return require(false, "the scene browser is shown again") }
+  scenes.hide()
+  browser.selection = SceneCatalog.entry("sponza")
+  controller.browseScenes()
+  let again = browser
   again.selection = SceneCatalog.entry(interior.id)
-  require(controller.downloadingScene?.id == interior.id && controller.exampleDownload?.isCancelled == false
+  require(controller.downloadingScene?.id == interior.id && controller.exampleDownload?.isCancelled == false && scenes.isVisible
     && again.control("scene-download-cancel")?.isHidden == false && again.control("scene-download")?.isHidden == true,
-    "a download keeps running and shows its progress when the browser is shown again")
+    "a download keeps running while the Scenes window is hidden and shows its progress when it is shown again")
   controller.cancelSceneDownload()
   waitUntil({ controller.downloadingScene == nil }, seconds: 60)
   require(controller.status.stringValue.contains("cancelled") && !controller.isInstalled(mismatched)
@@ -365,12 +369,13 @@
     waitUntil({ !controller.isBusy }, seconds: 60)
   }
   require(controller.isInstalled(correct) && controller.startScreen == nil && testRenderer.sceneIndex == 6
-    && controller.project.importReport?.first == interior.attribution,
-    "a verified download installs the scene and opens it with its credit")
+    && controller.project.importReport?.first == interior.attribution && !scenes.isVisible,
+    "a verified download with the Scenes window shown and no document loaded installs the scene, opens it with its credit and hides the window")
   history.undo()
   waitUntil({ !controller.isBusy }, seconds: 60)
-  // A download that finishes over a document with unsaved changes asks nothing and replaces nothing: the browser
-  // reloads with the scene selected and Open showing. A download that finishes after the browser closed only reports it.
+  // A download that finishes over a document with unsaved changes asks nothing and replaces nothing: the Scenes window
+  // stays with the scene selected and Open showing. A download that finishes while the window is hidden only reports
+  // it, even over an unedited document. One that finishes over an unedited document with the window shown opens.
   let overLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-over", isDirectory: true))
   controller.exampleLibrary = overLibrary
   controller.associate(nil, edited: true, replaced: false)
@@ -378,32 +383,48 @@
   controller.unsavedChangesAnswer = { respond in discardPrompts += 1; respond(.alertThirdButtonReturn) }
   let editedScene = testRenderer.sceneIndex
   controller.browseScenes()
-  guard let over = controller.sceneBrowser else { return require(false, "the browser is shown over the document") }
+  let over = browser
   over.selection = SceneCatalog.entry("sponza")
   require(over.control("scene-show-in-finder")?.isHidden == true, "Show in Finder is hidden for a download that is missing")
   over.selection = correct
   controller.beginSceneDownload(correct)
   waitUntil({ controller.downloadingScene == nil }, seconds: 60)
   waitUntil({ !controller.isBusy }, seconds: 60)
-  require(controller.isInstalled(correct) && discardPrompts == 0 && controller.documentEdited && controller.isBrowsingScenes
+  require(controller.isInstalled(correct) && discardPrompts == 0 && controller.documentEdited && scenes.isVisible
     && testRenderer.sceneIndex == editedScene && controller.project.importReport?.first != interior.attribution
     && over.selection?.id == interior.id && over.control("scene-open")?.isHidden == false
     && over.control("scene-download")?.isHidden == true
     && controller.status.stringValue == "\(interior.title) is downloaded; open it from the scene browser.",
     "a download finishing over an edited document does not prompt or replace it, selects the scene and shows Open: \(controller.status.stringValue)")
   require(over.control("scene-show-in-finder")?.isHidden == false, "Show in Finder is visible for an installed download")
-  controller.closeSceneBrowser()
+  scenes.hide()
   let closedLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-closed", isDirectory: true))
   controller.exampleLibrary = closedLibrary
+  controller.associate(nil, edited: false, replaced: false)
   controller.browseScenes()
+  browser.selection = SceneCatalog.entry("sponza")
   controller.beginSceneDownload(correct)
-  controller.closeSceneBrowser()
+  scenes.hide()
   waitUntil({ controller.downloadingScene == nil }, seconds: 60)
   waitUntil({ !controller.isBusy }, seconds: 60)
-  require(controller.isInstalled(correct) && discardPrompts == 0 && controller.documentEdited
+  require(controller.isInstalled(correct) && discardPrompts == 0 && !controller.documentEdited && !scenes.isVisible
     && testRenderer.sceneIndex == editedScene && controller.project.importReport?.first != interior.attribution
+    && browser.selection?.id == interior.id && browser.control("scene-open")?.isHidden == false
     && controller.status.stringValue == "\(interior.title) is downloaded; open it from the scene browser.",
-    "a download finishing after the browser closed does not open the scene and reports it in the status line")
+    "a download finishing while the Scenes window is hidden does not open the scene, selects it and reports it in the status line")
+  let shownLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-shown", isDirectory: true))
+  controller.exampleLibrary = shownLibrary
+  controller.browseScenes()
+  grouped {
+    controller.beginSceneDownload(correct)
+    waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(controller.isInstalled(correct) && discardPrompts == 0 && testRenderer.sceneIndex == 6
+    && controller.project.importReport?.first == interior.attribution && !scenes.isVisible,
+    "a download finishing over an unedited document with the Scenes window shown opens the scene and hides the window")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
   controller.unsavedChangesAnswer = nil
   controller.associate(nil, edited: false, replaced: false)
   controller.exampleLibrary = downloadLibrary

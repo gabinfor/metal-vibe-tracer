@@ -418,9 +418,9 @@ extension StudioController {
     }
   }
   // The scene browser's Download button: downloads, verifies and extracts the missing archives while the details pane
-  // shows the progress. The download goes on when another card is selected or the browser is dismissed. A finished
-  // download reloads the browser and opens the scene when the browser is showing and nothing would be discarded (the
-  // launch browser, or a document without unsaved changes); otherwise it selects the scene, whose Open button shows,
+  // shows the progress. The download goes on when another card is selected or the Scenes window is hidden. A finished
+  // download reloads the browser and opens the scene when the Scenes window is shown and nothing would be discarded (no
+  // document loaded, or a document without unsaved changes); otherwise it selects the scene, whose Open button shows,
   // and says so in the status line. A failure or a cancel leaves the archives that finished installed.
   func beginSceneDownload(_ entry: SceneEntry) {
     guard entry.isDownload, !isInstalled(entry) else { return }
@@ -436,7 +436,7 @@ extension StudioController {
     exampleDownload = job
     downloadingScene = entry
     downloadProgress = (0, "Connecting to \(host)…")
-    visibleBrowser?.setDownload(entry, fraction: 0, status: downloadProgress?.status)
+    scenes.browser.setDownload(entry, fraction: 0, status: downloadProgress?.status)
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let result = Result { try job.install(entry, into: library) }
       DispatchQueue.main.async { [weak self] in self?.sceneDownloadFinished(entry, job, result) }
@@ -446,28 +446,29 @@ extension StudioController {
   private func sceneDownloadProgress(_ entry: SceneEntry, _ fraction: Double, _ message: String) {
     guard downloadingScene?.id == entry.id else { return }
     downloadProgress = (fraction, message)
-    visibleBrowser?.setDownload(entry, fraction: fraction, status: message)
+    scenes.browser.setDownload(entry, fraction: fraction, status: message)
   }
   private func sceneDownloadFinished(_ entry: SceneEntry, _ job: ExampleSceneDownload, _ result: Result<Void, Error>) {
     exampleDownload = nil
     downloadingScene = nil
     downloadProgress = nil
-    visibleBrowser?.setDownload(nil, fraction: nil, status: nil)
-    visibleBrowser?.reload()
+    scenes.browser.setDownload(nil, fraction: nil, status: nil)
+    scenes.browser.reload()
     switch result {
     case .success:
-      // Opens the scene only when that discards nothing: from the launch browser or over a document without changes.
-      if visibleBrowser != nil && !isBusy && (startScreen != nil || !documentEdited) {
+      // Opens the scene only when the Scenes window is shown and that discards nothing: with no document loaded or
+      // over a document without changes.
+      if scenes.isVisible && !isBusy && (startScreen != nil || !documentEdited) {
         openScene(entry)
       } else {
-        visibleBrowser?.selection = entry
+        scenes.browser.selection = entry
         show("\(entry.title) is downloaded; open it from the scene browser.")
       }
     case .failure where job.isCancelled:
       show("Download of \(entry.title) cancelled; finished archives are kept.")
     case .failure(let error):
       let message = "Could not download \(entry.title): \(error.localizedDescription)"
-      visibleBrowser?.showDownloadError(entry, message)
+      scenes.browser.showDownloadError(entry, message)
       showError(message)
     }
   }
@@ -536,7 +537,7 @@ extension StudioController {
     }
   }
   func showExampleCredits() {
-    guard let window = hostWindow else { return }
+    guard let window = sheetWindow else { return }
     let alert = NSAlert()
     alert.messageText = "Example scene credits"
     alert.informativeText =

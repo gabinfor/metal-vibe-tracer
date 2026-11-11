@@ -290,7 +290,7 @@ print("PASS: production render scale, MetalFX, sample/time limits, display-only 
 let application=NSApplication.shared
 application.setActivationPolicy(.prohibited)
 let testWindow=NSWindow(contentRect:NSRect(x:0,y:0,width:900,height:680),styleMask:[.titled,.resizable],backing:.buffered,defer:false)
-let controller=StudioController(renderer:testRenderer,window:testWindow)
+let controller=StudioController(renderer:testRenderer,window:testWindow,scenes:ScenesWindowController(ordersOnScreen:false))
 testWindow.contentView=controller.view
 controller.viewport.isPaused=true
 // Autosaves from test edits stay in the run directory, never the user's Application Support.

@@ -13,9 +13,10 @@ func launchTrace(_ event: String) {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   var window: NSWindow!
   var studio: StudioController!
-  // Until the launch shader compilation finishes: the start screen, the compilation's progress and
+  // The Scenes window with the scene browser, handed to the studio once it exists.
+  private(set) var scenes: ScenesWindowController!
+  // Until the launch shader compilation finishes: the compilation's progress, shown in the browser, and
   // the start action the user chose meanwhile, performed once the renderer exists.
-  private(set) var startScreen: SceneBrowserView?
   private var launchProgress: OperationProgress?
   private var launchTimer: Timer?
   private var launchStarted = Date()
@@ -70,9 +71,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     studio?.exampleDownload?.cancel()
   }
 
-  // The window opens at once on the empty start screen; the GPU shaders compile in the background
-  // (minutes on the first launch of a new build, while the Metal compiler service fills its cache)
-  // and the studio replaces the launch screen when they are ready.
+  // The main window opens at once on the "No scene loaded" placeholder, with the Scenes window in front
+  // of it; the GPU shaders compile in the background (minutes on the first launch of a new build, while
+  // the Metal compiler service fills its cache) and the studio takes over both windows when they are ready.
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.regular)
     guard let device = MTLCreateSystemDefaultDevice() else {
@@ -89,14 +90,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     window.delegate = self
     window.contentMinSize = NSSize(width: 700, height: 440)
     window.center()
-    let start = SceneBrowserView()
-    start.setRestore(StudioController.autosaveDate(at: StudioController.defaultAutosaveURL))
-    start.onAction = { [weak self] action in self?.queueStartAction(action) }
-    start.onCancelPending = { [weak self] in self?.cancelPendingStart() }
-    startScreen = start
-    window.contentView = start
+    window.contentView = NoSceneView { [weak self] in self?.scenes.show() }
+    let scenes = ScenesWindowController(over: window)
+    scenes.browser.setRestore(StudioController.autosaveDate(at: StudioController.defaultAutosaveURL))
+    scenes.browser.onAction = { [weak self] action in self?.queueStartAction(action) }
+    scenes.browser.onCancelPending = { [weak self] in self?.cancelPendingStart() }
+    self.scenes = scenes
     installLaunchMenus()
     window.makeKeyAndOrderFront(nil)
+    scenes.show()
     NSApp.activate(ignoringOtherApps: true)
     launchTrace("window")
     compileShaders(device)
@@ -126,7 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     guard let progress = launchProgress else { return }
     // A cached build compiles in well under a second; explain only a compile that takes a while.
     let slow = Date().timeIntervalSince(launchStarted) > 2
-    startScreen?.setProgress(progress.snapshot, hint: slow
+    scenes.browser.setProgress(progress.snapshot, hint: slow
       ? "The first launch of a new build compiles the renderer's GPU shaders, which can take a few minutes. Later launches reuse them." : nil)
   }
 
@@ -136,13 +138,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     launchProgress = nil
     do {
       let renderer = try PathTracerRenderer(device: device, shaders: result.get())
-      let studio = StudioController(renderer: renderer, window: window)
+      scenes.browser.setProgress(nil)
+      let studio = StudioController(renderer: renderer, window: window, scenes: scenes)
       self.studio = studio
       window.contentView = studio.view
-      let start = startScreen ?? SceneBrowserView()
-      startScreen = nil
-      start.setProgress(nil)
-      studio.showStartScreen(start)
+      studio.showStartScreen()
       launchTrace("shaders-ready")
       // Warm the groups a first scene most likely needs: ReSTIR PT (imported scenes' default) and,
       // when it is the active transport, spectral transport; both compile in the background.
@@ -158,30 +158,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
   }
 
-  // Before the studio exists, open and import actions ask for their file at once and wait with it.
+  // Before the studio exists, open and import actions ask for their file at once (a sheet on the Scenes
+  // window while it is key, else on the main window) and wait with it.
   func queueStartAction(_ action: StartAction) {
     if let studio {
       studio.performStartAction(action)
       return
     }
-    guard pendingStart == nil, let window else { return }
-    SceneBrowserView.chooseFile(for: action, window: window) { [weak self] chosen in
+    guard pendingStart == nil, let window, let scenesWindow = scenes.window else { return }
+    SceneBrowserView.chooseFile(for: action, window: scenesWindow.isKeyWindow ? scenesWindow : window) { [weak self] chosen in
       guard let self, self.studio == nil else {
         self?.studio?.performStartAction(chosen)
         return
       }
       self.pendingStart = chosen
-      self.startScreen?.setPending(SceneBrowserView.describe(chosen) + " once the shaders are ready.")
-      self.startScreen?.setActionsEnabled(false)
+      self.scenes.browser.setPending(SceneBrowserView.describe(chosen) + " once the shaders are ready.")
+      self.scenes.browser.setActionsEnabled(false)
     }
   }
   private func cancelPendingStart() {
     pendingStart = nil
-    startScreen?.setPending(nil)
-    startScreen?.setActionsEnabled(true)
+    scenes.browser.setPending(nil)
+    scenes.browser.setActionsEnabled(true)
   }
 
-  // Quit, window commands and the start actions until StudioController installs the full menus.
+  // Quit, window commands, the start actions and Browse Scenes until StudioController installs the full menus.
   private func installLaunchMenus() {
     let main = NSMenu()
     func menu(_ title: String, _ entries: [(String, String, Selector, AnyObject?)]) {
@@ -202,6 +203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     menu("File", [
       ("Open Project…", "o", #selector(openProjectAction), self),
       ("Open Scene File…", "", #selector(openSceneFileAction), self),
+      ("Browse Scenes…", "O", #selector(browseScenesAction), self),
       ("Close Window", "w", #selector(NSWindow.performClose(_:)), nil),
     ])
     menu("Window", [("Minimize", "m", #selector(NSWindow.performMiniaturize(_:)), nil)])
@@ -209,4 +211,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   }
   @objc func openProjectAction() { queueStartAction(.openProject(nil)) }
   @objc func openSceneFileAction() { queueStartAction(.openScene(nil)) }
+  @objc func browseScenesAction() { scenes.show() }
 }
