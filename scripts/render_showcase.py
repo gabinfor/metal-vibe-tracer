@@ -19,7 +19,8 @@ driver, so there is no second list here) but the SceneCatalog.thumbnailExempt sc
 scene: its scene index at the default view) at 960 x 540 with at most 256 spp and no denoiser, downsampled to
 480 x 270 and written as JPEG (quality 0.85) to Examples/Thumbnails/<id>.jpg, with the ids in
 Examples/Thumbnails/scene-ids.txt for scripts/check_bundle.py. --only then names catalog ids. A scene whose files are
-not installed is skipped, and one whose render fails is reported, and both are listed at the end while the run goes on.
+not installed is skipped, and one whose render fails is reported, and both are listed at the end while the run goes on. A failed render removes that id's old JPEG and makes the exit status
+non-zero after every entry was tried; a skipped scene keeps its JPEG and the exit status is 0.
 The run always rewrites scene-ids.txt with every id that has a thumbnail, also with --only.
 Each line of progress is samples done / target and elapsed time.
 """
@@ -192,9 +193,12 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
     shot.name = "thumbnail-" + entry.id
     (shot.width, shot.height, shot.samples) = (960, 540, min(shot.samples ?? 256, 256))
     (shot.denoise, shot.raw, shot.keepRaw) = (false, false, nil)
+    // A failed render leaves no image, so the bundle check and the tests see it instead of a stale one.
+    let jpeg = thumbnailFolder.appendingPathComponent(entry.id + ".jpg")
+    try? FileManager.default.removeItem(at: jpeg)
     do {
       let png = try render(shot)
-      try writeThumbnail(png, to: thumbnailFolder.appendingPathComponent(entry.id + ".jpg"))
+      try writeThumbnail(png, to: jpeg)
       try? FileManager.default.removeItem(at: png)
       print("\(entry.id): wrote Examples/Thumbnails/\(entry.id).jpg")
     } catch {
@@ -202,8 +206,9 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
       failed.append(entry.id)
     }
   }
-  print(skipped.isEmpty && failed.isEmpty ? "All thumbnails rendered"
-    : "Skipped (files not installed): " + skipped.joined(separator: ", ") + "; failed: " + failed.joined(separator: ", "))
+  if !skipped.isEmpty { print("Skipped (files not installed): " + skipped.joined(separator: ", ")) }
+  if !failed.isEmpty { print("FAILED: " + failed.joined(separator: ", ")); exit(1) }
+  if skipped.isEmpty { print("All thumbnails rendered") }
 } else {
   for shot in shots { _ = try render(shot) }
 }
