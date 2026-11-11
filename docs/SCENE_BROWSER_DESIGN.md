@@ -89,7 +89,7 @@ Behaviour:
 ## 7. Errors
 
 - A missing thumbnail shows the placeholder; it never blocks opening.
-- A bundled scene missing from the bundle, a missing shot, a failed download, a size or digest mismatch and a full disk report the messages they reported before the browser, in the details pane's status line and the usual error alert.
+- A bundled scene missing from the bundle, a missing shot, a failed download, a size or digest mismatch and a full disk report their messages in the details pane's status line and the usual error alert.
 
 ## 8. Tests
 
