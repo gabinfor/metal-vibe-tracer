@@ -1202,7 +1202,7 @@ final class StudioController: NSViewController {
     heading("Object / surface group")
     selectObject()
     legacyObjectControls()
-    heading("Mesh import")
+    heading("Add model")
     text(project.meshName)
     button("Add Model…") { [weak self] in self?.addModel() }
     button("Frame imported mesh") { [weak self] in self?.frameMesh() }

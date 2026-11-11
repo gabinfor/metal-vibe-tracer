@@ -419,8 +419,9 @@ extension StudioController {
   }
   // The scene browser's Download button: downloads, verifies and extracts the missing archives while the details pane
   // shows the progress. The download goes on when another card is selected or the browser is dismissed. A finished
-  // download reloads the browser and opens the scene when the browser is showing; a failure or a cancel leaves the
-  // archives that finished installed.
+  // download reloads the browser and opens the scene when the browser is showing and nothing would be discarded (the
+  // launch browser, or a document without unsaved changes); otherwise it selects the scene, whose Open button shows,
+  // and says so in the status line. A failure or a cancel leaves the archives that finished installed.
   func beginSceneDownload(_ entry: SceneEntry) {
     guard entry.isDownload, !isInstalled(entry) else { return }
     if let running = downloadingScene {
@@ -455,9 +456,11 @@ extension StudioController {
     visibleBrowser?.reload()
     switch result {
     case .success:
-      if visibleBrowser != nil && !isBusy {
+      // Opens the scene only when that discards nothing: from the launch browser or over a document without changes.
+      if visibleBrowser != nil && !isBusy && (startScreen != nil || !documentEdited) {
         openScene(entry)
       } else {
+        visibleBrowser?.selection = entry
         show("\(entry.title) is downloaded; open it from the scene browser.")
       }
     case .failure where job.isCancelled:

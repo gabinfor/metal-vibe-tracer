@@ -369,6 +369,44 @@
     "a verified download installs the scene and opens it with its credit")
   history.undo()
   waitUntil({ !controller.isBusy }, seconds: 60)
+  // A download that finishes over a document with unsaved changes asks nothing and replaces nothing: the browser
+  // reloads with the scene selected and Open showing. A download that finishes after the browser closed only reports it.
+  let overLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-over", isDirectory: true))
+  controller.exampleLibrary = overLibrary
+  controller.associate(nil, edited: true, replaced: false)
+  var discardPrompts = 0
+  controller.unsavedChangesAnswer = { respond in discardPrompts += 1; respond(.alertThirdButtonReturn) }
+  let editedScene = testRenderer.sceneIndex
+  controller.browseScenes()
+  guard let over = controller.sceneBrowser else { return require(false, "the browser is shown over the document") }
+  over.selection = SceneCatalog.entry("sponza")
+  require(over.control("scene-show-in-finder")?.isHidden == true, "Show in Finder is hidden for a download that is missing")
+  over.selection = correct
+  controller.beginSceneDownload(correct)
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  require(controller.isInstalled(correct) && discardPrompts == 0 && controller.documentEdited && controller.isBrowsingScenes
+    && testRenderer.sceneIndex == editedScene && controller.project.importReport?.first != interior.attribution
+    && over.selection?.id == interior.id && over.control("scene-open")?.isHidden == false
+    && over.control("scene-download")?.isHidden == true
+    && controller.status.stringValue == "\(interior.title) is downloaded; open it from the scene browser.",
+    "a download finishing over an edited document does not prompt or replace it, selects the scene and shows Open: \(controller.status.stringValue)")
+  require(over.control("scene-show-in-finder")?.isHidden == false, "Show in Finder is visible for an installed download")
+  controller.closeSceneBrowser()
+  let closedLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-closed", isDirectory: true))
+  controller.exampleLibrary = closedLibrary
+  controller.browseScenes()
+  controller.beginSceneDownload(correct)
+  controller.closeSceneBrowser()
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  require(controller.isInstalled(correct) && discardPrompts == 0 && controller.documentEdited
+    && testRenderer.sceneIndex == editedScene && controller.project.importReport?.first != interior.attribution
+    && controller.status.stringValue == "\(interior.title) is downloaded; open it from the scene browser.",
+    "a download finishing after the browser closed does not open the scene and reports it in the status line")
+  controller.unsavedChangesAnswer = nil
+  controller.associate(nil, edited: false, replaced: false)
+  controller.exampleLibrary = downloadLibrary
   // Bundled thumbnails: one 480 x 270 image per scene but the exempt Stanford scans, listed in scene-ids.txt.
   require(SceneCatalog.thumbnailExempt == ["buddha", "chinese-dragon"], "the Stanford scans are exempt from thumbnails")
   let thumbnailIDs = SceneCatalog.entries.map(\.id).filter { !SceneCatalog.thumbnailExempt.contains($0) }

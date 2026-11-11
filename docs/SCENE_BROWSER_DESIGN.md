@@ -51,7 +51,7 @@ Download size and disk size come from the entry's archives through `ExampleLibra
 
 ## 4. Browser
 
-`SceneBrowserView` (`Sources/SceneBrowser.swift`) replaced the start screen. `StartAction.scene(id)` replaced `.builtInScene`, `.example` and `.download`. Every open path goes through `StudioController.openScene(_:)`, which confirms discarding changes and dispatches on the entry's source. `openScene` never starts a download: for a download entry that is not installed it does nothing. That entry's details pane has **Download** (`StudioController.beginSceneDownload`), which installs it and then opens it, and no **Open**. **Download** is disabled until the launch shader compile finishes, when the studio can download.
+`SceneBrowserView` (`Sources/SceneBrowser.swift`) replaced the start screen. `StartAction.scene(id)` replaced `.builtInScene`, `.example` and `.download`. Every open path goes through `StudioController.openScene(_:)`, which confirms discarding changes and dispatches on the entry's source. `openScene` never starts a download: for a download entry that is not installed it does nothing. That entry's details pane has **Download** (`StudioController.beginSceneDownload`), which installs it and then opens it when that discards nothing (the launch browser, or a document without unsaved changes; otherwise the entry is selected, **Open** shows and the status line says it is downloaded), and no **Open** until then. **Download** is disabled until the launch shader compile finishes, when the studio can download.
 
 Layout, top to bottom and left to right:
 
@@ -89,13 +89,13 @@ Behaviour:
 ## 7. Errors
 
 - A missing thumbnail shows the placeholder; it never blocks opening.
-- A bundled scene missing from the bundle, a missing shot, a failed download, a size or digest mismatch and a full disk report their messages in the details pane's status line and the usual error alert.
+- A failed download, a size or digest mismatch and a full disk show their message in the details pane, above **Download**, and in the usual error alert. A bundled scene missing from the bundle and a missing shot are reported by the error alert only.
 
 ## 8. Tests
 
-- `tests/Fix_example-scenes.swift` runs on `SceneCatalog`: unique ids, every non-built-in entry has a shot in `showcase.json`, every download entry has archives with a size and digest, markers, size and digest rejection, extraction, opening an installed scene without the network (and a missing one opening nothing), downloads from local archives (success, digest mismatch, cancel, a failure on the second archive, a download that outlives the browser), and one 480 × 270 thumbnail per entry but the exempted ones, listed in `scene-ids.txt`.
-- `tests/Fix_start-screen.swift` uses the identifiers `scene-card-<id>`, `scene-open`, `scene-download`, `scene-download-cancel`, `scene-close`, `start-open`, `start-open-scene` and `start-restore`, and covers filtering and search, selection, the busy state, the consent rule (no download starts without the button), **Browse Scenes** over a document and its discard prompts.
-- `scripts/check_bundle.py` checks the bundled thumbnails.
+- `tests/Fix_example-scenes.swift` runs on `SceneCatalog`: unique ids, every non-built-in entry has a shot in `showcase.json`, every download entry has archives with a size and digest, markers, size and digest rejection, extraction, opening an installed scene without the network (and a missing one opening nothing), downloads from local archives (success, digest mismatch, cancel, a failure on the second archive, a download that outlives the browser, and one that finishes over an edited document or after the browser closed, which opens nothing), and one 480 × 270 thumbnail per entry but the exempted ones, listed in `scene-ids.txt`.
+- `tests/Fix_start-screen.swift` uses the identifiers `scene-card-<id>` (a card is found and selected), `scene-open`, `scene-download`, `scene-download-cancel`, `scene-show-in-finder`, `scene-close`, `start-open`, `start-open-scene` and `start-restore`, and covers filtering and search, selection, the busy state, the consent rule (no download starts without the button), **Browse Scenes** over a document and its discard prompts (a scene, a bundled scene and a project file; Cancel keeps both).
+- `scripts/check_bundle.py` checks the bundled thumbnails: every listed id has one, identical to the repository's, and no other JPEG is bundled.
 - Per the project's test-timing rule, `tests/verify.py --only` checks during development and the full suite before release.
 
 ## 9. Documentation

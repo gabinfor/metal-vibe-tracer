@@ -9,8 +9,8 @@ enum SceneFile {
 // What the start screen asks for. A nil URL asks with an open panel first.
 enum StartAction {
   case openProject(URL?), openScene(URL?), restoreSession
-  // The SceneCatalog entry with this id. A download scene that is not installed is only selected in the browser,
-  // whose Download button downloads it.
+  // The SceneCatalog entry with this id. A download scene that is not installed does nothing (its Download button in
+  // the browser downloads it).
   case scene(String)
 }
 
@@ -424,11 +424,17 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     return find(self)
   }
   // The scene's bundled 480 x 270 render (scripts/render_showcase.py --thumbnails), decoded once, or nil for a scene
-  // without one.
+  // without one (also remembered).
   @MainActor private static var thumbnails: [String: NSImage] = [:]
+  @MainActor private static var withoutThumbnail: Set<String> = []
   @MainActor static func thumbnail(_ entry: SceneEntry) -> NSImage? {
     if let cached = thumbnails[entry.id] { return cached }
-    let image = SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg").flatMap { NSImage(contentsOf: $0) }
+    if withoutThumbnail.contains(entry.id) { return nil }
+    guard let image = SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg").flatMap({ NSImage(contentsOf: $0) })
+    else {
+      withoutThumbnail.insert(entry.id)
+      return nil
+    }
     thumbnails[entry.id] = image
     return image
   }

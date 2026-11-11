@@ -282,6 +282,16 @@
   require(over.control("scene-close")?.isHidden == false && over.control("start-restore")?.superview?.isHidden == true
     && over.control("scene-credits")?.isHidden == false && over.frame.width > 300,
     "the browser over a document has Close and Credits and does not offer Restore Last Session")
+  // A card is found by its identifier scene-card-<id>, and selecting it fills the details pane.
+  guard let cards = views(NSCollectionView.self, in: over).first,
+    let index = over.visibleEntries.firstIndex(where: { $0.id == "abbe-row" }),
+    let card = views(NSView.self, in: over).first(where: { $0.identifier?.rawValue == "scene-card-abbe-row" })
+  else { return require(false, "the browser shows a card with the identifier scene-card-abbe-row") }
+  require(card.accessibilityLabel()?.hasSuffix(", Included") == true, "the card is labelled with its title and state")
+  cards.selectionIndexPaths = [IndexPath(item: index, section: 0)]
+  cards.delegate?.collectionView?(cards, didSelectItemsAt: cards.selectionIndexPaths)
+  require(over.selection?.id == "abbe-row" && over.control("scene-open")?.isHidden == false,
+    "selecting the card selects its scene and shows Open")
   controller.browseScenes()
   require(controller.sceneBrowser === over, "browsing again keeps the open browser")
   controller.saveTimer?.invalidate()
@@ -294,7 +304,6 @@
     "Esc closes the browser, resumes the viewport and leaves the document untouched")
   controller.browseScenes()
   (controller.sceneBrowser?.control("scene-close") as? NSButton)?.performClick(nil)
-  controller.closeSceneBrowser()
   require(!controller.isBrowsingScenes && !controller.viewport.isPaused
     && StudioController.autosaveDate(at: controller.autosaveURL) == autosaved,
     "Close resumes the viewport and the autosave is unchanged across browse and close")
@@ -315,6 +324,22 @@
   require(browsePrompts == 2 && !controller.isBrowsingScenes && !controller.viewport.isPaused && !controller.documentEdited
     && (try? Data(contentsOf: controller.previousAutosaveURL)) == lastSession,
     "opening a scene from the browser discards the changes, dismisses it and keeps the recovery copy")
+  // Opening a project file or a bundled scene from the browser over an edited document asks first too; Cancel keeps both.
+  let editedProject = try encoder.encode(controller.project)
+  controller.associate(nil, edited: true, replaced: false)
+  browseAnswer = .alertThirdButtonReturn
+  controller.browseScenes()
+  controller.performStartAction(.openProject(folder.appendingPathComponent("never-opened.vtrace")))
+  require(browsePrompts == 3 && controller.isBrowsingScenes && controller.documentEdited
+    && (try? encoder.encode(controller.project)) == editedProject && controller.projectURL == nil,
+    "opening a project from the browser asks first, and Cancel keeps the browser open and the document unchanged")
+  controller.performStartAction(.scene("abbe-row"))
+  idle()
+  require(browsePrompts == 4 && controller.isBrowsingScenes && controller.documentEdited
+    && (try? encoder.encode(controller.project)) == editedProject,
+    "opening a bundled scene from the browser asks first, and Cancel keeps the browser open and the document unchanged")
+  controller.closeSceneBrowser()
+  controller.associate(nil, edited: false, replaced: false)
   controller.unsavedChangesAnswer = nil
 
   // Open Scene File: an OBJ opens as a new untitled scene; with unsaved changes the prompt comes first.

@@ -48,7 +48,11 @@ except (OSError, ValueError) as error:
 # without the scenes in SceneCatalog.thumbnailExempt, identical to the repository's.
 try:
     thumbnails = resources / "Examples/Thumbnails"
-    for scene_id in (thumbnails / "scene-ids.txt").read_text().split():
+    listed = (thumbnails / "scene-ids.txt").read_text().split()
+    for stray in sorted(thumbnails.glob("*.jpg")):
+        if stray.stem not in listed:
+            problems.append(f"Examples/Thumbnails/{stray.name} is not listed in scene-ids.txt")
+    for scene_id in listed:
         image = thumbnails / f"{scene_id}.jpg"
         if not image.is_file():
             problems.append(f"missing thumbnail Examples/Thumbnails/{scene_id}.jpg")
