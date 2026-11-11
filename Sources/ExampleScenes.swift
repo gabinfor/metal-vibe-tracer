@@ -419,8 +419,8 @@ extension StudioController {
   }
   // The scene browser's Download button: downloads, verifies and extracts the missing archives while the details pane
   // shows the progress. The download goes on when another card is selected or the Scenes window is hidden. A finished
-  // download reloads the browser and opens the scene when the Scenes window is shown and nothing would be discarded (no
-  // document loaded, or a document without unsaved changes); otherwise it selects the scene, whose Open button shows,
+  // download reloads the browser and opens the scene when the Scenes window is shown, with no sheet on it, and nothing
+  // would be discarded (no document loaded, or a document without unsaved changes); otherwise it selects the scene, whose Open button shows,
   // and says so in the status line. A failure or a cancel leaves the archives that finished installed.
   func beginSceneDownload(_ entry: SceneEntry) {
     guard entry.isDownload, !isInstalled(entry) else { return }
@@ -456,9 +456,9 @@ extension StudioController {
     scenes.browser.reload()
     switch result {
     case .success:
-      // Opens the scene only when the Scenes window is shown and that discards nothing: with no document loaded or
-      // over a document without changes.
-      if scenes.isVisible && !isBusy && (startScreen != nil || !documentEdited) {
+      // Opens the scene only when the Scenes window is shown without a sheet on it (opening would hide the window under
+      // the sheet) and that discards nothing: with no document loaded or over a document without changes.
+      if scenes.isVisible && scenes.window?.attachedSheet == nil && !isBusy && (startScreen != nil || !documentEdited) {
         openScene(entry)
       } else {
         scenes.browser.selection = entry

@@ -603,19 +603,18 @@ extension SceneBrowserView {
 }
 
 // The Scenes window: the app's one scene browser in its own window, which opens at launch in front of the main window
-// and is shown again by File › Browse Scenes… and the Browse buttons. Its close button and Esc hide it; it is never
-// released. `ordersOnScreen` false keeps the window off screen and only tracks `isVisible` (the test suite).
+// and is shown again by File › Browse Scenes… and the Browse buttons. Its close button closes it and Esc hides it; it
+// is never released. `ordersOnScreen` false keeps the window off screen and only tracks `isVisible` (the test suite).
 final class ScenesWindowController: NSWindowController, NSWindowDelegate {
-  let browser: SceneBrowserView
-  // Whether the window is shown: set by show() and hide().
+  let browser = SceneBrowserView()
+  // Whether the window is shown: set by show(), cleared by hide() and when the window closes.
   private(set) var isVisible = false
   private let ordersOnScreen: Bool
   private weak var parent: NSWindow?
   // Until the window is first shown without a remembered frame, when it is centred over `parent`.
   private var needsPlacement: Bool
 
-  init(browser: SceneBrowserView = SceneBrowserView(), over parent: NSWindow? = nil, ordersOnScreen: Bool = true) {
-    self.browser = browser
+  init(over parent: NSWindow? = nil, ordersOnScreen: Bool = true) {
     self.parent = parent
     self.ordersOnScreen = ordersOnScreen
     let window = NSWindow(
@@ -656,10 +655,18 @@ final class ScenesWindowController: NSWindowController, NSWindowDelegate {
     isVisible = false
     window?.orderOut(nil)
   }
-  // The close button (and Close Window) hides the window instead of closing it.
-  func windowShouldClose(_ sender: NSWindow) -> Bool {
+  // A document was opened: hides the window and brings the main window forward and makes it key (out of the Dock if it
+  // was minimized), so a window stays on screen.
+  func hideAfterOpening() {
+    guard isVisible else { return }
     hide()
-    return false
+    guard ordersOnScreen, let parent else { return }
+    if parent.isMiniaturized { parent.deminiaturize(nil) }
+    parent.makeKeyAndOrderFront(nil)
+  }
+  // The close button and Close Window close the window, which is kept for the next show().
+  func windowWillClose(_ notification: Notification) {
+    isVisible = false
   }
 }
 

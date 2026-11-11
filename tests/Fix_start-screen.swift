@@ -330,9 +330,11 @@
   require(StudioController.autosaveDate(at: controller.autosaveURL) == autosaved,
     "showing the Scenes window does not rewrite the autosave")
   start.cancelOperation(nil)
+  controller.browseScenes()
+  scenes.windowWillClose(Notification(name: NSWindow.willCloseNotification, object: scenes.window))
   require(!controller.isBrowsingScenes && !scenes.isVisible && !controller.viewport.isPaused
     && !controller.viewport.isHidden && sameDocument(),
-    "Esc hides the Scenes window over a document, and the viewport and the document are untouched")
+    "Esc and the close button hide the Scenes window over a document, and the viewport and the document are untouched")
   controller.browseScenes()
   scenes.hide()
   controller.saveTimer?.invalidate()
@@ -389,12 +391,38 @@
   history.groupsByEvent = false
   defer { history.groupsByEvent = groupsByEvent }
   func grouped(_ body: () -> Void) { history.beginUndoGrouping(); body(); history.endUndoGrouping() }
+  controller.browseScenes()
   grouped {
     controller.performStartAction(.openScene(sceneObj))
     idle()
   }
-  require(controller.startScreen == nil && controller.projectURL == nil
-    && controller.project.graph?.assets.map(\.geometry.count) == [2], "Open Scene File opens an OBJ as a new untitled scene")
+  require(controller.startScreen == nil && controller.projectURL == nil && !scenes.isVisible
+    && controller.project.graph?.assets.map(\.geometry.count) == [2],
+    "Open Scene File opens an OBJ as a new untitled scene and hides the Scenes window")
+  // Undo, redo and Add Model change the document but open none: the Scenes window stays shown.
+  controller.browseScenes()
+  history.undo()
+  idle()
+  require(scenes.isVisible && controller.project.graph?.assets.count != 1, "undoing an open leaves the Scenes window shown")
+  history.redo()
+  idle()
+  require(scenes.isVisible && controller.project.graph?.assets.map(\.geometry.count) == [2],
+    "redoing an open leaves the Scenes window shown")
+  let exposureBefore = testRenderer.options.exposure
+  grouped { controller.checkpoint("Exposure"); testRenderer.options.exposure = exposureBefore + 0.5 }
+  history.undo()
+  idle()
+  require(scenes.isVisible && testRenderer.options.exposure == exposureBefore, "undoing an edit leaves the Scenes window shown")
+  history.redo()
+  idle()
+  require(scenes.isVisible && testRenderer.options.exposure == exposureBefore + 0.5, "redoing an edit leaves the Scenes window shown")
+  let nodesBefore = controller.project.graph?.nodes.count ?? 0
+  grouped {
+    controller.beginImportOBJ(from: sceneObj)
+    idle()
+  }
+  require(scenes.isVisible && (controller.project.graph?.nodes.count ?? 0) > nodesBefore, "Add Model leaves the Scenes window shown")
+  scenes.hide()
   // Unsaved changes to an empty document, so that only a replacement brings the OBJ's graph back.
   try controller.restore(ProjectDocument())
   controller.associate(nil, edited: true, replaced: false)
@@ -424,6 +452,20 @@
     "a save shows its phase in the activity strip")
   idle()
   require(saved && controller.activityStrip.isHidden && controller.activity == nil, "the activity strip clears when the save ends")
+  // Opening a project and New hide the Scenes window too.
+  controller.browseScenes()
+  grouped {
+    controller.beginOpenProject(folder.appendingPathComponent("strip.vtrace"))
+    idle()
+  }
+  require(controller.projectURL?.lastPathComponent == "strip.vtrace" && !scenes.isVisible,
+    "opening a project hides the Scenes window")
+  controller.browseScenes()
+  grouped {
+    controller.newProject()
+    idle()
+  }
+  require(controller.projectURL == nil && !scenes.isVisible, "New hides the Scenes window")
 
   controller.viewport.isPaused = true
   controller.saveTimer?.invalidate()

@@ -1422,7 +1422,7 @@ final class StudioController: NSViewController {
       }
       // Undoing Open/New/USD open returns the previous file association too.
       if let association = record.association {
-        self.associate(association.url, edited: true, replaced: true)
+        self.associate(association.url, edited: true, replaced: true, undoing: true)
       }
       self.changed(reset: false)
     }
@@ -1440,10 +1440,12 @@ final class StudioController: NSViewController {
       MainActor.assumeIsolated { self?.autosave() }
     }
   }
-  // Records the file association after open/save/new and refreshes the recovery metadata.
-  func associate(_ url: URL?, edited: Bool, replaced: Bool) {
+  // Records the file association after open/save/new and refreshes the recovery metadata. A replaced document
+  // (an open or New, not an undo or redo of one) hides the Scenes window.
+  func associate(_ url: URL?, edited: Bool, replaced: Bool, undoing: Bool = false) {
     projectURL = url
     if replaced { documentIdentity &+= 1 }
+    if replaced && !undoing { scenes.hideAfterOpening() }
     documentEdited = edited
     documentRevision &+= 1
     scheduleAutosave()
@@ -1569,7 +1571,6 @@ final class StudioController: NSViewController {
   // export settings, saved views) keeps the accumulated samples and OIDN preview.
   func applyProject(_ p: ProjectDocument, resources: MaterialLibrary?, resourcesChanged: Bool = true) {
     if startScreen != nil { dismissStartScreen() }
-    scenes.hide()
     isRestoring = true
     defer { isRestoring = false }
     let r = renderer
@@ -1927,6 +1928,7 @@ final class StudioController: NSViewController {
         case .success(let (document, resources)):
           self.prepareGeneration &+= 1
           self.applyProject(document, resources: resources)
+          self.scenes.hideAfterOpening()
           // Recovered work keeps its file association and unsaved state.
           let path = document.recovery?.projectPath.map { URL(fileURLWithPath: $0) }
           self.projectURL = path.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
@@ -1959,7 +1961,7 @@ final class StudioController: NSViewController {
     panel.title = title
     panel.allowsMultipleSelection = false
     panel.allowedContentTypes = extensions.compactMap { UTType(filenameExtension: $0) }
-    guard let window = hostWindow else { return }
+    guard let window = sheetWindow else { return }
     panel.beginSheetModal(for: window) { response in
       if response == .OK, let url = panel.url { action(url) }
     }
@@ -2576,7 +2578,7 @@ extension StudioController {
     updateWindowTitle()
   }
   // Shows the Scenes window, or brings it to the front, whether or not a document is loaded. The viewport keeps
-  // rendering and the document is untouched; applyProject hides the window again.
+  // rendering and the document is untouched; opening a document hides the window again (associate, restoreAutosave).
   func browseScenes() {
     guard !isBusy else { return }
     scenes.show()
