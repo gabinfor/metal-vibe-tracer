@@ -19,8 +19,9 @@ driver, so there is no second list here) but the SceneCatalog.thumbnailExempt sc
 scene: its scene index at the default view) at 960 x 540 with at most 256 spp and no denoiser, downsampled to
 480 x 270 and written as JPEG (quality 0.85) to Examples/Thumbnails/<id>.jpg, with the ids in
 Examples/Thumbnails/scene-ids.txt for scripts/check_bundle.py. --only then names catalog ids. A scene whose files are
-not installed is skipped, and one whose render fails is reported, and both are listed at the end while the run goes on. A failed render removes that id's old JPEG and makes the exit status
-non-zero after every entry was tried; a skipped scene keeps its JPEG and the exit status is 0.
+not installed is skipped, and one whose render fails is reported, and both are listed at the end while the run goes
+on. A failed render removes that id's old JPEG and makes the exit status non-zero after every entry was tried; a
+skipped scene keeps its JPEG and the exit status is 0.
 The run always rewrites scene-ids.txt with every id that has a thumbnail, also with --only.
 Each line of progress is samples done / target and elapsed time.
 """
@@ -73,6 +74,11 @@ func waitFor(_ condition: () -> Bool, seconds: Double, every: Double = 0, report
 }
 let shotData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
 let outputFolder = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+// A shot that did not export, reported on stderr; thumbnail mode records it and goes on, showcase mode stops.
+struct ExportFailure: LocalizedError {
+  var errorDescription: String?
+}
+
 // Imports the shot's scene, applies its settings and exports it to outputFolder (PNG, or EXR for a raw shot).
 @MainActor func render(_ shot: ShowcaseShot) throws -> URL {
   var p: ProjectDocument
@@ -138,14 +144,14 @@ let outputFolder = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: t
   if denoise && shot.keepRaw == true {
     guard waitFor({ controller.exportDenoiseJob != nil || controller.exportRenderer == nil }, seconds: 3600, every: 30, report: report),
       let display = controller.exportOutput
-    else { fputs("FAIL: \(shot.name) did not reach denoising\n", stderr); exit(1) }
+    else { throw ExportFailure(errorDescription: "FAIL: \(shot.name) did not reach denoising") }
     let rawURL = outputFolder.appendingPathComponent(shot.name + "-raw.png")
     try RenderImage.write(texture: display, url: rawURL, hdr: false)
     print("\(shot.name): raw accumulation saved as \(rawURL.lastPathComponent)")
   }
   guard waitFor({ controller.exportRenderer == nil && controller.exportDenoiseJob == nil }, seconds: 3600, every: 30, report: report),
     FileManager.default.fileExists(atPath: url.path)
-  else { fputs("FAIL: \(shot.name) did not export\n", stderr); exit(1) }
+  else { throw ExportFailure(errorDescription: "FAIL: \(shot.name) did not export") }
   print("\(shot.name): \(p.options.outputWidth)x\(p.options.outputHeight), \(p.options.exportSamples) spp, "
     + "\(Int(Date().timeIntervalSince(start))) s, camera yaw \(p.camera.yaw) pitch \(p.camera.pitch) "
     + "distance \(p.camera.distance) fov \(p.camera.fov) target \(p.camera.target)")
@@ -210,7 +216,12 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
   if !failed.isEmpty { print("FAILED: " + failed.joined(separator: ", ")); exit(1) }
   if skipped.isEmpty { print("All thumbnails rendered") }
 } else {
-  for shot in shots { _ = try render(shot) }
+  for shot in shots {
+    do { _ = try render(shot) } catch let failure as ExportFailure {
+      fputs((failure.errorDescription ?? "FAIL") + "\n", stderr)
+      exit(1)
+    }
+  }
 }
 '''
 
