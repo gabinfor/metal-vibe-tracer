@@ -8,15 +8,15 @@
   try? manager.removeItem(at: folder)
   try manager.createDirectory(at: folder, withIntermediateDirectories: true)
 
-  // Catalog: every scene names a showcase shot of its own OBJ, and pinned McGuire archive downloads.
+  // Catalog: every scene names a showcase shot of its own scene file, and pinned archive downloads.
   let shots = try ShowcaseShot.bundled()
   func shot(_ name: String) throws -> ShowcaseShot {
     guard let found = shots.first(where: { $0.name == name }) else { throw MaterialLibrary.error("no \(name) shot") }
     return found
   }
   let entries = SceneCatalog.entries
-  require(Set(entries.map(\.id)).count == entries.count && entries.count == 21, "catalog ids are unique")
-  require(entries.filter(\.isDownload).compactMap(\.shot) == ["sponza-noon", "san-miguel-golden",
+  require(Set(entries.map(\.id)).count == entries.count && entries.count == 31, "catalog ids are unique")
+  require(entries.filter { $0.isDownload && $0.collection == .mcguire }.compactMap(\.shot) == ["sponza-noon", "san-miguel-golden",
     "bistro-exterior-golden", "bistro-interior", "bedroom", "breakfast-room", "buddha", "chinese-dragon",
     "fireplace-room", "living-room"], "download entries keep their shots")
   for entry in entries {
@@ -63,22 +63,87 @@
   require(entries.filter { !$0.isDownload }.allSatisfy { $0.attribution == nil && $0.archives.isEmpty && $0.credit == nil },
     "built-in and bundled scenes carry no credit and need no archive")
   let credits = SceneCatalog.credits
-  require(credits.count == 9 && credits.contains { $0.hasPrefix("Amazon Lumberyard Bistro © 2017") }
-    && credits.filter { $0.contains("creativecommons.org/licenses/by/") }.count == 6
+  require(credits.count == 19 && credits.contains { $0.hasPrefix("Amazon Lumberyard Bistro © 2017") }
+    && credits.filter { $0.contains("creativecommons.org/licenses/by/") }.count == 10
     && credits.contains { $0.hasPrefix("Bedroom") && $0.contains("creativecommons.org/licenses/by-sa/4.0/") }
-    && credits.filter { $0.contains("graphics.stanford.edu/data/3Dscanrep/") }.count == 2,
+    && credits.filter { $0.contains("graphics.stanford.edu/data/3Dscanrep/") }.count == 2
+    && credits.filter { $0.contains("creativecommons.org/publicdomain/zero/1.0/") }.count == 6
+    && credits.contains { $0.hasPrefix("The White Room © Jay-Artist. CC BY 3.0") }
+    && credits.contains { $0.hasPrefix("Glass of Water aXel. CC0 1.0") },
     "credits list each work once with its license: \(credits)")
   // The Stanford scans carry the repository's non-commercial and good-taste terms; the Bedroom's ShareAlike.
   require(catalog.filter { $0.terms == SceneCatalog.stanfordTerms }.map(\.shot) == ["buddha", "chinese-dragon"]
     && catalog[4].terms?.contains("CC BY-SA 4.0") == true, "per-scene terms: the Stanford scans' and the Bedroom's ShareAlike")
+  require(catalog.allSatisfy { $0.attribution?.contains("Morgan McGuire's Computer Graphics Archive (casual-effects.com/data). ") == true
+    && $0.attribution?.contains("Bitterli") == false }, "McGuire attributions name McGuire's archive")
+
+  // Bitterli's ten validated scenes: Mitsuba scene files in archives of benedikt-bitterli.me, each extracting into
+  // a folder of its archive's name, under a storage folder of its own.
+  let bitterliIDs = ["veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp", "kitchen",
+    "white-room", "grey-white-room", "modern-hall"]
+  let bitterliArchives = ["veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp", "kitchen",
+    "living-room-2", "living-room", "staircase2"]
+  let publicDomain = ["veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp"]
+  let bitterli = entries.filter { $0.collection == .bitterli }
+  require(bitterli.map(\.id) == bitterliIDs && entries.suffix(10).map(\.id) == bitterliIDs
+    && bitterli.allSatisfy { $0.format == .mitsuba && $0.isDownload && $0.triangles == nil && $0.materials == nil },
+    "the ten Bitterli scenes follow the McGuire ones as Mitsuba downloads")
+  require(bitterli.map(\.title) == ["Veach, Bidir Room", "Veach, Ajar", "Glass of Water", "Contemporary Bathroom",
+    "Water Caustic", "Little Lamp", "Country Kitchen", "The White Room", "The Grey & White Room", "Modern Hall"]
+    && bitterli.map(\.credit) == ["Benedikt Bitterli", "Benedikt Bitterli", "aXel", "Mareck", "Benedikt Bitterli", "UP3D",
+      "© Jay-Artist", "© Jay-Artist", "© Wig42", "© NewSee2l035"], "titles and credits")
+  require(bitterli.map(\.tags) == [["caustics", "glass"], ["glass", "textures"], ["caustics", "glass"],
+    ["glass", "textures"], ["caustics", "glass"], ["caustics", "glass"], ["glass", "textures"], ["glass", "textures"],
+    ["glass", "textures"], ["glass", "textures"]], "Bitterli tags")
+  let publicDomainTerms = "Public domain (CC0). Credit is appreciated but not required."
+  var bitterliStorages = Set<String>()
+  let mcguireStorages = Set(catalog.compactMap { scene -> String? in
+    if case .download(let storage, _, _) = scene.source { return storage }
+    return nil
+  })
+  for (scene, archiveName) in zip(bitterli, bitterliArchives) {
+    guard let shot = shots.first(where: { $0.name == scene.shot }), case .download(let storage, let file, let archives) = scene.source,
+      let archive = archives.first, let licenseURL = scene.licenseURL, let terms = scene.terms, let attribution = scene.attribution,
+      let credit = scene.credit
+    else {
+      require(false, "\(scene.id) is a download with a showcase shot, credit, license and terms")
+      continue
+    }
+    let sceneFile = scene.id == "water-caustic" ? "water-caustic/scene_v0.6.xml" : "\(archiveName)/scene_v3.xml"
+    require(scene.shot == "bitterli-\(scene.id)" && shot.mitsuba?.hasSuffix("/\(file)") == true && file == sceneFile
+      && shot.view == "Mitsuba: camera" && shot.obj == nil && shot.usd == nil && shot.scene == nil
+      && shot.width == nil && shot.height == nil && shot.samples == nil && shot.depth == nil
+      && shot.caustics == (scene.id == "water-caustic" ? 3 : nil), "\(scene.id) shot (\(shot.mitsuba ?? "none") vs \(file))")
+    require(archives.count == 1 && archive.name == "\(archiveName).zip" && archive.folder.isEmpty
+      && archive.url.scheme == "https" && archive.url.host == "benedikt-bitterli.me"
+      && archive.url.path == "/resources/mitsuba/\(archive.name)", "\(scene.id) downloads \(archive.url)")
+    require(archive.sha256.count == 64 && archive.sha256.allSatisfy { "0123456789abcdef".contains($0) }
+      && archive.bytes > 0 && archive.unpackedBytes > archive.bytes, "\(scene.id) pins its archive")
+    require(storage == "bitterli-\(archiveName)" && bitterliStorages.insert(storage).inserted
+      && !mcguireStorages.contains(storage), "\(scene.id) has a storage folder of its own: \(storage)")
+    if publicDomain.contains(scene.id) {
+      require(scene.license == "CC0 1.0" && licenseURL.absoluteString == "https://creativecommons.org/publicdomain/zero/1.0/"
+        && terms == publicDomainTerms, "\(scene.id) is CC0")
+    } else {
+      require(scene.license == "CC BY 3.0" && licenseURL.absoluteString == "https://creativecommons.org/licenses/by/3.0/"
+        && terms == SceneCatalog.entry("sponza")?.terms, "\(scene.id) is CC BY 3.0 with the default terms")
+    }
+    require(attribution == "\(scene.title): \(credit), from Benedikt Bitterli's Rendering Resources "
+      + "(benedikt-bitterli.me/resources). \(scene.license ?? "") (\(licenseURL.absoluteString)). \(terms)"
+      && !attribution.contains("McGuire"), "\(scene.id) attribution names Bitterli's resources")
+  }
+  require(bitterli.filter { $0.credit?.hasPrefix("© ") == true }.count == 4 && publicDomain.count == 6,
+    "four CC BY works and six CC0 works")
   let exterior = catalog[2], interior = catalog[3]
   let root = ExampleLibrary(root: folder)
   require(root.storage(exterior) == root.storage(interior)
     && Array(exterior.archives.dropFirst()) == Array(interior.archives.dropFirst())
     && exterior.archives.dropFirst().map(\.name) == ["BuildingTextures.zip", "OtherTextures.zip", "PropTextures.zip"],
     "the Bistro exterior and interior share one folder and its three texture archives")
-  require(SceneEntry.Collection.allCases.map(\.title) == ["Built-in", "Spectral examples", "McGuire Computer Graphics Archive"]
+  require(SceneEntry.Collection.allCases.map(\.title) == ["Built-in", "Spectral examples", "McGuire Computer Graphics Archive",
+      "Bitterli's Rendering Resources"]
     && SceneEntry.Collection.mcguire.website?.absoluteString == "https://casual-effects.com/data/"
+    && SceneEntry.Collection.bitterli.website?.absoluteString == "https://benedikt-bitterli.me/resources/"
     && SceneEntry.Collection.spectral.website == nil && interior.work == "Amazon Lumberyard Bistro",
     "collections name themselves and the archive's website")
   // Tags: the spectral scenes name their effect, textured downloads say so.
@@ -429,7 +494,8 @@
   controller.associate(nil, edited: false, replaced: false)
   controller.exampleLibrary = downloadLibrary
   // Bundled thumbnails: one 480 x 270 image per scene but the exempt Stanford scans, listed in scene-ids.txt.
-  require(SceneCatalog.thumbnailExempt == ["buddha", "chinese-dragon"], "the Stanford scans are exempt from thumbnails")
+  require(SceneCatalog.thumbnailExempt == Set(["buddha", "chinese-dragon"] + bitterliIDs),
+    "the Stanford scans and the Bitterli scenes, until their thumbnails are rendered, are exempt from thumbnails")
   let thumbnailIDs = SceneCatalog.entries.map(\.id).filter { !SceneCatalog.thumbnailExempt.contains($0) }
   let listed = SceneCatalog.bundledURL("Examples/Thumbnails/scene-ids.txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) }
   require(listed?.split(separator: "\n").map(String.init) == thumbnailIDs && thumbnailIDs.count == 19,

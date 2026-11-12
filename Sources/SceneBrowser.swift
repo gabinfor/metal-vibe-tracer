@@ -570,6 +570,7 @@ private extension SceneEntry.Format {
     case .procedural: return "Procedural"
     case .usd: return "OpenUSD"
     case .obj: return "OBJ"
+    case .mitsuba: return "Mitsuba"
     }
   }
 }

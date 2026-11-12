@@ -211,9 +211,9 @@
 
   // The browser: filters, search, the details pane's primary button, the busy state and the minimum window size.
   let browser = SceneBrowserView(library: ExampleLibrary(root: folder.appendingPathComponent("library")))
-  require(browser.visibleEntries.count == 21 && browser.selection?.id == "pavilion", "all scenes, first selected")
+  require(browser.visibleEntries.count == 31 && browser.selection?.id == "pavilion", "all scenes, first selected")
   browser.filter = .downloads
-  require(browser.visibleEntries.count == 10 && browser.visibleEntries.allSatisfy(\.isDownload), "downloads filter")
+  require(browser.visibleEntries.count == 20 && browser.visibleEntries.allSatisfy(\.isDownload), "downloads filter")
   browser.filter = .installed
   require(browser.visibleEntries.isEmpty && browser.selection == nil && browser.control("scene-empty")?.isHidden == false,
     "nothing installed")

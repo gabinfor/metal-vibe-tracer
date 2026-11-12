@@ -21,5 +21,15 @@
   {"name": "buddha", "obj": "build/scenes/buddha/buddha.obj", "width": 1600, "height": 900, "samples": 128, "sky": 0, "yaw": 0.0, "pitch": 0.1, "distance": 1.4, "fov": 45, "target": [0.0, 0.06, 0.0], "exposure": 0},
   {"name": "chinese-dragon", "obj": "build/scenes/dragon/dragon.obj", "width": 1600, "height": 900, "samples": 128, "sky": 0, "yaw": 1.5708, "pitch": 0.15, "distance": 1.8, "fov": 45, "target": [0.0, 0.07, 0.03], "exposure": 0},
   {"name": "fireplace-room", "obj": "build/scenes/fireplace_room/fireplace_room.obj", "width": 1600, "height": 900, "samples": 128, "sky": 0, "yaw": 1.3034, "pitch": -0.0745, "distance": 3.0, "fov": 58.72, "target": [2.2198, 0.9543, -1.5275], "exposure": 0},
-  {"name": "living-room", "obj": "build/scenes/living_room/living_room.obj", "width": 1600, "height": 900, "samples": 128, "sky": 0, "yaw": 2.6921, "pitch": 0.0366, "distance": 3.0, "fov": 58.72, "target": [0.9476, 1.2018, 3.4785], "exposure": 0}
+  {"name": "living-room", "obj": "build/scenes/living_room/living_room.obj", "width": 1600, "height": 900, "samples": 128, "sky": 0, "yaw": 2.6921, "pitch": 0.0366, "distance": 3.0, "fov": 58.72, "target": [0.9476, 1.2018, 3.4785], "exposure": 0},
+  {"name": "bitterli-veach-bidir", "mitsuba": "build/scenes/veach-bidir/veach-bidir/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-veach-ajar", "mitsuba": "build/scenes/veach-ajar/veach-ajar/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-glass-of-water", "mitsuba": "build/scenes/glass-of-water/glass-of-water/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-bathroom", "mitsuba": "build/scenes/bathroom/bathroom/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-water-caustic", "mitsuba": "build/scenes/water-caustic/water-caustic/scene_v0.6.xml", "view": "Mitsuba: camera", "caustics": 3},
+  {"name": "bitterli-lamp", "mitsuba": "build/scenes/lamp/lamp/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-kitchen", "mitsuba": "build/scenes/kitchen/kitchen/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-white-room", "mitsuba": "build/scenes/living-room-2/living-room-2/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-grey-white-room", "mitsuba": "build/scenes/living-room/living-room/scene_v3.xml", "view": "Mitsuba: camera"},
+  {"name": "bitterli-modern-hall", "mitsuba": "build/scenes/staircase2/staircase2/scene_v3.xml", "view": "Mitsuba: camera"}
 ]

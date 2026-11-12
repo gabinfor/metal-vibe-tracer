@@ -4,11 +4,12 @@ import Foundation
 // scenes: OPENPBR (thin film, dispersion), SCHOTTGLASS, DIAMANTI2014, OPENUSD (implicit prims, ShapingAPI),
 // BUCHOLTZ1995, PLANCK, CIEDATA (docs/VOLUME_DESIGN.md: media, light spectra, spot cones).
 // The one list of scenes the application offers (docs/SCENE_BROWSER_DESIGN.md): the built-in scenes, the OpenUSD
-// stages bundled in Examples/Spectral, and the scenes of Morgan McGuire's Computer Graphics Archive, which are
-// downloaded on request and opened with the camera and lighting of the scripts/showcase.json shot of their `shot`.
+// stages bundled in Examples/Spectral, the scenes of Morgan McGuire's Computer Graphics Archive and Benedikt Bitterli's
+// Mitsuba scenes (BITTERLI2016), which are downloaded on request and opened with the camera and lighting of the
+// scripts/showcase.json shot of their `shot`.
 
 struct SceneEntry: Sendable {
-  enum Collection: String, Sendable, CaseIterable { case builtIn, spectral, mcguire }
+  enum Collection: String, Sendable, CaseIterable { case builtIn, spectral, mcguire, bitterli }
   enum Source: Sendable {
     // An index into StudioController.sceneNames.
     case builtIn(Int)
@@ -17,7 +18,7 @@ struct SceneEntry: Sendable {
     // A folder under ExampleLibrary.root, the scene's file in it and the archives that provide it.
     case download(storage: String, file: String, archives: [ExampleArchive])
   }
-  enum Format: String, Sendable { case procedural, usd, obj }
+  enum Format: String, Sendable { case procedural, usd, obj, mitsuba }
   var id: String
   var title: String
   var summary: String
@@ -47,8 +48,7 @@ struct SceneEntry: Sendable {
   var work: String { title.components(separatedBy: " (")[0] }
   var attribution: String? {
     guard let credit, let license, let licenseURL, let terms else { return nil }
-    return "\(title): \(credit), from Morgan McGuire's Computer Graphics Archive (casual-effects.com/data). "
-      + "\(license) (\(licenseURL.absoluteString)). \(terms)"
+    return "\(title): \(credit), from \(collection.origin). \(license) (\(licenseURL.absoluteString)). \(terms)"
   }
 }
 
@@ -58,9 +58,24 @@ extension SceneEntry.Collection {
     case .builtIn: return "Built-in"
     case .spectral: return "Spectral examples"
     case .mcguire: return "McGuire Computer Graphics Archive"
+    case .bitterli: return "Bitterli's Rendering Resources"
     }
   }
-  var website: URL? { self == .mcguire ? URL(string: "https://casual-effects.com/data/") : nil }
+  var website: URL? {
+    switch self {
+    case .builtIn, .spectral: return nil
+    case .mcguire: return URL(string: "https://casual-effects.com/data/")
+    case .bitterli: return URL(string: "https://benedikt-bitterli.me/resources/")
+    }
+  }
+  // Where a credited work comes from, as the attribution and the credits sheet state it.
+  var origin: String {
+    switch self {
+    case .builtIn, .spectral: return ""
+    case .mcguire: return "Morgan McGuire's Computer Graphics Archive (casual-effects.com/data)"
+    case .bitterli: return "Benedikt Bitterli's Rendering Resources (benedikt-bitterli.me/resources)"
+    }
+  }
 }
 
 enum SceneCatalog {
@@ -79,6 +94,7 @@ enum SceneCatalog {
     archive("PropTextures.zip", "research/model/bistro/PropTextures", folder: "PropTextures", 415_421_476,
             unpacked: 416_385_050, "a179e4ee6367d2b518c4978d7e2e690c59503861634d67d0da8bacfa7196571a"),
   ]
+  private static let cc0 = URL(string: "https://creativecommons.org/publicdomain/zero/1.0/")!
   private static let cc30 = URL(string: "https://creativecommons.org/licenses/by/3.0/")!
   private static let cc40 = URL(string: "https://creativecommons.org/licenses/by/4.0/")!
   private static let ccBySA40 = URL(string: "https://creativecommons.org/licenses/by-sa/4.0/")!
@@ -91,6 +107,23 @@ enum SceneCatalog {
   private static func research(_ model: String, _ bytes: Int64, unpacked: Int64, _ sha256: String) -> [ExampleArchive] {
     [archive("\(model).zip", "research/model/\(model)/\(model).zip", folder: "", bytes, unpacked: unpacked, sha256)]
   }
+
+  // A Bitterli scene: one archive `<stem>.zip` of benedikt-bitterli.me/resources/mitsuba, extracted into the folder
+  // `<stem>` of the storage folder "bitterli-<stem>" (Bitterli's Living Room is not McGuire's "living_room"). Sizes and
+  // digests are those of the archives in build/scenes/downloads, whose sizes matched the server's Content-Length on
+  // 2026-11-12.
+  private static func bitterli(_ id: String, _ title: String, _ summary: String, stem: String, sceneFile: String = "scene_v3.xml",
+                               bytes: Int64, unpacked: Int64, sha256: String, tags: [String], credit: String,
+                               license: String = "CC0 1.0", licenseURL: URL, terms: String) -> SceneEntry {
+    let name = "\(stem).zip"
+    let archive = ExampleArchive(name: name, url: URL(string: "https://benedikt-bitterli.me/resources/mitsuba/" + name)!,
+                                 folder: "", bytes: bytes, unpackedBytes: unpacked, sha256: sha256)
+    return SceneEntry(id: id, title: title, summary: summary, collection: .bitterli,
+                      source: .download(storage: "bitterli-\(stem)", file: "\(stem)/\(sceneFile)", archives: [archive]),
+                      format: .mitsuba, tags: tags, credit: credit, license: license, licenseURL: licenseURL, terms: terms,
+                      shot: "bitterli-\(id)")
+  }
+  private static let publicDomainTerms = "Public domain (CC0). Credit is appreciated but not required."
 
   private static func builtIn(_ index: Int, _ id: String, _ summary: String, tags: [String] = []) -> SceneEntry {
     SceneEntry(id: id, title: StudioController.sceneNames[index], summary: summary, collection: .builtIn,
@@ -195,10 +228,54 @@ enum SceneCatalog {
                                "f14daf4f566871e18c262a450db9ae0285b7124e93e05b3a8bfbcbf674a21aeb"),
             triangles: 580_592, materials: 42, tags: ["textures"], credit: "© 2012 Jay-Artist", license: "CC BY 3.0",
             licenseURL: cc30),
+    bitterli("veach-bidir", "Veach, Bidir Room", "Veach's bidirectional path tracing test room",
+             stem: "veach-bidir", bytes: 3_617_538, unpacked: 4_507_749,
+             sha256: "22c93fdf6fa94b95a13e670f168d77dd7e91c02b9dbb55564692244b45dc313d", tags: ["caustics", "glass"],
+             credit: "Benedikt Bitterli", licenseURL: cc0, terms: publicDomainTerms),
+    bitterli("veach-ajar", "Veach, Ajar", "A room lit through a door ajar",
+             stem: "veach-ajar", bytes: 9_421_239, unpacked: 20_069_900,
+             sha256: "70f1cf84b1c4cbeead3c26d3bc6cab60519febf1b2076bc635af1eed3cdd3da2", tags: ["glass", "textures"],
+             credit: "Benedikt Bitterli", licenseURL: cc0, terms: publicDomainTerms),
+    bitterli("glass-of-water", "Glass of Water", "A glass of water",
+             stem: "glass-of-water", bytes: 11_401_226, unpacked: 50_923_597,
+             sha256: "0b27c1d45e570da9cd24196106d7ec8af6388bb8f092979bda7e789e0194cc88", tags: ["caustics", "glass"],
+             credit: "aXel", licenseURL: cc0, terms: publicDomainTerms),
+    bitterli("bathroom", "Contemporary Bathroom", "A contemporary bathroom",
+             stem: "bathroom", bytes: 26_111_702, unpacked: 72_030_229,
+             sha256: "59cf1c96e916d6873c0a421cd54b2be55b4da68f5f25720525f75d9afdbea562", tags: ["glass", "textures"],
+             credit: "Mareck", licenseURL: cc0, terms: publicDomainTerms),
+    bitterli("water-caustic", "Water Caustic", "Water casting a caustic",
+             stem: "water-caustic", sceneFile: "scene_v0.6.xml", bytes: 6_838_237, unpacked: 15_139_647,
+             sha256: "054d899c6da58532ba0e1055ed185fa4415519d4a34f79cd5dc94a20b4daa8ba", tags: ["caustics", "glass"],
+             credit: "Benedikt Bitterli", licenseURL: cc0, terms: publicDomainTerms),
+    bitterli("lamp", "Little Lamp", "A small lamp",
+             stem: "lamp", bytes: 20_967_786, unpacked: 102_969_217,
+             sha256: "614cbb8b4fb12592e575a13bfd343265b7065f393e9b9efd7d9baa990687cfcf", tags: ["caustics", "glass"],
+             credit: "UP3D", licenseURL: cc0, terms: publicDomainTerms),
+    bitterli("kitchen", "Country Kitchen", "A country kitchen",
+             stem: "kitchen", bytes: 26_620_413, unpacked: 143_346_369,
+             sha256: "a5bf67b75ec4da835b3de4ff36a3dd25b11575fab715b6242116bfb98c80f637", tags: ["glass", "textures"],
+             credit: "© Jay-Artist", license: "CC BY 3.0", licenseURL: cc30, terms: adaptedTerms),
+    bitterli("white-room", "The White Room", "A white living room",
+             stem: "living-room-2", bytes: 15_719_296, unpacked: 65_954_909,
+             sha256: "848553497c430de971e6924487ca0ac15629b61d61e276a454be1635d5b137d7", tags: ["glass", "textures"],
+             credit: "© Jay-Artist", license: "CC BY 3.0", licenseURL: cc30, terms: adaptedTerms),
+    bitterli("grey-white-room", "The Grey & White Room", "A grey and white living room",
+             stem: "living-room", bytes: 9_867_976, unpacked: 23_743_486,
+             sha256: "e028f7148c18355b1141e148439f371330b9499d4fab85491eca9b52c59728be", tags: ["glass", "textures"],
+             credit: "© Wig42", license: "CC BY 3.0", licenseURL: cc30, terms: adaptedTerms),
+    bitterli("modern-hall", "Modern Hall", "A modern hall with a staircase",
+             stem: "staircase2", bytes: 5_284_547, unpacked: 8_040_571,
+             sha256: "922bfaf428c58a7ea3886f5367194b68132b254b6ea6ba5414c12fe7bfce939e", tags: ["glass", "textures"],
+             credit: "© NewSee2l035", license: "CC BY 3.0", licenseURL: cc30, terms: adaptedTerms),
   ]
 
-  // The Stanford scans ship no thumbnail until their repository terms are confirmed for redistributed renders.
-  static let thumbnailExempt: Set<String> = ["buddha", "chinese-dragon"]
+  // The Stanford scans ship no thumbnail until their repository terms are confirmed for redistributed renders; the
+  // Bitterli scenes none until their thumbnails are rendered.
+  static let thumbnailExempt: Set<String> = [
+    "buddha", "chinese-dragon", "veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp",
+    "kitchen", "white-room", "grey-white-room", "modern-hall",
+  ]
   static func entry(_ id: String) -> SceneEntry? { entries.first { $0.id == id } }
   // One line per credited work, for the credits sheet.
   static var credits: [String] {
