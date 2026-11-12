@@ -1,7 +1,8 @@
 import Cocoa
+import Compression
 import simd
 
-// REFERENCES.md: MITSUBA3, BITTERLI2016, OPENPBR, MATERIALX, SRGB1999. Mitsuba scene files (.xml whose root element is
+// REFERENCES.md: MITSUBA3, BITTERLI2016, OPENPBR, MATERIALX, SRGB1999, OBJ2026, PLY1994, OPENEXRLAYOUT. Mitsuba scene files (.xml whose root element is
 // <scene>) open like OpenUSD stages. This layer reads and resolves the XML into a tree of Nodes; later
 // stages map the shapes, BSDFs and sensor onto the project. The XML layer's rules:
 //   <default name value>                      a $name variable, substituted in every attribute value, also
@@ -371,4 +372,670 @@ enum MitsubaImporter {
       return done
     }
   }
+}
+
+// Shapes as world-space triangles. REFERENCES.md: MITSUBA3 (the shape plugins and Mesh::recompute_vertex_normals,
+// v3.9.1), OBJ2026, PLY1994, OPENEXRLAYOUT (zlib streams).
+//   obj          v, vt, vn and f statements (negative indices count back from the last element read; polygons
+//                fan-triangulate); every other statement is ignored and the whole file is one mesh. Corners with
+//                the same (position, uv, normal) index triple share a vertex, and vertices no face uses are dropped,
+//                as in Mitsuba. Texture coordinates are flipped (1 - v) unless flip_tex_coords is false.
+//   ply          ascii and binary_little_endian; vertex x y z, optional nx ny nz and u v (or texture_u texture_v,
+//                or s t); face lists named vertex_indices or vertex_index, fan-triangulated. Texture coordinates
+//                are kept unless flip_tex_coords is true.
+//   serialized   format 0x041C, version 3 or 4; shape_index picks the sub-mesh through the offset table at the
+//                end of the file; positions, normals and texture coordinates in single or double precision.
+//                Texture coordinates are kept.
+//   normals      face_normals true gives none (the renderer uses face normals); a file or sub-mesh without
+//                normals gets Mitsuba's angle-weighted vertex normals; otherwise the file's normals, transformed
+//                by the inverse transpose of to_world's 3 x 3 and renormalized.
+//   texture      This project's v runs from the top of the image, as Mitsuba's does after its own OBJ flip, so
+//   coordinates  the other formats' coordinates and the analytic shapes' (Mitsuba's, and the converter's) are kept.
+//   rectangle    (-1, -1, 0) to (1, 1, 0), normal +z, uv 0 to 1.
+//   disk         radius 1, 64 triangles around the centre, normal +z, uv = 0.5 + 0.5 (x, y) (the converter's
+//                planar mapping; Mitsuba's own is polar).
+//   cube         -1 to 1 in 24 vertices (Mitsuba's order, one uv square per face), 12 triangles, no normals.
+//   sphere       center and radius (0 and 1) applied before to_world; 64 segments by 32 rings from the +z pole,
+//                smooth normals, uv (angle about z / 2 pi, angle from +z / pi).
+//   A to_world with a negative determinant reverses the winding of the analytic shapes, whose front side is the
+//   analytic normal's; file meshes keep their winding, as Mitsuba does.
+extension MitsubaImporter {
+  struct Mesh {
+    var positions: [SIMD3<Float>]
+    // nil: the renderer uses face normals.
+    var normals: [SIMD3<Float>]?
+    // v already flipped to this project's convention.
+    var uvs: [SIMD2<Float>]?
+    var triangles: [SIMD3<UInt32>]
+  }
+
+  // The shape as one world-space mesh; nil, with a report line, for a shape type that is not read. Errors name
+  // the file for an unreadable or malformed mesh.
+  static func mesh(_ shape: Node, scene: inout Scene) throws -> Mesh? {
+    let type = shape.type ?? "(no type)"
+    let toWorld = shape.transform("to_world")
+    let linear = simd_float3x3(columns: (toWorld.columns.0.xyz, toWorld.columns.1.xyz, toWorld.columns.2.xyz))
+    let determinant = simd_determinant(linear)
+    guard determinant.isFinite, determinant != 0 else {
+      scene.note("shape \(type) has a singular to_world; skipped")
+      return nil
+    }
+    switch type {
+    case "obj", "ply", "serialized":
+      guard let url = shape.url("filename") else { throw error("shape \(type) has no filename") }
+      let name = url.lastPathComponent
+      let data: Data
+      do { data = try Data(contentsOf: url, options: .alwaysMapped) } catch {
+        throw MitsubaImporter.error("cannot read \(name): \(error.localizedDescription)")
+      }
+      let faceNormals = shape.bool("face_normals") ?? false
+      let local: Mesh = try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+        switch type {
+        case "obj":
+          return try readOBJ(raw.bindMemory(to: UInt8.self), name: name, normals: !faceNormals, flipV: shape.bool("flip_tex_coords") ?? true)
+        case "ply":
+          return try readPLY(raw, name: name, normals: !faceNormals, flipV: shape.bool("flip_tex_coords") ?? false)
+        default:
+          return try readSerialized(raw, name: name, normals: !faceNormals, index: Int(shape.float("shape_index") ?? 0))
+        }
+      }
+      return world(local, toWorld, smoothNormals: !faceNormals)
+    case "rectangle", "disk", "cube", "sphere":
+      var mesh = world(unitShape(type, shape), toWorld, smoothNormals: false)
+      if determinant < 0 { mesh.triangles = mesh.triangles.map { SIMD3($0.x, $0.z, $0.y) } }
+      return mesh
+    default:
+      scene.note("shape \(type) is not supported; skipped")
+      return nil
+    }
+  }
+
+  // MARK: Placement and normals
+
+  // The mesh in world space. A mesh without normals gets smooth ones when asked; one with them has them
+  // transformed by the inverse transpose of the matrix's 3 x 3 and renormalized.
+  fileprivate static func world(_ local: Mesh, _ matrix: simd_float4x4, smoothNormals: Bool) -> Mesh {
+    var mesh = local
+    mesh.positions = local.positions.map { (matrix * SIMD4($0, 1)).xyz }
+    if let normals = local.normals {
+      let linear = simd_float3x3(columns: (matrix.columns.0.xyz, matrix.columns.1.xyz, matrix.columns.2.xyz))
+      let normalMatrix = linear.inverse.transpose
+      mesh.normals = normals.map { n in
+        let transformed = normalMatrix * n
+        let length = simd_length(transformed)
+        return length > 0 ? transformed / length : transformed
+      }
+    } else if smoothNormals {
+      mesh.normals = vertexNormals(mesh.positions, mesh.triangles)
+    }
+    return mesh
+  }
+
+  // Mitsuba's Mesh::recompute_vertex_normals: each triangle's unit normal weighted by its angle at the vertex.
+  // A vertex without a usable normal gets (1, 0, 0).
+  fileprivate static func vertexNormals(_ positions: [SIMD3<Float>], _ triangles: [SIMD3<UInt32>]) -> [SIMD3<Float>] {
+    func angle(_ u: SIMD3<Float>, _ v: SIMD3<Float>) -> Float {
+      simd_dot(u, v) < 0 ? .pi - 2 * asin(min(1, simd_length(v + u) / 2)) : 2 * asin(min(1, simd_length(v - u) / 2))
+    }
+    var sums = [SIMD3<Float>](repeating: .zero, count: positions.count)
+    for t in triangles {
+      let a = positions[Int(t.x)], b = positions[Int(t.y)], c = positions[Int(t.z)]
+      let n = simd_cross(b - a, c - a)
+      let lengthSquared = simd_length_squared(n)
+      guard lengthSquared > 0 else { continue }
+      let unit = n / lengthSquared.squareRoot()
+      let ab = simd_normalize(b - a), ac = simd_normalize(c - a), bc = simd_normalize(c - b)
+      sums[Int(t.x)] += unit * angle(ab, ac)
+      sums[Int(t.y)] += unit * angle(bc, -ab)
+      sums[Int(t.z)] += unit * angle(-ac, -bc)
+    }
+    return sums.map { sum in
+      let length = simd_length(sum)
+      return length != 0 ? sum / length : SIMD3(1, 0, 0)
+    }
+  }
+
+  // MARK: Analytic shapes
+
+  // Mitsuba's cube plugin's 24 vertices (outward counter-clockwise quads, four per face) and each quad's
+  // corner uvs; faces (0 1 2) (3 0 2) of every quad.
+  fileprivate static let cubePositions: [SIMD3<Float>] = [
+    [1, -1, -1], [1, -1, 1], [-1, -1, 1], [-1, -1, -1],
+    [1, 1, -1], [-1, 1, -1], [-1, 1, 1], [1, 1, 1],
+    [1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1],
+    [1, -1, 1], [1, 1, 1], [-1, 1, 1], [-1, -1, 1],
+    [-1, -1, 1], [-1, 1, 1], [-1, 1, -1], [-1, -1, -1],
+    [1, 1, -1], [1, -1, -1], [-1, -1, -1], [-1, 1, -1],
+  ]
+
+  // The unit shape in its own space (the shape's center and radius applied to a sphere), before to_world.
+  fileprivate static func unitShape(_ type: String, _ shape: Node) -> Mesh {
+    switch type {
+    case "rectangle":
+      return Mesh(positions: [[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], normals: Array(repeating: [0, 0, 1], count: 4),
+                  uvs: [[0, 0], [1, 0], [1, 1], [0, 1]], triangles: [[0, 1, 2], [0, 2, 3]])
+    case "disk":
+      let segments = 64
+      var positions: [SIMD3<Float>] = [[0, 0, 0]], uvs: [SIMD2<Float>] = [[0.5, 0.5]]
+      for i in 0..<segments {
+        let angle = 2 * Float.pi * Float(i) / Float(segments)
+        positions.append([cos(angle), sin(angle), 0])
+        uvs.append([0.5 + 0.5 * cos(angle), 0.5 + 0.5 * sin(angle)])
+      }
+      return Mesh(positions: positions, normals: Array(repeating: [0, 0, 1], count: segments + 1), uvs: uvs,
+                  triangles: (0..<segments).map { [0, UInt32(1 + $0), UInt32(1 + ($0 + 1) % segments)] })
+    case "cube":
+      let corners: [SIMD2<Float>] = [[0, 1], [1, 1], [1, 0], [0, 0]]
+      return Mesh(positions: cubePositions, normals: nil, uvs: (0..<24).map { corners[$0 % 4] },
+                  triangles: (0..<6).flatMap { f -> [SIMD3<UInt32>] in
+                    let b = UInt32(4 * f)
+                    return [[b, b + 1, b + 2], [b + 3, b, b + 2]]
+                  })
+    default:
+      let segments = 64, rings = 32
+      var positions: [SIMD3<Float>] = [], uvs: [SIMD2<Float>] = []
+      for i in 0...rings {
+        let theta = Float.pi * Float(i) / Float(rings)
+        for j in 0...segments {
+          let phi = 2 * Float.pi * Float(j) / Float(segments)
+          positions.append([sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta)])
+          uvs.append([Float(j) / Float(segments), Float(i) / Float(rings)])
+        }
+      }
+      var triangles: [SIMD3<UInt32>] = []
+      for i in 0..<rings {
+        for j in 0..<segments {
+          // The quad a b c d is two triangles; at a pole two of its corners coincide and one triangle is dropped.
+          let a = UInt32(i * (segments + 1) + j), d = a + 1
+          let b = a + UInt32(segments + 1), c = b + 1
+          if i > 0 { triangles.append([a, c, d]) }
+          if i < rings - 1 { triangles.append([a, b, c]) }
+        }
+      }
+      let center = point(shape.child("center")) ?? .zero, radius = shape.float("radius") ?? 1
+      return Mesh(positions: positions.map { center + radius * $0 }, normals: positions, uvs: uvs, triangles: triangles)
+    }
+  }
+
+  // A <point> or <vector> as three numbers (value="x, y, z" or x, y and z attributes, missing ones 0).
+  fileprivate static func point(_ node: Node?) -> SIMD3<Float>? {
+    guard let node, node.tag == "point" || node.tag == "vector" else { return nil }
+    if let value = node.attributes["value"] {
+      guard let v = numbers(value), v.count == 3 else { return nil }
+      return SIMD3(v[0], v[1], v[2])
+    }
+    func axis(_ name: String) -> Float { node.attributes[name].flatMap { number($0) } ?? 0 }
+    return SIMD3(axis("x"), axis("y"), axis("z"))
+  }
+
+  // MARK: Number scanning
+
+  fileprivate static let powersOfTen: [Double] = {
+    var powers = [1.0]
+    for _ in 1...22 { powers.append(powers[powers.count - 1] * 10) }
+    return powers
+  }()
+
+  @inline(__always) fileprivate static func isBlank(_ c: UInt8) -> Bool { c == 0x20 || c == 0x09 || c == 0x0D }
+
+  // The decimal number at p[i], advancing i past it; nil when none starts there. A value of at most 15
+  // significant digits and a decimal exponent within +-22 is one correctly rounded division or product; others
+  // go through Float(String).
+  fileprivate static func scanFloat(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int, _ end: Int) -> Float? {
+    var j = i
+    var negative = false
+    if j < end, p[j] == 0x2D || p[j] == 0x2B { negative = p[j] == 0x2D; j += 1 }
+    var mantissa: UInt64 = 0, significant = 0, exponent = 0, digits = 0
+    while j < end, p[j] &- 0x30 < 10 {
+      if significant < 19 {
+        mantissa = mantissa * 10 + UInt64(p[j] &- 0x30)
+        if mantissa != 0 { significant += 1 }
+      } else {
+        exponent += 1
+      }
+      digits += 1
+      j += 1
+    }
+    if j < end, p[j] == 0x2E {
+      j += 1
+      while j < end, p[j] &- 0x30 < 10 {
+        if significant < 19 {
+          mantissa = mantissa * 10 + UInt64(p[j] &- 0x30)
+          if mantissa != 0 { significant += 1 }
+          exponent -= 1
+        }
+        digits += 1
+        j += 1
+      }
+    }
+    guard digits > 0 else { return nil }
+    if j < end, p[j] | 0x20 == 0x65 {
+      var k = j + 1, exponentNegative = false, value = 0, exponentDigits = 0
+      if k < end, p[k] == 0x2D || p[k] == 0x2B { exponentNegative = p[k] == 0x2D; k += 1 }
+      while k < end, p[k] &- 0x30 < 10 {
+        if value < 10000 { value = value * 10 + Int(p[k] &- 0x30) }
+        exponentDigits += 1
+        k += 1
+      }
+      if exponentDigits > 0 {
+        exponent += exponentNegative ? -value : value
+        j = k
+      }
+    }
+    let start = i
+    i = j
+    if mantissa == 0 { return negative ? -0.0 : 0 }
+    if significant <= 15, exponent >= -22, exponent <= 22 {
+      let m = Double(mantissa)
+      let value = exponent < 0 ? m / powersOfTen[-exponent] : m * powersOfTen[exponent]
+      return Float(negative ? -value : value)
+    }
+    return Float(String(decoding: UnsafeBufferPointer(rebasing: p[start..<j]), as: UTF8.self))
+  }
+
+  // The optionally signed integer at p[i], advancing i past it; nil when none starts there.
+  fileprivate static func scanInt(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int, _ end: Int) -> Int? {
+    var j = i
+    var negative = false
+    if j < end, p[j] == 0x2D || p[j] == 0x2B { negative = p[j] == 0x2D; j += 1 }
+    var value = 0, digits = 0
+    while j < end, p[j] &- 0x30 < 10 {
+      guard value < (Int.max - 9) / 10 else { return nil }
+      value = value * 10 + Int(p[j] &- 0x30)
+      digits += 1
+      j += 1
+    }
+    guard digits > 0 else { return nil }
+    i = j
+    return negative ? -value : value
+  }
+
+  // MARK: OBJ
+
+  fileprivate static func readOBJ(_ p: UnsafeBufferPointer<UInt8>, name: String, normals wantNormals: Bool, flipV: Bool) throws -> Mesh {
+    var fileVertices: [SIMD3<Float>] = [], fileNormals: [SIMD3<Float>] = [], fileUVs: [SIMD2<Float>] = []
+    var positions: [SIMD3<Float>] = [], normals: [SIMD3<Float>] = [], uvs: [SIMD2<Float>] = []
+    var triangles: [SIMD3<UInt32>] = []
+    var welded: [SIMD3<UInt32>: UInt32] = [:]
+    var corners: [UInt32] = []
+    var missingNormal = false
+    let size = p.count
+    var line = 0, cursor = 0
+    while cursor < size {
+      line += 1
+      var end = size
+      if let base = p.baseAddress, let hit = memchr(base + cursor, 0x0A, size - cursor) {
+        end = base.distance(to: hit.assumingMemoryBound(to: UInt8.self))
+      }
+      defer { cursor = end + 1 }
+      var i = cursor
+      func failure(_ what: String) -> Error { MitsubaImporter.error("\(name): line \(line): \(what)") }
+      func number() throws -> Float {
+        while i < end, isBlank(p[i]) { i += 1 }
+        guard let value = scanFloat(p, &i, end), value.isFinite else { throw failure("cannot read a number") }
+        return value
+      }
+      // A 1-based element index (0 for none) for an index that counts from the start or, when negative, back
+      // from the end of the `count` elements read so far.
+      func resolve(_ value: Int, _ count: Int, _ what: String) throws -> UInt32 {
+        let k = value > 0 ? value - 1 : count + value
+        guard value != 0, k >= 0, k < count else { throw failure("invalid \(what) index \(value)") }
+        return UInt32(k + 1)
+      }
+      while i < end, isBlank(p[i]) { i += 1 }
+      guard i + 1 < end else { continue }
+      let c0 = p[i], c1 = p[i + 1]
+      if c0 == 0x76 /* v */ {
+        if isBlank(c1) {
+          i += 2
+          let v = SIMD3(try number(), try number(), try number())
+          fileVertices.append(v)
+        } else if c1 == 0x6E /* n */, i + 2 < end, isBlank(p[i + 2]) {
+          guard wantNormals else { continue }
+          i += 3
+          fileNormals.append(SIMD3(try number(), try number(), try number()))
+        } else if c1 == 0x74 /* t */, i + 2 < end, isBlank(p[i + 2]) {
+          i += 3
+          let u = try number(), v = try number()
+          fileUVs.append(SIMD2(u, flipV ? 1 - v : v))
+        }
+      } else if c0 == 0x66 /* f */, isBlank(c1) {
+        i += 2
+        corners.removeAll(keepingCapacity: true)
+        while true {
+          while i < end, isBlank(p[i]) { i += 1 }
+          if i >= end || p[i] == 0x23 { break }
+          guard let v = scanInt(p, &i, end) else { throw failure("cannot read a face") }
+          var vt: Int?, vn: Int?
+          if i < end, p[i] == 0x2F {
+            i += 1
+            vt = scanInt(p, &i, end)
+            if i < end, p[i] == 0x2F {
+              i += 1
+              guard let n = scanInt(p, &i, end) else { throw failure("cannot read a face") }
+              vn = n
+            }
+          }
+          guard i >= end || isBlank(p[i]) || p[i] == 0x23 else { throw failure("cannot read a face") }
+          let key = SIMD3(try resolve(v, fileVertices.count, "vertex"),
+                          try vt.map { try resolve($0, fileUVs.count, "texture coordinate") } ?? 0,
+                          wantNormals ? try vn.map { try resolve($0, fileNormals.count, "normal") } ?? 0 : 0)
+          if let id = welded[key] {
+            corners.append(id)
+          } else {
+            let id = UInt32(positions.count)
+            welded[key] = id
+            positions.append(fileVertices[Int(key.x) - 1])
+            uvs.append(key.y != 0 ? fileUVs[Int(key.y) - 1] : .zero)
+            if key.z != 0 { normals.append(fileNormals[Int(key.z) - 1]) } else { normals.append(.zero); missingNormal = true }
+            corners.append(id)
+          }
+        }
+        if corners.count >= 3 {
+          for k in 1..<(corners.count - 1) { triangles.append([corners[0], corners[k], corners[k + 1]]) }
+        }
+      }
+    }
+    guard !triangles.isEmpty else { throw MitsubaImporter.error("\(name) contains no triangles") }
+    return Mesh(positions: positions, normals: wantNormals && !fileNormals.isEmpty && !missingNormal ? normals : nil,
+                uvs: fileUVs.isEmpty ? nil : uvs, triangles: triangles)
+  }
+
+  // MARK: PLY
+
+  fileprivate enum PLYType {
+    case int8, uint8, int16, uint16, int32, uint32, float32, float64
+    init?(_ name: String) {
+      switch name {
+      case "char", "int8": self = .int8
+      case "uchar", "uint8": self = .uint8
+      case "short", "int16": self = .int16
+      case "ushort", "uint16": self = .uint16
+      case "int", "int32": self = .int32
+      case "uint", "uint32": self = .uint32
+      case "float", "float32": self = .float32
+      case "double", "float64": self = .float64
+      default: return nil
+      }
+    }
+    var size: Int {
+      switch self {
+      case .int8, .uint8: return 1
+      case .int16, .uint16: return 2
+      case .int32, .uint32, .float32: return 4
+      case .float64: return 8
+      }
+    }
+  }
+
+  // A scalar property, or a list property (`count` is the type of its length, `type` that of its items).
+  fileprivate struct PLYProperty {
+    let name: String
+    let type: PLYType
+    let count: PLYType?
+  }
+
+  fileprivate struct PLYElement {
+    let name: String
+    let count: Int
+    var properties: [PLYProperty] = []
+  }
+
+  // Values of the body, as text or as little-endian binary (the host is little-endian).
+  fileprivate struct PLYReader {
+    let bytes: UnsafeBufferPointer<UInt8>
+    let ascii: Bool
+    let name: String
+    var cursor: Int
+
+    func truncated() -> Error { MitsubaImporter.error("\(name): the PLY data is truncated or malformed") }
+
+    mutating func scalar(_ type: PLYType) throws -> Float {
+      if ascii {
+        while cursor < bytes.count, bytes[cursor] <= 0x20 { cursor += 1 }
+        guard let value = MitsubaImporter.scanFloat(bytes, &cursor, bytes.count) else { throw truncated() }
+        return value
+      }
+      guard cursor + type.size <= bytes.count else { throw truncated() }
+      let raw = UnsafeRawBufferPointer(bytes)
+      defer { cursor += type.size }
+      switch type {
+      case .int8: return Float(raw.loadUnaligned(fromByteOffset: cursor, as: Int8.self))
+      case .uint8: return Float(raw.loadUnaligned(fromByteOffset: cursor, as: UInt8.self))
+      case .int16: return Float(raw.loadUnaligned(fromByteOffset: cursor, as: Int16.self))
+      case .uint16: return Float(raw.loadUnaligned(fromByteOffset: cursor, as: UInt16.self))
+      case .int32: return Float(raw.loadUnaligned(fromByteOffset: cursor, as: Int32.self))
+      case .uint32: return Float(raw.loadUnaligned(fromByteOffset: cursor, as: UInt32.self))
+      case .float32: return raw.loadUnaligned(fromByteOffset: cursor, as: Float.self)
+      case .float64: return Float(raw.loadUnaligned(fromByteOffset: cursor, as: Double.self))
+      }
+    }
+
+    mutating func integer(_ type: PLYType) throws -> Int {
+      if ascii {
+        while cursor < bytes.count, bytes[cursor] <= 0x20 { cursor += 1 }
+        guard let value = MitsubaImporter.scanInt(bytes, &cursor, bytes.count) else { throw truncated() }
+        return value
+      }
+      guard cursor + type.size <= bytes.count else { throw truncated() }
+      let raw = UnsafeRawBufferPointer(bytes)
+      defer { cursor += type.size }
+      switch type {
+      case .int8: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Int8.self))
+      case .uint8: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: UInt8.self))
+      case .int16: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Int16.self))
+      case .uint16: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: UInt16.self))
+      case .int32: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Int32.self))
+      case .uint32: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: UInt32.self))
+      case .float32: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Float.self))
+      case .float64: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Double.self))
+      }
+    }
+
+    // Reads and discards a property.
+    mutating func skip(_ property: PLYProperty) throws {
+      if let count = property.count {
+        for _ in 0..<max(0, try integer(count)) { _ = try scalar(property.type) }
+      } else {
+        _ = try scalar(property.type)
+      }
+    }
+  }
+
+  fileprivate static func readPLY(_ raw: UnsafeRawBufferPointer, name: String, normals wantNormals: Bool, flipV: Bool) throws -> Mesh {
+    func failure(_ what: String) -> Error { MitsubaImporter.error("\(name): \(what)") }
+    let bytes = raw.bindMemory(to: UInt8.self)
+    var elements: [PLYElement] = []
+    var ascii = false, cursor = 0, first = true, finished = false
+    while cursor < bytes.count, !finished {
+      var end = bytes.count
+      if let base = bytes.baseAddress, let hit = memchr(base + cursor, 0x0A, bytes.count - cursor) {
+        end = base.distance(to: hit.assumingMemoryBound(to: UInt8.self))
+      }
+      let words = String(decoding: UnsafeBufferPointer(rebasing: bytes[cursor..<end]), as: UTF8.self)
+        .split(whereSeparator: { $0.isWhitespace }).map(String.init)
+      cursor = end + 1
+      if first {
+        guard words == ["ply"] else { throw failure("is not a PLY file") }
+        first = false
+        continue
+      }
+      guard let keyword = words.first else { continue }
+      switch keyword {
+      case "format":
+        switch words.dropFirst().first {
+        case "ascii": ascii = true
+        case "binary_little_endian": ascii = false
+        case "binary_big_endian": throw failure("binary big-endian PLY is not supported")
+        default: throw failure("unknown PLY format")
+        }
+      case "element":
+        guard words.count == 3, let count = Int(words[2]), count >= 0 else { throw failure("malformed PLY element line") }
+        elements.append(PLYElement(name: words[1], count: count))
+      case "property":
+        guard !elements.isEmpty else { throw failure("a PLY property outside an element") }
+        if words.count == 5, words[1] == "list", let count = PLYType(words[2]), let item = PLYType(words[3]) {
+          elements[elements.count - 1].properties.append(PLYProperty(name: words[4], type: item, count: count))
+        } else if words.count == 3, let type = PLYType(words[1]) {
+          elements[elements.count - 1].properties.append(PLYProperty(name: words[2], type: type, count: nil))
+        } else {
+          throw failure("unsupported PLY property '\(words.dropFirst().joined(separator: " "))'")
+        }
+      case "end_header":
+        finished = true
+      default:
+        break
+      }
+    }
+    guard finished else { throw failure("the PLY header is truncated") }
+
+    var reader = PLYReader(bytes: bytes, ascii: ascii, name: name, cursor: cursor)
+    var positions: [SIMD3<Float>] = [], normals: [SIMD3<Float>] = [], uvs: [SIMD2<Float>] = []
+    var triangles: [SIMD3<UInt32>] = []
+    var hasNormals = false, hasUVs = false, maxIndex = -1
+    for element in elements {
+      guard element.count <= bytes.count else { throw reader.truncated() }
+      if element.name == "vertex" {
+        // Property index -> slot of (x y z nx ny nz u v).
+        let names = element.properties.map(\.name)
+        let uvPair = [("u", "v"), ("texture_u", "texture_v"), ("s", "t")].first { names.contains($0.0) && names.contains($0.1) }
+        let slots = ["x", "y", "z", "nx", "ny", "nz", uvPair?.0 ?? "", uvPair?.1 ?? ""]
+        guard names.contains("x"), names.contains("y"), names.contains("z") else { throw failure("the PLY vertices have no x, y, z") }
+        hasNormals = wantNormals && names.contains("nx") && names.contains("ny") && names.contains("nz")
+        hasUVs = uvPair != nil
+        let roles = element.properties.map { property in property.count == nil ? slots.firstIndex(of: property.name) : nil }
+        positions.reserveCapacity(element.count)
+        if hasNormals { normals.reserveCapacity(element.count) }
+        if hasUVs { uvs.reserveCapacity(element.count) }
+        var row = [Float](repeating: 0, count: 8)
+        for _ in 0..<element.count {
+          for (k, property) in element.properties.enumerated() {
+            if let slot = roles[k] { row[slot] = try reader.scalar(property.type) } else { try reader.skip(property) }
+          }
+          guard row[0].isFinite, row[1].isFinite, row[2].isFinite else { throw failure("mesh contains invalid vertex position data") }
+          positions.append(SIMD3(row[0], row[1], row[2]))
+          if hasNormals { normals.append(SIMD3(row[3], row[4], row[5])) }
+          if hasUVs { uvs.append(SIMD2(row[6], flipV ? 1 - row[7] : row[7])) }
+        }
+      } else if element.name == "face" {
+        guard let listIndex = element.properties.firstIndex(where: { $0.count != nil && ($0.name == "vertex_indices" || $0.name == "vertex_index") }) else {
+          throw failure("the PLY faces have no vertex_indices or vertex_index list")
+        }
+        var corners: [UInt32] = []
+        for _ in 0..<element.count {
+          for (k, property) in element.properties.enumerated() {
+            guard k == listIndex, let countType = property.count else { try reader.skip(property); continue }
+            let n = try reader.integer(countType)
+            guard n >= 0 else { throw reader.truncated() }
+            corners.removeAll(keepingCapacity: true)
+            for _ in 0..<n {
+              let index = try reader.integer(property.type)
+              guard index >= 0, index <= Int(UInt32.max) else { throw failure("the PLY face has an invalid vertex index") }
+              maxIndex = max(maxIndex, index)
+              corners.append(UInt32(index))
+            }
+            if n >= 3 { for j in 1..<(n - 1) { triangles.append([corners[0], corners[j], corners[j + 1]]) } }
+          }
+        }
+      } else {
+        for _ in 0..<element.count { for property in element.properties { try reader.skip(property) } }
+      }
+    }
+    guard !positions.isEmpty, !triangles.isEmpty else { throw failure("contains no triangles") }
+    guard maxIndex < positions.count else { throw failure("a PLY face refers to a vertex that does not exist") }
+    return Mesh(positions: positions, normals: hasNormals ? normals : nil, uvs: hasUVs ? uvs : nil, triangles: triangles)
+  }
+
+  // MARK: Serialized
+
+  // The zlib stream (RFC 1950: a two-byte header, DEFLATE data, a checksum) at the start of `input`, which may be
+  // followed by other data; Compression's zlib decoder reads the raw DEFLATE data after the header.
+  fileprivate static func inflate(_ input: UnsafeRawBufferPointer, name: String) throws -> [UInt8] {
+    func failure() -> Error { MitsubaImporter.error("\(name): the compressed mesh data is damaged") }
+    guard input.count > 2, input[0] & 0x0F == 8, (Int(input[0]) << 8 | Int(input[1])) % 31 == 0, input[1] & 0x20 == 0 else { throw failure() }
+    let chunk = 1 << 20
+    let scratch = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+    defer { scratch.deallocate() }
+    let body = input.baseAddress!.assumingMemoryBound(to: UInt8.self) + 2
+    var stream = compression_stream(dst_ptr: scratch, dst_size: 0, src_ptr: body, src_size: 0, state: nil)
+    guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else { throw failure() }
+    defer { compression_stream_destroy(&stream) }
+    stream.src_ptr = body
+    stream.src_size = input.count - 2
+    var output: [UInt8] = []
+    while true {
+      stream.dst_ptr = scratch
+      stream.dst_size = chunk
+      let status = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+      let produced = chunk - stream.dst_size
+      output.append(contentsOf: UnsafeBufferPointer(start: scratch, count: produced))
+      if status == COMPRESSION_STATUS_END { return output }
+      guard status == COMPRESSION_STATUS_OK, produced > 0 else { throw failure() }
+    }
+  }
+
+  fileprivate static func readSerialized(_ raw: UnsafeRawBufferPointer, name: String, normals wantNormals: Bool, index: Int) throws -> Mesh {
+    func failure(_ what: String) -> Error { MitsubaImporter.error("\(name): \(what)") }
+    func integer<T: FixedWidthInteger>(_ type: T.Type, in bytes: UnsafeRawBufferPointer, at offset: Int) throws -> Int {
+      guard offset >= 0, offset + MemoryLayout<T>.size <= bytes.count else { throw failure("the serialized data is truncated") }
+      return Int(truncatingIfNeeded: bytes.loadUnaligned(fromByteOffset: offset, as: T.self))
+    }
+    guard try integer(UInt16.self, in: raw, at: 0) == 0x041C else { throw failure("is not a Mitsuba serialized file") }
+    let version = try integer(UInt16.self, in: raw, at: 2)
+    guard version == 3 || version == 4 else { throw failure("serialized version \(version) is not supported (3 and 4 are)") }
+    guard index >= 0 else { throw failure("the shape index must not be negative") }
+    var start = 0
+    if index != 0 {
+      let count = try integer(UInt32.self, in: raw, at: raw.count - 4)
+      guard index < count else { throw failure("shape index \(index) is out of range (the file holds \(count))") }
+      start = version == 4
+        ? try integer(UInt64.self, in: raw, at: raw.count - 8 * (count - index) - 4)
+        : try integer(UInt32.self, in: raw, at: raw.count - 4 * (count - index + 1))
+      guard start >= 0, start + 4 < raw.count else { throw failure("the serialized offset table is damaged") }
+    }
+    let body = try inflate(UnsafeRawBufferPointer(rebasing: raw[(start + 4)...]), name: name)
+    return try body.withUnsafeBytes { (data: UnsafeRawBufferPointer) in
+      var cursor = 0
+      let flags = try integer(UInt32.self, in: data, at: cursor)
+      cursor += 4
+      if version == 4 {
+        // The sub-mesh's name, null-terminated.
+        guard let terminator = data[cursor...].firstIndex(of: 0) else { throw failure("the serialized data is truncated") }
+        cursor = terminator + 1
+      }
+      let vertexCount = try integer(UInt64.self, in: data, at: cursor), faceCount = try integer(UInt64.self, in: data, at: cursor + 8)
+      cursor += 16
+      let double = flags & 0x2000 != 0, hasNormals = flags & 0x1 != 0, hasUVs = flags & 0x2 != 0, hasColors = flags & 0x8 != 0
+      let width = double ? 8 : 4
+      guard vertexCount >= 0, vertexCount < 1 << 32, faceCount > 0, faceCount < 1 << 32,
+            cursor + width * vertexCount * (3 + (hasNormals ? 3 : 0) + (hasUVs ? 2 : 0) + (hasColors ? 3 : 0)) + 12 * faceCount <= data.count
+      else { throw failure("the serialized data is truncated") }
+      func floats(_ components: Int) -> [Float] {
+        let values = (0..<vertexCount * components).map { k -> Float in
+          let offset = cursor + k * width
+          return double ? Float(data.loadUnaligned(fromByteOffset: offset, as: Double.self)) : data.loadUnaligned(fromByteOffset: offset, as: Float.self)
+        }
+        cursor += vertexCount * components * width
+        return values
+      }
+      let p = floats(3), n = hasNormals ? floats(3) : [], uv = hasUVs ? floats(2) : []
+      if hasColors { cursor += vertexCount * 3 * width }
+      let positions = (0..<vertexCount).map { SIMD3(p[3 * $0], p[3 * $0 + 1], p[3 * $0 + 2]) }
+      guard positions.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { throw failure("mesh contains invalid vertex position data") }
+      var triangles: [SIMD3<UInt32>] = []
+      triangles.reserveCapacity(faceCount)
+      for f in 0..<faceCount {
+        let t = SIMD3(UInt32(try integer(UInt32.self, in: data, at: cursor + 12 * f)), UInt32(try integer(UInt32.self, in: data, at: cursor + 12 * f + 4)),
+                      UInt32(try integer(UInt32.self, in: data, at: cursor + 12 * f + 8)))
+        guard t.max() < vertexCount else { throw failure("a serialized face refers to a vertex that does not exist") }
+        triangles.append(t)
+      }
+      return Mesh(positions: positions, normals: hasNormals && wantNormals ? (0..<vertexCount).map { SIMD3(n[3 * $0], n[3 * $0 + 1], n[3 * $0 + 2]) } : nil,
+                  uvs: hasUVs ? (0..<vertexCount).map { SIMD2(uv[2 * $0], uv[2 * $0 + 1]) } : nil, triangles: triangles)
+    }
+  }
+}
+
+extension SIMD4 where Scalar == Float {
+  fileprivate var xyz: SIMD3<Float> { SIMD3(x, y, z) }
 }

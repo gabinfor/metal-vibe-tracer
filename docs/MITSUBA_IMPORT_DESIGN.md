@@ -33,8 +33,8 @@ Out of scope, reported on import: scattering media, `point`, `spot` and `directi
 
 | Mitsuba | Becomes |
 | --- | --- |
-| `obj`, `ply`, `serialized` shapes | One mesh per shape, in world space; `face_normals` gives flat normals, and a file without normals gets smooth ones, as in Mitsuba |
-| `rectangle`, `disk`, `cube`, `sphere` | Tessellated meshes; a mirroring transform on a rectangle or disk reverses the winding so the emitting side is Mitsuba's |
+| `obj`, `ply`, `serialized` shapes | One mesh per shape, in world space (`MitsubaImporter.mesh`); `face_normals` gives flat normals, and a file without normals gets smooth ones, as in Mitsuba |
+| `rectangle`, `disk`, `cube`, `sphere` | Tessellated meshes (a 64 × 32 sphere, a 64-segment disk); a mirroring transform reverses the winding so the front side stays the analytic normal's, which is the emitting side |
 | `diffuse` | `base_color`, `specular_weight` 0 |
 | `plastic`, `roughplastic` | `base_color` = reflectance × internal-scattering ratio (§5), `specular_ior`, `specular_roughness` = √alpha |
 | `conductor`, `roughconductor` | `base_metalness` 1, `base_color` = F0, `specular_color` = 82° edge tint, `specular_reflectance` as `specular_weight` |
@@ -57,7 +57,7 @@ The mappings are those of `scripts/mitsuba_to_usd.py` as validated in `REFERENCE
 | Explicit conductor `eta`, `k` | The unpolarized conductor Fresnel formula at normal incidence and at μ = 1/7 |
 | Plastic internal-scattering ratio | Computed with the quadrature Mitsuba uses for its plastics; a fixture of ratios generated from Mitsuba at a grid of IOR, alpha, distribution and reflectance checks it |
 | Nonlinear plastic textures | Baked per texel and channel into the import folder, from the ratio at 17 reflectances |
-| Mesh loading | The app's own readers; normals and vertex welding may differ slightly from Mitsuba's |
+| Mesh loading | Readers in `MitsubaImporter` for the three formats (the app's OBJ reader splits by material and group, which Mitsuba's `obj` does not); welding and computed normals follow Mitsuba's plugins and agree with it on the Bitterli scenes' OBJ files (`REFERENCES.md`, `MITSUBA3`) |
 
 ## 6. Download entries
 

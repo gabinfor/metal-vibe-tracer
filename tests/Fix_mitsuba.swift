@@ -1,6 +1,6 @@
 // Mitsuba scene import (MitsubaImporter), XML layer: <default> values and $variables, global <ref> ids
 // (including a BSDF nested in another), <include>, transforms in document order, the Mitsuba 0.6 property
-// names, and detection by root element.
+// names, and detection by root element; shapes (mesh files and analytic shapes as world-space triangles).
 @MainActor func fixMitsubaChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -222,5 +222,137 @@
   require(b.bool("yes") == true && b.bool("no") == false && b.bool("odd") == nil && b.bool("w") == nil, "bool reads true and false only")
   require(b.float("w") == 48 && b.float("v") == 32, "$resx is not $res followed by x; the first default wins")
   print("PASS: Mitsuba XML layer: defaults, variables, references, includes, transforms, hex colours, 0.6 names")
+
+  // Shapes. tri.ply, tri-binary.ply and tri.serialized are written by Mitsuba (tests/fixtures/mitsuba/README.md);
+  // the OBJ files are written here.
+  let fixtures = URL(fileURLWithPath: runtimeRepositoryRoot() ?? "/nonexistent").appendingPathComponent("tests/fixtures/mitsuba")
+  var shapeScene = try MitsubaImporter.Scene(url: try write("shapes.xml", #"<scene version="3.0.0"/>"#))
+  var shapeCount = 0
+  func shapeNode(_ xml: String) throws -> MitsubaImporter.Node {
+    shapeCount += 1
+    return try MitsubaImporter.Scene(url: try write("shape\(shapeCount).xml", #"<scene version="3.0.0">\#(xml)</scene>"#)).root.children[0]
+  }
+  func meshNode(_ file: String, faceNormals: Bool = false, extra: String = "") throws -> MitsubaImporter.Node {
+    let inFixtures = FileManager.default.fileExists(atPath: fixtures.appendingPathComponent(file).path)
+    let path = inFixtures ? fixtures.appendingPathComponent(file).path : file
+    let type = file.hasSuffix(".obj") ? "obj" : file.hasSuffix(".ply") ? "ply" : "serialized"
+    return try shapeNode(#"<shape type="\#(type)"><string name="filename" value="\#(path)"/>"#
+      + (faceNormals ? #"<boolean name="face_normals" value="true"/>"# : "") + extra + "</shape>")
+  }
+  func faceNormal(_ m: MitsubaImporter.Mesh, _ i: Int) -> SIMD3<Float> {
+    let t = m.triangles[i]
+    let a = m.positions[Int(t.x)]
+    return simd_normalize(simd_cross(m.positions[Int(t.y)] - a, m.positions[Int(t.z)] - a))
+  }
+  func outward(_ m: MitsubaImporter.Mesh, from centre: SIMD3<Float>) -> Bool {
+    m.triangles.indices.allSatisfy { i in
+      let t = m.triangles[i]
+      let middle = (m.positions[Int(t.x)] + m.positions[Int(t.y)] + m.positions[Int(t.z)]) / 3
+      return simd_dot(faceNormal(m, i), middle - centre) > 0
+    }
+  }
+
+  let quad = try MitsubaImporter.mesh(try shapeNode(#"<shape type="rectangle"><transform name="to_world"><scale x="-1"/></transform></shape>"#), scene: &shapeScene)!
+  require(quad.triangles.count == 2 && faceNormal(quad, 0).z > 0.99, "a mirrored rectangle still faces +z")
+  require(quad.normals?.allSatisfy { simd_length($0 - SIMD3(0, 0, 1)) < 1e-6 } == true && quad.uvs?.count == 4, "rectangle normals and uvs")
+  let plain = try MitsubaImporter.mesh(try shapeNode(#"<shape type="rectangle"/>"#), scene: &shapeScene)!
+  require(plain.positions == [SIMD3(-1, -1, 0), SIMD3(1, -1, 0), SIMD3(1, 1, 0), SIMD3(-1, 1, 0)] && faceNormal(plain, 1).z > 0.99
+    && plain.uvs![2] == SIMD2(1, 1), "rectangle spans -1...1 with uv 0...1")
+  let disk = try MitsubaImporter.mesh(try shapeNode(#"<shape type="disk"><transform name="to_world"><scale y="-1"/></transform></shape>"#), scene: &shapeScene)!
+  require(disk.triangles.count == 64 && disk.positions.count == 65 && (0..<64).allSatisfy { faceNormal(disk, $0).z > 0.99 }
+    && disk.normals?.allSatisfy { $0 == SIMD3(0, 0, 1) } == true, "a mirrored disk: 64 triangles facing +z")
+  let cube = try MitsubaImporter.mesh(try shapeNode(#"<shape type="cube"/>"#), scene: &shapeScene)!
+  require(cube.triangles.count == 12 && cube.normals == nil && cube.uvs?.count == cube.positions.count
+    && cube.positions.allSatisfy { $0.max() == 1 || $0.min() == -1 } && outward(cube, from: .zero), "cube: 12 outward triangles, flat normals")
+  let mirroredCube = try MitsubaImporter.mesh(try shapeNode(#"<shape type="cube"><transform name="to_world"><scale x="-2"/></transform></shape>"#), scene: &shapeScene)!
+  require(outward(mirroredCube, from: .zero), "a mirrored cube stays outward")
+  let ball = try MitsubaImporter.mesh(try shapeNode(#"<shape type="sphere"><point name="center" x="1" y="0" z="0"/><float name="radius" value="2"/></shape>"#), scene: &shapeScene)!
+  require(ball.positions.allSatisfy { abs(simd_length($0 - SIMD3(1, 0, 0)) - 2) < 1e-4 }, "sphere centre and radius")
+  require(ball.normals.map { n in zip(n, ball.positions).allSatisfy { simd_length($0 - ($1 - SIMD3(1, 0, 0)) / 2) < 1e-4 } } == true
+    && outward(ball, from: SIMD3(1, 0, 0)) && ball.uvs?.count == ball.positions.count, "sphere: smooth outward normals and uvs")
+  let moved = try MitsubaImporter.mesh(try shapeNode("""
+    <shape type="sphere"><float name="radius" value="2"/><transform name="to_world"><scale x="-1"/><translate y="3"/></transform></shape>
+    """), scene: &shapeScene)!
+  require(moved.positions.allSatisfy { abs(simd_length($0 - SIMD3(0, 3, 0)) - 2) < 1e-4 }
+    && outward(moved, from: SIMD3(0, 3, 0)), "a sphere's to_world follows its radius; a mirrored one stays outward")
+
+  _ = try write("tri.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0.5\nvt 1 0.25\nvt 0 0\nvn 0 0 1\nf 1/1/1 2/2/1 3/3/1\n")
+  for file in ["tri.obj", "tri.ply", "tri-binary.ply", "tri.serialized"] {
+    let m = try MitsubaImporter.mesh(try meshNode(file), scene: &shapeScene)!
+    require(m.triangles.count == 1 && m.positions.count == 3 && m.uvs?.count == 3, "\(file) reads one triangle")
+    require(abs(m.uvs![1].y - (1 - 0.25)) < 1e-6, "\(file): v is flipped")
+    require(m.normals == [SIMD3(0, 0, 1), SIMD3(0, 0, 1), SIMD3(0, 0, 1)] && m.positions[1] == SIMD3(1, 0, 0), "\(file): positions and normals")
+  }
+  let second = try MitsubaImporter.mesh(try meshNode("tri.serialized", extra: #"<integer name="shape_index" value="1"/>"#), scene: &shapeScene)!
+  require(second.positions == [SIMD3(0, 0, 5), SIMD3(1, 0, 5), SIMD3(0, 1, 5)] && second.uvs == nil && second.normals == [SIMD3(0, 0, 1), SIMD3(0, 0, 1), SIMD3(0, 0, 1)],
+    "a serialized shape_index selects a double-precision sub-mesh without normals or uvs; smooth normals are computed")
+  requireThrows("shape index") {
+    _ = try MitsubaImporter.mesh(try meshNode("tri.serialized", extra: #"<integer name="shape_index" value="2"/>"#), scene: &shapeScene)
+  }
+  let placed = try MitsubaImporter.mesh(try meshNode("tri.ply", extra: #"<transform name="to_world"><scale z="2"/><translate x="1"/></transform>"#), scene: &shapeScene)!
+  require(placed.positions[1] == SIMD3(2, 0, 0) && placed.normals?[0] == SIMD3(0, 0, 1), "to_world applies to positions and normals")
+  let flatPly = try MitsubaImporter.mesh(try meshNode("tri-binary.ply", faceNormals: true), scene: &shapeScene)!
+  require(flatPly.normals == nil && flatPly.uvs?.count == 3, "face_normals drops a file's normals")
+
+  _ = try write("slanted.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 1 1\nf 1//1 2//1 3//1\n")
+  let slanted = try MitsubaImporter.mesh(try meshNode("slanted.obj", extra: #"<transform name="to_world"><scale z="2"/></transform>"#), scene: &shapeScene)!
+  let expectedNormal = simd_normalize(SIMD3<Float>(0, 1, 0.5))
+  require(slanted.uvs == nil && slanted.normals!.allSatisfy { simd_length($0 - expectedNormal) < 1e-6 }, "normals use the inverse transpose and are renormalized")
+
+  _ = try write("cube-no-normals.obj", """
+    v -1 -1 -1
+    v 1 -1 -1
+    v 1 1 -1
+    v -1 1 -1
+    v -1 -1 1
+    v 1 -1 1
+    v 1 1 1
+    v -1 1 1
+    f 1 4 3 2
+    f 5 6 7 8
+    f 1 2 6 5
+    f 3 4 8 7
+    f 1 5 8 4
+    f 2 3 7 6
+    """)
+  let flat = try MitsubaImporter.mesh(try meshNode("cube-no-normals.obj", faceNormals: true), scene: &shapeScene)!
+  let smooth = try MitsubaImporter.mesh(try meshNode("cube-no-normals.obj"), scene: &shapeScene)!
+  require(flat.normals == nil && smooth.normals?.count == smooth.positions.count, "face_normals and smooth normals")
+  require(smooth.triangles.count == 12 && smooth.positions.count == 8 && outward(smooth, from: .zero), "quads fan-triangulate and weld positions")
+  require(zip(smooth.normals!, smooth.positions).allSatisfy { simd_length($0 - simd_normalize($1)) < 1e-5 },
+    "a cube's angle-weighted corner normals point along the diagonals")
+
+  _ = try write("polygons.obj", """
+    # comment
+    v 9 9 9
+    v 0 0 0
+    v 1 0 0
+    v 1 1 0
+    v 0 1 0   # trailing comment
+    o ignored
+    usemtl ignored
+    g ignored
+    f -4 -3 -2 -1
+    """)
+  let polygon = try MitsubaImporter.mesh(try meshNode("polygons.obj"), scene: &shapeScene)!
+  require(polygon.triangles == [SIMD3(0, 1, 2), SIMD3(0, 2, 3)] && polygon.positions.count == 4 && polygon.positions[0] == SIMD3(0, 0, 0),
+    "negative indices count back from the vertices read so far; unused vertices are dropped; other statements are ignored")
+  _ = try write("seams.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nvt 1 1\nvt 0.5 0.5\nf 1/1 2/2 3/3\nf 2/2 4/4 3/5\n")
+  let seams = try MitsubaImporter.mesh(try meshNode("seams.obj"), scene: &shapeScene)!
+  require(seams.positions.count == 5 && seams.triangles.count == 2 && seams.triangles[1].x == seams.triangles[0].y
+    && seams.triangles[1].z != seams.triangles[0].z, "vertices weld per (position, uv, normal) triple")
+
+  _ = try write("bad.obj", "v 0 0 0\nv 1 0 0\nf 1 2 3\n")
+  requireThrows("invalid vertex index") { _ = try MitsubaImporter.mesh(try meshNode("bad.obj"), scene: &shapeScene) }
+  _ = try write("big-endian.ply", "ply\nformat binary_big_endian 1.0\nelement vertex 0\nproperty float x\nend_header\n")
+  requireThrows("big-endian") { _ = try MitsubaImporter.mesh(try meshNode("big-endian.ply"), scene: &shapeScene) }
+  let truncated = try Data(contentsOf: fixtures.appendingPathComponent("tri-binary.ply")).dropLast(20)
+  try truncated.write(to: folder.appendingPathComponent("truncated.ply"))
+  requireThrows("truncated") { _ = try MitsubaImporter.mesh(try meshNode("truncated.ply"), scene: &shapeScene) }
+  requireThrows("missing.obj") { _ = try MitsubaImporter.mesh(try meshNode("missing.obj"), scene: &shapeScene) }
+  let hair = try shapeNode(#"<shape type="hair"/>"#)
+  let skipped = try MitsubaImporter.mesh(hair, scene: &shapeScene)
+  require(skipped == nil && shapeScene.report.contains { $0.contains("shape hair") }, "unsupported shapes are reported")
+  print("PASS: Mitsuba shapes: obj, ply and serialized readers, analytic shapes, normals, winding, texture coordinates")
 }
 try fixMitsubaChecks()
