@@ -18,7 +18,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 - 🔬 **Recent research, implemented and cited.** ReSTIR DI, GI and PT, plus 2025–2026 papers on spatial reuse, reservoir splatting and control variates. [REFERENCES.md](REFERENCES.md) maps every method to the code that implements it.
 - 🌈 **Spectral light transport.** Four wavelengths per path, CIE illuminants, dispersion and thin-film interference, through every ReSTIR mode.
 - 📏 **Defaults chosen by measurement.** A new method becomes the default only where it wins at equal render time. The figures are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md).
-- 🧪 **Tested on the GPU.** The verification suite runs the production shaders and render path on Metal (198 checks passed for 0.3.0, Apple M4).
+- 🧪 **Tested on the GPU.** The verification suite runs the production shaders and render path on Metal (216 checks passed for 0.4.0, Apple M4).
 - 🎬 **Production formats.** OpenPBR surfaces, MaterialX graphs, OpenUSD, glTF 2.0 and Mitsuba scenes, OBJ/MTL, and OpenEXR export.
 - 🏛️ **Production-scale scenes.** San Miguel (10 M triangles, 287 materials) and the Amazon Lumberyard Bistro import and render, with alpha cutouts, glass and anisotropic texture filtering.
 - ✅ **Validated against Mitsuba 3.** Built-in scenes agree within 0.1% of mean radiance, and Bitterli's ten scenes, imported natively, have mean radiance ratios to Mitsuba 3.9.1 between about 0.97 and 1.04; every difference is measured and traced to a documented cause (see [Validation](#validation)).

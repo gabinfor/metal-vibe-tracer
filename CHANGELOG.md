@@ -2,7 +2,9 @@
 
 Metal Vibe Tracer is in early development: releases are validated builds, not stable APIs or file formats. Every method below is cited, with its adaptations, in [REFERENCES.md](REFERENCES.md); measurements are in [tests/PERFORMANCE.md](tests/PERFORMANCE.md) and [docs/SCENE_STORAGE_DESIGN.md](docs/SCENE_STORAGE_DESIGN.md).
 
-## Unreleased
+## 0.4.0 — 2026-11-13
+
+Scenes from other renderers, and a place to find them: glTF 2.0 and native Mitsuba 3 and 0.6 import, a scene browser in its own Scenes window with a preview render of nearly every scene, and ten of Benedikt Bitterli's scenes as downloads, which render within 0.97–1.04 of Mitsuba 3.9.1's mean radiance with every difference traced. Caustic light tracing and photons render light focused through glass, water and mirrors. A main menu with Open Recent replaces the empty start screen. Texture mip levels keep an image's brightness at every size, so some textured scenes render slightly darker in bounce light than in 0.3.0 (Bitterli's Modern Hall by 3%). Validated on an Apple M4 (16 GB, 10-core GPU) with macOS 27: the GPU verification suite passes (216 checks).
 
 ### Interface
 

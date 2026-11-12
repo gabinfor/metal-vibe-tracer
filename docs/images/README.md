@@ -21,6 +21,7 @@ The README images were rendered on 2026-10-20 on an Apple M4 with `python3 scrip
 | `filtering-before-after.jpg` | 1:1 crops of 1920×1080, 128-spp Sponza renders before and after anisotropic ray-cone filtering (the "after" render applied the footprint scale at every hit, which looks the same at primary hits as the committed version). |
 | `glass-before-after.jpg` | 1:1 crops of 960×540, 64-spp Bistro exterior renders before and after MTL glass translation. The "after" reads `Tf` as the specification's transmission filter (20% for these panes); since 2026-11-04 the importer reads it as 1 − transmission (80%), so the panes now render clearer. |
 | `bump-before-after.jpg` | 1:1 crops of 1920×1080, 128-spp Sponza gallery renders with bump strength `-bm`/512 and 4× that (`-bm`/128, the new constant). |
+| `social-preview.jpg` | The repository's 1280×640 social preview (GitHub › Settings › Social preview): `pavilion-hdri.jpg`, `spectral-abbe-row.jpg` and `spectral-newton-series.jpg` cropped beside the project name and tagline, drawn by `swift scripts/make_social_preview.swift docs/images docs/images/social-preview.jpg` on 2026-11-13. It uses only renders without attribution requirements. Not shown in the README. |
 | `grazing-cylinder.png` | Built-in grazing-angle cylinder regression comparison (commit `86f8c7d`, 2026-09-08). Not shown in the README. |
 
 ## Attribution: `shaderball-loft.jpg`
