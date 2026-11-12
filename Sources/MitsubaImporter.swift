@@ -19,10 +19,16 @@ import Synchronization
 //                                             matrix (16 values row-major, or 9 for a uv transform),
 //                                             translate, rotate (angle in degrees about x, y, z), scale
 //                                             (uniform or per axis) and lookat (the camera looks along +z)
-//   version below 2 (Mitsuba 0.6)             camelCase property names take their Mitsuba 3 names
-//                                             (MitsubaImporter.legacyNames), <lookAt> is <lookat>, a texture's
-//                                             uscale and vscale become a to_uv scale, and the <srgb> values of
-//                                             a BSDF are linearized into <rgb>
+//   version below 2 (Mitsuba 0.6)             the camelCase property names of MitsubaImporter.legacyNames take
+//                                             their Mitsuba 3 names, <lookAt> is <lookat>, a texture's uscale,
+//                                             vscale, uoffset and voffset become a to_uv scale and translation,
+//                                             the <srgb> values of a BSDF are linearized into <rgb>, and a
+//                                             conductor's extEta divides its eta and k (dropped when 1)
+//   limits                                    a file nested more than maxElementDepth elements deep (counted
+//                                             through includes and resolved references), references nested
+//                                             more than maxReferenceDepth deep, more than maxIncludeDepth files
+//                                             open at once and an attribute value longer than
+//                                             maxSubstitutedLength after substitution are errors
 //   #rrggbb, #rgb                             an sRGB hex colour in <rgb> or <srgb> (SRGB1999 transfer
 //                                             function), read as linear RGB
 //   lookat without a usable up                an up vector parallel to the view direction, or none, is
@@ -31,14 +37,32 @@ import Synchronization
 enum MitsubaImporter {
   static func error(_ message: String) -> Error { MaterialLibrary.error("Mitsuba: " + message) }
 
-  // Mitsuba 0.6 property and element names and their Mitsuba 3 names. Other camelCase names stay as they are.
+  // Mitsuba 0.6 names of the properties the importer reads, and their Mitsuba 3 names. Other camelCase names stay as
+  // they are, and a supported plugin reports them as unsupported properties.
   static let legacyNames: [String: String] = [
     "toWorld": "to_world", "toUV": "to_uv", "intIOR": "int_ior", "extIOR": "ext_ior", "maxDepth": "max_depth",
     "sampleCount": "sample_count", "faceNormals": "face_normals", "fovAxis": "fov_axis",
     "diffuseReflectance": "diffuse_reflectance", "specularReflectance": "specular_reflectance",
     "specularTransmittance": "specular_transmittance", "sigmaT": "sigma_t", "sigmaA": "sigma_a", "sigmaS": "sigma_s",
-    "focusDistance": "focus_distance", "lookAt": "lookat",
+    "focusDistance": "focus_distance", "lookAt": "lookat", "filterType": "filter_type", "wrapMode": "wrap_mode",
   ]
+
+  // Limits on untrusted files: the open runs on a worker thread with a 512 KB stack, and the XML layer, Foundation's
+  // XMLDocument (whose release of a document about 3,000 elements deep overflows such a stack) and the material
+  // mapping recurse once per level. Bitterli's ten scenes nest at most 7 elements deep after references are
+  // resolved, follow references 1 deep, wrap BSDFs at most 2 deep and include no files.
+  // Elements nested deeper than this below and including <scene>, through includes and resolved references.
+  static let maxElementDepth = 128
+  // A reference to a definition that holds a reference, and so on.
+  static let maxReferenceDepth = 64
+  // Files open at once, the scene's own included: Mitsuba 3.9.1's limit ("Exceeded maximum include recursion depth
+  // of 15").
+  static let maxIncludeDepth = 15
+  // BSDF wrappers (twosided, mask, bumpmap, normalmap) around one another.
+  static let maxWrapperDepth = 16
+  // An attribute value after $variable substitution, in UTF-8 bytes: nested <default>s that repeat a variable grow
+  // exponentially.
+  static let maxSubstitutedLength = 1 << 20
 
   // One resolved XML element: its attributes after $ substitution and the 0.6 rename, and its children with
   // every <ref> replaced by its target.
@@ -157,12 +181,9 @@ enum MitsubaImporter {
     }
   }
 
-  // The parsed file: its resolved root <scene> node, the folder that relative paths start from, the Mitsuba
-  // major version and the import report.
+  // The parsed file: its resolved root <scene> node and the import report.
   struct Scene {
     let root: Node
-    let folder: URL
-    let version: Int
     var report: [String] = []
 
     init(url: URL) throws {
@@ -171,12 +192,12 @@ enum MitsubaImporter {
       guard let element = document.rootElement(), element.name == "scene" else {
         throw MitsubaImporter.error("\(url.lastPathComponent) is not a Mitsuba scene (its root element is not <scene>)")
       }
-      folder = url.deletingLastPathComponent()
-      version = element.attribute(forName: "version")?.stringValue.flatMap { $0.split(separator: ".").first }.flatMap { Int($0) } ?? 3
+      // The Mitsuba major version.
+      let version = element.attribute(forName: "version")?.stringValue.flatMap { $0.split(separator: ".").first }.flatMap { Int($0) } ?? 3
       loader.legacy = version < 2
       loader.includeStack = [url.standardizedFileURL]
-      let raw = try loader.node(element, folder: folder)[0]
-      root = try loader.resolved(raw)
+      let raw = try loader.node(element, folder: url.deletingLastPathComponent(), depth: 1)[0]
+      root = try loader.resolved(raw, depth: 1).node
     }
 
     mutating func note(_ line: String) {
@@ -205,13 +226,11 @@ enum MitsubaImporter {
     return [Float((hex >> 16) & 255) / 255, Float((hex >> 8) & 255) / 255, Float(hex & 255) / 255]
   }
 
-  // The sRGB electro-optical transfer function (SRGB1999) per component.
-  fileprivate static func linearized(_ encoded: [Float]) -> [Float] {
-    encoded.map { $0 <= 0.04045 ? $0 / 12.92 : powf(($0 + 0.055) / 1.055, 2.4) }
-  }
+  // The sRGB electro-optical transfer function (SRGB1999): an encoded component in 0...1 as linear.
+  static func srgbToLinear(_ x: Float) -> Float { x <= 0.04045 ? x / 12.92 : powf((x + 0.055) / 1.055, 2.4) }
 
   // A hex colour decoded from sRGB to linear RGB.
-  fileprivate static func hexColor(_ text: String) -> [Float]? { hexComponents(text).map(linearized) }
+  fileprivate static func hexColor(_ text: String) -> [Float]? { hexComponents(text).map { $0.map(srgbToLinear) } }
 
   // The tree in one pass: variables, includes and renames applied in document order, with every element that
   // carries an id recorded, then a second pass replaces <ref> nodes (an id may be defined after its use).
@@ -220,12 +239,38 @@ enum MitsubaImporter {
     var variables: [String: String] = [:]
     var includeStack: [URL] = []
     var definitions: [String: Node] = [:]
-    var resolvedDefinitions: [String: Node] = [:]
+    var resolvedDefinitions: [String: (node: Node, height: Int)] = [:]
     var resolving: Set<String> = []
 
+    // The file's elements, after a streaming pass has checked that they nest at most maxElementDepth deep, so that
+    // XMLDocument never holds (and releases) a deeper tree.
     static func document(_ url: URL) throws -> XMLDocument {
-      do { return try XMLDocument(contentsOf: url, options: [.nodeLoadExternalEntitiesNever]) } catch {
-        throw MitsubaImporter.error("cannot read \(url.lastPathComponent): \(error.localizedDescription)")
+      func failure(_ error: Error) -> Error { MitsubaImporter.error("cannot read \(url.lastPathComponent): \(error.localizedDescription)") }
+      let data: Data
+      do { data = try Data(contentsOf: url) } catch { throw failure(error) }
+      let parser = XMLParser(data: data), depth = DepthCheck()
+      parser.delegate = depth
+      parser.shouldResolveExternalEntities = false
+      parser.parse()
+      if depth.exceeded { throw MitsubaImporter.error("\(url.lastPathComponent): \(Loader.tooDeep)") }
+      do { return try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) } catch { throw failure(error) }
+    }
+
+    static let tooDeep = "elements are nested more than \(MitsubaImporter.maxElementDepth) deep"
+
+    // Stops the streaming pass at the first element deeper than maxElementDepth.
+    final class DepthCheck: NSObject, XMLParserDelegate {
+      var depth = 0, exceeded = false
+      func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName: String?,
+                  attributes: [String: String] = [:]) {
+        depth += 1
+        if depth > MitsubaImporter.maxElementDepth {
+          exceeded = true
+          parser.abortParsing()
+        }
+      }
+      func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName: String?) {
+        depth -= 1
       }
     }
 
@@ -241,14 +286,18 @@ enum MitsubaImporter {
           throw MitsubaImporter.error("undefined variable '$\(name)'")
         }
         result += value
+        guard result.utf8.count <= MitsubaImporter.maxSubstitutedLength else {
+          throw MitsubaImporter.error("a value with '$\(name)' expands beyond \(MitsubaImporter.maxSubstitutedLength >> 20) MB")
+        }
         rest = after.dropFirst(name.count)
       }
       return result + rest
     }
 
-    // The nodes one element stands for: none for <default>, the included file's children for <include>,
-    // otherwise the element itself.
-    mutating func node(_ element: XMLElement, folder: URL) throws -> [Node] {
+    // The nodes one element at `depth` (<scene> 1) stands for: none for <default>, the included file's children
+    // (at the include's depth) for <include>, otherwise the element itself.
+    mutating func node(_ element: XMLElement, folder: URL, depth: Int) throws -> [Node] {
+      guard depth <= MitsubaImporter.maxElementDepth else { throw MitsubaImporter.error(Loader.tooDeep) }
       var tag = element.name ?? ""
       var attributes: [String: String] = [:]
       for attribute in element.attributes ?? [] {
@@ -265,27 +314,33 @@ enum MitsubaImporter {
         guard let filename = attributes["filename"] else { throw MitsubaImporter.error("<include> needs a filename") }
         let url = URL(fileURLWithPath: filename, relativeTo: folder).standardizedFileURL
         guard !includeStack.contains(url) else { throw MitsubaImporter.error("include cycle at '\(filename)'") }
+        guard includeStack.count < MitsubaImporter.maxIncludeDepth else {
+          throw MitsubaImporter.error("includes nested more than \(MitsubaImporter.maxIncludeDepth) files deep at '\(filename)'")
+        }
         includeStack.append(url)
         defer { includeStack.removeLast() }
         guard let included = try Loader.document(url).rootElement(), included.name == "scene" else {
           throw MitsubaImporter.error("included file \(url.lastPathComponent) is not a Mitsuba scene")
         }
-        return try nodes(included.children, folder: url.deletingLastPathComponent())
+        return try nodes(included.children, folder: url.deletingLastPathComponent(), depth: depth)
       default:
         break
       }
-      var children = try nodes(element.children, folder: folder)
+      var children = try nodes(element.children, folder: folder, depth: depth + 1)
       if legacy {
         if let renamed = attributes["name"].flatMap({ MitsubaImporter.legacyNames[$0] }) { attributes["name"] = renamed }
         if tag == "lookAt" { tag = "lookat" }
-        if tag == "texture" { children = Self.uvScale(children, folder: folder) }
-        if tag == "bsdf" { children = children.map(Self.linearized) }
+        if tag == "texture" { children = Self.uvTransform(children, folder: folder) }
+        if tag == "bsdf" {
+          children = children.map(Self.linearized)
+          if attributes["type"] == "conductor" || attributes["type"] == "roughconductor" { children = Self.exteriorIOR(children, folder: folder) }
+        }
       }
       if tag == "lookat" {
-        // An absent origin or target is the point 0 0 0.
+        // An absent origin or target is the point 0 0 0; one number is repeated, as in Node.operation.
         func point(_ key: String) -> [Float]? {
           guard let text = attributes[key] else { return [0, 0, 0] }
-          return MitsubaImporter.numbers(text)
+          return MitsubaImporter.numbers(text).map { $0.count == 1 ? [$0[0], $0[0], $0[0]] : $0 }
         }
         if let origin = point("origin"), origin == point("target") { throw MitsubaImporter.error("lookat needs distinct origin and target") }
       }
@@ -298,30 +353,59 @@ enum MitsubaImporter {
       return [node]
     }
 
-    mutating func nodes(_ list: [XMLNode]?, folder: URL) throws -> [Node] {
+    mutating func nodes(_ list: [XMLNode]?, folder: URL, depth: Int) throws -> [Node] {
       var result: [Node] = []
-      for case let child as XMLElement in list ?? [] { result += try node(child, folder: folder) }
+      for case let child as XMLElement in list ?? [] { result += try node(child, folder: folder, depth: depth) }
       return result
     }
 
-    // Mitsuba 0.6's uscale and vscale on a texture are a scale of its uv transform.
-    static func uvScale(_ children: [Node], folder: URL) -> [Node] {
-      func scale(_ name: String) -> Float? {
+    // Mitsuba 0.6's uscale and vscale on a texture are a scale of its uv transform, and its uoffset and voffset a
+    // translation after it (Texture2D: uv x scale + offset).
+    static func uvTransform(_ children: [Node], folder: URL) -> [Node] {
+      func value(_ name: String) -> Float? {
         children.first { $0.name == name && $0.tag == "float" }?.attributes["value"].flatMap { MitsubaImporter.number($0) }
       }
-      let u = scale("uscale"), v = scale("vscale")
-      guard u != nil || v != nil else { return children }
-      let step = Node(tag: "scale", type: nil, name: nil, id: nil,
-                      attributes: ["x": "\(u ?? 1)", "y": "\(v ?? 1)", "z": "1"], children: [], folder: folder)
-      var rest = children.filter { $0.name != "uscale" && $0.name != "vscale" }
+      let u = value("uscale"), v = value("vscale"), du = value("uoffset"), dv = value("voffset")
+      guard u != nil || v != nil || du != nil || dv != nil else { return children }
+      func operation(_ tag: String, _ x: Float, _ y: Float, _ z: Float) -> Node {
+        Node(tag: tag, type: nil, name: nil, id: nil, attributes: ["x": "\(x)", "y": "\(y)", "z": "\(z)"], children: [], folder: folder)
+      }
+      let step = [operation("scale", u ?? 1, v ?? 1, 1), operation("translate", du ?? 0, dv ?? 0, 0)]
+      var rest = children.filter { !["uscale", "vscale", "uoffset", "voffset"].contains($0.name) }
       if let index = rest.firstIndex(where: { $0.tag == "transform" && $0.name == "to_uv" }) {
         let existing = rest[index]
         rest[index] = Node(tag: existing.tag, type: existing.type, name: existing.name, id: existing.id,
-                           attributes: existing.attributes, children: existing.children + [step], folder: existing.folder)
+                           attributes: existing.attributes, children: existing.children + step, folder: existing.folder)
       } else {
-        rest.append(Node(tag: "transform", type: nil, name: "to_uv", id: nil, attributes: ["name": "to_uv"], children: [step], folder: folder))
+        rest.append(Node(tag: "transform", type: nil, name: "to_uv", id: nil, attributes: ["name": "to_uv"], children: step, folder: folder))
       }
       return rest
+    }
+
+    // Mitsuba 0.6's conductor takes eta and k relative to extEta, the exterior's real IOR (a number or an IOR name):
+    // they become eta / extEta and k / extEta, Mitsuba 3's relative values. An extEta of 1 is dropped. One that cannot
+    // be applied (a named material, an eta or k not given as one or three numbers) stays, and the conductor reports
+    // it as an unsupported property.
+    static func exteriorIOR(_ children: [Node], folder: URL) -> [Node] {
+      guard let index = children.firstIndex(where: { $0.name == "extEta" }), let text = children[index].attributes["value"] else { return children }
+      let exterior: Float?
+      switch children[index].tag {
+      case "float": exterior = MitsubaImporter.number(text)
+      case "string": exterior = MitsubaTables.ior[text.lowercased()]
+      default: exterior = nil
+      }
+      guard let exterior, exterior.isFinite, exterior > 0 else { return children }
+      var rest = children
+      rest.remove(at: index)
+      guard exterior != 1 else { return rest }
+      let bsdf = Node(tag: "bsdf", type: nil, name: nil, id: nil, attributes: [:], children: rest, folder: folder)
+      guard bsdf.child("material") == nil, let eta = bsdf.rgb("eta"), let k = bsdf.rgb("k") else { return children }
+      return rest.map { node in
+        guard node.name == "eta" || node.name == "k" else { return node }
+        let value = (node.name == "eta" ? eta : k) / exterior
+        return Node(tag: "rgb", type: nil, name: node.name, id: node.id,
+                    attributes: ["name": node.name!, "value": "\(value.x), \(value.y), \(value.z)"], children: [], folder: node.folder)
+      }
     }
 
     // Mitsuba 0.6's <srgb> is gamma encoded ("#rrggbb", "#rgb" or floats); the result is a linear <rgb>.
@@ -329,32 +413,47 @@ enum MitsubaImporter {
       guard node.tag == "srgb", let text = node.attributes["value"],
             let encoded = MitsubaImporter.hexComponents(text) ?? MitsubaImporter.numbers(text) else { return node }
       var attributes = node.attributes
-      attributes["value"] = MitsubaImporter.linearized(encoded).map { "\($0)" }.joined(separator: ", ")
+      attributes["value"] = encoded.map { "\(MitsubaImporter.srgbToLinear($0))" }.joined(separator: ", ")
       return Node(tag: "rgb", type: node.type, name: node.name, id: node.id, attributes: attributes,
                   children: node.children, folder: node.folder)
     }
 
-    // The node with every <ref> below it replaced by the resolved node it names.
-    mutating func resolved(_ node: Node) throws -> Node {
+    // The node at `depth` with every <ref> below it replaced by the resolved node it names, and the height of the
+    // result (1 for a leaf). A resolved definition is reused wherever it is referenced, so its height is checked at
+    // each use: no element of the result lies deeper than maxElementDepth.
+    mutating func resolved(_ node: Node, depth: Int) throws -> (node: Node, height: Int) {
+      guard depth <= MitsubaImporter.maxElementDepth else { throw MitsubaImporter.error(Loader.tooDeep) }
       if node.tag == "ref" {
         guard let id = node.attributes["id"], definitions[id] != nil else {
           throw MitsubaImporter.error("undefined reference '\(node.attributes["id"] ?? "")'")
         }
-        let target = try resolvedDefinition(id)
+        let (target, height) = try resolvedDefinition(id, depth: depth)
+        guard depth - 1 + height <= MitsubaImporter.maxElementDepth else { throw MitsubaImporter.error(Loader.tooDeep) }
         var attributes = target.attributes
         attributes["name"] = node.name
-        return Node(tag: target.tag, type: target.type, name: node.name, id: target.id, attributes: attributes, children: target.children, folder: target.folder)
+        return (Node(tag: target.tag, type: target.type, name: node.name, id: target.id, attributes: attributes, children: target.children,
+                     folder: target.folder), height)
       }
-      var children: [Node] = []
-      for child in node.children { children.append(try resolved(child)) }
-      return Node(tag: node.tag, type: node.type, name: node.name, id: node.id, attributes: node.attributes, children: children, folder: node.folder)
+      var children: [Node] = [], height = 1
+      for child in node.children {
+        let result = try resolved(child, depth: depth + 1)
+        children.append(result.node)
+        height = max(height, result.height + 1)
+      }
+      return (Node(tag: node.tag, type: node.type, name: node.name, id: node.id, attributes: node.attributes, children: children,
+                   folder: node.folder), height)
     }
 
-    mutating func resolvedDefinition(_ id: String) throws -> Node {
+    // The definition with this id, resolved where a reference at `depth` first needs it; the definitions being
+    // resolved (`resolving`) are the chain of references that leads to it.
+    mutating func resolvedDefinition(_ id: String, depth: Int) throws -> (node: Node, height: Int) {
       if let done = resolvedDefinitions[id] { return done }
       guard resolving.insert(id).inserted else { throw MitsubaImporter.error("reference cycle through '\(id)'") }
       defer { resolving.remove(id) }
-      let done = try resolved(definitions[id]!)
+      guard resolving.count <= MitsubaImporter.maxReferenceDepth else {
+        throw MitsubaImporter.error("references nested too deeply (more than \(MitsubaImporter.maxReferenceDepth)) at '\(id)'")
+      }
+      let done = try resolved(definitions[id]!, depth: depth)
       resolvedDefinitions[id] = done
       return done
     }
@@ -367,7 +466,9 @@ enum MitsubaImporter {
 //                named by its id, else <type><index>; one material per BSDF, area-emitter radiance and interior
 //                medium (MitsubaImporter.material), shared by the shapes that reference the same BSDF id with the same
 //                emission; zero-area triangles are dropped. A shape whose dielectric (wrapped or not) has an IOR
-//                ratio below 1 is reversed (reversesFacing), unless it emits
+//                ratio below 1 is reversed (reversesFacing), unless it emits. Every surface is two-sided, so a BSDF
+//                that Mitsuba renders black from the back (isOneSided) adds one report line for the scene. Loading
+//                stops as soon as the meshes pass SceneLimits.triangles
 //   sensor       the first perspective or thinlens sensor is the saved view "Mitsuba: camera" and the active camera.
 //                Mitsuba's camera looks along +z with x to the left, so its to_world times diag(-1, 1, -1, 1) is a
 //                camera looking along -z (eye: the origin, direction: to_world's z, up: its y). The vertical field
@@ -375,12 +476,15 @@ enum MitsubaImporter {
 //                diagonal over the film's diagonal) or, without fov, focal_length (50mm by default, over a 35 mm
 //                film's 43.2666 mm diagonal), and the film's width and height (768 x 576 by default), which are also
 //                the render size. A thinlens's aperture_radius (at most 0.5) and focus_distance (10000 by default,
-//                Mitsuba's far clip) are the lens.
-//   integrator   max_depth sets the path depth, max_depth - 1 from 1 to 64; -1 (unbounded) or none gives 64. A
+//                Mitsuba's far clip) are the lens. A singular or non-finite to_world is reported and the default
+//                camera kept.
+//   integrator   max_depth sets the path depth, max_depth - 1 from 1 to 64; -1 (unbounded), none or a value that
+//                is not finite (reported) gives 64. A
 //                wrapper (aov, moment) gives its inner integrator's; an integrator other than path, volpath and
 //                volpathmis contributes only its depth.
-//   envmap       the environment: its file, scale as the intensity, and its turn about +y minus 90 degrees as the
-//                rotation (Mitsuba's envmap, like USD's dome, puts +z at the image centre; the app puts +x there)
+//   envmap       the environment: its file, scale as the intensity (0 when not a number), and its turn about +y
+//                minus 90 degrees as the rotation (Mitsuba's envmap, like USD's dome, puts +z at the image centre;
+//                the app puts +x there)
 //   constant     a uniform 8 x 4 latlong Radiance HDR image of its radiance, at intensity 1
 // A film crop, a principal point offset and a near_clip other than 0.01 are reported and ignored.
 // Other emitters and sensors, further ones, media outside a shape's interior and unknown elements are reported and
@@ -416,10 +520,6 @@ extension MitsubaImporter {
     }
 
     var meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
-    let triangles = meshes.reduce(0) { $0 + ($1?.triangles.count ?? 0) }
-    guard triangles <= SceneLimits.triangles else {
-      throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
-    }
 
     // Materials, in shape order: the first shape with a material passes its mesh (a bump map's UV stretch).
     var materials: [USDImportSnapshot.Material] = [], materialIndex: [String: Int] = [:], bindings: [Int?] = []
@@ -428,9 +528,12 @@ extension MitsubaImporter {
       progress?.update("Building Mitsuba materials", completed: i, of: shapes.count)
       guard var mesh = meshes[i] else { bindings.append(nil); continue }
       let type = shape.type ?? "(no type)"
-      let label = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? "\(type)\(i)"
+      let label = self.label(shape, i)
       let bsdf = shape.child("bsdf"), interior = shape.child("interior")
       if shape.child("exterior") != nil { scene.note("shape '\(label)': exterior medium is not supported; ignored") }
+      if let bsdf, isOneSided(bsdf) {
+        scene.note("BSDFs without twosided are one-sided in Mitsuba (black from the back); rendered two-sided")
+      }
       let emission = areaEmission(shape, label: label, scene: &scene)
       // A dielectric whose IOR ratio is below 1 is imported as 1 / eta (MitsubaImporter.material) from the other side.
       if reversesFacing(bsdf, emits: emission != nil) {
@@ -485,25 +588,38 @@ extension MitsubaImporter {
     return result
   }
 
+  // A shape in report lines: its id, else its type and index.
+  static func label(_ shape: Node, _ index: Int) -> String {
+    shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? "\(shape.type ?? "(no type)")\(index)"
+  }
+
   // Each shape's world-space mesh (nil for a skipped shape), read in parallel; report lines in shape order, and the
-  // first shape's error in shape order.
+  // first shape's error in shape order. The running triangle total fails the load as soon as it passes the scene
+  // limit: shapes not yet read are then skipped.
   private static func loadMeshes(_ shapes: [Node], scene: inout Scene, progress: OperationProgress?) throws -> [Mesh?] {
     guard !shapes.isEmpty else { return [] }
     var results = [(mesh: Mesh?, report: [String], error: Error?)](repeating: (nil, [], nil), count: shapes.count)
     var base = scene
     base.report = []
     let shared = base
+    let triangles = Atomic<Int>(0)
     results.withUnsafeMutableBufferPointer { buffer in
       let output = DisjointWrites(base: buffer.baseAddress!)  // Each worker writes only its own shape's entry.
       DispatchQueue.concurrentPerform(iterations: shapes.count) { i in
+        defer { progress?.advance("Loading Mitsuba meshes", total: shapes.count) }
+        guard triangles.load(ordering: .relaxed) <= SceneLimits.triangles else { return }
         var local = shared
         do {
-          output.base[i] = (try mesh(shapes[i], scene: &local), local.report, nil)
+          let mesh = try mesh(shapes[i], index: i, scene: &local)
+          if triangles.add(mesh?.triangles.count ?? 0, ordering: .relaxed).newValue > SceneLimits.triangles { return }
+          output.base[i] = (mesh, local.report, nil)
         } catch {
           output.base[i] = (nil, local.report, error)
         }
-        progress?.advance("Loading Mitsuba meshes", total: shapes.count)
       }
+    }
+    guard triangles.load(ordering: .relaxed) <= SceneLimits.triangles else {
+      throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
     }
     for result in results {
       for line in result.report { scene.note(line) }
@@ -638,8 +754,13 @@ extension MitsubaImporter {
     }
     let toWorld = sensor.transform("to_world")
     let linear = simd_float3x3(columns: (toWorld.columns.0.xyz, toWorld.columns.1.xyz, toWorld.columns.2.xyz))
-    if simd_determinant(linear) < 0 { scene.note("sensor: a mirroring to_world is not represented; the image is not mirrored") }
+    let determinant = simd_determinant(linear)
     let eye = toWorld.columns.3.xyz, direction = simd_normalize(toWorld.columns.2.xyz), up = simd_normalize(toWorld.columns.1.xyz)
+    guard determinant.isFinite, determinant != 0, [eye, direction, up].allSatisfy({ v in (0..<3).allSatisfy { v[$0].isFinite } }) else {
+      scene.note("sensor: a singular or non-finite to_world; the default camera is used")
+      return nil
+    }
+    if determinant < 0 { scene.note("sensor: a mirroring to_world is not represented; the image is not mirrored") }
     var focus: Float?, aperture: Float?
     if sensor.type == "thinlens" {
       if let radius = sensor.float("aperture_radius"), radius.isFinite, radius >= 0 {
@@ -668,10 +789,17 @@ extension MitsubaImporter {
     if let type = node?.type, !["path", "volpath", "volpathmis"].contains(type) {
       scene.note("integrator \(type) is not supported; the path tracer renders with its max_depth")
     }
-    guard let maxDepth = node?.float("max_depth"), maxDepth >= 0 else { return 64 }
+    guard let maxDepth = node?.float("max_depth") else { return 64 }
+    guard maxDepth.isFinite else {
+      scene.note("max_depth \(maxDepth) is not a finite number; path depth 64 used")
+      return 64
+    }
+    guard maxDepth >= 0 else { return 64 }
+    // Clamped before the conversion: Int traps on a Float beyond its range.
     let depth = Int(min(maxDepth, 1000)) - 1
-    if depth < 1 { scene.note("max_depth \(Int(maxDepth)) rendered at path depth 1, the app's smallest") }
-    if depth > 64 { scene.note("max_depth \(Int(maxDepth)) rendered at path depth 64, the app's largest") }
+    let shown = maxDepth < 1000 ? "\(Int(maxDepth))" : "\(maxDepth)"
+    if depth < 1 { scene.note("max_depth \(shown) rendered at path depth 1, the app's smallest") }
+    if depth > 64 { scene.note("max_depth \(shown) rendered at path depth 64, the app's largest") }
     return min(max(depth, 1), 64)
   }
 
@@ -707,8 +835,13 @@ extension MitsubaImporter {
         scene.note("envmap: to_world is not a turn about +y; only its turn about +y is applied")
       }
       let degrees = turn * 180 / .pi - 90
-      let scale = emitter.float("scale") ?? 1
-      if !(0...100).contains(scale) { scene.note("envmap scale \(scale) rendered as \(min(max(scale, 0), 100)), the app's limit") }
+      var scale = emitter.float("scale") ?? 1
+      if scale.isNaN {
+        scene.note("envmap scale is not a number; 0 used")
+        scale = 0
+      } else if !(0...100).contains(scale) {
+        scene.note("envmap scale \(scale) rendered as \(min(max(scale, 0), 100)), the app's limit")
+      }
       environment = USDImportSnapshot.Environment(file: file.path, intensity: scale,
         rotation: degrees < -180 ? degrees + 360 : degrees)
     }
@@ -755,8 +888,9 @@ extension MitsubaImporter {
 //   disk         radius 1, 64 triangles around the centre, normal +z, uv = 0.5 + 0.5 (x, y) (a planar mapping;
 //                Mitsuba's own is polar).
 //   cube         -1 to 1 in 24 vertices (Mitsuba's order, one uv square per face), 12 triangles, no normals.
-//   sphere       center and radius (0 and 1) applied before to_world; 64 segments by 32 rings from the +z pole,
-//                smooth normals, uv (angle about z / 2 pi, angle from +z / pi).
+//   sphere       center and |radius| (0 and 1) applied before to_world; 64 segments by 32 rings from the +z pole,
+//                smooth normals, uv (angle about z / 2 pi, angle from +z / pi). A non-uniform to_world gives an
+//                ellipsoid, where Mitsuba keeps a sphere of the radius times the x scale; it is reported.
 //   A to_world with a negative determinant reverses the winding of the analytic shapes, whose front side is the
 //   analytic normal's; file meshes keep their winding, as Mitsuba does.
 //   flip_normals reverses the winding and negates the normals of any shape, so an area emitter emits from the other
@@ -786,16 +920,16 @@ extension MitsubaImporter {
     init(_ message: String) { self.message = message }
   }
 
-  // The shape as one world-space mesh; nil, with a report line, for a shape type that is not read. An error for
-  // a mesh file names the shape (its id, else its type) and the file.
-  static func mesh(_ shape: Node, scene: inout Scene) throws -> Mesh? {
+  // The shape (the `index`th) as one world-space mesh; nil, with a report line, for a shape type that is not read.
+  // An error for a mesh file names the shape (label(_:_:)) and the file.
+  static func mesh(_ shape: Node, index: Int, scene: inout Scene) throws -> Mesh? {
     let type = shape.type ?? "(no type)"
-    let label = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? type
+    let label = self.label(shape, index)
     let toWorld = shape.transform("to_world")
     let linear = simd_float3x3(columns: (toWorld.columns.0.xyz, toWorld.columns.1.xyz, toWorld.columns.2.xyz))
     let determinant = simd_determinant(linear)
     guard determinant.isFinite, determinant != 0 else {
-      scene.note("shape \(type) has a singular to_world; skipped")
+      scene.note("shape '\(label)' has a singular to_world; skipped")
       return nil
     }
     var mesh: Mesh
@@ -837,6 +971,12 @@ extension MitsubaImporter {
       mesh = world(local, toWorld, smoothNormals: !faceNormals, invalidNormals: &invalidNormals)
       if invalidNormals { scene.note("shape '\(label)': invalid normals in \(fileName); smooth normals computed") }
     case "rectangle", "disk", "cube", "sphere":
+      // Mitsuba 3.9.1 keeps a sphere: its radius times to_world's scale along x, without the other axes' scales.
+      let gram = linear.transpose * linear
+      let uniform = (0..<3).allSatisfy { c in (0..<3).allSatisfy { r in abs(gram[c][r] - (c == r ? gram[0][0] : 0)) <= 1e-5 * gram[0][0] } }
+      if type == "sphere", !uniform {
+        scene.note("shape '\(label)': a sphere under a non-uniform to_world is an ellipsoid here; Mitsuba keeps a sphere (radius times the x scale)")
+      }
       var unused = false
       mesh = world(unitShape(type, shape), toWorld, smoothNormals: false, invalidNormals: &unused)
       if determinant < 0 { mesh.triangles = mesh.triangles.map { SIMD3($0.x, $0.z, $0.y) } }
@@ -958,7 +1098,8 @@ extension MitsubaImporter {
           if i < rings - 1 { triangles.append([a, b, c]) }
         }
       }
-      let center = point(shape.child("center")) ?? .zero, radius = shape.float("radius") ?? 1
+      // Mitsuba uses a negative radius's magnitude.
+      let center = point(shape.child("center")) ?? .zero, radius = abs(shape.float("radius") ?? 1)
       return Mesh(positions: positions.map { center + radius * $0 }, normals: positions, uvs: uvs, triangles: triangles)
     }
   }
@@ -1555,6 +1696,19 @@ extension MitsubaImporter {
     var leaf = node
     while wrapperBSDFs.contains(leaf.type ?? ""), let inner = innerBSDF(leaf) { leaf = inner }
     return leaf
+  }
+
+  // Whether Mitsuba renders the BSDF black from the back: no twosided in the wrapper chain leafBSDF follows, and a
+  // leaf other than the dielectrics and principledthin, which scatter from both sides (Mitsuba 3.9.1: diffuse,
+  // plastic and conductor evaluate to 0 from below). The app's surfaces are two-sided.
+  static func isOneSided(_ bsdf: Node) -> Bool {
+    var node = bsdf
+    while wrapperBSDFs.contains(node.type ?? "") {
+      if node.type == "twosided" { return false }
+      guard let inner = innerBSDF(node) else { break }
+      node = inner
+    }
+    return !["dielectric", "roughdielectric", "thindielectric", "principledthin"].contains(node.type ?? "")
   }
 
   // A dielectric or roughdielectric, wrapped or not, with int_ior / ext_ior below 1 (an air bubble in ice, with the
