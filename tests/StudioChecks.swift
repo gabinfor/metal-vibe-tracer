@@ -285,12 +285,19 @@ testRenderer.options.timeLimit=2;testRenderer.options.maxSamples=0;testRenderer.
 require(testRenderer.reachedLimit,"time target stops rendering")
 print("PASS: production render scale, MetalFX, sample/time limits, display-only accumulation preservation")
 
-// AppKit layout/actions, without displaying a native window or touching user autosave.
+// AppKit layout/actions, without displaying a native window or touching user autosave or recent documents.
 // verify.py: begin studio controller
 let application=NSApplication.shared
 application.setActivationPolicy(.prohibited)
+// The test controller's recent projects stay in memory, never in the user's recent-documents list.
+@MainActor final class TestRecentProjects: RecentProjectsStore {
+    var urls: [URL] = []
+    func note(_ url: URL) { urls.removeAll { $0 == url }; urls.insert(url, at: 0) }
+    func clear() { urls = [] }
+}
 let testWindow=NSWindow(contentRect:NSRect(x:0,y:0,width:900,height:680),styleMask:[.titled,.resizable],backing:.buffered,defer:false)
-let controller=StudioController(renderer:testRenderer,window:testWindow,scenes:ScenesWindowController(ordersOnScreen:false))
+let controller=StudioController(renderer:testRenderer,window:testWindow,scenes:ScenesWindowController(ordersOnScreen:false),
+    recent:RecentProjects(store:TestRecentProjects()))
 testWindow.contentView=controller.view
 controller.viewport.isPaused=true
 // Autosaves from test edits stay in the run directory, never the user's Application Support.

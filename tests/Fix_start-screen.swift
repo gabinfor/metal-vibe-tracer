@@ -1,6 +1,6 @@
-// Launch state (AppDelegate, SceneBrowserView, ScenesWindowController): background shader compilation with
-// on-demand kernel groups, the "No scene loaded" placeholder and the Scenes window, the kept and restorable
-// last-session autosave, and the activity strip of project operations.
+// Launch state (AppDelegate, MainMenuView, RecentProjects, SceneBrowserView, ScenesWindowController): background
+// shader compilation with on-demand kernel groups, the main menu and the Scenes window, recent projects, the kept and
+// restorable last-session autosave, and the activity strip of project operations.
 @MainActor func fixStartScreenChecks() throws {
   let folder = studioDirectory.absoluteURL.appendingPathComponent("fix-start-screen", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -66,37 +66,148 @@
     && scenes.window?.contentMinSize == NSSize(width: 700, height: 440) && scenes.window?.isReleasedWhenClosed == false,
     "the scene browser lives in the resizable Scenes window, which is kept when closed")
   scenes.hide()
+  // Whether a control is shown: neither it nor a view between it and `root` is hidden.
+  func visible(_ control: NSView?, in root: NSView) -> Bool {
+    guard var view = control else { return false }
+    while view !== root {
+      if view.isHidden { return false }
+      guard let parent = view.superview else { return false }
+      view = parent
+    }
+    return true
+  }
+  func click(_ control: NSControl?) { (control as? NSButton)?.performClick(nil) }
 
-  // No document loaded: the No scene loaded placeholder covers the paused viewport and the inspector; nothing renders,
-  // only open and import commands apply, quitting keeps the autosave.
+  // No document loaded: the main menu covers the paused viewport and the inspector; nothing renders, only open and
+  // import commands apply, quitting keeps the autosave. The Scenes window opens only on request.
+  let recent = controller.recent
+  recent.clear()
   controller.showStartScreen()
   controller.view.layoutSubtreeIfNeeded()
-  guard let placeholder = controller.startScreen, placeholder.superview === controller.view,
-    placeholder.identifier?.rawValue == "no-scene"
-  else { return require(false, "the no-scene placeholder is in the controller's view") }
-  require(controller.viewport.isPaused && controller.viewport.isHidden && placeholder.frame.width > 300
-    && views(NSTextField.self, in: placeholder).contains { $0.stringValue == "No scene loaded" },
-    "with no document the No scene loaded placeholder covers the paused, hidden viewport")
-  controller.browseScenes()
-  require(scenes.isVisible && controller.isBrowsingScenes, "Browse Scenes shows the Scenes window with no document loaded")
+  guard let menu = controller.startScreen, menu.superview === controller.view, menu.identifier?.rawValue == "main-menu"
+  else { return require(false, "the main menu is in the controller's view") }
+  let menuTexts = views(NSTextField.self, in: menu).map(\.stringValue)
+  require(controller.viewport.isPaused && controller.viewport.isHidden && menu.frame.width > 300
+    && menuTexts.contains("Metal Vibe Tracer") && menuTexts.contains("Start") && menuTexts.contains("Recent projects")
+    && !menuTexts.contains { $0.hasPrefix("Version") },
+    "with no document the main menu covers the paused, hidden viewport; without a bundle version it shows none")
+  require(!scenes.isVisible && !controller.isBrowsingScenes, "the Scenes window is not shown with the main menu")
+  let startButtons = [("menu-new", "New Project"), ("menu-open-project", "Open Project…"),
+                      ("menu-open-scene", "Open Scene File…"), ("menu-browse", "Browse Scenes…"),
+                      ("menu-restore", "Restore Last Session")]
+  require(startButtons.allSatisfy { (menu.control($0.0) as? NSButton)?.title == $0.1 && menu.control($0.0)?.isEnabled == true }
+    && (menu.control("menu-guide") as? NSButton)?.title == "User Guide"
+    && (menu.control("menu-credits") as? NSButton)?.title == "Credits and licenses…"
+    && menu.control("menu-credits")?.isEnabled == true && menu.control("menu-settings") == nil,
+    "the main menu's Start buttons, User Guide and Credits and licenses… with their labels; no Settings")
+  require(visible(menu.control("menu-restore"), in: menu)
+    && views(NSTextField.self, in: menu).contains { $0.stringValue.hasPrefix("Autosaved ") && visible($0, in: menu) },
+    "with an autosave the main menu offers Restore Last Session with its date")
+  require(visible(menu.control("menu-recent-empty"), in: menu) && !visible(menu.control("menu-recent-clear"), in: menu)
+    && (menu.control("menu-recent-empty") as? NSTextField)?.stringValue == "No recent projects",
+    "an empty recent list shows No recent projects and no Clear")
+  var openedURLs: [URL] = []
+  menu.openURL = { openedURLs.append($0) }
+  click(menu.control("menu-guide"))
+  require(openedURLs == [MainMenuView.userGuideURL]
+    && MainMenuView.userGuideURL.absoluteString == "https://github.com/gabinfor/metal-vibe-tracer/blob/main/docs/USER_GUIDE.md",
+    "User Guide opens the guide on GitHub")
+  click(menu.control("menu-browse"))
+  require(scenes.isVisible && controller.isBrowsingScenes, "Browse Scenes… on the main menu shows the Scenes window")
   start.cancelOperation(nil)
-  require(!scenes.isVisible && controller.startScreen === placeholder && controller.viewport.isHidden,
-    "Esc hides the Scenes window with no document loaded, and the placeholder stays")
-  let placeholderBrowse = views(NSButton.self, in: placeholder).first { $0.identifier?.rawValue == "no-scene-browse" }
-  require(placeholderBrowse?.title == "Browse Scenes…", "the placeholder has a Browse Scenes… button")
-  placeholderBrowse?.performClick(nil)
-  require(scenes.isVisible, "the placeholder's Browse Scenes… shows the Scenes window after it was hidden")
+  require(!scenes.isVisible && controller.startScreen === menu && controller.viewport.isHidden,
+    "Esc hides the Scenes window with no document loaded, and the main menu stays")
+  click(menu.control("menu-browse"))
+  require(scenes.isVisible, "Browse Scenes… shows the Scenes window again after it was hidden")
   if let rep = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) {
     controller.view.cacheDisplay(in: controller.view.bounds, to: rep)
-    try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("start-screen.png"))
+    try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("main-menu.png"))
   }
   start.filter = .all; start.search = ""
-  require(start.control("start-restore")?.superview?.isHidden == false && start.control("start-open")?.isEnabled == true
+  require(start.control("start-open") == nil && start.control("start-open-scene") == nil && start.control("start-restore") == nil
+    && start.control("start-progress") == nil && start.control("start-cancel-pending") == nil
     && (start.control("scene-filter-0") as? NSButton)?.state == .on && (start.control("scene-filter-1") as? NSButton)?.state == .off
     && start.control("scene-credits")?.isHidden == false && start.control("scene-close") == nil
     && start.visibleEntries.count == SceneCatalog.entries.count
-    && SceneBrowserView.describe(.scene("lantern-arcade")) == "Opening Lantern Arcade",
-    "the Scenes window offers open, restoring the autosaved session and every catalog scene, and has no Close button")
+    && SceneBrowserView.describe(.scene("lantern-arcade")) == "Opening Lantern Arcade"
+    && SceneBrowserView.describe(.newProject) == "Creating a new project",
+    "the Scenes window holds scenes only: every catalog scene, no file actions, no launch rows and no Close button")
+
+  // The main menu in its launch state, before the studio exists (AppDelegate): its buttons send start actions, and it
+  // shows the shader progress, a queued action with Cancel and its own messages.
+  let launch = MainMenuView(version: "1.2.3")
+  var sent: [String] = []
+  launch.onAction = { action in
+    switch action {
+    case .newProject: sent.append("new")
+    case .openProject(nil): sent.append("project")
+    case .openScene(nil): sent.append("scene")
+    case .restoreSession: sent.append("restore")
+    default: sent.append("other")
+    }
+  }
+  var browsed = 0, launchCancels = 0
+  launch.onBrowse = { browsed += 1 }
+  launch.onCancelPending = { launchCancels += 1 }
+  launch.frame = NSRect(x: 0, y: 0, width: 900, height: 640); launch.layoutSubtreeIfNeeded()
+  require(views(NSTextField.self, in: launch).contains { $0.stringValue == "Version 1.2.3" },
+    "the header shows the bundle version")
+  require(!visible(launch.control("menu-restore"), in: launch), "without an autosave Restore Last Session is hidden")
+  launch.setRestore(Date())
+  require(visible(launch.control("menu-restore"), in: launch), "an autosave date shows Restore Last Session")
+  for id in ["menu-new", "menu-open-project", "menu-open-scene", "menu-restore", "menu-browse"] { click(launch.control(id)) }
+  require(sent == ["new", "project", "scene", "restore"] && browsed == 1,
+    "the Start buttons send New Project, Open Project…, Open Scene File… and Restore Last Session; Browse Scenes… browses")
+  require(launch.control("menu-credits")?.isEnabled == false && launch.control("menu-guide")?.isEnabled == true,
+    "Credits and licenses… is disabled until the studio sets its action; User Guide is not")
+  var launchCredits = 0
+  launch.onCredits = { launchCredits += 1 }
+  click(launch.control("menu-credits"))
+  require(launchCredits == 1, "Credits and licenses… calls onCredits once set")
+  require(!visible(launch.control("start-progress"), in: launch) && !visible(launch.control("start-cancel-pending"), in: launch),
+    "no launch rows without progress or a queued action")
+  launch.setProgress(OperationProgress("Preparing GPU shaders").snapshot)
+  launch.setPending("Opening a.vtrace once the shaders are ready.")
+  require(visible(launch.control("start-progress"), in: launch) && visible(launch.control("start-cancel-pending"), in: launch),
+    "the main menu shows the shader progress and the queued action with Cancel")
+  click(launch.control("start-cancel-pending"))
+  require(launchCancels == 1, "Cancel calls onCancelPending")
+  launch.setProgress(nil); launch.setPending(nil)
+  require(!visible(launch.control("start-progress"), in: launch) && !visible(launch.control("start-cancel-pending"), in: launch),
+    "nil hides the launch rows")
+  launch.setMessage("Old.vtrace is no longer at ~/Gone.")
+  require(visible(launch.control("menu-message"), in: launch)
+    && (launch.control("menu-message") as? NSTextField)?.stringValue == "Old.vtrace is no longer at ~/Gone.",
+    "the main menu's message row")
+  let manyRecent = (0..<10).map { folder.appendingPathComponent("many/Project \($0).vtrace") }
+  launch.setRecent(manyRecent)
+  var openedRecent: [URL] = []
+  launch.onOpenRecent = { openedRecent.append($0) }
+  click(launch.control("menu-recent-2"))
+  require(launch.control("menu-recent-7") != nil && launch.control("menu-recent-8") == nil && openedRecent == [manyRecent[2]]
+    && !visible(launch.control("menu-recent-empty"), in: launch) && visible(launch.control("menu-recent-clear"), in: launch),
+    "at most eight recent rows, each opening its project")
+  launch.setActionsEnabled(false)
+  require(["menu-new", "menu-open-project", "menu-open-scene", "menu-browse", "menu-restore", "menu-recent-0",
+           "menu-recent-clear", "menu-credits"].allSatisfy { launch.control($0)?.isEnabled == false }
+    && launch.control("menu-guide")?.isEnabled == true && launch.control("start-cancel-pending")?.isEnabled == true,
+    "setActionsEnabled(false) disables the Start buttons, recent rows, Clear and Credits; User Guide and Cancel stay")
+  launch.setActionsEnabled(true)
+  // At the minimum window size the menu scrolls to its last control.
+  launch.frame = NSRect(x: 0, y: 0, width: 700, height: 440); launch.layoutSubtreeIfNeeded()
+  guard let lastControl = launch.control("menu-credits"), let menuScroll = lastControl.enclosingScrollView,
+    let menuDocument = menuScroll.documentView
+  else { return require(false, "the main menu sits in a scroll view") }
+  require(menuDocument.bounds.contains(lastControl.convert(lastControl.bounds, to: menuDocument))
+    && launch.bounds.contains(menuScroll.convert(menuScroll.bounds, to: launch)) && menuDocument.frame.height > 440,
+    "at 700 x 440 the main menu's document holds its last control and is taller than the window")
+  lastControl.scrollToVisible(lastControl.bounds)
+  require(lastControl.convert(lastControl.bounds, to: menuDocument).intersects(menuScroll.contentView.documentVisibleRect),
+    "at 700 x 440 the main menu's last control scrolls into view")
+  if let rep = launch.bitmapImageRepForCachingDisplay(in: launch.bounds) {
+    launch.cacheDisplay(in: launch.bounds, to: rep)
+    try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("main-menu-700x440.png"))
+  }
 
   // The browser: filters, search, the details pane's primary button, the busy state and the minimum window size.
   let browser = SceneBrowserView(library: ExampleLibrary(root: folder.appendingPathComponent("library")))
@@ -203,7 +314,7 @@
   browser.setDownload(nil, fraction: nil, status: nil)
   require(error?.isHidden == true, "a new attempt clears the failure")
   browser.setActionsEnabled(false)
-  require(browser.control("scene-open")?.isEnabled == false && browser.control("start-open")?.isEnabled == false,
+  require(browser.control("scene-open")?.isEnabled == false && browser.control("scene-download")?.isEnabled == false,
     "busy disables actions")
   browser.setActionsEnabled(true)
   browser.frame = NSRect(x: 0, y: 0, width: 700, height: 440); browser.layoutSubtreeIfNeeded()
@@ -234,7 +345,9 @@
   require(valid(#selector(StudioController.browseScenesAction)), "Browse Scenes is available with no document loaded")
   require(valid(#selector(StudioController.openAction)) && valid(#selector(StudioController.openSceneFileAction))
     && !valid(#selector(StudioController.saveAction)) && !valid(#selector(StudioController.exportAction))
-    && !valid(#selector(StudioController.undoAction)), "with no document only open, import and browse commands apply")
+    && valid(#selector(StudioController.openRecentAction(_:))) && valid(#selector(StudioController.clearRecentAction))
+    && !valid(#selector(StudioController.settingsAction))
+    && !valid(#selector(StudioController.undoAction)), "with no document only open, Open Recent, import and browse commands apply")
   testRenderer.options.exposure = 3
   controller.changed(reset: false)
   controller.saveTimer?.invalidate()
@@ -244,14 +357,14 @@
 
   // Restore Last Session loads the autosave, keeps the file and hides the Scenes window.
   controller.browseScenes()
-  controller.performStartAction(.restoreSession)
-  require(controller.projectOperationInProgress && !controller.activityStrip.isHidden,
-    "restoring runs off the main thread with the activity strip shown")
+  click(menu.control("menu-restore"))
+  require(controller.projectOperationInProgress && !controller.activityStrip.isHidden
+    && menu.control("menu-new")?.isEnabled == false,
+    "restoring runs off the main thread with the activity strip shown and the main menu's buttons disabled")
   idle()
-  require(controller.startScreen == nil && placeholder.superview == nil && testRenderer.options.exposure == 1.75
-    && !controller.viewport.isPaused && !controller.viewport.isHidden && controller.activityStrip.isHidden && !scenes.isVisible
-    && start.control("start-restore")?.superview?.isHidden == true,
-    "restoring the last session removes the placeholder, hides the Scenes window and no longer offers Restore")
+  require(controller.startScreen == nil && menu.superview == nil && testRenderer.options.exposure == 1.75
+    && !controller.viewport.isPaused && !controller.viewport.isHidden && controller.activityStrip.isHidden && !scenes.isVisible,
+    "restoring the last session removes the main menu and hides the Scenes window")
   controller.autosaveQueue.sync {}
   require(FileManager.default.fileExists(atPath: controller.autosaveURL.path)
     && !FileManager.default.fileExists(atPath: controller.previousAutosaveURL.path),
@@ -306,8 +419,7 @@
   require(controller.isBrowsingScenes && scenes.isVisible && controller.startScreen == nil && !controller.viewport.isPaused
     && !controller.viewport.isHidden && sameDocument(),
     "browseScenes shows the Scenes window and the viewport is neither paused nor hidden")
-  require(start.control("start-restore")?.superview?.isHidden == true && start.control("scene-credits")?.isHidden == false,
-    "over a document the Scenes window has Credits and does not offer Restore Last Session")
+  require(start.control("scene-credits")?.isHidden == false, "over a document the Scenes window has Credits")
   // A card is found by its identifier scene-card-<id> once scrolled into view, and selecting it fills the details pane.
   start.layoutSubtreeIfNeeded()
   guard let cards = views(NSCollectionView.self, in: start).first,
@@ -382,9 +494,9 @@
 
   // Open Scene File: an OBJ opens as a new untitled scene; with unsaved changes the prompt comes first.
   require(["glb", "gltf", "usdz", "usd", "obj"].allSatisfy(SceneFile.extensions.contains)
-    && (start.control("start-open-scene") as? NSButton)?.title == "Open Scene File…" && start.control("start-import-obj") == nil
+    && (MainMenuView().control("menu-open-scene") as? NSButton)?.title == "Open Scene File…"
     && SceneBrowserView.describe(.openScene(URL(fileURLWithPath: "/tmp/Chair.glb"))) == "Opening Chair.glb",
-    "the Scenes window and SceneFile offer one Open Scene File entry for USD, glTF and OBJ")
+    "the main menu and SceneFile offer one Open Scene File entry for USD, glTF and OBJ")
   let sceneObj = folder.appendingPathComponent("quad.obj")
   try "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n".write(to: sceneObj, atomically: true, encoding: .utf8)
   let history = controller.history, groupsByEvent = history.groupsByEvent
@@ -443,6 +555,9 @@
   }
   require(prompts == 2 && controller.projectURL == nil
     && controller.project.graph?.assets.map(\.geometry.count) == [2], "Don't Save lets Open Scene File replace the document")
+  try controller.flushAutosave()
+  require(recent.urls.isEmpty,
+    "restoring the session, catalog scenes, scene files and the autosave add nothing to the recent projects")
   controller.unsavedChangesAnswer = nil
   controller.associate(nil, edited: false, replaced: false)
   // Saving reports its phase in the activity strip until it finishes.
@@ -467,12 +582,69 @@
   }
   require(controller.projectURL == nil && !scenes.isVisible, "New hides the Scenes window")
 
+  // Recent projects (the test controller's in-memory list): saving, saving as and opening a project file put it first.
+  let strip = folder.appendingPathComponent("strip.vtrace"), other = folder.appendingPathComponent("recent-other.vtrace")
+  require(recent.urls == [strip], "saving and then opening a project file lists it once")
+  var savedAs = false
+  controller.beginSaveProject(other) { savedAs = $0 }  // Save As writes the chosen file through beginSaveProject.
+  idle()
+  require(savedAs && recent.urls == [other, strip], "saving as adds the new file first")
+  grouped {
+    controller.beginOpenProject(strip)
+    idle()
+  }
+  require(recent.urls == [strip, other], "opening a project file moves it first")
+  let gone = folder.appendingPathComponent("gone/Gone.vtrace")
+  recent.note(gone)
+  controller.showStartScreen()
+  controller.view.layoutSubtreeIfNeeded()
+  guard let recentMenu = controller.startScreen else { return require(false, "the main menu shows again") }
+  let folderText = (folder.path as NSString).abbreviatingWithTildeInPath
+  let rowTitles = (0..<3).map { (recentMenu.control("menu-recent-\($0)") as? NSButton)?.title ?? "" }
+  require(rowTitles[0].hasPrefix("Gone.vtrace") && rowTitles[1].hasPrefix("strip.vtrace") && rowTitles[1].contains(folderText)
+    && rowTitles[2].hasPrefix("recent-other.vtrace") && folderText.hasPrefix("~") && recentMenu.control("menu-recent-3") == nil
+    && !visible(recentMenu.control("menu-recent-empty"), in: recentMenu)
+    && visible(recentMenu.control("menu-recent-clear"), in: recentMenu),
+    "the main menu lists the recent projects newest first with their ~-abbreviated folders: \(rowTitles)")
+  let openRecentMenu = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu?.items
+    .first { $0.title == "Open Recent" }?.submenu
+  require(openRecentMenu?.items.map(\.title) == ["Gone.vtrace", "strip.vtrace", "recent-other.vtrace", "", "Clear Menu"]
+    && openRecentMenu?.items[3].isSeparatorItem == true,
+    "File › Open Recent lists the same projects, then Clear Menu: \(openRecentMenu?.items.map(\.title) ?? [])")
+  let beforeMissing = try encoder.encode(controller.project)
+  click(recentMenu.control("menu-recent-0"))
+  require(recent.urls == [strip, other] && controller.status.stringValue == "Gone.vtrace is no longer at \(folderText)/gone."
+    && controller.startScreen === recentMenu && (try? encoder.encode(controller.project)) == beforeMissing
+    && (recentMenu.control("menu-recent-0") as? NSButton)?.title.hasPrefix("strip.vtrace") == true
+    && openRecentMenu?.items.first?.title == "strip.vtrace",
+    "a recent project that is gone is removed with a message, and the document is unchanged: \(controller.status.stringValue)")
+  grouped {
+    if let item = openRecentMenu?.items.first { controller.openRecentAction(item) }
+    idle()
+  }
+  require(controller.startScreen == nil && recentMenu.superview == nil && controller.projectURL == strip
+    && recent.urls == [strip, other], "File › Open Recent opens the project like Open Project")
+  controller.showStartScreen()
+  guard let clearing = controller.startScreen else { return require(false, "the main menu shows again") }
+  click(clearing.control("menu-recent-clear"))
+  require(recent.urls.isEmpty && visible(clearing.control("menu-recent-empty"), in: clearing)
+    && !visible(clearing.control("menu-recent-clear"), in: clearing) && clearing.control("menu-recent-0") == nil
+    && openRecentMenu?.items.map(\.title) == ["Clear Menu"] && openRecentMenu?.items.first?.action == nil,
+    "Clear empties the recent projects in the main menu and File › Open Recent")
+  grouped {
+    click(clearing.control("menu-new"))
+    idle()
+  }
+  require(controller.startScreen == nil && clearing.superview == nil && controller.projectURL == nil
+    && !controller.documentEdited && !controller.viewport.isHidden && recent.urls.isEmpty,
+    "New Project on the main menu loads an untitled project and removes the main menu")
+
   controller.viewport.isPaused = true
   controller.saveTimer?.invalidate()
   try controller.restore(ProjectDocument())
   controller.associate(nil, edited: false, replaced: true)
   controller.saveTimer?.invalidate()
   controller.history.removeAllActions()
-  print("PASS: fix-start-screen no-scene placeholder and Scenes window, kept and restored autosave, activity strip")
+  print("PASS: fix-start-screen main menu and Scenes window, recent projects, kept and restored autosave, activity strip")
 }
 try fixStartScreenChecks()

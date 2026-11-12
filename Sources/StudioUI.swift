@@ -161,10 +161,14 @@ final class StudioController: NSViewController {
   private var activityCancelHandler: (() -> Void)?
   private var activityTimer: Timer?
   private var statusAtEdge: NSLayoutConstraint!, statusAfterActivity: NSLayoutConstraint!
-  // The "No scene loaded" placeholder (NoSceneView) covering the content until a document is loaded; nil once one is.
-  fileprivate(set) var startScreen: NoSceneView?
+  // The main menu (MainMenuView) covering the content until a document is loaded; nil once one is.
+  fileprivate(set) var startScreen: MainMenuView?
   // The Scenes window with the app's scene browser, created by AppDelegate at launch.
   let scenes: ScenesWindowController
+  // The recent projects of the main menu and File › Open Recent, created by AppDelegate at launch.
+  let recent: RecentProjects
+  // File › Open Recent's submenu, refilled when the recent projects change.
+  private var openRecentMenu: NSMenu?
   // The inspector's scene title, refreshed when the document's name changes.
   private weak var sceneTitleLabel: NSTextField?
   var isBrowsingScenes: Bool { scenes.isVisible }
@@ -299,10 +303,11 @@ final class StudioController: NSViewController {
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
 
-  init(renderer: PathTracerRenderer, window: NSWindow, scenes: ScenesWindowController) {
+  init(renderer: PathTracerRenderer, window: NSWindow, scenes: ScenesWindowController, recent: RecentProjects) {
     self.renderer = renderer
     hostWindow = window
     self.scenes = scenes
+    self.recent = recent
     viewport = InteractiveMTKView(frame: .zero, device: renderer.device)
     super.init(nibName: nil, bundle: nil)
     viewport.renderer = renderer
@@ -328,6 +333,7 @@ final class StudioController: NSViewController {
     renderer.onKernelsReady = { [weak self] in self?.rebuild(); self?.refreshActivity() }
     installMenus()
     connectSceneBrowser()
+    recent.onChange = { [weak self] in self?.recentProjectsChanged() }
     updateWindowTitle()
     rebuild()
   }
@@ -1254,7 +1260,7 @@ final class StudioController: NSViewController {
     button("Save project") { [weak self] in self?.saveProject() }
     button("Save project as…") { [weak self] in self?.saveProject(asNew: true) }
     text(
-      "Projects embed textures, the environment image, and imported geometry. Changes are also autosaved locally; the start screen offers to restore them at the next launch."
+      "Projects embed textures, the environment image, and imported geometry. Changes are also autosaved locally; the main menu offers to restore them at the next launch."
     )
     heading("Export")
     number("Output width", Float(renderer.options.outputWidth), 16...8192, 1920, reset: false, integral: true) {
@@ -1458,6 +1464,7 @@ final class StudioController: NSViewController {
       refreshActivity()
     }
     scenes.browser.setActionsEnabled(enabled)
+    startScreen?.setActionsEnabled(enabled)
     for button in busyButtons { button.isEnabled = enabled }
     pauseButton?.isEnabled = enabled
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
@@ -1469,7 +1476,7 @@ final class StudioController: NSViewController {
     rebuild()
     return progress
   }
-  // Shows a new operation's progress in the activity strip (and on the start screen) until the
+  // Shows a new operation's progress in the activity strip (and on the main menu) until the
   // controller is no longer busy; `cancel` adds a Cancel button. Call it once the operation is busy.
   @discardableResult func beginActivity(_ phase: String, cancel: (() -> Void)? = nil) -> OperationProgress {
     let progress = OperationProgress(phase)
@@ -1505,8 +1512,8 @@ final class StudioController: NSViewController {
     } else {
       activityBar.stopAnimation(nil)
     }
-    // A load started from the scene browser shows its progress there too.
-    scenes.browser.setProgress(activity?.snapshot)
+    // An operation started with no document loaded shows its progress on the main menu too.
+    startScreen?.setProgress(activity?.snapshot)
     if visible, activityTimer == nil {
       let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
         MainActor.assumeIsolated { self?.refreshActivity() }
@@ -1854,7 +1861,7 @@ final class StudioController: NSViewController {
   // older snapshot can never replace the final state during application shutdown.
   // Nothing is rewritten when the current revision is already on disk.
   func flushAutosave(to destination: URL? = nil) throws {
-    // Quitting from the start screen keeps the last session's autosave for the next launch.
+    // Quitting from the main menu keeps the last session's autosave for the next launch.
     guard !isRestoring, !autosaveSuppressed, startScreen == nil || destination != nil else { return }
     saveTimer?.invalidate()
     saveTimer = nil
@@ -1949,7 +1956,7 @@ final class StudioController: NSViewController {
         // The file on disk (or its preserved copy) already holds this state.
         self.markAutosaved()
         self.restoringSession = false
-        if self.startScreen != nil { self.scenes.browser.setRestore(Self.autosaveDate(at: url)) }
+        self.startScreen?.setRestore(Self.autosaveDate(at: url))
         self.rebuild()
         self.finishProjectOperation()
       }
@@ -2015,6 +2022,7 @@ final class StudioController: NSViewController {
           self.applyProject(document, resources: resources)
           self.commit(record)
           self.associate(url, edited: false, replaced: true)
+          self.recent.note(url)
           self.show("Opened \(url.lastPathComponent)")
         case .failure(let error): self.showError(error.localizedDescription)
         }
@@ -2079,6 +2087,7 @@ final class StudioController: NSViewController {
             self.associate(
               url, edited: self.documentEdited && self.documentRevision != revision, replaced: false)
           }
+          self.recent.note(url)
           self.show("Saved \(url.lastPathComponent)")
           completion?(true)
         case .failure(let error):
@@ -2426,6 +2435,11 @@ final class StudioController: NSViewController {
         ("Show Downloaded Scenes in Finder", "", #selector(revealExampleScenesAction)),
         ("Export…", "e", #selector(exportAction)),
       ])
+    if let file = main.items.last?.submenu {
+      let item = recent.menuItem(target: self, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
+      openRecentMenu = item.submenu
+      file.insertItem(item, at: 1)
+    }
     // Standard application and window commands go to NSApp and the key window.
     if let app = main.items.first?.submenu {
       let hide = NSMenuItem(title: "Hide Metal Vibe Tracer", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
@@ -2506,6 +2520,10 @@ final class StudioController: NSViewController {
   @objc func saveAsAction() { saveProject(asNew: true) }
   @objc func openSceneFileAction() { openSceneFile() }
   @objc func browseScenesAction() { browseScenes() }
+  @objc func openRecentAction(_ sender: NSMenuItem) {
+    if let url = sender.representedObject as? URL { openRecent(url) }
+  }
+  @objc func clearRecentAction() { recent.clear() }
   @objc func frameSelectionAction() { guard !isBusy else { return }; frameMesh() }
   @objc func frameAllAction() { guard !isBusy else { return }; selectedNode = nil; frameMesh() }
   @objc func quit() { NSApp.terminate(nil) }
@@ -2524,7 +2542,8 @@ final class StudioController: NSViewController {
   @objc func restartAction() { restart() }
 }
 
-// The "No scene loaded" state and the Scenes window (ScenesWindowController) with the scene browser.
+// The main menu shown while no document is loaded, recent projects, and the Scenes window (ScenesWindowController) with
+// the scene browser.
 extension StudioController {
   // The Scenes window while it is the key window, else the main window: where the scene browser's sheets and open
   // panels attach.
@@ -2538,39 +2557,46 @@ extension StudioController {
     browser.onDownload = { [weak self] entry in self?.beginSceneDownload(entry) }
     browser.onCancelDownload = { [weak self] in self?.cancelSceneDownload() }
     browser.onCredits = { [weak self] in self?.showExampleCredits() }
-    browser.onCancelPending = nil
-    browser.setPending(nil)
     browser.setActionsEnabled(!isBusy)
     browser.setDownload(downloadingScene, fraction: downloadProgress?.fraction, status: downloadProgress?.status)
   }
-  // No document loaded: the No scene loaded placeholder covers the viewport and inspector until a document loads, and
-  // the browser offers the last session. Nothing renders meanwhile, and no autosave is written, so the last session
-  // stays restorable.
+  // No document loaded: the main menu covers the viewport and inspector until a document loads, and offers the last
+  // session. Nothing renders meanwhile, and no autosave is written, so the last session stays restorable.
   func showStartScreen() {
-    scenes.browser.setRestore(Self.autosaveDate(at: autosaveURL))
-    guard startScreen == nil else { return }
-    let placeholder = NoSceneView { [weak self] in self?.browseScenes() }
-    placeholder.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(placeholder)
+    if let menu = startScreen {
+      menu.setRestore(Self.autosaveDate(at: autosaveURL))
+      return
+    }
+    let menu = MainMenuView()
+    menu.onAction = { [weak self] action in self?.performStartAction(action) }
+    menu.onBrowse = { [weak self] in self?.browseScenes() }
+    menu.onOpenRecent = { [weak self] url in self?.openRecent(url) }
+    menu.onClearRecent = { [weak self] in self?.recent.clear() }
+    menu.onCredits = { [weak self] in self?.showExampleCredits() }
+    menu.setRestore(Self.autosaveDate(at: autosaveURL))
+    menu.setRecent(recent.shown)
+    menu.setActionsEnabled(!isBusy)
+    menu.setProgress(activity?.snapshot)
+    menu.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(menu)
     NSLayoutConstraint.activate([
-      placeholder.topAnchor.constraint(equalTo: view.topAnchor),
-      placeholder.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      placeholder.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      placeholder.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
+      menu.topAnchor.constraint(equalTo: view.topAnchor),
+      menu.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      menu.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      menu.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
     ])
-    startScreen = placeholder
+    startScreen = menu
     viewport.isPaused = true
     viewport.isHidden = true
     updateWindowTitle()
   }
-  // A loaded document (applyProject) removes the placeholder and resumes the viewport. Unless the last session was
+  // A loaded document (applyProject) removes the main menu and resumes the viewport. Unless the last session was
   // restored, its autosave becomes the recovery copy (Autosave-previous.vtrace) before this session's first autosave
   // can replace it.
   func dismissStartScreen() {
-    guard let placeholder = startScreen else { return }
-    placeholder.removeFromSuperview()
+    guard let menu = startScreen else { return }
+    menu.removeFromSuperview()
     startScreen = nil
-    scenes.browser.setRestore(nil)
     if !restoringSession { retireLastSessionAutosave() }
     viewport.isHidden = false
     viewport.isPaused = false
@@ -2596,9 +2622,22 @@ extension StudioController {
   nonisolated static func autosaveDate(at url: URL) -> Date? {
     (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
   }
+  // A recent project from the main menu or File › Open Recent: opened like Open Project, or, when the file is gone,
+  // removed from the list with a message in the status line.
+  func openRecent(_ url: URL) {
+    guard !isBusy else { return }
+    recent.open(url, with: { [weak self] in self?.performStartAction(.openProject($0)) }, report: { [weak self] in self?.show($0) })
+  }
+  private func recentProjectsChanged() {
+    if let menu = openRecentMenu {
+      recent.fill(menu, target: self, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
+    }
+    startScreen?.setRecent(recent.shown)
+  }
   func performStartAction(_ action: StartAction) {
     guard !isBusy else { return }
     switch action {
+    case .newProject: newProject()
     case .openProject(let url?): confirmDiscardingChanges { [weak self] in self?.beginOpenProject(url) }
     case .openScene(let url?): beginOpenSceneFile(url)
     case .scene(let id): if let entry = SceneCatalog.entry(id) { openScene(entry) }
@@ -2646,7 +2685,10 @@ extension StudioController: NSMenuItemValidation {
     if isBusy { return false }
     // With no document loaded only the commands that open one apply.
     if startScreen != nil {
-      return [#selector(openAction), #selector(openSceneFileAction), #selector(browseScenesAction)].contains(item.action)
+      return [
+        #selector(openAction), #selector(openRecentAction(_:)), #selector(clearRecentAction), #selector(openSceneFileAction),
+        #selector(browseScenesAction),
+      ].contains(item.action)
     }
     if item.action == #selector(undoAction) {
       item.title = history.undoMenuItemTitle

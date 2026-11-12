@@ -6,18 +6,17 @@ enum SceneFile {
   static let extensions = ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions + ["obj"]
 }
 
-// What the scene browser asks for. A nil URL asks with an open panel first.
+// What the main menu and the scene browser ask for. A nil URL asks with an open panel first.
 enum StartAction {
-  case openProject(URL?), openScene(URL?), restoreSession
+  case newProject, openProject(URL?), openScene(URL?), restoreSession
   // The SceneCatalog entry with this id. A download scene that is not installed does nothing (its Download button in
   // the browser downloads it).
   case scene(String)
 }
 
-// The scene browser (docs/SCENE_BROWSER_DESIGN.md §4), the content of the Scenes window (ScenesWindowController): a top
-// row of file actions (open a project or a scene file, restore the last session) over filters and search, a grid of
-// scene cards and the details pane of the selected card. While the GPU shaders compile at launch (AppDelegate) it shows
-// their progress and the action queued until they are ready; afterwards StudioController drives it.
+// The scene browser (docs/SCENE_BROWSER_DESIGN.md §4), the content of the Scenes window (ScenesWindowController):
+// filters and search, a grid of scene cards and the details pane of the selected card. While the GPU shaders compile at
+// launch AppDelegate takes its actions; afterwards StudioController drives it.
 final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionViewDelegate {
   enum Filter: Int, CaseIterable { case all, builtIn, included, downloads, installed }
   var onAction: ((StartAction) -> Void)?
@@ -26,7 +25,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   var onDownload: ((SceneEntry) -> Void)? { didSet { updateDownloadEnabled() } }
   // The details pane's Cancel button while a download runs (setDownload).
   var onCancelDownload: (() -> Void)?
-  var onCancelPending: (() -> Void)?
   // The Credits and licenses… link; nil hides it (the launch state, before the studio can show the credits sheet).
   var onCredits: (() -> Void)? { didSet { creditsButton.isHidden = onCredits == nil } }
   var filter: Filter = .all { didSet { applyFilter() } }
@@ -49,14 +47,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   var library: ExampleLibrary { didSet { reload() } }
   private var actionButtons: [NSButton] = []
   private var actionsEnabled = true
-  private let restoreRow = NSStackView()
-  private let restoreInfo = NSTextField(labelWithString: "")
-  private let progressRow = NSStackView()
-  private let progressBar = NSProgressIndicator()
-  private let progressLabel = NSTextField(labelWithString: "")
-  private let hint = NSTextField(wrappingLabelWithString: "")
-  private let pendingRow = NSStackView()
-  private let pendingLabel = NSTextField(wrappingLabelWithString: "")
   private let searchField = NSSearchField()
   private var filterButtons: [NSButton] = []
   private let grid = NSCollectionView()
@@ -95,7 +85,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     wantsLayer = true
     identifier = NSUserInterfaceItemIdentifier("scene-browser")
 
-    let top = buildTopRow()
     let filters = buildFilters()
     buildGrid()
     let detailsScroll = buildDetails()
@@ -103,15 +92,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     columns.orientation = .horizontal
     columns.alignment = .top
     columns.spacing = 16
-    columns.setHuggingPriority(.init(1), for: .vertical)
-    let content = NSStackView(views: [top, progressRow, hint, pendingRow, columns])
-    content.orientation = .vertical
-    content.alignment = .leading
-    content.spacing = 10
-    content.distribution = .fill
-    content.detachesHiddenViews = true
-    content.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(content)
+    columns.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(columns)
     emptyLabel.identifier = NSUserInterfaceItemIdentifier("scene-empty")
     emptyLabel.textColor = .secondaryLabelColor
     emptyLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -119,13 +101,10 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     addSubview(emptyLabel)
 
     NSLayoutConstraint.activate([
-      content.topAnchor.constraint(equalTo: topAnchor, constant: 16),
-      content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-      content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-      content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
-      top.widthAnchor.constraint(equalTo: content.widthAnchor),
-      columns.widthAnchor.constraint(equalTo: content.widthAnchor),
-      hint.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor),
+      columns.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+      columns.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      columns.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+      columns.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
       filters.widthAnchor.constraint(equalToConstant: 140),
       detailsScroll.widthAnchor.constraint(equalToConstant: 260),
       gridScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: CardGridLayout.minimumWidth),
@@ -159,64 +138,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   }
 
   // MARK: Building
-
-  private func buildTopRow() -> NSView {
-    let row = NSStackView()
-    row.orientation = .horizontal
-    row.spacing = 10
-    for (title, id, action) in [
-      ("Open Project…", "start-open", StartAction.openProject(nil)),
-      ("Open Scene File…", "start-open-scene", .openScene(nil)),
-    ] {
-      let button = ActionButton(title) { [weak self] in self?.onAction?(action) }
-      button.identifier = NSUserInterfaceItemIdentifier(id)
-      row.addArrangedSubview(button)
-      actionButtons.append(button)
-    }
-    restoreRow.orientation = .horizontal
-    restoreRow.spacing = 8
-    let restore = ActionButton("Restore Last Session") { [weak self] in self?.onAction?(.restoreSession) }
-    restore.identifier = NSUserInterfaceItemIdentifier("start-restore")
-    actionButtons.append(restore)
-    restoreInfo.textColor = .secondaryLabelColor
-    restoreInfo.font = .systemFont(ofSize: 11)
-    restoreInfo.lineBreakMode = .byTruncatingTail
-    restoreInfo.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-    restoreRow.addArrangedSubview(restore)
-    restoreRow.addArrangedSubview(restoreInfo)
-    restoreRow.isHidden = true
-    row.addArrangedSubview(restoreRow)
-    let spacer = NSView()
-    spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-    row.addArrangedSubview(spacer)
-    row.detachesHiddenViews = true
-
-    progressBar.style = .bar
-    progressBar.controlSize = .small
-    progressBar.minValue = 0
-    progressBar.maxValue = 1
-    progressBar.widthAnchor.constraint(equalToConstant: 220).isActive = true
-    progressLabel.font = .systemFont(ofSize: 12)
-    progressLabel.identifier = NSUserInterfaceItemIdentifier("start-progress")
-    progressRow.orientation = .horizontal
-    progressRow.spacing = 10
-    progressRow.addArrangedSubview(progressBar)
-    progressRow.addArrangedSubview(progressLabel)
-    progressRow.isHidden = true
-    hint.textColor = .secondaryLabelColor
-    hint.font = .systemFont(ofSize: 11)
-    hint.isHidden = true
-
-    pendingRow.orientation = .horizontal
-    pendingRow.spacing = 10
-    pendingLabel.font = .systemFont(ofSize: 12)
-    let cancel = ActionButton("Cancel") { [weak self] in self?.onCancelPending?() }
-    cancel.identifier = NSUserInterfaceItemIdentifier("start-cancel-pending")
-    pendingRow.addArrangedSubview(pendingLabel)
-    pendingRow.addArrangedSubview(cancel)
-    pendingRow.isHidden = true
-    return row
-  }
 
   private func buildFilters() -> NSView {
     searchField.identifier = NSUserInterfaceItemIdentifier("scene-search")
@@ -358,34 +279,6 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   func reload() {
     applyFilter()
     fillDetails()
-  }
-  // The autosave's modification date; nil hides the restore button.
-  func setRestore(_ date: Date?) {
-    restoreRow.isHidden = date == nil
-    if let date { restoreInfo.stringValue = "Autosaved " + date.formatted(date: .abbreviated, time: .shortened) }
-  }
-  // Shader compilation or another launch step; nil hides the progress row.
-  func setProgress(_ snapshot: OperationProgress.Snapshot?, hint text: String? = nil) {
-    progressRow.isHidden = snapshot == nil
-    hint.isHidden = snapshot == nil || text == nil
-    hint.stringValue = text ?? ""
-    guard let snapshot else {
-      progressBar.stopAnimation(nil)
-      return
-    }
-    progressLabel.stringValue = snapshot.text
-    if let fraction = snapshot.fraction {
-      progressBar.isIndeterminate = false
-      progressBar.doubleValue = fraction
-    } else if !progressBar.isIndeterminate {
-      progressBar.isIndeterminate = true
-    }
-    progressBar.startAnimation(nil)
-  }
-  // An action queued until the shaders are ready; nil hides it.
-  func setPending(_ text: String?) {
-    pendingRow.isHidden = text == nil
-    pendingLabel.stringValue = text ?? ""
   }
   // Disabled while a queued action or a started operation is in progress: the action buttons and card selection.
   func setActionsEnabled(_ enabled: Bool) {
@@ -591,9 +484,10 @@ extension SceneBrowserView {
       if response == .OK, let url = panel.url { chosen(make(url)) }
     }
   }
-  // What a queued action will do, for the browser's pending row ("Opening Sponza.vtrace").
+  // What a queued action will do, for the main menu's pending row ("Opening Sponza.vtrace").
   static func describe(_ action: StartAction) -> String {
     switch action {
+    case .newProject: return "Creating a new project"
     case .openProject(let url): return "Opening \(url?.lastPathComponent ?? "a project")"
     case .openScene(let url): return "Opening \(url?.lastPathComponent ?? "a scene")"
     case .scene(let id): return "Opening \(SceneCatalog.entry(id)?.title ?? "a scene")"
@@ -602,8 +496,8 @@ extension SceneBrowserView {
   }
 }
 
-// The Scenes window: the app's one scene browser in its own window, which opens at launch in front of the main window
-// and is shown again by File › Browse Scenes… and the Browse buttons. Its close button closes it and Esc hides it; it
+// The Scenes window: the app's one scene browser in its own window, created at launch but shown only on request: by
+// the main menu's Browse Scenes…, File › Browse Scenes… and the inspector's Browse… button. Its close button closes it and Esc hides it; it
 // is never released. `ordersOnScreen` false keeps the window off screen and only tracks `isVisible` (the test suite).
 final class ScenesWindowController: NSWindowController, NSWindowDelegate {
   let browser = SceneBrowserView()
@@ -668,32 +562,6 @@ final class ScenesWindowController: NSWindowController, NSWindowDelegate {
   func windowWillClose(_ notification: Notification) {
     isVisible = false
   }
-}
-
-// The main window's content while no document is loaded: a grey "No scene loaded" placeholder with a Browse Scenes…
-// button that shows the Scenes window.
-final class NoSceneView: NSView {
-  init(browse: @escaping () -> Void) {
-    super.init(frame: .zero)
-    wantsLayer = true
-    identifier = NSUserInterfaceItemIdentifier("no-scene")
-    let label = NSTextField(labelWithString: "No scene loaded")
-    label.font = .systemFont(ofSize: 17, weight: .medium)
-    label.textColor = .secondaryLabelColor
-    let button = ActionButton("Browse Scenes…", browse)
-    button.identifier = NSUserInterfaceItemIdentifier("no-scene-browse")
-    let stack = NSStackView(views: [label, button])
-    stack.orientation = .vertical
-    stack.spacing = 12
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(stack)
-    NSLayoutConstraint.activate([
-      stack.centerXAnchor.constraint(equalTo: centerXAnchor), stack.centerYAnchor.constraint(equalTo: centerYAnchor),
-    ])
-  }
-  required init?(coder: NSCoder) { fatalError() }
-  override var wantsUpdateLayer: Bool { true }
-  override func updateLayer() { layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor }
 }
 
 private extension SceneEntry.Format {
