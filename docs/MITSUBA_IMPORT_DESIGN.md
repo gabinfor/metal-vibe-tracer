@@ -61,22 +61,22 @@ The mappings are those of `scripts/mitsuba_to_usd.py` as validated in `REFERENCE
 
 ## 6. Download entries
 
-Ten `SceneEntry` values in a `.bitterli` collection (`format: .mitsuba`), each with one archive from `https://benedikt-bitterli.me/resources/mitsuba/<name>.zip`. Sizes and SHA-256 digests are pinned from the archives in `build/scenes/downloads`, after each is re-checked against the server's `Content-Length`.
+Ten `SceneEntry` values in a `.bitterli` collection (`format: .mitsuba`), each with one archive from `https://benedikt-bitterli.me/resources/mitsuba/<name>.zip`. Sizes and SHA-256 digests are pinned in `SceneCatalog` from the archives in `build/scenes/downloads`, after each was re-checked against the server's `Content-Length` (2026-11-12).
 
-| Scene | Archive | Author | License |
+| Scene (`id`) | Archive | Author | License |
 | --- | --- | --- | --- |
-| Veach, Bidir Room | `veach-bidir.zip` | Benedikt Bitterli | CC0 1.0 |
-| Veach, Ajar | `veach-ajar.zip` | Benedikt Bitterli | CC0 1.0 |
-| Glass of Water | `glass-of-water.zip` | aXel | CC0 1.0 |
-| Contemporary Bathroom | `bathroom.zip` | Mareck | CC0 1.0 |
-| Water Caustic | `water-caustic.zip` | Benedikt Bitterli | CC0 1.0 |
-| Little Lamp | `lamp.zip` | UP3D | CC0 1.0 |
-| Country Kitchen | `kitchen.zip` | Jay-Artist | CC BY 3.0 |
-| The White Room | `living-room-2.zip` | Jay-Artist | CC BY 3.0 |
-| The Grey & White Room | `living-room.zip` | Wig42 | CC BY 3.0 |
-| Modern Hall | `staircase2.zip` | NewSee2l035 | CC BY 3.0 |
+| Veach, Bidir Room (`veach-bidir`) | `veach-bidir.zip` | Benedikt Bitterli | CC0 1.0 |
+| Veach, Ajar (`veach-ajar`) | `veach-ajar.zip` | Benedikt Bitterli | CC0 1.0 |
+| Glass of Water (`glass-of-water`) | `glass-of-water.zip` | aXel | CC0 1.0 |
+| Contemporary Bathroom (`bathroom`) | `bathroom.zip` | Mareck | CC0 1.0 |
+| Water Caustic (`water-caustic`) | `water-caustic.zip` | Benedikt Bitterli | CC0 1.0 |
+| Little Lamp (`lamp`) | `lamp.zip` | UP3D | CC0 1.0 |
+| Country Kitchen (`kitchen`) | `kitchen.zip` | Jay-Artist | CC BY 3.0 |
+| The White Room (`white-room`) | `living-room-2.zip` | Jay-Artist | CC BY 3.0 |
+| The Grey & White Room (`grey-white-room`) | `living-room.zip` | Wig42 | CC BY 3.0 |
+| Modern Hall (`modern-hall`) | `staircase2.zip` | NewSee2l035 | CC BY 3.0 |
 
-- Each entry names the scene file inside the archive: `scene_v3.xml`, or the 0.6 file for Water Caustic.
+- Each archive extracts into a folder of its own name, so the entry's storage folder is `bitterli-<archive name>` (the McGuire `living_room` storage stays separate from Bitterli's `living-room`) and its scene file is `<archive name>/scene_v3.xml`; Water Caustic's archive holds only `water-caustic/scene_v0.6.xml`.
 - Each has a shot in `scripts/showcase.json` with a new `"mitsuba"` source key, `"view": "Mitsuba: camera"`, and a caustics mode where the 2026-11-09 comparison needs one (Water Caustic: light tracing + photons).
 - CC0 entries state that credit is appreciated and not required; CC BY 3.0 entries use the existing credit terms.
 - Thumbnails follow the browser's rules.

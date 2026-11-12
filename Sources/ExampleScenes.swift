@@ -2,14 +2,15 @@ import Cocoa
 import CryptoKit
 
 // REFERENCES.md: MCGUIRE2017, OBJ2026, MTL2026, SHA256FIPS, STANFORD3DSCAN, BITTERLI2016 (the Fireplace and Living
-// Room cameras). The download scenes of SceneCatalog, from Morgan McGuire's Computer Graphics Archive. Nothing is
-// bundled: the scene browser's Download button, whose details pane states the size and source, downloads an archive,
-// checks it against the size and SHA-256 digest pinned in SceneCatalog, extracts it into Application Support and imports it
-// through ProjectDocument.appendOBJ, unchanged, with the camera and lighting of the README image (the
-// scripts/showcase.json shot of the same name, ShowcaseShot). The bundled spectral examples open through the USD
-// importer with their shot (Examples/Spectral).
+// Room cameras; the Mitsuba scenes). The download scenes of SceneCatalog, from Morgan McGuire's Computer Graphics
+// Archive and Benedikt Bitterli's Rendering Resources. Nothing is bundled: the scene browser's Download button, whose
+// details pane states the size and source, downloads an archive, checks it against the size and SHA-256 digest pinned
+// in SceneCatalog, extracts it into Application Support and imports it with the camera and lighting of the README
+// image (the scripts/showcase.json shot of the same name, ShowcaseShot): McGuire's OBJ unchanged through
+// ProjectDocument.appendOBJ, Bitterli's scenes through the Mitsuba importer. The bundled spectral examples open
+// through the USD importer with their shot (Examples/Spectral).
 
-// One archive of the McGuire archive and the folder it extracts into, relative to its scene's storage folder.
+// One archive of a scene's download and the folder it extracts into, relative to its scene's storage folder.
 struct ExampleArchive: Sendable, Equatable {
   var name: String
   var url: URL
@@ -273,6 +274,7 @@ struct ShowcaseShot: Decodable, Sendable {
   var project: String?
   var usd: String?
   var gltf: String?
+  var mitsuba: String?
   var obj: String?
   var hdri: String?
   var sky: UInt32?
@@ -326,7 +328,7 @@ struct ShowcaseShot: Decodable, Sendable {
     return try load(url)
   }
 
-  // Everything but the scene source (scene, usd, gltf, obj, project, hdri) and the export mode (raw).
+  // Everything but the scene source (scene, usd, gltf, mitsuba, obj, project, hdri) and the export mode (raw).
   func apply(to p: inout ProjectDocument) {
     if let k = emissionScale { p.scaleImportedEmission(by: k) }
     if let r = rotation, r.count == 3, var graph = p.graph {
@@ -414,6 +416,8 @@ extension StudioController {
     switch entry.source {
     case .builtIn(let index): confirmDiscardingChanges { [weak self] in self?.startBuiltInScene(index) }
     case .bundled: openBundledScene(entry)
+    // Temporary placeholder: the Mitsuba importer's call replaces this line.
+    case .download where entry.format == .mitsuba: show("Opening Mitsuba scenes arrives with the importer.")
     case .download: confirmDiscardingChanges { [weak self] in self?.beginExampleImport(entry) }
     }
   }
@@ -542,9 +546,12 @@ extension StudioController {
     alert.messageText = "Example scene credits"
     alert.informativeText =
       SceneCatalog.credits.joined(separator: "\n\n")
-      + "\n\nFrom Morgan McGuire's Computer Graphics Archive, July 2017, downloaded on request and imported unchanged. "
-      + "Metal Vibe Tracer translates their MTL materials and sets its own camera, sky and sun; renders are adapted "
-      + "works and must keep this credit and the license link."
+      + "\n\nFrom Morgan McGuire's Computer Graphics Archive (casual-effects.com/data), July 2017, downloaded on "
+      + "request and imported unchanged: Metal Vibe Tracer translates their MTL materials and sets its own camera, sky "
+      + "and sun. From Benedikt Bitterli's Rendering Resources (benedikt-bitterli.me/resources), downloaded on request "
+      + "and opened through the Mitsuba importer, which translates their Mitsuba materials to OpenPBR. Renders are "
+      + "adapted works and must keep the credit and the license link, except for the public domain (CC0) scenes, "
+      + "where credit is appreciated but not required."
     alert.addButton(withTitle: "OK")
     alert.addButton(withTitle: "Open Archive Website")
     alert.beginSheetModal(for: window) { response in
