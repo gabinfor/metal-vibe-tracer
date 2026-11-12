@@ -684,8 +684,9 @@ try fixMitsubaChecks()
 
 // Mitsuba scene assembly (MitsubaImporter.load): shapes as assets and nodes, shared materials, the sensor as the saved
 // view "Mitsuba: camera" (field of view from fov, fov_axis and the film), the film size as the render size, max_depth
-// as the path depth, envmap and constant emitters as the environment, unsupported plugins in the report, Open Scene
-// File, and on the GPU an emitter that lights the floor in absolute units.
+// as the path depth, envmap and constant emitters as the environment, unsupported plugins in the report, shapes reversed
+// for a dielectric (wrapped or not) with an IOR ratio below 1 and their emitters and media, Open Scene File, and on the
+// GPU an emitter that lights the floor in absolute units.
 @MainActor func fixMitsubaSceneChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba-scene", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -841,15 +842,77 @@ try fixMitsubaChecks()
   require(flipped.report.contains("shape 'mapped': to_uv is not supported; ignored"), "a shape's to_uv is reported (\(flipped.report))")
   // A dielectric whose int_ior / ext_ior is below 1 (Glass of Water's air bubbles in ice) is the same interface seen from
   // its other side: the shape's facing is reversed (the material takes 1 / eta, Fix_mitsuba-materials.swift).
-  let bubbles = try load("""
+  let bubbleScene = try load("""
     <scene version="3.0.0">
       <shape type="rectangle" id="ice"><bsdf type="dielectric"><float name="int_ior" value="1.31"/><float name="ext_ior" value="1"/></bsdf></shape>
       <shape type="rectangle" id="bubble"><bsdf type="roughdielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf></shape>
       <shape type="rectangle" id="pane"><bsdf type="thindielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf></shape>
     </scene>
-    """).document
+    """)
+  let bubbles = bubbleScene.document
   require((facing(bubbles, "ice")?.z ?? 0) > 0.99 && (facing(bubbles, "bubble")?.z ?? 0) < -0.99 && (facing(bubbles, "pane")?.z ?? 0) > 0.99,
     "an IOR ratio below 1 reverses a dielectric's facing, not a thin dielectric's (\(String(describing: facing(bubbles, "bubble"))))")
+  // A thin dielectric below 1 reflects totally beyond its critical angle in Mitsuba; the inverse ratio does not.
+  require(bubbleScene.report.contains("rectangle2: thindielectric with an IOR ratio below 1 is rendered with the inverse ratio; its total internal reflection is lost"),
+    "a thin dielectric below 1 is reported as an approximation (\(bubbleScene.report))")
+
+  // The flip follows the BSDF the material mapping reaches (MitsubaImporter.leafBSDF): through twosided, mask,
+  // bumpmap and normalmap an inverted dielectric's shape is reversed and reported; a wrapped one above 1 is not.
+  let bumpImage = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4, bitsPerSample: 8, samplesPerPixel: 3,
+    hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 12, bitsPerPixel: 24)!
+  for i in 0..<48 { bumpImage.bitmapData![i] = i % 3 == 2 ? 255 : 128 }
+  try bumpImage.representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent("bump.png"))
+  func wrapped(_ kind: String, _ inner: String) -> String {
+    switch kind {
+    case "bumpmap": return #"<bsdf type="bumpmap"><texture type="bitmap" name="map"><string name="filename" value="bump.png"/></texture>\#(inner)</bsdf>"#
+    case "normalmap":
+      return #"<bsdf type="normalmap"><texture type="bitmap" name="normalmap"><string name="filename" value="bump.png"/><boolean name="raw" value="true"/></texture>\#(inner)</bsdf>"#
+    default: return #"<bsdf type="\#(kind)">\#(inner)</bsdf>"#
+    }
+  }
+  let inverted = #"<bsdf type="roughdielectric"><float name="int_ior" value="0.75"/><float name="ext_ior" value="1"/></bsdf>"#
+  let upright = #"<bsdf type="dielectric"><float name="int_ior" value="1.5"/><float name="ext_ior" value="1"/></bsdf>"#
+  for kind in ["twosided", "mask", "bumpmap", "normalmap"] {
+    let result = try load("""
+      <scene version="3.0.0">
+        <shape type="rectangle" id="inverted">\(wrapped(kind, inverted))</shape>
+        <shape type="rectangle" id="upright">\(wrapped(kind, upright))</shape>
+      </scene>
+      """)
+    let reversed = result.report.contains { $0.hasPrefix("rectangle0: int_ior / ext_ior 0.75 is below 1;") && $0.hasSuffix("with the shape's facing reversed") }
+    require((facing(result.document, "inverted")?.z ?? 0) < -0.99 && (facing(result.document, "upright")?.z ?? 0) > 0.99 && reversed
+      && !result.report.contains { $0.hasPrefix("rectangle1: int_ior") },
+      "\(kind) around a dielectric below 1 reverses the shape and says so; around one above 1 it does not (\(result.report))")
+  }
+  // flip_normals and the inverted IOR's reversal cancel: the winding is the unflipped file's.
+  let cancelled = try load("""
+    <scene version="3.0.0">
+      <shape type="rectangle" id="both"><boolean name="flip_normals" value="true"/>\(inverted)</shape>
+      <shape type="rectangle" id="neither"/>
+    </scene>
+    """).document
+  require((facing(cancelled, "both")?.z ?? 0) > 0.99 && (facing(cancelled, "neither")?.z ?? 0) > 0.99,
+    "flip_normals on a dielectric below 1 cancels the reversal (\(String(describing: facing(cancelled, "both"))))")
+  // An emitter on such a shape keeps Mitsuba's side (the app's emission is one-sided by winding), so the shape is not
+  // reversed and its glass is index-matched; an interior medium on a reversed shape would be outside it and is dropped.
+  let sided = try load("""
+    <scene version="3.0.0">
+      <shape type="rectangle" id="lamp">\(inverted)<emitter type="area"><rgb name="radiance" value="2"/></emitter></shape>
+      <shape type="rectangle" id="cavity">\(inverted)<medium type="homogeneous" name="interior"><rgb name="albedo" value="0"/><rgb name="sigma_t" value="1"/></medium></shape>
+    </scene>
+    """)
+  func compiledMaterial(_ document: ProjectDocument, _ name: String) -> MaterialXProgram? {
+    guard let slot = document.graph?.materials.first(where: { $0.name == name })?.slot else { return nil }
+    return document.scenes[6]?.materialX?[slot]
+  }
+  let lampIOR = compiledMaterial(sided.document, "rectangle0_emitter")?.parameters.first { $0.name.hasSuffix("/specular_ior") }?.defaultValue?.x
+  let cavity = compiledMaterial(sided.document, "rectangle1")
+  require((facing(sided.document, "lamp")?.z ?? 0) > 0.99 && lampIOR == 1
+    && sided.report.contains("rectangle0_emitter: int_ior / ext_ior 0.75 is below 1; rendered index-matched, so that the shape's emitter keeps its side"),
+    "an emitter on a dielectric below 1 keeps its side; the glass is index-matched and reported (\(String(describing: lampIOR)), \(sided.report))")
+  require((facing(sided.document, "cavity")?.z ?? 0) < -0.99 && cavity != nil && cavity?.medium == nil
+    && sided.report.contains("rectangle1: interior medium ignored (the shape is reversed for its IOR ratio below 1, which puts Mitsuba's interior on its outside)"),
+    "an interior medium on a reversed shape is dropped and reported (\(sided.report))")
   print("PASS: Mitsuba scenes: shapes, shared materials, camera and field of view, render size, depth, environment, report")
 
   // Open Scene File: a Mitsuba scene opens as an untitled document; an .xml that is not one fails and changes nothing.

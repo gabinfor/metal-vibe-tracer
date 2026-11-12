@@ -1,8 +1,9 @@
 // Mitsuba materials (MitsubaImporter.material) beyond Fix_mitsuba.swift's mapping rows: the baked images' texels
 // against their formulas (bump normal maps, nonlinear plastics), principledthin, textured masks and
-// plastics, conductor chroma and textured specular_reflectance, normal maps, transmission colours, IOR ratios below 1,
-// values that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's
-// rows for any v scale) and the bake size limit.
+// plastics, conductor chroma and textured specular_reflectance (sRGB, raw, near-grey, and unreadable or too large to
+// check), normal maps, transmission colours, IOR ratios below 1 (dielectric, roughdielectric, thindielectric), values
+// that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's rows for
+// any v scale) and the bake size limit.
 @MainActor func fixMitsubaMaterialChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba-materials", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -156,9 +157,38 @@
       <rgb name="color0" value="0.8"/><rgb name="color1" value="0.2"/></texture></bsdf>
     """, name: "checker")
   let checker = try compiled(checkerText)
+  // The colour space of the colour image that specular_weight's extract reads, and the extract's index.
+  func weightSource(_ text: String) -> (colorspace: String, index: String)? {
+    func capture(_ pattern: String) -> String? {
+      guard let match = try? Regex(pattern).firstMatch(in: text), match.output.count > 1, let value = match.output[1].substring else { return nil }
+      return String(value)
+    }
+    guard let extract = capture(#"<input name="specular_weight" type="float" nodename="(\w+)"/>"#),
+      let image = capture(#"<extract name="\#(extract)" type="float">\s*<input name="in" type="color3" nodename="(\w+)"/>"#),
+      let index = capture(#"<extract name="\#(extract)" type="float">\s*<input name="in" [^>]*/>\s*<input name="index" type="integer" value="(\d+)"/>"#),
+      let space = capture(#"<image name="\#(image)" type="color3">\s*<input name="file" type="filename" value="[^"]*" colorspace="(\w+)"/>"#)
+    else { return nil }
+    return (space, index)
+  }
+  let checkerSource = weightSource(checkerText)
   require(input(checker, "specular_weight") == nil && checker.images.count == 1 && near(input(checker, "base_color"), cu)
-    && checkerText.contains(#"<image name="mitsuba_n"#) && checkerText.contains(#"type="color3""#) && checkerText.contains("<extract "),
-    "a grey specular_reflectance texture: specular_weight from the sRGB image's red channel, base_color F0 (\(String(describing: input(checker, "base_color"))))")
+    && checkerSource?.colorspace == "srgb_texture" && checkerSource?.index == "0",
+    "a grey specular_reflectance texture: specular_weight from the sRGB image's red channel, base_color F0 (\(String(describing: checkerSource)), \(String(describing: input(checker, "base_color"))))")
+  // A raw grey texture: the same red channel of an image read without sRGB decoding.
+  let rawWeightText = try document("""
+    <bsdf type="conductor"><texture type="bitmap" name="specular_reflectance"><string name="filename" value="grey.png"/>
+      <boolean name="raw" value="true"/></texture></bsdf>
+    """, name: "rawweight")
+  let rawSource = weightSource(rawWeightText)
+  require(rawSource?.colorspace == "raw" && rawSource?.index == "0" && !rawWeightText.contains("srgb_texture"),
+    "a raw grey specular_reflectance texture: specular_weight from the raw image's red channel (\(String(describing: rawSource)))")
+  // Near-grey (channels a level apart, as a JPEG's chroma subsampling leaves them) counts as grey.
+  try png("near-grey.png") { x, y in let v = UInt8(100 + 20 * x); return (v, (x + y) % 2 == 0 ? v + 1 : v, (x + y) % 2 == 0 ? v : v - 1) }
+  let nearGrey = try document("""
+    <bsdf type="conductor"><texture type="bitmap" name="specular_reflectance"><string name="filename" value="near-grey.png"/></texture></bsdf>
+    """, name: "neargrey")
+  require(weightSource(nearGrey)?.colorspace == "srgb_texture" && !reported(prefix: "neargrey:"),
+    "a near-grey specular_reflectance texture (channels within 2 of 255) takes the grey path")
   try png("red.png") { _, _ in (200, 50, 50) }
   let tinted = try program("""
     <bsdf type="conductor"><string name="material" value="Cu"/><texture type="bitmap" name="specular_reflectance">
@@ -182,6 +212,11 @@
   let bubble = try program(#"<bsdf type="dielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf>"#, name: "bubble")
   require(near(input(bubble, "specular_ior"), SIMD3(repeating: 1 / 0.763)) && reported(prefix: "bubble: int_ior / ext_ior 0.763 is below 1"),
     "a dielectric with int_ior / ext_ior 0.763: specular_ior 1 / 0.763, reported (\(String(describing: input(bubble, "specular_ior"))))")
+  let roughBubble = try program(#"<bsdf type="roughdielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf>"#, name: "froth")
+  let thinBubble = try program(#"<bsdf type="thindielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf>"#, name: "film0")
+  require(near(input(roughBubble, "specular_ior"), SIMD3(repeating: 1 / 0.763)) && near(input(thinBubble, "specular_ior"), SIMD3(repeating: 1 / 0.763))
+    && reported("film0: thindielectric with an IOR ratio below 1 is rendered with the inverse ratio; its total internal reflection is lost"),
+    "a roughdielectric and a thindielectric below 1: specular_ior 1 / eta, the thin one reported as an approximation")
   // A named conductor material with k alone: Mitsuba rejects the unused property; the importer reports it.
   _ = try program(#"<bsdf type="conductor"><string name="material" value="Au"/><rgb name="k" value="1"/></bsdf>"#, name: "gold")
   require(reported("gold: k ignored with a named conductor material"), "a named conductor material with k is reported")
@@ -248,6 +283,18 @@
       <bsdf type="plastic"><boolean name="nonlinear" value="true"/>
         <texture type="bitmap" name="diffuse_reflectance"><string name="filename" value="huge.png"/></texture></bsdf>
       """, name: "huge")
+  }
+  // A conductor's specular_reflectance texture that cannot be checked for grey (above the bake limit, or not an
+  // image) takes the coloured path with a report line naming the reason; the import succeeds.
+  try Data("not an image".utf8).write(to: folder.appendingPathComponent("unreadable.png"))
+  for (file, label, reason) in [("huge.png", "hugemetal", "too large to bake (8193 × 8192)"), ("unreadable.png", "badmetal", "cannot decode unreadable.png")] {
+    let text = try document("""
+      <bsdf type="conductor"><texture type="bitmap" name="specular_reflectance"><string name="filename" value="\(file)"/></texture></bsdf>
+      """, name: label)
+    require(weightSource(text) == nil && text.contains(#"name="base_color" type="color3" nodename"#)
+      && scene.report.contains { $0.hasPrefix("\(label): specular_reflectance texture \(file) not checked for grey") && $0.contains(reason) }
+      && reported("\(label): coloured specular_reflectance texture scales F0 only"),
+      "\(file) as a conductor's specular_reflectance: the coloured path, reported with the reason (\(scene.report.filter { $0.hasPrefix(label) }))")
   }
   print("PASS: Mitsuba materials: baked texels, principledthin, value guards, texture reports, to_uv sampling, bake limit")
 }

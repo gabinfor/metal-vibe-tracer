@@ -11,12 +11,13 @@ import simd
 //                        baked per texel and channel from the ratio at 17 reflectances, linearly interpolated
 //   conductor/rough...   base_metalness 1, base_color = F0 and specular_color = the 82-degree tint of
 //                        MitsubaImporter.conductor (none, a perfect mirror, by default), specular_reflectance as
-//                        specular_weight (its chroma kept in base_color; a grey texture is connected to
-//                        specular_weight, a coloured one multiplies base_color instead)
+//                        specular_weight (its chroma kept in base_color; a grey texture, channels within 2 of 255, is
+//                        connected to specular_weight, a coloured or unreadable one multiplies base_color instead)
 //   dielectric/rough...  transmission_weight 1, specular_ior = int_ior (1.5046) / ext_ior (1.000277) (below 1: its
-//                        inverse, with the shape's facing reversed by MitsubaImporter.load), specular_transmittance
-//                        as transmission_color, and zero as a black reflector
-//   thindielectric       the same with geometry_thin_walled
+//                        inverse, with the shape's facing reversed by MitsubaImporter.load and its interior medium
+//                        dropped; on an emitting shape, which keeps its facing, 1: index-matched),
+//                        specular_transmittance as transmission_color, and zero as a black reflector
+//   thindielectric       the same with geometry_thin_walled (below 1: its inverse, without total internal reflection)
 //   principledthin       thin-walled; base_color, diff_trans as subsurface weight and anisotropy, spec_trans as
 //                        transmission_weight and specular_weight, roughness, eta
 //   twosided             its (first) inner BSDF; mask: geometry_opacity = opacity (a texture, or a constant's mean)
@@ -36,7 +37,8 @@ extension MitsubaImporter {
   // normal map depends on its UV stretch; without UVs the bump map is dropped and reported.
   static func material(bsdf: Node?, emission: SIMD3<Float>?, interior: Node?, name: String,
                        scene: inout Scene, folder: URL, mesh: Mesh? = nil) throws -> String {
-    var builder = MaterialBuilder(name: name, folder: folder, scene: scene)
+    var builder = MaterialBuilder(name: name, folder: folder, scene: scene,
+                                  reversed: MitsubaImporter.reversesFacing(bsdf, emits: emission != nil))
     defer { scene = builder.scene }
     var inputs: Inputs
     if let bsdf {
@@ -154,6 +156,8 @@ private struct MaterialBuilder {
   let name: String
   let folder: URL
   var scene: MitsubaImporter.Scene
+  // Whether MitsubaImporter.load reverses the shape (reversesFacing).
+  let reversed: Bool
 
   // The properties each BSDF's mapping reads; any other property is reported as unsupported.
   static let properties: [String: Set<String>] = [
@@ -182,22 +186,21 @@ private struct MaterialBuilder {
         scene.note("\(name): \(kind) \(property) unsupported; ignored")
       }
     }
-    func inner() throws -> MitsubaImporter.Node {
-      guard let bsdf = node.children.first(where: { $0.tag == "bsdf" }) else {
+    var m = Inputs()
+    if MitsubaImporter.wrapperBSDFs.contains(kind) {
+      // The wrapped BSDF, the one MitsubaImporter.leafBSDF follows.
+      guard let inner = MitsubaImporter.innerBSDF(node) else {
         throw MitsubaImporter.error("material '\(name)': \(kind) has no inner BSDF")
       }
-      return bsdf
+      m = try inputs(inner)
     }
-    var m = Inputs()
     switch kind {
     case "twosided":
       let sides = node.children.filter { $0.tag == "bsdf" }
       if sides.count > 1, sides[0].id == nil || sides[1].id != sides[0].id {
         scene.note("\(name): twosided back-side BSDF unsupported; the front BSDF used on both sides")
       }
-      return try inputs(inner())
     case "bumpmap", "normalmap":
-      m = try inputs(inner())
       let map = node.children.first { $0.tag == "texture" }
       guard let t = try map.flatMap({ try texture($0, property: $0.name ?? "map") }) else {
         scene.note("\(name): \(kind) texture unsupported; dropped")
@@ -211,7 +214,6 @@ private struct MaterialBuilder {
       }
     case "mask":
       // OpenPBR geometry_opacity: coverage, stochastic in both renderers.
-      m = try inputs(inner())
       switch try colour(node, "opacity", default: SIMD3(repeating: 1)) {
       case .texture(let t, _): m["geometry_opacity"] = .texture(t, tint: nil)
       case .color(let c) where c.sum() / 3 < 1: m["geometry_opacity"] = .value(c.sum() / 3)
@@ -294,7 +296,14 @@ private struct MaterialBuilder {
     // specular_weight, while a coloured one can only scale base_color (F0).
     switch try colour(node, "specular_reflectance", default: SIMD3(repeating: 1)) {
     case .texture(let t, _):
-      if try Self.isGrey(t, owner: name) {
+      var grey = false
+      do {
+        grey = try Self.isGrey(t, owner: name)
+      } catch {
+        // The coloured path needs no decoding here; the renderer reads the image itself.
+        scene.note("\(name): specular_reflectance texture \(t.file.lastPathComponent) not checked for grey (\(error.localizedDescription))")
+      }
+      if grey {
         m["base_color"] = .color(f0)
         m["specular_weight"] = .texture(t, tint: nil)
       } else {
@@ -315,11 +324,18 @@ private struct MaterialBuilder {
     let eta = try MitsubaImporter.ior(node, "int_ior", default: 1.5046) / MitsubaImporter.ior(node, "ext_ior", default: 1.000277)
     var m = Inputs()
     if eta.isFinite && eta > 0 {
-      // Below 1, the same interface from its other side (MitsubaImporter.invertedDielectric).
       m["specular_ior"] = .value(eta < 1 ? 1 / eta : eta)
-      if eta < 1 {
-        scene.note("\(name): int_ior / ext_ior \(eta) is below 1; rendered as \(1 / eta)"
-          + (kind == "thindielectric" ? "" : " with the shape's facing reversed"))
+      if eta < 1 && kind == "thindielectric" {
+        // Mitsuba's pane below 1 reflects totally beyond the critical angle (3.9.1 at 0.763: 1.0 from 50 degrees;
+        // at 1 / 0.763, 0.06 at 50 degrees and 0.34 at 75); 1 / eta matches it only near normal incidence.
+        scene.note("\(name): thindielectric with an IOR ratio below 1 is rendered with the inverse ratio; its total internal reflection is lost")
+      } else if eta < 1 && reversed {
+        // The same interface from its other side (MitsubaImporter.invertedDielectric).
+        scene.note("\(name): int_ior / ext_ior \(eta) is below 1; rendered as \(1 / eta) with the shape's facing reversed")
+      } else if eta < 1 {
+        // An emitting shape keeps its facing (MitsubaImporter.reversesFacing): 1 / eta would bend light the wrong way.
+        m["specular_ior"] = .value(1)
+        scene.note("\(name): int_ior / ext_ior \(eta) is below 1; rendered index-matched, so that the shape's emitter keeps its side")
       }
     } else {
       scene.note("\(name): int_ior / ext_ior \(eta) is not a finite positive IOR; specular_ior 1.5 used")
@@ -621,6 +637,11 @@ private struct MaterialBuilder {
       scene.note("\(name): interior medium ignored (its BSDF \(m["geometry_thin_walled"] == nil ? "does not refract" : "is thin-walled"))")
       return
     }
+    // The app applies a medium on entering a front face; reversed, Mitsuba's interior is the shape's outside.
+    guard !reversed else {
+      scene.note("\(name): interior medium ignored (the shape is reversed for its IOR ratio below 1, which puts Mitsuba's interior on its outside)")
+      return
+    }
     if m["transmission_color"] != nil { scene.note("\(name): specular_transmittance replaced by the interior medium's absorption") }
     m["transmission_color"] = .color(SIMD3((0..<3).map { exp(-sigma[$0]) }))
     m["transmission_depth"] = .value(1)
@@ -645,11 +666,16 @@ private struct MaterialBuilder {
     return image
   }
 
-  // Whether every texel of the texture has equal red, green and blue.
+  // Whether every texel's red, green and blue are within 2 of 255 levels of each other, as stored (8-bit sRGB, or
+  // raw values times 255): an 8-bit JPEG of a grey image keeps its channels a level or two apart after chroma
+  // subsampling. Throws when the image cannot be decoded or is above bakeTexels.
   static func isGrey(_ t: Inputs.Texture, owner: String) throws -> Bool {
+    func level(_ v: Float) -> Float { t.srgb && v <= 1 ? Float(encoded(v)) : v * 255 }
     var grey = true
     try forEachTexel(try image(t.file, owner: owner), srgb: t.srgb, owner: owner) { _, red, green, blue in
-      if red != green || green != blue { grey = false }
+      guard grey, red != green || green != blue else { return }
+      let r = level(red), g = level(green), b = level(blue)
+      if max(r, g, b) - min(r, g, b) > 2 { grey = false }
     }
     return grey
   }

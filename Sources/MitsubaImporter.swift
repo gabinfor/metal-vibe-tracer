@@ -366,7 +366,8 @@ enum MitsubaImporter {
 //   shape        one mesh asset and one node per shape (MitsubaImporter.mesh, world space, identity node transform),
 //                named by its id, else <type><index>; one material per BSDF, area-emitter radiance and interior
 //                medium (MitsubaImporter.material), shared by the shapes that reference the same BSDF id with the same
-//                emission; zero-area triangles are dropped
+//                emission; zero-area triangles are dropped. A shape whose dielectric (wrapped or not) has an IOR
+//                ratio below 1 is reversed (reversesFacing), unless it emits
 //   sensor       the first perspective or thinlens sensor is the saved view "Mitsuba: camera" and the active camera.
 //                Mitsuba's camera looks along +z with x to the left, so its to_world times diag(-1, 1, -1, 1) is a
 //                camera looking along -z (eye: the origin, direction: to_world's z, up: its y). The vertical field
@@ -415,10 +416,6 @@ extension MitsubaImporter {
     }
 
     var meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
-    // A dielectric whose IOR ratio is below 1 is imported as 1 / eta (MitsubaImporter.material) from the other side.
-    for (i, shape) in shapes.enumerated() where invertedDielectric(shape.child("bsdf")) {
-      meshes[i] = meshes[i]?.flipped()
-    }
     let triangles = meshes.reduce(0) { $0 + ($1?.triangles.count ?? 0) }
     guard triangles <= SceneLimits.triangles else {
       throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
@@ -429,12 +426,17 @@ extension MitsubaImporter {
     var materialNames = Set<String>()
     for (i, shape) in shapes.enumerated() {
       progress?.update("Building Mitsuba materials", completed: i, of: shapes.count)
-      guard let mesh = meshes[i] else { bindings.append(nil); continue }
+      guard var mesh = meshes[i] else { bindings.append(nil); continue }
       let type = shape.type ?? "(no type)"
       let label = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? "\(type)\(i)"
       let bsdf = shape.child("bsdf"), interior = shape.child("interior")
       if shape.child("exterior") != nil { scene.note("shape '\(label)': exterior medium is not supported; ignored") }
       let emission = areaEmission(shape, label: label, scene: &scene)
+      // A dielectric whose IOR ratio is below 1 is imported as 1 / eta (MitsubaImporter.material) from the other side.
+      if reversesFacing(bsdf, emits: emission != nil) {
+        mesh = mesh.flipped()
+        meshes[i] = mesh
+      }
       let key = [bsdf?.id ?? "shape \(i)", emission.map { "\($0)" } ?? "", interior.map { $0.id ?? "shape \(i)" } ?? ""]
         .joined(separator: "|")
       if let index = materialIndex[key] { bindings.append(index); continue }
@@ -758,8 +760,8 @@ extension MitsubaImporter {
 //   A to_world with a negative determinant reverses the winding of the analytic shapes, whose front side is the
 //   analytic normal's; file meshes keep their winding, as Mitsuba does.
 //   flip_normals reverses the winding and negates the normals of any shape, so an area emitter emits from the other
-//   side, and so does a dielectric or roughdielectric whose int_ior / ext_ior is below 1 (imported as 1 / eta);
-//   a to_uv on a shape other than the identity is reported and ignored.
+//   side; MitsubaImporter.load reverses a shape again for a dielectric whose int_ior / ext_ior is below 1
+//   (reversesFacing), so the two cancel. A to_uv on a shape other than the identity is reported and ignored.
 extension MitsubaImporter {
   struct Mesh {
     var positions: [SIMD3<Float>]
@@ -1542,15 +1544,35 @@ extension MitsubaImporter {
 //                  tag v3.9.1 (with microfacet.h's eval_reflectance and eval_transmittance and their
 //                  Gauss-Legendre quadrature over visible normals) in double precision
 extension MitsubaImporter {
-  // A dielectric or roughdielectric with int_ior / ext_ior below 1 (an air bubble in ice, with the denser side
-  // outside): the app's IOR is at least 1.01, so the interface is imported from its other side, as 1 / eta with the
-  // shape's facing reversed. A thindielectric's two interfaces reflect the same for eta and 1 / eta.
+  // The BSDFs that wrap another, their first <bsdf> child. MaterialBuilder.inputs maps a wrapper's inner BSDF through
+  // innerBSDF and invertedDielectric decides from leafBSDF, so the material and the shape's facing follow one chain.
+  static let wrapperBSDFs: Set<String> = ["twosided", "mask", "bumpmap", "normalmap"]
+
+  static func innerBSDF(_ node: Node) -> Node? { node.children.first { $0.tag == "bsdf" } }
+
+  // The BSDF a chain of wrappers ends in (the node itself when it wraps nothing).
+  static func leafBSDF(_ node: Node) -> Node {
+    var leaf = node
+    while wrapperBSDFs.contains(leaf.type ?? ""), let inner = innerBSDF(leaf) { leaf = inner }
+    return leaf
+  }
+
+  // A dielectric or roughdielectric, wrapped or not, with int_ior / ext_ior below 1 (an air bubble in ice, with the
+  // denser side outside). The app's IOR is at least 1.01, and each surface uses only its own relative IOR, so the
+  // interface is imported from its other side: 1 / eta with the shape's facing reversed (reversesFacing). A
+  // thindielectric is not reversed: it is imported as 1 / eta, which loses its total internal reflection beyond the
+  // critical angle (MaterialBuilder.dielectric reports it).
   static func invertedDielectric(_ bsdf: Node?) -> Bool {
-    guard let bsdf, bsdf.type == "dielectric" || bsdf.type == "roughdielectric",
+    guard let bsdf = bsdf.map(leafBSDF), bsdf.type == "dielectric" || bsdf.type == "roughdielectric",
       let eta = try? ior(bsdf, "int_ior", default: 1.5046) / ior(bsdf, "ext_ior", default: 1.000277)
     else { return false }
     return eta.isFinite && eta > 0 && eta < 1
   }
+
+  // Whether a shape is imported from its other side: an inverted dielectric without an area emitter. The app's
+  // emission is one-sided by winding, so an emitting one keeps its facing and its interface is rendered
+  // index-matched instead (MaterialBuilder.dielectric).
+  static func reversesFacing(_ bsdf: Node?, emits: Bool) -> Bool { !emits && invertedDielectric(bsdf) }
 
   static func ior(_ node: Node, _ name: String, default fallback: Float) throws -> Float {
     guard node.child(name) != nil else { return fallback }
