@@ -162,7 +162,7 @@ struct ExportFailure: LocalizedError {
   else { throw ExportFailure(errorDescription: "FAIL: \(shot.name) did not export") }
   print("\(shot.name): \(p.options.outputWidth)x\(p.options.outputHeight), \(p.options.exportSamples) spp, "
     + "\(Int(Date().timeIntervalSince(start))) s, camera yaw \(p.camera.yaw) pitch \(p.camera.pitch) "
-    + "distance \(p.camera.distance) fov \(p.camera.fov) target \(p.camera.target)")
+    + "distance \(p.camera.distance) fov \(p.camera.fov) target \(p.camera.target) depth \(p.options.depth)")
   return url
 }
 
