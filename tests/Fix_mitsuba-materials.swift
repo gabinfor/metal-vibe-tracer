@@ -1,6 +1,6 @@
 // Mitsuba materials (MitsubaImporter.material) beyond Fix_mitsuba.swift's mapping rows: the baked images' texels
 // against the converter's formulas (bump normal maps, nonlinear plastics), principledthin, textured masks and
-// plastics, conductor chroma, normal maps, transmission colours, IOR ratios below 1,
+// plastics, conductor chroma and textured specular_reflectance, normal maps, transmission colours, IOR ratios below 1,
 // values that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's
 // rows for any v scale) and the bake size limit.
 @MainActor func fixMitsubaMaterialChecks() throws {
@@ -138,6 +138,22 @@
   let cu = MitsubaTables.conductors["Cu"]!.f0
   require(near(input(chroma, "specular_weight"), SIMD3(repeating: 0.5)) && near(input(chroma, "base_color"), cu * SIMD3(1, 0.5, 0.25)),
     "conductor: a coloured specular_reflectance splits into specular_weight (its maximum) and base_color chroma")
+  // A textured specular_reflectance scales Mitsuba's whole Fresnel: a grey one (Veach Ajar's checkerboard floor) is a
+  // connected specular_weight over the conductor's F0; a coloured one can only scale F0 and is reported.
+  let checker = try program("""
+    <bsdf type="roughconductor"><string name="material" value="Cu"/><texture type="checkerboard" name="specular_reflectance">
+      <rgb name="color0" value="0.8"/><rgb name="color1" value="0.2"/></texture></bsdf>
+    """, name: "checker")
+  require(input(checker, "specular_weight") == nil && checker.images.count == 1 && near(input(checker, "base_color"), cu),
+    "a grey specular_reflectance texture: connected specular_weight, base_color F0 (\(String(describing: input(checker, "base_color"))))")
+  try png("red.png") { _, _ in (200, 50, 50) }
+  let tinted = try program("""
+    <bsdf type="conductor"><string name="material" value="Cu"/><texture type="bitmap" name="specular_reflectance">
+      <string name="filename" value="red.png"/></texture></bsdf>
+    """, name: "tinted")
+  require(input(tinted, "base_color") == nil && tinted.images.count == 1
+    && reported("tinted: coloured specular_reflectance texture scales F0 only"),
+    "a coloured specular_reflectance texture multiplies base_color and is reported")
   try png("normal.png") { _, _ in (128, 128, 255) }
   let mapped = try document("""
     <bsdf type="normalmap"><texture type="bitmap" name="normalmap"><string name="filename" value="normal.png"/><boolean name="raw" value="true"/></texture>

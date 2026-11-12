@@ -12,7 +12,8 @@ import simd
 //                        baked per texel and channel from the ratio at 17 reflectances, linearly interpolated
 //   conductor/rough...   base_metalness 1, base_color = F0 and specular_color = the 82-degree tint of
 //                        MitsubaImporter.conductor (none, a perfect mirror, by default), specular_reflectance as
-//                        specular_weight (its chroma kept in base_color; a texture multiplies base_color instead)
+//                        specular_weight (its chroma kept in base_color; a grey texture is connected to
+//                        specular_weight, a coloured one multiplies base_color instead)
 //   dielectric/rough...  transmission_weight 1, specular_ior = int_ior (1.5046) / ext_ior (1.000277) (below 1: its
 //                        inverse, with the shape's facing reversed by MitsubaImporter.load), specular_transmittance
 //                        as transmission_color, and zero as a black reflector
@@ -128,7 +129,7 @@ private struct Inputs {
       case .color(let c): values.append((name, .color(c)))
       case .boolean(let b): values.append((name, .boolean(b)))
       case .texture(let t, let tint):
-        let type = name == "geometry_opacity" ? "float" : "color3"
+        let type = name == "geometry_opacity" || name == "specular_weight" ? "float" : "color3"
         let node = w.image(t.file.path, type: type, colorspace: t.srgb ? "srgb_texture" : "raw", uv: coordinates(t.scale),
                            u: "periodic", v: "periodic")
         if let tint {
@@ -281,10 +282,17 @@ private struct MaterialBuilder {
     // OpenPBR's metal Fresnel is Schlick from F0 with its 82-degree value tinted by specular_color.
     if tint.min() < 0.999 { m["specular_color"] = .color(tint) }
     // specular_reflectance scales Mitsuba's whole Fresnel, grazing angles included; OpenPBR's specular_weight scales
-    // the metal lobe the same way. A colour keeps its chroma in base_color; a texture can only scale base_color (F0).
+    // the metal lobe the same way. A colour keeps its chroma in base_color; a grey texture is a connected
+    // specular_weight, while a coloured one can only scale base_color (F0).
     switch try colour(node, "specular_reflectance", default: SIMD3(repeating: 1)) {
     case .texture(let t, _):
-      m["base_color"] = .texture(t, tint: f0)
+      if try Self.isGrey(t, owner: name) {
+        m["base_color"] = .color(f0)
+        m["specular_weight"] = .texture(t, tint: nil)
+      } else {
+        m["base_color"] = .texture(t, tint: f0)
+        scene.note("\(name): coloured specular_reflectance texture scales F0 only")
+      }
     case .color(let s):
       let weight = min(1, s.max())
       m["base_color"] = .color(f0 * (weight > 0 ? s / weight : SIMD3(repeating: 1)))
@@ -625,6 +633,15 @@ private struct MaterialBuilder {
       throw MitsubaImporter.error("material '\(owner)': texture \(url.lastPathComponent) is too large to bake (\(image.width) × \(image.height))")
     }
     return image
+  }
+
+  // Whether every texel of the texture has equal red, green and blue.
+  static func isGrey(_ t: Inputs.Texture, owner: String) throws -> Bool {
+    var grey = true
+    try forEachTexel(try image(t.file, owner: owner), srgb: t.srgb, owner: owner) { _, red, green, blue in
+      if red != green || green != blue { grey = false }
+    }
+    return grey
   }
 
   // Calls `body` with each texel's index (rows from the top) and linear RGB: integer formats are normalized and sRGB
