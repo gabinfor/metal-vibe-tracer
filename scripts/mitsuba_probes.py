@@ -2,11 +2,14 @@
 
 Usage:
   build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py variant SCENE.xml MODE OUTDIR
-      Writes OUTDIR/<scene folder>_<MODE>/scene.xml (":" as "_"), beside links to everything else in SCENE.xml's
-      folder (so relative paths keep resolving for the app and for Mitsuba), and prints its path.
+      Writes OUTDIR/<scene folder>_<MODE>/scene.xml (":" and "=" as "_"), beside links to everything else in
+      SCENE.xml's folder, including the .xml files it <include>s, which are linked unchanged (so relative paths
+      keep resolving for the app and for Mitsuba), and prints its path.
       MODE flat: every BSDF becomes a two-sided diffuse 0.5; drop:KIND: only BSDFs containing KIND
       (e.g. roughconductor) are flattened. Nested BSDF ids keep a flattened copy, since Mitsuba ids
       are global. A scene that matches when flattened has no transport or emitter error.
+      constant:PROPERTY=VALUE: every BSDF property PROPERTY given by a texture becomes <rgb value="VALUE">
+      (constant:specular_reflectance=0.5 gives Veach Ajar's constant-floor variant, for compare_scene.py --metal-ms).
   build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py plate OUTDIR NAME front|back|backlit 'BSDF XML'
       A 1.2 x 1.2 plate with the given BSDF over a grey floor under a large area light; backlit puts the
       light behind the plate, so the camera sees only light the plate transmits (and the lit floor).
@@ -48,14 +51,24 @@ def variant(src, mode, outdir):
                     flat(c)
             else:
                 visit(c, kind)
-    visit(root, mode[5:] if mode.startswith('drop:') else None)
+    if mode.startswith('constant:'):
+        prop, value = mode[9:].split('=', 1)
+        for b in list(root.iter('bsdf')):
+            for i, c in enumerate(list(b)):
+                if c.tag == 'texture' and c.get('name') == prop:
+                    b.remove(c)
+                    b.insert(i, ET.Element('rgb', name=prop, value=value))
+    else:
+        visit(root, mode[5:] if mode.startswith('drop:') else None)
     for i in nested:
         e = ET.Element('bsdf', id=i); flat(e); root.insert(0, e)
-    folder = pathlib.Path(outdir) / f'{src.parent.name}_{mode.replace(":", "_")}'
+    folder = pathlib.Path(outdir) / f'{src.parent.name}_{mode.replace(":", "_").replace("=", "_")}'
     folder.mkdir(parents=True, exist_ok=True)
+    # The scene file itself is replaced; files it includes (the first component of each include's path) are linked.
+    included = {pathlib.Path(i.get('filename', '')).parts[0] for i in root.iter('include') if i.get('filename')}
     for entry in src.parent.iterdir():
         link = folder / entry.name
-        if entry.suffix != '.xml' and not link.exists():
+        if (entry.suffix != '.xml' or entry.name in included) and not link.exists():
             link.symlink_to(entry)
     out = folder / 'scene.xml'
     tree.write(out)
