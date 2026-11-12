@@ -6,20 +6,23 @@ import simd
 // Bitterli's scenes (REFERENCES.md BITTERLI2016):
 //   diffuse              base_color = reflectance (0.5), specular_weight 0
 //   plastic/roughplastic base_color = diffuse_reflectance (0.5) x plasticRatio (int_ior 1.49, ext_ior 1.000277,
-//                        alpha 0.1, beckmann), specular_ior = int_ior / ext_ior, specular_roughness = sqrt(alpha)
-//                        (0 when smooth); a texture is multiplied by the ratio at rho 0.5, or for a nonlinear plastic
-//                        baked per texel and channel from the ratio at 17 reflectances, linearly interpolated
+//                        alpha 0.1, beckmann), specular_ior = int_ior / ext_ior (below 1: 1.01, reported),
+//                        specular_roughness = sqrt(alpha) (0 when smooth); a texture is multiplied by the ratio at
+//                        rho 0.5, or for a nonlinear plastic baked per texel and channel from the ratio at 17
+//                        reflectances, linearly interpolated
 //   conductor/rough...   base_metalness 1, base_color = F0 and specular_color = the 82-degree tint of
 //                        MitsubaImporter.conductor (none, a perfect mirror, by default), specular_reflectance as
 //                        specular_weight (its chroma kept in base_color; a grey texture, channels within 2 of 255, is
 //                        connected to specular_weight, a coloured or unreadable one multiplies base_color instead)
+//   rough...             specular_roughness = sqrt(alpha); a conductor's or dielectric's alpha_u and alpha_v, without
+//                        alpha, as their geometric mean sqrt(alpha_u alpha_v) (an approximation, reported)
 //   dielectric/rough...  transmission_weight 1, specular_ior = int_ior (1.5046) / ext_ior (1.000277) (below 1: its
 //                        inverse, with the shape's facing reversed by MitsubaImporter.load and its interior medium
 //                        dropped; on an emitting shape, which keeps its facing, 1: index-matched),
 //                        specular_transmittance as transmission_color, and zero as a black reflector
 //   thindielectric       the same with geometry_thin_walled (below 1: its inverse, without total internal reflection)
 //   principledthin       thin-walled; base_color, diff_trans as subsurface weight and anisotropy, spec_trans as
-//                        transmission_weight and specular_weight, roughness, eta
+//                        transmission_weight and specular_weight, roughness, eta (below 1: 1.01, reported)
 //   twosided             its (first) inner BSDF; mask: geometry_opacity = opacity (a texture, or a constant's mean)
 //   bumpmap              the inner BSDF with the height map as a tangent-space normal map, from the mesh's UV stretch
 //   normalmap            the inner BSDF with its texture as the normal map
@@ -165,9 +168,10 @@ private struct MaterialBuilder {
     "plastic": ["diffuse_reflectance", "int_ior", "ext_ior", "nonlinear"],
     "roughplastic": ["diffuse_reflectance", "int_ior", "ext_ior", "nonlinear", "alpha", "distribution", "sample_visible"],
     "conductor": ["material", "eta", "k", "specular_reflectance"],
-    "roughconductor": ["material", "eta", "k", "specular_reflectance", "alpha", "distribution", "sample_visible"],
+    "roughconductor": ["material", "eta", "k", "specular_reflectance", "alpha", "alpha_u", "alpha_v", "distribution", "sample_visible"],
     "dielectric": ["int_ior", "ext_ior", "specular_reflectance", "specular_transmittance"],
-    "roughdielectric": ["int_ior", "ext_ior", "specular_reflectance", "specular_transmittance", "alpha", "distribution", "sample_visible"],
+    "roughdielectric": ["int_ior", "ext_ior", "specular_reflectance", "specular_transmittance", "alpha", "alpha_u", "alpha_v", "distribution",
+                        "sample_visible"],
     "thindielectric": ["int_ior", "ext_ior", "specular_reflectance", "specular_transmittance"],
     "principledthin": ["base_color", "diff_trans", "spec_trans", "roughness", "eta", "anisotropic", "spec_tint", "sheen",
                        "sheen_tint", "flatness"],
@@ -274,7 +278,7 @@ private struct MaterialBuilder {
     default:
       break
     }
-    if validIOR { m["specular_ior"] = .value(eta) }
+    if validIOR { m["specular_ior"] = .value(lowestIOR(eta, kind: rough ? "roughplastic" : "plastic")) }
     m["specular_roughness"] = .value(alpha.map { ($0.isFinite ? $0 : 0.1).squareRoot() } ?? 0)
     return m
   }
@@ -390,7 +394,7 @@ private struct MaterialBuilder {
       scene.note("\(name): eta \(eta) is not positive; 1.5 used")
       eta = 1.5
     }
-    m["specular_ior"] = .value(eta)
+    m["specular_ior"] = .value(lowestIOR(eta, kind: "principledthin"))
     m["specular_weight"] = .value(s)
     if d > 0 {
       m["subsurface_weight"] = .value(min(d, 1))
@@ -427,6 +431,15 @@ private struct MaterialBuilder {
     return value
   }
 
+  // An IOR ratio below 1 is reported and 1.01 used, the renderer's smallest (it clamps specular_ior to 1.01-2.5).
+  // The inverse ratio is not used as for a dielectric: an opaque coating has no other side to import, and Mitsuba's
+  // coating below 1 reflects totally beyond its critical angle, which neither value renders.
+  mutating func lowestIOR(_ eta: Float, kind: String) -> Float {
+    guard eta < 1 else { return eta }
+    scene.note("\(name): \(kind) IOR ratio \(eta) is below 1; rendered at specular_ior 1.01, the app's smallest")
+    return 1.01
+  }
+
   // A value that cannot be negative; a negative one is reported and 0 used.
   mutating func nonNegative(_ value: Float, _ property: String) -> Float {
     guard value < 0 else { return value }
@@ -434,9 +447,16 @@ private struct MaterialBuilder {
     return 0
   }
 
-  // sqrt(alpha), alpha 0.1 when absent.
+  // sqrt(alpha), alpha 0.1 when absent. Without alpha, an anisotropic alpha_u and alpha_v (0.1 each when absent, as in
+  // Mitsuba's MicrofacetDistribution) are rendered isotropic at their geometric mean, which is reported.
   mutating func roughness(_ node: MitsubaImporter.Node) -> Float {
-    nonNegative(scalar(node, "alpha", 0.1), "alpha").squareRoot()
+    guard node.child("alpha") == nil, node.child("alpha_u") != nil || node.child("alpha_v") != nil else {
+      return nonNegative(scalar(node, "alpha", 0.1), "alpha").squareRoot()
+    }
+    let u = nonNegative(scalar(node, "alpha_u", 0.1), "alpha_u"), v = nonNegative(scalar(node, "alpha_v", 0.1), "alpha_v")
+    let alpha = (u * v).squareRoot()
+    if u != v { scene.note("\(name): anisotropic alpha_u \(u) and alpha_v \(v) rendered isotropic at alpha \(alpha), their geometric mean") }
+    return alpha.squareRoot()
   }
 
   // Whether the microfacet distribution is GGX. OpenPBR's is, so Beckmann (Mitsuba's default) is reported.
@@ -700,7 +720,7 @@ private struct MaterialBuilder {
       let maximum = layout.bits == 8 ? 255 : 65535
       let table = (0...maximum).map { v -> Float in
         let x = Float(v) / Float(maximum)
-        return srgb ? (x <= 0.04045 ? x / 12.92 : powf((x + 0.055) / 1.055, 2.4)) : x
+        return srgb ? MitsubaImporter.srgbToLinear(x) : x
       }
       let rowBytes = image.bytesPerRow, pixelBytes = image.bitsPerPixel / 8, colourCount = layout.colours
       guard CFDataGetLength(data) >= (h - 1) * rowBytes + w * pixelBytes else {
@@ -724,7 +744,7 @@ private struct MaterialBuilder {
               let a = Float(component(colourCount)) / Float(maximum)
               func value(_ k: Int) -> Float {
                 let x = Float(component(k)) / Float(maximum), u = a > 0 ? min(1, x / a) : x
-                return srgb ? (u <= 0.04045 ? u / 12.92 : powf((u + 0.055) / 1.055, 2.4)) : u
+                return srgb ? MitsubaImporter.srgbToLinear(u) : u
               }
               c = colourCount == 3 ? SIMD3(value(0), value(1), value(2)) : SIMD3(repeating: value(0))
             }
@@ -746,7 +766,7 @@ private struct MaterialBuilder {
     }
     guard drawn else { throw MitsubaImporter.error("material '\(owner)': cannot read a texture's pixels") }
     let decode = srgb && !image.bitmapInfo.contains(.floatComponents)
-    func linear(_ v: Float) -> Float { decode ? (v <= 0.04045 ? v / 12.92 : powf((v + 0.055) / 1.055, 2.4)) : v }
+    func linear(_ v: Float) -> Float { decode ? MitsubaImporter.srgbToLinear(v) : v }
     for i in 0..<(w * h) {
       let a = stored[4 * i + 3], scale: Float = a > 0 ? 1 / a : 1
       body(i, linear(stored[4 * i] * scale), linear(stored[4 * i + 1] * scale), linear(stored[4 * i + 2] * scale))

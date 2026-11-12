@@ -1,6 +1,6 @@
 // Mitsuba sensors (MitsubaImporter.camera): the camera looks from the sensor's origin toward its target with the
 // image not mirrored, the report is quiet about area-emitter-only lighting, and film and sensor settings that
-// change the image but are not represented are reported.
+// change the image but are not represented are reported; a singular to_world keeps the default camera.
 @MainActor func fixMitsubaCameraChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba-camera", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -66,6 +66,13 @@
   require(report(#"<float name="near_clip" value="0.5"/>"#) == ["near_clip 0.5 is not supported; ignored"], "a near_clip other than 0.01 is reported")
   require(report(#"<float name="near_clip" value="0.01"/><float name="far_clip" value="500"/>"#).isEmpty,
     "the default near_clip and any far_clip are not reported")
-  print("PASS: Mitsuba camera: direction, up and handedness, quiet area-emitter report, unsupported film and sensor settings")
+
+  // A singular to_world (a zero scale) has no view direction: reported, and the default camera kept.
+  let flat = try load(scene(sensor: """
+    <sensor type="perspective"><float name="fov" value="45"/><transform name="to_world"><scale z="0"/></transform></sensor>
+    """))
+  require(flat.document.views["Mitsuba: camera"] == nil && flat.report.contains("sensor: a singular or non-finite to_world; the default camera is used"),
+    "a singular sensor to_world falls back to the default camera (\(flat.report))")
+  print("PASS: Mitsuba camera: direction, up and handedness, quiet area-emitter report, unsupported film and sensor settings, singular to_world")
 }
 try fixMitsubaCameraChecks()

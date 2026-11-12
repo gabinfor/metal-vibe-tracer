@@ -3,7 +3,8 @@
 // plastics, conductor chroma and textured specular_reflectance (sRGB, raw, near-grey, and unreadable or too large to
 // check), normal maps, transmission colours, IOR ratios below 1 (dielectric, roughdielectric, thindielectric), values
 // that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's rows for
-// any v scale), the bake size limit, hostile values in baked images and BSDF wrapper depth.
+// any v scale), the bake size limit, hostile values in baked images, BSDF wrapper depth, anisotropic roughness, coating
+// IOR ratios below 1, and a 0.6 file shaped like Bitterli's archives.
 @MainActor func fixMitsubaMaterialChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba-materials", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -296,6 +297,7 @@
       && reported("\(label): coloured specular_reflectance texture scales F0 only"),
       "\(file) as a conductor's specular_reflectance: the coloured path, reported with the reason (\(scene.report.filter { $0.hasPrefix(label) }))")
   }
+
   // Hostile values in baked images: a huge bump scale and NaN texels give finite texels (a flat normal, a 0 albedo)
   // instead of trapping on the 8-bit conversion.
   // Scale 3e38: slopes near Float's largest still give the bump's direction, normalize(-d_u, d_v, 0) at (1, 1).
@@ -339,6 +341,57 @@
   let wrapped = String(repeating: #"<bsdf type="twosided">"#, count: 20) + #"<bsdf type="diffuse"/>"# + String(repeating: "</bsdf>", count: 20)
   requireThrows("BSDF wrappers nested more than \(MitsubaImporter.maxWrapperDepth) deep") { _ = try document(wrapped, name: "onion") }
 
-  print("PASS: Mitsuba materials: baked texels, principledthin, value guards, texture reports, to_uv sampling, bake limit, hostile values")
+  // Anisotropic roughness as its geometric mean; an IOR ratio below 1 on an opaque coating is 1.01.
+  let brushed = try program(#"<bsdf type="roughconductor"><float name="alpha_u" value="0.04"/><float name="alpha_v" value="0.16"/><string name="distribution" value="ggx"/></bsdf>"#, name: "brushed")
+  require(near(input(brushed, "specular_roughness"), SIMD3<Float>(repeating: Float(0.08).squareRoot()))
+    && reported(prefix: "brushed: anisotropic alpha_u 0.04 and alpha_v 0.16 rendered isotropic at alpha 0.08")
+    && !reported(prefix: "brushed: roughconductor alpha_"), "alpha_u and alpha_v: sqrt(alpha_u alpha_v), reported (\(scene.report.filter { $0.hasPrefix("brushed") }))")
+  let frosted = try program(#"<bsdf type="roughdielectric"><float name="alpha_u" value="0.09"/><string name="distribution" value="ggx"/></bsdf>"#, name: "frosted")
+  require(near(input(frosted, "specular_roughness"), SIMD3(repeating: (0.09 * 0.1 as Float).squareRoot().squareRoot())),
+    "a missing alpha_v is Mitsuba's 0.1")
+  for (xml, label, kind) in [(#"<bsdf type="plastic"><float name="int_ior" value="1"/><float name="ext_ior" value="1.5"/></bsdf>"#, "under", "plastic"),
+                             (#"<bsdf type="principledthin"><float name="eta" value="0.8"/></bsdf>"#, "underthin", "principledthin")] {
+    let p = try program(xml, name: label)
+    require(near(input(p, "specular_ior"), SIMD3(repeating: 1.01)) && reported(prefix: "\(label): \(kind) IOR ratio 0.") ,
+      "\(kind) with an IOR ratio below 1: specular_ior 1.01, reported (\(scene.report.filter { $0.hasPrefix(label) }))")
+  }
+
+  // A 0.6 file shaped like Bitterli's archives: conductor extEta (1, dropped; 2, dividing eta and k), bitmap filterType,
+  // checkerboard uoffset, and a medium's sigmaS and sigmaA. No "unsupported" line.
+  try png("tile.png") { x, y in ((x + y) % 2 == 0 ? 200 : 50, 90, 90) }
+  let legacyURL = folder.appendingPathComponent("archive06.xml")
+  try """
+    <scene version="0.6.0">
+      <bsdf type="roughconductor" id="steel"><float name="alpha" value="0.1"/><string name="distribution" value="ggx"/>
+        <float name="extEta" value="1"/><rgb name="specularReflectance" value="0.5, 0.5, 0.5"/>
+        <rgb name="eta" value="1.6, 0.9, 0.5"/><rgb name="k" value="9.2, 6.3, 4.8"/></bsdf>
+      <bsdf type="conductor" id="immersed"><float name="extEta" value="2"/><rgb name="eta" value="1.6, 0.9, 0.5"/><rgb name="k" value="9.2, 6.3, 4.8"/></bsdf>
+      <bsdf type="conductor" id="named"><float name="extEta" value="1.33"/><string name="material" value="Au"/></bsdf>
+      <bsdf type="diffuse" id="tiles"><texture type="bitmap" name="reflectance"><string name="filename" value="tile.png"/>
+        <string name="filterType" value="trilinear"/></texture></bsdf>
+      <bsdf type="roughconductor" id="floor"><float name="extEta" value="1"/><string name="distribution" value="ggx"/>
+        <texture type="checkerboard" name="specularReflectance"><float name="uoffset" value="0"/><float name="voffset" value="0"/>
+          <float name="uscale" value="20"/><float name="vscale" value="80"/></texture></bsdf>
+      <bsdf type="dielectric" id="glass"/>
+      <medium type="homogeneous" id="tint"><rgb name="sigmaS" value="0"/><rgb name="sigmaA" value="0.5"/></medium>
+    </scene>
+    """.write(to: legacyURL, atomically: true, encoding: .utf8)
+  let legacy = try MitsubaImporter.Scene(url: legacyURL).root.children
+  func legacyNode(_ id: String) -> MitsubaImporter.Node { legacy.first { $0.id == id }! }
+  let before = scene.report.count
+  for id in ["steel", "immersed", "tiles", "floor"] {
+    _ = try compiled(MitsubaImporter.material(bsdf: legacyNode(id), emission: nil, interior: nil, name: "old-\(id)", scene: &scene, folder: bakes))
+  }
+  let absorbing = try compiled(MitsubaImporter.material(bsdf: legacyNode("glass"), emission: nil, interior: legacyNode("tint"), name: "old-glass",
+                                                     scene: &scene, folder: bakes))
+  let legacyLines = scene.report[before...].filter { $0.contains("unsupported") }
+  require(legacyLines.isEmpty && absorbing.transmissionColor.map { simd_length($0 - SIMD3(repeating: exp(-0.5))) < 1e-5 } == true,
+    "a 0.6 file shaped like the archives: no unsupported lines, and its medium read (\(legacyLines))")
+  let relative = try document(#"<bsdf type="conductor"><rgb name="eta" value="0.8, 0.45, 0.25"/><rgb name="k" value="4.6, 3.15, 2.4"/></bsdf>"#, name: "old-immersed")
+  let immersed = try MitsubaImporter.material(bsdf: legacyNode("immersed"), emission: nil, interior: nil, name: "old-immersed", scene: &scene, folder: bakes)
+  require(immersed == relative, "a 0.6 conductor's eta and k are divided by its extEta")
+  _ = try MitsubaImporter.material(bsdf: legacyNode("named"), emission: nil, interior: nil, name: "old-named", scene: &scene, folder: bakes)
+  require(reported("old-named: conductor extEta unsupported; ignored"), "extEta with a named conductor is reported")
+  print("PASS: Mitsuba materials: baked texels, principledthin, value guards, texture reports, to_uv sampling, bake limit, hostile values, anisotropy, 0.6 archives")
 }
 try fixMitsubaMaterialChecks()
