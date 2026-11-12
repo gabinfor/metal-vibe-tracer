@@ -104,6 +104,72 @@ do {
 } catch { require(testRenderer.materials.images[4] === previousImage, "failed load preserves current texture") }
 for channel in 0..<4 { try testRenderer.materials.clear(slot: 1, channel: channel) }
 
+// Every mip level keeps level 0's linear mean, whatever the texture's size: noise over a brighter centre,
+// which a filter that skips or under-weights texels of odd-sized levels moves at the coarse levels (Metal's
+// own mip generation is off by 7–52% at the odd sizes' coarsest levels and by up to 0.85% at the power of two).
+let mipLibrary = try gpu.makeLibrary(source: """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void mip_row_sums(texture2d<float, access::read> image [[texture(0)]], device float4 *rows [[buffer(0)]],
+        constant uint &level [[buffer(1)]], uint y [[thread_position_in_grid]]) {
+        uint width = max(1u, image.get_width() >> level), height = max(1u, image.get_height() >> level);
+        if (y >= height) return;
+        float4 sum = 0;
+        for (uint x = 0; x < width; ++x) sum += image.read(uint2(x, y), level);
+        rows[y] = sum;
+    }
+    """, options: nil)
+let mipPipeline = try gpu.makeComputePipelineState(function: mipLibrary.makeFunction(name: "mip_row_sums")!)
+func mipFixture(width: Int, height: Int, bits: Int) -> Data {
+    let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+        bitsPerSample: bits, samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: width * 3 * bits / 8, bitsPerPixel: 3 * bits)!
+    let top = Double((1 << bits) - 1)
+    for y in 0..<height { for x in 0..<width { for c in 0..<3 {
+        var h = UInt32(truncatingIfNeeded: (y * width + x) * 3 + c) &* 0x9E3779B1
+        h ^= h >> 15; h = h &* 0x85EBCA77; h ^= h >> 13
+        let centre = abs(2 * x - width) < width / 3 && abs(2 * y - height) < height / 3
+        let value = (0.5 + 0.3 * Double(h >> 8) / 16_777_216 + (centre ? 0.15 : 0)) * top
+        let i = (y * width + x) * 3 + c
+        if bits == 16 {
+            bitmap.bitmapData!.withMemoryRebound(to: UInt16.self, capacity: width * height * 3) { $0[i] = UInt16(value) }
+        } else { bitmap.bitmapData![i] = UInt8(value) }
+    }}}
+    return bitmap.representation(using: .png, properties: [:])!
+}
+func mipMeans(_ texture: MTLTexture) -> [SIMD3<Double>] {
+    (0..<texture.mipmapLevelCount).map { level in
+        let height = max(1, texture.height >> level)
+        let rows = gpu.makeBuffer(length: height * 16, options: .storageModeShared)!
+        var index = UInt32(level)
+        let command = testRenderer.commandQueue.makeCommandBuffer()!
+        let encoder = command.makeComputeCommandEncoder()!
+        encoder.setComputePipelineState(mipPipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setBuffer(rows, offset: 0, index: 0)
+        encoder.setBytes(&index, length: 4, index: 1)
+        encoder.dispatchThreads(MTLSize(width: height, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+        let sums = rows.contents().bindMemory(to: SIMD4<Float>.self, capacity: height)
+        let total = (0..<height).reduce(SIMD3<Double>()) { $0 + SIMD3<Double>(Double(sums[$1].x), Double(sums[$1].y), Double(sums[$1].z)) }
+        return total / Double(max(1, texture.width >> level) * height)
+    }
+}
+let mipCases = try [("894² 8-bit sRGB", 894, 894, 8, true), ("300×200 16-bit sRGB", 300, 200, 16, true),
+        ("300×200 8-bit linear", 300, 200, 8, false), ("512² 8-bit sRGB (power-of-two control)", 512, 512, 8, true)]
+    .map { name, width, height, bits, srgb in
+        let texture = try testRenderer.materials.decodeTexture(mipFixture(width: width, height: height, bits: bits), srgb: srgb)
+        let means = mipMeans(texture)
+        let error = means.map { simd_reduce_max(simd_abs($0 / means[0] - 1)) }
+        print("Mip mean error, \(name): " + error.enumerated().map { String(format: "L%d %.3f%%", $0, $1 * 100) }.joined(separator: " "))
+        return (name, texture.mipmapLevelCount == Int(log2(Double(max(width, height)))) + 1, error)
+    }
+for (name, chain, error) in mipCases {
+    require(chain, "full mip chain, \(name)")
+    require(error.allSatisfy { $0 <= 0.005 }, "every mip level keeps level 0's mean within 0.5%, \(name)")
+}
+print("PASS: mip levels keep the texture's mean at odd and power-of-two sizes")
+
 // Real scene: textured floor, reflected by chrome and gold, and mapped rough copper.
 var materialView = makeUniforms(scene: 0, mode: 0, width: 240, height: 180)
 let materialEye = SIMD3<Float>(1.4,0.9,-1.3), materialTarget = SIMD3<Float>(0.2,-0.45,0.9)

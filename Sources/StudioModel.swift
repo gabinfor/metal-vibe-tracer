@@ -984,7 +984,7 @@ extension MaterialLibrary {
   // Material images always sample as RGBA. MTKTextureLoader keeps gray and gray+alpha
   // files as R/RG, so those become swizzled views (RRR1, RRRG). sRGB cases the formats
   // cannot express (16-bit data; RG8 sRGB, which would also decode alpha) are expanded
-  // to RGBA on the CPU.
+  // to RGBA on the CPU. Mip levels are box-filtered in linear space (encodeMipmaps).
   func decodeTexture(_ data: Data, srgb: Bool, maximumSide: Int? = nil) throws -> MTLTexture {
     // Budget downscaling (materialXCandidate): an ImageIO thumbnail at most `maximumSide` texels
     // long, passed on as uncompressed TIFF so every format path below still applies.
@@ -1022,12 +1022,15 @@ extension MaterialLibrary {
       else { throw error }
       context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
       guard let rgba = context.makeImage() else { throw error }
-      return try loader.newTexture(cgImage: rgba, options: options)
+      let texture = try loader.newTexture(cgImage: rgba, options: options)
+      try refilterMipmaps(texture)
+      return texture
     }
     let format = texture.pixelFormat
     if srgb, [.r8Unorm, .r16Unorm, .rg16Unorm, .rgba16Unorm, .rg8Unorm, .rg8Unorm_srgb].contains(format) {
       return try expandedSRGB(data)
     }
+    try refilterMipmaps(texture)
     let swizzle: MTLTextureSwizzleChannels
     switch format {
     case .r8Unorm, .r8Unorm_srgb, .r16Unorm, .r16Float, .r32Float:
@@ -1114,14 +1117,125 @@ extension MaterialLibrary {
       sourceBytesPerImage: width * height * pixelBytes,
       sourceSize: MTLSize(width: width, height: height, depth: 1), to: texture, destinationSlice: 0,
       destinationLevel: 0, destinationOrigin: MTLOrigin())
-    blit.generateMipmaps(for: texture)
     blit.endEncoding()
+    try encodeMipmaps(texture, into: command)
     command.commit()
     command.waitUntilCompleted()
     guard command.status == .completed else {
       throw Self.error("Could not upload the expanded sRGB texture.")
     }
     return texture
+  }
+
+  // Mip levels come from MSL area_mipmap: each texel is the area-weighted mean, in linear space, of the
+  // footprint it covers in the level above (a box filter over the exact footprint: 2×2 texels, up to 3×3
+  // below an odd side). sRGB textures are read decoded and written re-encoded through a linear view.
+  // Metal's own mip generation (the blit's generateMipmaps, and MTKTextureLoader's .generateMipmaps, measured
+  // the same) takes one bilinear tap per texel below an odd side instead, which skips some source texels and
+  // under-weights others; the error compounds level by level (Bitterli's 894² Modern Hall floor: up to +11% at
+  // 6×6 and +86% at 1×1). At power-of-two sides its levels drift upward by about 0.1% a level on bright sRGB
+  // images. Formats the kernel cannot write keep the blit's levels (REFERENCES.md METALTEXTURES).
+  private static let areaMipmapSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void area_mipmap(texture2d<float, access::read> source [[texture(0)]],
+        texture2d<float, access::write> destination [[texture(1)]], constant uint &srgb [[buffer(0)]],
+        uint2 id [[thread_position_in_grid]]) {
+      uint2 size = uint2(destination.get_width(), destination.get_height());
+      uint2 sourceSize = uint2(source.get_width(), source.get_height());
+      if (any(id >= size)) return;
+      float2 lo = float2(id * sourceSize) / float2(size);
+      float2 hi = min(float2((id + 1) * sourceSize) / float2(size), float2(sourceSize));
+      float4 sum = 0;
+      float total = 0;
+      for (uint y = uint(lo.y); float(y) < hi.y; ++y) {
+        float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));
+        for (uint x = uint(lo.x); float(x) < hi.x; ++x) {
+          float w = wy * (min(hi.x, float(x + 1)) - max(lo.x, float(x)));
+          sum += w * source.read(uint2(x, y));
+          total += w;
+        }
+      }
+      float4 c = sum / total;
+      if (srgb != 0) {
+        float3 v = saturate(c.rgb);
+        c.rgb = select(1.055f * powr(v, 1.0f / 2.4f) - 0.055f, 12.92f * v, v <= 0.0031308f);
+      }
+      destination.write(c, id);
+    }
+    """
+  // The pixel format area_mipmap writes for each format it filters (sRGB formats through their linear twin).
+  private static let areaMipmapWriteFormats: [MTLPixelFormat: MTLPixelFormat] = [
+    .rgba8Unorm_srgb: .rgba8Unorm, .bgra8Unorm_srgb: .bgra8Unorm, .r8Unorm_srgb: .r8Unorm, .rg8Unorm_srgb: .rg8Unorm,
+    .rgba8Unorm: .rgba8Unorm, .bgra8Unorm: .bgra8Unorm, .r8Unorm: .r8Unorm, .rg8Unorm: .rg8Unorm,
+    .r16Unorm: .r16Unorm, .rg16Unorm: .rg16Unorm, .rgba16Unorm: .rgba16Unorm,
+    .r16Float: .r16Float, .rg16Float: .rg16Float, .rgba16Float: .rgba16Float,
+    .r32Float: .r32Float, .rg32Float: .rg32Float, .rgba32Float: .rgba32Float,
+  ]
+  // Replaces the levels MTKTextureLoader generated.
+  private func refilterMipmaps(_ texture: MTLTexture) throws {
+    guard texture.mipmapLevelCount > 1 else { return }
+    guard let queue = device.makeCommandQueue(), let command = queue.makeCommandBuffer() else {
+      throw Self.error("Could not filter the texture's mip levels.")
+    }
+    try encodeMipmaps(texture, into: command)
+    command.commit()
+    command.waitUntilCompleted()
+    guard command.status == .completed else { throw Self.error("Could not filter the texture's mip levels.") }
+  }
+  // Encodes levels 1... of a 2D texture from its level 0 with area_mipmap (the blit for formats it cannot
+  // write). Levels are written to a scratch chain and copied in, so the texture needs no shader-write usage.
+  private func encodeMipmaps(_ texture: MTLTexture, into command: MTLCommandBuffer) throws {
+    let levels = texture.mipmapLevelCount
+    guard levels > 1 else { return }
+    guard texture.textureType == .type2D, let writeFormat = Self.areaMipmapWriteFormats[texture.pixelFormat]
+    else {
+      guard let blit = command.makeBlitCommandEncoder() else { throw Self.error("Could not generate mip levels.") }
+      blit.generateMipmaps(for: texture)
+      blit.endEncoding()
+      return
+    }
+    if areaMipmapPipeline == nil {
+      let library = try device.makeLibrary(source: Self.areaMipmapSource, options: nil)
+      guard let function = library.makeFunction(name: "area_mipmap") else {
+        throw Self.error("Could not compile the mip filter.")
+      }
+      areaMipmapPipeline = try device.makeComputePipelineState(function: function)
+    }
+    // Scratch level k holds the texture's level k + 1.
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: texture.pixelFormat, width: max(1, texture.width / 2), height: max(1, texture.height / 2),
+      mipmapped: true)
+    descriptor.usage = writeFormat == texture.pixelFormat ? [.shaderRead, .shaderWrite]
+      : [.shaderRead, .shaderWrite, .pixelFormatView]
+    descriptor.storageMode = .private
+    guard let pipeline = areaMipmapPipeline, let scratch = device.makeTexture(descriptor: descriptor),
+      scratch.mipmapLevelCount == levels - 1, let encoder = command.makeComputeCommandEncoder()
+    else { throw Self.error("Could not generate mip levels.") }
+    var srgb = UInt32(writeFormat == texture.pixelFormat ? 0 : 1)
+    encoder.setComputePipelineState(pipeline)
+    encoder.setBytes(&srgb, length: 4, index: 0)
+    for level in 0..<(levels - 1) {
+      guard
+        let source = level == 0 ? texture.makeTextureView(
+          pixelFormat: texture.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1)
+          : scratch.makeTextureView(
+            pixelFormat: texture.pixelFormat, textureType: .type2D, levels: (level - 1)..<level, slices: 0..<1),
+        let destination = scratch.makeTextureView(
+          pixelFormat: writeFormat, textureType: .type2D, levels: level..<(level + 1), slices: 0..<1)
+      else { throw Self.error("Could not generate mip levels.") }
+      encoder.setTexture(source, index: 0)
+      encoder.setTexture(destination, index: 1)
+      encoder.dispatchThreads(
+        MTLSize(width: destination.width, height: destination.height, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+    }
+    encoder.endEncoding()
+    guard let blit = command.makeBlitCommandEncoder() else { throw Self.error("Could not generate mip levels.") }
+    blit.copy(
+      from: scratch, sourceSlice: 0, sourceLevel: 0, to: texture, destinationSlice: 0, destinationLevel: 1,
+      sliceCount: 1, levelCount: levels - 1)
+    blit.endEncoding()
   }
 
   func environmentImportance(_ pixels: UnsafeBufferPointer<Float>, width: Int, height: Int) throws -> (MTLTexture, MTLTexture) {
