@@ -624,6 +624,23 @@
   }
   require(controller.startScreen == nil && recentMenu.superview == nil && controller.projectURL == strip
     && recent.urls == [strip, other], "File › Open Recent opens the project like Open Project")
+  // A project on a volume that is not connected stays listed, with a message, and the document is unchanged.
+  let unmounted = URL(fileURLWithPath: "/Volumes/vibe-tracer-unmounted-\(UUID().uuidString)/Away.vtrace")
+  recent.note(unmounted)
+  let beforeUnmounted = try encoder.encode(controller.project)
+  controller.openRecent(unmounted)
+  require(recent.urls == [unmounted, strip, other]
+    && controller.status.stringValue == "Away.vtrace is on a volume that is not connected."
+    && controller.projectURL == strip && (try? encoder.encode(controller.project)) == beforeUnmounted,
+    "a recent project on a volume that is not connected is kept: \(controller.status.stringValue)")
+  recent.remove(unmounted)
+  // Same-named projects in different folders are told apart in File › Open Recent by their folders.
+  let twin = folder.appendingPathComponent("twin/strip.vtrace")
+  recent.note(twin)
+  require(openRecentMenu?.items.prefix(3).map(\.title)
+    == ["strip.vtrace — \(folderText)/twin", "strip.vtrace — \(folderText)", "recent-other.vtrace"],
+    "File › Open Recent adds the folder to colliding names: \(openRecentMenu?.items.map(\.title) ?? [])")
+  recent.remove(twin)
   controller.showStartScreen()
   guard let clearing = controller.startScreen else { return require(false, "the main menu shows again") }
   click(clearing.control("menu-recent-clear"))

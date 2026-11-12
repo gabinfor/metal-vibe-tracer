@@ -45,22 +45,33 @@ final class SystemRecentProjects: RecentProjectsStore {
     store.clear()
     onChange?()
   }
-  // Opens `url` with `open`, or, when the file is gone, removes it from the list and reports
-  // "<name> is no longer at <folder>." with `report`.
+  // Opens `url` with `open`. When the file is missing, `report` says why: on a volume that is not connected the entry
+  // stays ("<name> is on a volume that is not connected."); otherwise it is removed ("<name> is no longer at <folder>.").
   func open(_ url: URL, with open: (URL) -> Void, report: (String) -> Void) {
     guard FileManager.default.fileExists(atPath: url.path) else {
+      guard Self.volumeConnected(url) else {
+        report("\(url.lastPathComponent) is on a volume that is not connected.")
+        return
+      }
       remove(url)
       report("\(url.lastPathComponent) is no longer at \(Self.folder(url)).")
       return
     }
     open(url)
   }
+  // External and network volumes mount under /Volumes, so a path there needs its mount point; any other path is on
+  // the startup volume, which is always connected.
+  static func volumeConnected(_ url: URL) -> Bool {
+    let components = url.standardizedFileURL.pathComponents
+    guard components.count > 2, components[1] == "Volumes" else { return true }
+    return FileManager.default.fileExists(atPath: "/Volumes/" + components[2])
+  }
   // The file's folder with the home folder abbreviated to ~.
   static func folder(_ url: URL) -> String {
     (url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
   }
-  // File › Open Recent: the shown projects by file name (each item's representedObject is its URL, sent to `open`),
-  // a separator and Clear Menu (disabled when the list is empty).
+  // File › Open Recent: the shown projects by file name, followed by " — <folder>" where names collide (each item's
+  // representedObject is its URL, sent to `open`), a separator and Clear Menu (disabled when the list is empty).
   func menuItem(target: AnyObject, open: Selector, clear: Selector) -> NSMenuItem {
     let item = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
     item.submenu = NSMenu(title: "Open Recent")
@@ -69,8 +80,11 @@ final class SystemRecentProjects: RecentProjectsStore {
   }
   func fill(_ menu: NSMenu, target: AnyObject, open: Selector, clear: Selector) {
     menu.removeAllItems()
+    let names = shown.map(\.lastPathComponent)
     for url in shown {
-      let item = NSMenuItem(title: url.lastPathComponent, action: open, keyEquivalent: "")
+      let name = url.lastPathComponent
+      let title = names.filter { $0 == name }.count > 1 ? "\(name) — \(Self.folder(url))" : name
+      let item = NSMenuItem(title: title, action: open, keyEquivalent: "")
       item.target = target
       item.representedObject = url
       item.toolTip = Self.folder(url)

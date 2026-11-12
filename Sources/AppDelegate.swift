@@ -13,7 +13,7 @@ func launchTrace(_ event: String) {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   var window: NSWindow!
   var studio: StudioController!
-  // The Scenes window with the scene browser and the recent projects, handed to the studio once it exists.
+  // The Scenes window with the scene browser, and the recent projects; both are handed to the studio once it exists.
   private(set) var scenes: ScenesWindowController!
   private var recent: RecentProjects!
   // Until the launch shader compilation finishes: the main menu, the compilation's progress shown on it,
@@ -250,4 +250,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     if let url = sender.representedObject as? URL { openRecent(url) }
   }
   @objc func clearRecentAction() { recent.clear() }
+}
+
+// File › Open Recent and its Clear Menu wait, like the main menu, while an action is queued.
+extension AppDelegate: NSMenuItemValidation {
+  func validateMenuItem(_ item: NSMenuItem) -> Bool {
+    if item.action == #selector(openRecentAction(_:)) || item.action == #selector(clearRecentAction) {
+      return pendingStart == nil
+    }
+    return true
+  }
 }
