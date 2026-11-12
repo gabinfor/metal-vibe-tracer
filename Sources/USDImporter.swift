@@ -403,8 +403,10 @@ enum USDImporter {
     let graphEmissive = state.materialX?.values.contains { $0.emissionWeight > 0 } == true
     if snapshot.environment == nil && snapshot.sun == nil && state.emissions?.isEmpty != false {
       if graphEmissive {
-        snapshot.report.append(
-          "No \(lights) lights: emissive materials light the scene; no environment or sun added.")
+        if inspectionSky {
+          snapshot.report.append(
+            "No \(lights) lights: emissive materials light the scene; no environment or sun added.")
+        }
       } else if !inspectionSky {
         snapshot.report.append("No supported authored lighting: the scene is unlit.")
       } else {

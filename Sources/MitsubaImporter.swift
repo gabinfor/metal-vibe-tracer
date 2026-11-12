@@ -29,25 +29,6 @@ import Synchronization
 //                                             replaced by the world axis least aligned with it (y when tied)
 // A missing version counts as Mitsuba 3.
 enum MitsubaImporter {
-  // Reads only up to the first element, so a large file is not parsed whole.
-  static func isMitsuba(_ url: URL) -> Bool {
-    guard url.pathExtension.lowercased() == "xml", let parser = XMLParser(contentsOf: url) else { return false }
-    let finder = RootFinder()
-    parser.delegate = finder
-    parser.shouldResolveExternalEntities = false
-    parser.parse()
-    return finder.root == "scene"
-  }
-
-  private final class RootFinder: NSObject, XMLParserDelegate {
-    var root: String?
-    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
-                qualifiedName: String?, attributes: [String: String]) {
-      root = elementName
-      parser.abortParsing()
-    }
-  }
-
   static func error(_ message: String) -> Error { MaterialLibrary.error("Mitsuba: " + message) }
 
   // Mitsuba 0.6 property and element names and their Mitsuba 3 names. Other camelCase names stay as they are.
@@ -395,6 +376,7 @@ enum MitsubaImporter {
 //   envmap       the environment: its file, scale as the intensity, and its turn about +y minus 90 degrees as the
 //                rotation (Mitsuba's envmap, like USD's dome, puts +z at the image centre; the app puts +x there)
 //   constant     a uniform 8 x 4 latlong Radiance HDR image of its radiance, at intensity 1
+// A film crop, a principal point offset and a near_clip other than 0.01 are reported and ignored.
 // Other emitters and sensors, further ones, media outside a shape's interior and unknown elements are reported and
 // skipped. A scene without a supported emitter stays unlit, as Mitsuba renders it without them (no inspection sky).
 extension MitsubaImporter {
@@ -606,6 +588,16 @@ extension MitsubaImporter {
       return Int(value)
     }
     let width = try size("width", 768), height = try size("height", 576)
+    // Settings that change the image and are not represented.
+    let cropped = ["crop_offset_x", "crop_offset_y", "crop_width", "crop_height"].contains { name in
+      guard let value = film?.float(name) else { return false }
+      return value != (name == "crop_width" ? Float(width) : name == "crop_height" ? Float(height) : 0)
+    }
+    if cropped { scene.note("film crop is not supported; the full frame is rendered") }
+    if ["principal_point_offset_x", "principal_point_offset_y"].contains(where: { (sensor.float($0) ?? 0) != 0 }) {
+      scene.note("principal point offset is not supported; ignored")
+    }
+    if let nearClip = sensor.float("near_clip"), nearClip != 0.01 { scene.note("near_clip \(nearClip) is not supported; ignored") }
     let aspect = Float(width) / Float(height)
     // tan of half the horizontal field of view.
     var tanX: Float

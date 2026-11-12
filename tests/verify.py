@@ -52,6 +52,7 @@ PARTS = [
     ('Fix_gltf.swift', {'full', 'studio'}),
     ('Fix_mitsuba.swift', {'full', 'studio'}),
     ('Fix_mitsuba-materials.swift', {'full', 'studio'}),
+    ('Fix_mitsuba-camera.swift', {'full', 'studio'}),
     ('Fix_caustics.swift', {'full', 'studio'}),
     ('Fix_example-scenes.swift', {'full', 'studio'}),
     ('Fix_scaling.swift', {'full', 'studio'}),

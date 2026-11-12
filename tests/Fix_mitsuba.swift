@@ -1,6 +1,6 @@
 // Mitsuba scene import (MitsubaImporter), XML layer: <default> values and $variables, global <ref> ids
 // (including a BSDF nested in another), <include>, transforms in document order, the Mitsuba 0.6 property
-// names, and detection by root element; shapes (mesh files and analytic shapes as world-space triangles); the values
+// names, and the not-a-scene error; shapes (mesh files and analytic shapes as world-space triangles); the values
 // taken from Mitsuba (IORs, conductors, plastic ratios); materials (BSDFs, textures, emitters and interior media as
 // OpenPBR MaterialX documents).
 @MainActor func fixMitsubaChecks() throws {
@@ -130,8 +130,6 @@
   require(scene.folder.standardizedFileURL == folder.standardizedFileURL, "folder is the scene's directory")
 
   let otherXMLURL = try write("other.xml", "<svg/>")
-  require(MitsubaImporter.isMitsuba(defaultsURL) && !MitsubaImporter.isMitsuba(otherXMLURL)
-    && !MitsubaImporter.isMitsuba(folder.appendingPathComponent("nothing.xml")), "detection by root element")
   requireThrows("not a Mitsuba scene") { _ = try MitsubaImporter.Scene(url: otherXMLURL) }
   let badRefURL = try write("badref.xml", #"<scene version="3.0.0"><shape type="obj"><ref id="missing"/></shape></scene>"#)
   requireThrows("undefined reference 'missing'") { _ = try MitsubaImporter.Scene(url: badRefURL) }
