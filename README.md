@@ -21,7 +21,7 @@ Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 - 🧪 **Tested on the GPU.** The verification suite runs the production shaders and render path on Metal (198 checks passed for 0.3.0, Apple M4).
 - 🎬 **Production formats.** OpenPBR surfaces, MaterialX graphs, OpenUSD, glTF 2.0 and Mitsuba scenes, OBJ/MTL, and OpenEXR export.
 - 🏛️ **Production-scale scenes.** San Miguel (10 M triangles, 287 materials) and the Amazon Lumberyard Bistro import and render, with alpha cutouts, glass and anisotropic texture filtering.
-- ✅ **Validated against Mitsuba 3.** Built-in scenes agree within 0.1% of mean radiance, and Bitterli's ten scenes, imported natively, have mean radiance ratios to Mitsuba 3.9.1 between about 0.97 and 1.06; every difference is measured, and each is traced to a documented cause or, for Veach Bidir and Modern Hall, to renderer changes since October 2026 that were localized but not investigated further (see [Validation](#validation)).
+- ✅ **Validated against Mitsuba 3.** Built-in scenes agree within 0.1% of mean radiance, and Bitterli's ten scenes, imported natively, have mean radiance ratios to Mitsuba 3.9.1 between about 0.97 and 1.04; every difference is measured, and each is traced to a documented cause or, for Veach Bidir and Modern Hall, to renderer changes since October 2026 that were localized but not investigated further (see [Validation](#validation)).
 
 ## Production scenes
 
@@ -118,7 +118,7 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 <p align="center"><sub><b>Veach MIS</b>, Metal Vibe Tracer | Mitsuba 3 | relative difference. Mean radiance agrees within 0.11%, the Cornell box within 0.02%.</sub></p>
 
 <p align="center"><img src="docs/images/validation-bathroom.jpg" alt="Contemporary Bathroom: Metal Vibe Tracer, Mitsuba 3 and their relative difference"></p>
-<p align="center"><sub><b>Contemporary Bathroom</b> (Bitterli's rendering resources), Metal Vibe Tracer | Mitsuba 3 | relative difference: within 0.1%. This 2026-10-21 render used the development converter that the native importer has since replaced. Bitterli's ten scenes, imported natively, have mean radiance ratios to Mitsuba 3.9.1 between about 0.97 and 1.06; every difference is measured, and each is traced to a documented cause or, for Veach Bidir and Modern Hall, to renderer changes since October 2026 that were localized but not investigated further: OpenPBR's rough-metal energy compensation, an emitter inside glass and Mitsuba's ray offset on a two-layer blind are among the causes (<a href="REFERENCES.md">REFERENCES.md</a>, <code>BITTERLI2016</code>).</sub></p>
+<p align="center"><sub><b>Contemporary Bathroom</b> (Bitterli's rendering resources), Metal Vibe Tracer | Mitsuba 3 | relative difference: within 0.1%. This 2026-10-21 render used the development converter that the native importer has since replaced. Bitterli's ten scenes, imported natively, have mean radiance ratios to Mitsuba 3.9.1 between about 0.97 and 1.04; every difference is measured, and each is traced to a documented cause or, for Veach Bidir and Modern Hall, to renderer changes since October 2026 that were localized but not investigated further: OpenPBR's rough-metal energy compensation and Mitsuba's ray offset on a two-layer blind are among the causes (<a href="REFERENCES.md">REFERENCES.md</a>, <code>BITTERLI2016</code>).</sub></p>
 
 ## Features
 

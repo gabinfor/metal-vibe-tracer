@@ -1090,6 +1090,63 @@ try fixMitsubaChecks()
   require((facing(sided.document, "cavity")?.z ?? 0) < -0.99 && cavity != nil && cavity?.medium == nil
     && sided.report.contains("rectangle1: interior medium ignored (the shape is reversed for its IOR ratio below 1, which puts Mitsuba's interior on its outside)"),
     "an interior medium on a reversed shape is dropped and reported (\(sided.report))")
+
+  // An area emitter inside a dielectric (Little Lamp's filament in its bulb): Mitsuba's radiance is radiance in the
+  // glass, the app's emission basic radiance, so the radiance is divided by eta^2 of each enclosing dielectric, with a
+  // report line (MitsubaImporter.emitterEnclosures). Closed and nested glass spheres, an inverted dielectric (an air
+  // bubble, eta 1 / 1.5), a box open at the top around a panel facing its floor (enclosed) and one facing the opening
+  // (partly: reported, not converted), and an emitter beside the glass, in a thindielectric, or with no glass are
+  // unchanged.
+  try """
+    v -1 -1 -1\nv 1 -1 -1\nv 1 1 -1\nv -1 1 -1\nv -1 -1 1\nv 1 -1 1\nv 1 1 1\nv -1 1 1
+    f 1 2 6 5\nf 1 4 3 2\nf 5 6 7 8\nf 1 5 8 4\nf 2 3 7 6
+    """.write(to: folder.appendingPathComponent("open-box.obj"), atomically: true, encoding: .utf8)
+  func glassSphere(_ id: String, x: Float, radius: Float, int: Float, ext: Float, type: String = "roughdielectric") -> String {
+    #"<shape type="sphere" id="\#(id)"><point name="center" x="\#(x)" y="0" z="0"/><float name="radius" value="\#(radius)"/><bsdf type="\#(type)"><float name="int_ior" value="\#(int)"/><float name="ext_ior" value="\#(ext)"/></bsdf></shape>"#
+  }
+  func filament(_ id: String, x: Float) -> String {
+    #"<shape type="sphere" id="\#(id)"><point name="center" x="\#(x)" y="0" z="0"/><float name="radius" value="0.3"/><emitter type="area"><rgb name="radiance" value="9"/></emitter></shape>"#
+  }
+  func emitterPanel(_ id: String, x: Float, angle: Float) -> String {
+    #"<shape type="rectangle" id="\#(id)"><transform name="to_world"><scale value="0.2"/><rotate x="1" angle="\#(angle)"/><translate x="\#(x)" y="-0.5"/></transform><emitter type="area"><rgb name="radiance" value="9"/></emitter></shape>"#
+  }
+  func openBox(_ id: String, x: Float) -> String {
+    #"<shape type="obj" id="\#(id)"><string name="filename" value="open-box.obj"/><transform name="to_world"><translate x="\#(x)"/></transform><bsdf type="dielectric"><float name="int_ior" value="1.5"/><float name="ext_ior" value="1"/></bsdf></shape>"#
+  }
+  let enclosed = try load("""
+    <scene version="3.0.0">
+      \(glassSphere("bulb", x: 0, radius: 1, int: 1.5, ext: 1))\(filament("filament", x: 0))
+      \(filament("beside", x: 2))
+      \(glassSphere("water", x: 10, radius: 2, int: 1.2, ext: 1))\(glassSphere("inner", x: 10, radius: 1, int: 1.5, ext: 1.2))\(filament("nested", x: 10))
+      \(glassSphere("bubble", x: 20, radius: 1, int: 1, ext: 1.5))\(filament("bubbled", x: 20))
+      \(glassSphere("pane", x: 30, radius: 1, int: 1.5, ext: 1, type: "thindielectric"))\(filament("thin", x: 30))
+      \(openBox("box", x: 40))\(emitterPanel("floorward", x: 40, angle: 90))
+      \(openBox("cup", x: 50))\(emitterPanel("skyward", x: 50, angle: -90))
+      \(filament("bare", x: 60))
+    </scene>
+    """)
+  func surfaceInput(_ p: MaterialXProgram, _ name: String) -> SIMD3<Float>? {
+    p.parameters.first { $0.name.hasSuffix("/" + name) }.flatMap { $0.defaultValue }.map { SIMD3($0.x, $0.y, $0.z) }
+  }
+  func radiance(_ name: String) -> SIMD3<Float>? {
+    guard let shape = enclosed.document.graph?.nodes.first(where: { $0.name == name }), let id = shape.bindings.first,
+      let program = compiledMaterial(enclosed.document, enclosed.document.graph?.materials.first { $0.id == id }?.name ?? "") else { return nil }
+    return surfaceInput(program, "emission_color").map { $0 * (surfaceInput(program, "emission_luminance")?.x ?? 0) }
+  }
+  let insideGlass: [(String, Float)] = [("filament", 4), ("beside", 9), ("nested", 4), ("bubbled", 20.25), ("thin", 9), ("floorward", 4),
+                                     ("skyward", 9), ("bare", 9)]
+  let measuredRadiance = insideGlass.map { (name, _) in radiance(name)?.x ?? -1 }
+  require(zip(insideGlass, measuredRadiance).allSatisfy { abs($1 - $0.1) < 1e-3 * $0.1 },
+    "an area emitter inside glass is divided by eta^2 of each enclosing dielectric (\(measuredRadiance), expected \(insideGlass.map(\.1)))")
+  let enclosureLines = enclosed.report.filter { $0.contains("dielectric '") }
+  require(enclosureLines.count == 5
+    && enclosureLines.contains("shape 'filament': area emitter inside dielectric 'bulb' (int_ior / ext_ior 1.5, 100% of test rays); radiance divided by 2.25, from Mitsuba's radiance in the glass to the app's")
+    && enclosureLines.contains("shape 'nested': area emitter inside dielectric 'water' (int_ior / ext_ior 1.2, 100% of test rays), dielectric 'inner' (int_ior / ext_ior 1.25, 100% of test rays); radiance divided by 2.25, from Mitsuba's radiance in the glass to the app's")
+    && enclosureLines.contains("shape 'bubbled': area emitter inside dielectric 'bubble' (int_ior / ext_ior 0.666667, 100% of test rays); radiance divided by 0.444444, from Mitsuba's radiance in the glass to the app's")
+    && enclosureLines.contains { $0.hasPrefix("shape 'floorward': area emitter inside dielectric 'box' (int_ior / ext_ior 1.5, ") }
+    && enclosureLines.contains { $0.hasPrefix("shape 'skyward': ") && $0.hasSuffix("of test rays from its area emitter leave dielectric 'cup' from inside; radiance not converted (90% needed)") },
+    "each converted emitter and the partly enclosed one have a report line (\(enclosureLines))")
+  print("PASS: Mitsuba scenes: area emitters inside dielectrics take the app's basic radiance")
   print("PASS: Mitsuba scenes: shapes, shared materials, camera and field of view, render size, depth, environment, report")
 
   // Open Scene File: a Mitsuba scene opens as an untitled document; an .xml that is not one fails and changes nothing.

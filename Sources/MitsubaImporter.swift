@@ -500,11 +500,12 @@ enum MitsubaImporter {
 //   shape        one mesh asset and one node per shape (MitsubaImporter.mesh, world space, identity node transform),
 //                named by its id, else <type><index>; one material per BSDF, area-emitter radiance and interior
 //                medium (MitsubaImporter.material), shared by the shapes that reference the same BSDF id with the same
-//                emission; zero-area triangles are dropped. A shape whose dielectric (wrapped or not) has an IOR
-//                ratio below 1 is reversed (reversesFacing), unless it emits. Every surface is two-sided, so a BSDF
-//                that Mitsuba renders black from the back (isOneSided), or no BSDF on a shape that does not emit
-//                (Mitsuba's default diffuse), adds one report line for the scene. Loading stops as soon as the meshes
-//                pass SceneLimits.triangles or meshMemoryBudget (loadMeshes)
+//                emission; an area emitter inside dielectrics has its radiance divided by their eta^2, with a report
+//                line (emitterEnclosures). Zero-area triangles are dropped. A shape whose dielectric (wrapped or not)
+//                has an IOR ratio below 1 is reversed (reversesFacing), unless it emits. Every surface is two-sided,
+//                so a BSDF that Mitsuba renders black from the back (isOneSided), or no BSDF on a shape that does not
+//                emit (Mitsuba's default diffuse), adds one report line for the scene. Loading stops as soon as the
+//                meshes pass SceneLimits.triangles or meshMemoryBudget (loadMeshes)
 //   sensor       the first perspective or thinlens sensor is the saved view "Mitsuba: camera" and the active camera.
 //                Mitsuba's camera looks along +z with x to the left, so its to_world times diag(-1, 1, -1, 1) is a
 //                camera looking along -z (eye: the origin, direction: to_world's z, up: its y). The vertical field
@@ -556,6 +557,12 @@ extension MitsubaImporter {
     }
 
     var meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
+    // Before the loop below reverses inverted dielectrics: containment takes Mitsuba's facing.
+    progress?.begin("Finding emitters inside glass")
+    let enclosures = emitterEnclosures(shapes, meshes)
+    if enclosures.untested > 0 {
+      scene.note("\(enclosures.untested) area emitters not tested for enclosing dielectrics (more than \(enclosureTestLimit.formatted()) ray-triangle tests); their radiance is not converted")
+    }
 
     // Materials, in shape order: the first shape with a material passes its mesh (a bump map's UV stretch).
     var materials: [USDImportSnapshot.Material] = [], materialIndex: [String: Int] = [:], bindings: [Int?] = []
@@ -567,7 +574,10 @@ extension MitsubaImporter {
       let label = self.label(shape, i)
       let bsdf = shape.child("bsdf"), interior = shape.child("interior")
       if shape.child("exterior") != nil { scene.note("shape '\(label)': exterior medium is not supported; ignored") }
-      let emission = areaEmission(shape, label: label, scene: &scene)
+      var emission = areaEmission(shape, label: label, scene: &scene)
+      if let radiance = emission, let found = enclosures.enclosures[i] {
+        emission = radiance / enclosedRadianceScale(found, label: label, shapes: shapes, scene: &scene)
+      }
       // Without a BSDF, Mitsuba's default diffuse is one-sided too; an emitter's default is black from both sides.
       if bsdf.map(isOneSided) ?? (emission == nil) {
         scene.note("BSDFs without twosided are one-sided in Mitsuba (black from the back); rendered two-sided")
@@ -916,6 +926,141 @@ extension MitsubaImporter {
     let file = folder.appendingPathComponent("constant.hdr")
     try data.write(to: file)
     return file
+  }
+}
+
+// Area emitters inside dielectrics, a convention conversion (REFERENCES.md MITSUBA3, ADOBEOPENPBR). Mitsuba's emitted
+// radiance is radiance in the medium the emitter lies in, and its dielectrics scale radiance by (eta_i / eta_t)^2 on
+// refraction in radiance mode (dielectric.cpp, roughdielectric.cpp), so an emitter inside glass of int_ior / ext_ior eta
+// is seen from outside at radiance / eta^2. The app's camera paths carry basic radiance (L / n^2) through OpenPBR
+// transmission, which applies no such factor, and its light paths match them (caustic_trace_kernel), so an emission
+// value is the radiance seen outside: load divides the radiance by eta^2 of each dielectric that encloses the emitter.
+//
+// Containment: enclosureRays rays from the emitter's surface, uniform by area and cosine-distributed on its emitting
+// side (as its light leaves), against each dielectric or roughdielectric shape whose bounds contain the emitter's, in
+// Mitsuba's facing (before reversesFacing). A ray whose nearest hit on the shape leaves it through its interior side
+// (along the winding normal) counts; a shape that enclosureShare of the rays leave encloses the emitter, so a mesh
+// with a gap (Little Lamp's bulb is open at its socket) still does, and one that partialShare to enclosureShare leave
+// is reported and not converted. Emitters past enclosureTestLimit ray-triangle tests in all are left untested and
+// counted.
+extension MitsubaImporter {
+  static let enclosureRays = 256
+  static let enclosureShare: Float = 0.9
+  static let partialShare: Float = 0.1
+  static let enclosureTestLimit = 1 << 28
+
+  // A dielectric shape around an emitter: its int_ior / ext_ior and the share of test rays that leave it from inside.
+  struct Enclosure {
+    var dielectric: Int
+    var eta: Float
+    var share: Float
+  }
+
+  // For each emitting shape (by index) the dielectric shapes that test rays from it leave from inside, in shape order,
+  // and the number of emitters left untested by the limit.
+  static func emitterEnclosures(_ shapes: [Node], _ meshes: [Mesh?]) -> (enclosures: [Int: [Enclosure]], untested: Int) {
+    func bounds(_ mesh: Mesh) -> (lo: SIMD3<Float>, hi: SIMD3<Float>) {
+      mesh.positions.reduce((lo: SIMD3<Float>(repeating: .infinity), hi: SIMD3<Float>(repeating: -.infinity))) {
+        (simd_min($0.lo, $1), simd_max($0.hi, $1))
+      }
+    }
+    var dielectrics: [(index: Int, eta: Float, lo: SIMD3<Float>, hi: SIMD3<Float>)] = []
+    for (i, shape) in shapes.enumerated() {
+      guard let mesh = meshes[i], !mesh.triangles.isEmpty, let bsdf = shape.child("bsdf").map(leafBSDF),
+        bsdf.type == "dielectric" || bsdf.type == "roughdielectric",
+        let eta = try? ior(bsdf, "int_ior", default: 1.5046) / ior(bsdf, "ext_ior", default: 1.000277), eta.isFinite, eta > 0
+      else { continue }
+      let box = bounds(mesh)
+      dielectrics.append((i, eta, box.lo, box.hi))
+    }
+    guard !dielectrics.isEmpty else { return ([:], 0) }
+    var enclosures: [Int: [Enclosure]] = [:], untested = 0, tests = 0
+    for (i, shape) in shapes.enumerated() where shape.children.contains(where: { $0.tag == "emitter" && $0.type == "area" }) {
+      guard let emitter = meshes[i], !emitter.triangles.isEmpty else { continue }
+      let box = bounds(emitter)
+      let candidates = dielectrics.filter { d in
+        let margin = 1e-4 * simd_length(d.hi - d.lo)
+        return d.index != i && all(box.lo .>= d.lo - margin) && all(box.hi .<= d.hi + margin)
+      }
+      guard !candidates.isEmpty else { continue }
+      let work = enclosureRays * candidates.reduce(0) { $0 + meshes[$1.index]!.triangles.count }
+      guard tests + work <= enclosureTestLimit else { untested += 1; continue }
+      tests += work
+      // Area CDF of the emitter's triangles.
+      let cdf = emitter.triangles.reduce(into: [Float]()) { cdf, t in
+        let a = emitter.positions[Int(t.x)], b = emitter.positions[Int(t.y)], c = emitter.positions[Int(t.z)]
+        cdf.append((cdf.last ?? 0) + simd_length(simd_cross(b - a, c - a)))
+      }
+      let total = cdf.last ?? 0
+      guard total > 0, total.isFinite else { continue }
+      let surfaces = candidates.map { meshes[$0.index]! }
+      var exits = [UInt8](repeating: 0, count: enclosureRays * candidates.count)
+      exits.withUnsafeMutableBufferPointer { buffer in
+        let output = DisjointWrites(base: buffer.baseAddress!)  // Each ray writes only its own entries.
+        DispatchQueue.concurrentPerform(iterations: enclosureRays) { r in
+          // A point by area (stratified triangle choice, Halton barycentrics) and a cosine direction (Halton).
+          func halton(_ index: Int, _ base: Int) -> Float {
+            var f: Float = 1, value: Float = 0, n = index + 1
+            while n > 0 { f /= Float(base); value += f * Float(n % base); n /= base }
+            return value
+          }
+          let pick = (Float(r) + 0.5) / Float(enclosureRays) * total
+          var low = 0, high = cdf.count - 1
+          while low < high { let middle = (low + high) / 2; if cdf[middle] >= pick { high = middle } else { low = middle + 1 } }
+          let t = emitter.triangles[low]
+          let a = emitter.positions[Int(t.x)], b = emitter.positions[Int(t.y)], c = emitter.positions[Int(t.z)]
+          let root = halton(r, 2).squareRoot(), v = halton(r, 3)
+          let origin = (1 - root) * a + root * (1 - v) * b + root * v * c
+          let normal = simd_normalize(simd_cross(b - a, c - a))
+          let helper: SIMD3<Float> = abs(normal.x) < 0.9 ? SIMD3(1, 0, 0) : SIMD3(0, 1, 0)
+          let x = simd_normalize(simd_cross(normal, helper)), y = simd_cross(normal, x)
+          let u1 = halton(r, 5), phi = 2 * Float.pi * halton(r, 7), radius = u1.squareRoot()
+          let direction = simd_normalize(radius * cos(phi) * x + radius * sin(phi) * y + (1 - u1).squareRoot() * normal)
+          for (k, surface) in surfaces.enumerated() {
+            let tMin = 1e-4 * simd_length(candidates[k].hi - candidates[k].lo)
+            var nearest = Float.infinity, leaves = false
+            for t in surface.triangles {
+              // Moller-Trumbore, both sides.
+              let p0 = surface.positions[Int(t.x)], e1 = surface.positions[Int(t.y)] - p0, e2 = surface.positions[Int(t.z)] - p0
+              let p = simd_cross(direction, e2), det = simd_dot(e1, p)
+              guard abs(det) > 1e-20 else { continue }
+              let s = origin - p0, u = simd_dot(s, p) / det
+              guard u >= 0, u <= 1 else { continue }
+              let q = simd_cross(s, e1), w = simd_dot(direction, q) / det
+              guard w >= 0, u + w <= 1 else { continue }
+              let distance = simd_dot(e2, q) / det
+              guard distance > tMin, distance < nearest else { continue }
+              nearest = distance
+              leaves = simd_dot(direction, simd_cross(e1, e2)) > 0
+            }
+            output.base[r * candidates.count + k] = leaves ? 1 : 0
+          }
+        }
+      }
+      let found = candidates.indices.compactMap { k -> Enclosure? in
+        let count = (0..<enclosureRays).reduce(0) { $0 + Int(exits[$1 * candidates.count + k]) }
+        let share = Float(count) / Float(enclosureRays)
+        return share >= partialShare ? Enclosure(dielectric: candidates[k].index, eta: candidates[k].eta, share: share) : nil
+      }
+      if !found.isEmpty { enclosures[i] = found }
+    }
+    return (enclosures, untested)
+  }
+
+  // The divisor of an emitting shape's radiance, eta^2 for each dielectric that encloses it (1 when none does), with
+  // a report line for the conversion and one for each dielectric that test rays leave only in part.
+  static func enclosedRadianceScale(_ found: [Enclosure], label: String, shapes: [Node], scene: inout Scene) -> Float {
+    func number(_ x: Float) -> String { String(format: "%g", Double(x)) }
+    func percent(_ share: Float) -> String { "\(Int((share * 100 + 1e-3).rounded(.down)))%" }  // 0.9 as 90%
+    let enclosing = found.filter { $0.share >= enclosureShare }
+    for partial in found where partial.share < enclosureShare {
+      scene.note("shape '\(label)': \(percent(partial.share)) of test rays from its area emitter leave dielectric '\(self.label(shapes[partial.dielectric], partial.dielectric))' from inside; radiance not converted (\(percent(enclosureShare)) needed)")
+    }
+    guard !enclosing.isEmpty else { return 1 }
+    let scale = enclosing.reduce(Float(1)) { $0 * $1.eta * $1.eta }
+    let list = enclosing.map { "dielectric '\(self.label(shapes[$0.dielectric], $0.dielectric))' (int_ior / ext_ior \(number($0.eta)), \(percent($0.share)) of test rays)" }
+    scene.note("shape '\(label)': area emitter inside \(list.joined(separator: ", ")); radiance divided by \(number(scale)), from Mitsuba's radiance in the glass to the app's")
+    return scale
   }
 }
 
