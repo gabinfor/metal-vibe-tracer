@@ -273,6 +273,7 @@ struct ShowcaseShot: Decodable, Sendable {
   var project: String?
   var usd: String?
   var gltf: String?
+  var mitsuba: String?
   var obj: String?
   var hdri: String?
   var sky: UInt32?
@@ -326,7 +327,7 @@ struct ShowcaseShot: Decodable, Sendable {
     return try load(url)
   }
 
-  // Everything but the scene source (scene, usd, gltf, obj, project, hdri) and the export mode (raw).
+  // Everything but the scene source (scene, usd, gltf, mitsuba, obj, project, hdri) and the export mode (raw).
   func apply(to p: inout ProjectDocument) {
     if let k = emissionScale { p.scaleImportedEmission(by: k) }
     if let r = rotation, r.count == 3, var graph = p.graph {

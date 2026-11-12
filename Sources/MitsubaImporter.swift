@@ -375,6 +375,360 @@ enum MitsubaImporter {
   }
 }
 
+// The scene as a project document. REFERENCES.md: MITSUBA3, BITTERLI2016, OPENUSD (the dome's orientation). As in
+// GLTFImporter, a USDImportSnapshot goes through USDImporter.document (format "Mitsuba"):
+//   shape        one mesh asset and one node per shape (MitsubaImporter.mesh, world space, identity node transform),
+//                named by its id, else <type><index>; one material per BSDF, area-emitter radiance and interior
+//                medium (MitsubaImporter.material), shared by the shapes that reference the same BSDF id with the same
+//                emission; zero-area triangles are dropped
+//   sensor       the first perspective or thinlens sensor is the saved view "Mitsuba: camera" and the active camera.
+//                Mitsuba's camera looks along +z with x to the left, so its to_world times diag(-1, 1, -1, 1) is a
+//                camera looking along -z (eye: the origin, direction: to_world's z, up: its y). The vertical field
+//                of view comes from fov and fov_axis (x by default; smaller and larger resolved against the film,
+//                diagonal over the film's diagonal) or, without fov, focal_length (50mm by default, over a 35 mm
+//                film's 43.2666 mm diagonal), and the film's width and height (768 x 576 by default), which are also
+//                the render size. A thinlens's aperture_radius (at most 0.5) and focus_distance (10000 by default,
+//                Mitsuba's far clip) are the lens.
+//   integrator   max_depth sets the path depth, max_depth - 1 from 1 to 64; -1 (unbounded) or none gives 64. A
+//                wrapper (aov, moment) gives its inner integrator's; an integrator other than path, volpath and
+//                volpathmis contributes only its depth.
+//   envmap       the environment: its file, scale as the intensity, and its turn about +y minus 90 degrees as the
+//                rotation (Mitsuba's envmap, like USD's dome, puts +z at the image centre; the app puts +x there)
+//   constant     a uniform 8 x 4 latlong Radiance HDR image of its radiance, at intensity 1
+// Other emitters and sensors, further ones, media outside a shape's interior and unknown elements are reported and
+// skipped. A scene without a supported emitter stays unlit, as Mitsuba renders it without them (no inspection sky).
+extension MitsubaImporter {
+  static let fileExtensions = ["xml"]
+
+  static func load(_ url: URL, into source: ProjectDocument, progress: OperationProgress? = nil) throws -> USDImportResult {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("vibe-mitsuba-" + UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    progress?.begin("Reading \(url.lastPathComponent)")
+    var scene = try Scene(url: url)
+    var shapes: [Node] = [], sensors: [Node] = [], emitters: [Node] = [], media: [Node] = []
+    var integrator: Node?
+    for node in scene.root.children {
+      switch node.tag {
+      case "shape": shapes.append(node)
+      case "sensor": sensors.append(node)
+      case "emitter": emitters.append(node)
+      case "medium": media.append(node)
+      case "integrator":
+        if integrator == nil { integrator = node } else { scene.note("additional integrator \(node.type ?? "(no type)") skipped") }
+      case "bsdf", "texture":
+        break  // Definitions, read where a shape references them.
+      default:
+        scene.note("element <\(node.tag)> is not supported; ignored")
+      }
+    }
+    let interiors = Set(shapes.compactMap { $0.child("interior")?.id })
+    for medium in media where !(medium.id.map(interiors.contains) ?? false) {
+      scene.note("medium \(medium.type ?? "(no type)") outside a shape's interior is not supported; ignored")
+    }
+
+    let meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
+    let triangles = meshes.reduce(0) { $0 + ($1?.triangles.count ?? 0) }
+    guard triangles <= SceneLimits.triangles else {
+      throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
+    }
+
+    // Materials, in shape order: the first shape with a material passes its mesh (a bump map's UV stretch).
+    var materials: [USDImportSnapshot.Material] = [], materialIndex: [String: Int] = [:], bindings: [Int?] = []
+    for (i, shape) in shapes.enumerated() {
+      progress?.update("Building Mitsuba materials", completed: i, of: shapes.count)
+      guard let mesh = meshes[i] else { bindings.append(nil); continue }
+      let type = shape.type ?? "(no type)"
+      let label = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? "\(type)\(i)"
+      let bsdf = shape.child("bsdf"), interior = shape.child("interior")
+      if shape.child("exterior") != nil { scene.note("shape '\(label)': exterior medium is not supported; ignored") }
+      let emission = areaEmission(shape, label: label, scene: &scene)
+      let key = [bsdf?.id ?? "shape \(i)", emission.map { "\($0)" } ?? "", interior.map { $0.id ?? "shape \(i)" } ?? ""]
+        .joined(separator: "|")
+      if let index = materialIndex[key] { bindings.append(index); continue }
+      let name = (bsdf?.id ?? "\(type)\(i)") + (emission == nil ? "" : "_emitter")
+      let mtlx = try material(bsdf: bsdf, emission: emission, interior: interior, name: name, scene: &scene, folder: folder, mesh: mesh)
+      materialIndex[key] = materials.count
+      bindings.append(materials.count)
+      materials.append(USDImportSnapshot.Material(id: UUID(), name: name, color: [0.5, 0.5, 0.5], path: "materials/\(name)", mtlx: mtlx))
+    }
+
+    progress?.begin("Building Mitsuba meshes")
+    let built = geometries(meshes)
+    let degenerate = built.reduce(0) { $0 + $1.dropped }
+    if degenerate > 0 { scene.note("\(degenerate) zero-area triangles dropped") }
+    let root = SceneNode(name: url.lastPathComponent)
+    var nodes = [root], assets: [MeshAsset] = []
+    for (i, shape) in shapes.enumerated() {
+      guard let material = bindings[i], let geometry = built[i].geometry, !geometry.isEmpty else { continue }
+      let name = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? "\(shape.type ?? "shape")\(i)"
+      let asset = MeshAsset(name: name, geometry: geometry, subsets: [materials[material].name])
+      var node = SceneNode(name: name, parent: root.id)
+      node.mesh = asset.id
+      node.bindings = [materials[material].id]
+      assets.append(asset)
+      nodes.append(node)
+    }
+
+    let view = try camera(sensors, scene: &scene)
+    let depth = pathDepth(integrator, scene: &scene)
+    let environment = try sceneEnvironment(emitters, folder: folder, scene: &scene)
+    let snapshot = USDImportSnapshot(
+      nodes: nodes, assets: [], materials: materials, cameras: view.map { [$0.camera] } ?? [], environment: environment, sun: nil,
+      report: scene.report, fallbackColors: nil, medium: nil)
+    var result = try USDImporter.document(snapshot, assets: assets, folder: folder, url: url, into: source,
+      format: "Mitsuba", lights: "envmap or constant", inspectionSky: false)
+    if let view {
+      result.document.options.outputWidth = view.width
+      result.document.options.outputHeight = view.height
+      if let aperture = view.aperture { result.document.options.aperture = aperture }
+    }
+    result.document.options.depth = depth
+    try result.document.validate()
+    return result
+  }
+
+  // Each shape's world-space mesh (nil for a skipped shape), read in parallel; report lines in shape order, and the
+  // first shape's error in shape order.
+  private static func loadMeshes(_ shapes: [Node], scene: inout Scene, progress: OperationProgress?) throws -> [Mesh?] {
+    guard !shapes.isEmpty else { return [] }
+    var results = [(mesh: Mesh?, report: [String], error: Error?)](repeating: (nil, [], nil), count: shapes.count)
+    let done = Mutex(0)
+    var base = scene
+    base.report = []
+    let shared = base
+    results.withUnsafeMutableBufferPointer { buffer in
+      let output = DisjointWrites(base: buffer.baseAddress!)  // Each worker writes only its own shape's entry.
+      DispatchQueue.concurrentPerform(iterations: shapes.count) { i in
+        var local = shared
+        do {
+          output.base[i] = (try mesh(shapes[i], scene: &local), local.report, nil)
+        } catch {
+          output.base[i] = (nil, local.report, error)
+        }
+        let count = done.withLock { $0 += 1; return $0 }
+        progress?.update("Loading Mitsuba meshes", completed: count, of: shapes.count)
+      }
+    }
+    for result in results {
+      for line in result.report { scene.note(line) }
+      if let error = result.error { throw error }
+    }
+    return results.map(\.mesh)
+  }
+
+  // The meshes as indexed geometry, in parallel: vertices with their normals (a face normal per triangle corner for a
+  // mesh without normals) and uvs (0 without them); zero-area triangles are dropped and counted.
+  private static func geometries(_ meshes: [Mesh?]) -> [(geometry: MeshGeometry?, dropped: Int)] {
+    guard !meshes.isEmpty else { return [] }
+    var results = [(geometry: MeshGeometry?, dropped: Int)](repeating: (nil, 0), count: meshes.count)
+    results.withUnsafeMutableBufferPointer { buffer in
+      let output = DisjointWrites(base: buffer.baseAddress!)  // Each worker writes only its own mesh's entry.
+      DispatchQueue.concurrentPerform(iterations: meshes.count) { i in
+        guard let mesh = meshes[i] else { return }
+        var vertices: [MeshVertex] = [], faces: [MeshFace] = []
+        faces.reserveCapacity(mesh.triangles.count)
+        var dropped = 0
+        if let normals = mesh.normals {
+          vertices = mesh.positions.indices.map { k in
+            let p = mesh.positions[k], n = normals[k], uv = mesh.uvs?[k] ?? .zero
+            return MeshVertex(p.x, p.y, p.z, n.x, n.y, n.z, uv.x, uv.y)
+          }
+        } else {
+          vertices.reserveCapacity(3 * mesh.triangles.count)
+        }
+        for t in mesh.triangles {
+          let a = mesh.positions[Int(t.x)], b = mesh.positions[Int(t.y)], c = mesh.positions[Int(t.z)]
+          let cross = simd_cross(b - a, c - a), length = simd_length(cross)
+          guard length > 0, length.isFinite else { dropped += 1; continue }
+          if mesh.normals != nil {
+            faces.append(MeshFace(t.x, t.y, t.z, 0))
+          } else {
+            let n = cross / length, first = UInt32(vertices.count)
+            for k in [t.x, t.y, t.z] {
+              let p = mesh.positions[Int(k)], uv = mesh.uvs?[Int(k)] ?? .zero
+              vertices.append(MeshVertex(p.x, p.y, p.z, n.x, n.y, n.z, uv.x, uv.y))
+            }
+            faces.append(MeshFace(first, first + 1, first + 2, 0))
+          }
+        }
+        output.base[i] = (MeshGeometry(vertices: vertices, faces: faces), dropped)
+      }
+    }
+    return results
+  }
+
+  // The radiance of the shape's area emitter (1 when not given); nil without one. Other emitters are reported.
+  private static func areaEmission(_ shape: Node, label: String, scene: inout Scene) -> SIMD3<Float>? {
+    var radiance: SIMD3<Float>?
+    for emitter in shape.children where emitter.tag == "emitter" {
+      guard emitter.type == "area" else {
+        scene.note("shape '\(label)': emitter \(emitter.type ?? "(no type)") unsupported; skipped")
+        continue
+      }
+      guard radiance == nil else {
+        scene.note("shape '\(label)': additional area emitter skipped")
+        continue
+      }
+      if emitter.child("radiance") == nil {
+        radiance = SIMD3(repeating: 1)
+      } else if let value = emitter.rgb("radiance") {
+        radiance = simd_max(value, .zero)
+      } else {
+        scene.note("shape '\(label)': area emitter radiance is not read (a texture or a sampled spectrum); 1 used")
+        radiance = SIMD3(repeating: 1)
+      }
+    }
+    return radiance
+  }
+
+  // The first perspective or thinlens sensor as a camera, with its film size and a thinlens's aperture radius.
+  private static func camera(_ sensors: [Node], scene: inout Scene) throws
+    -> (camera: USDImportSnapshot.Camera, width: Int, height: Int, aperture: Float?)? {
+    var chosen: Node?
+    for sensor in sensors {
+      let type = sensor.type ?? "(no type)"
+      guard type == "perspective" || type == "thinlens" else { scene.note("sensor \(type) unsupported; skipped"); continue }
+      if chosen == nil { chosen = sensor } else { scene.note("additional sensor \(type) skipped") }
+    }
+    guard let sensor = chosen else {
+      scene.note("no supported sensor: the default camera is used")
+      return nil
+    }
+    if sensor.children.contains(where: { $0.tag == "medium" }) { scene.note("the sensor's medium is not supported; ignored") }
+    // The film's size: whole numbers of pixels; the render size is clamped to the app's 16...8192.
+    let film = sensor.child("film")
+    func size(_ name: String, _ fallback: Int) throws -> Int {
+      guard let value = film?.float(name) else { return fallback }
+      guard value.isFinite, value >= 1, value < 1_000_000, value == value.rounded() else {
+        throw error("the film's \(name) must be a positive whole number")
+      }
+      return Int(value)
+    }
+    let width = try size("width", 768), height = try size("height", 576)
+    let aspect = Float(width) / Float(height)
+    // tan of half the horizontal field of view.
+    var tanX: Float
+    if let fov = sensor.float("fov") {
+      guard fov.isFinite, fov > 0, fov < 180 else { throw error("the sensor's fov must be between 0 and 180 degrees") }
+      let t = tan(fov * .pi / 360)
+      var axis = sensor.string("fov_axis") ?? "x"
+      if axis == "smaller" { axis = aspect > 1 ? "y" : "x" } else if axis == "larger" { axis = aspect > 1 ? "x" : "y" }
+      switch axis {
+      case "x": tanX = t
+      case "y": tanX = t * aspect
+      case "diagonal": tanX = t / (1 + 1 / (aspect * aspect)).squareRoot()
+      default:
+        scene.note("sensor fov_axis '\(axis)' unknown; x used")
+        tanX = t
+      }
+    } else {
+      let text = sensor.string("focal_length") ?? "50mm"
+      var millimetres = Float(text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "mm", with: "")) ?? 0
+      if !(millimetres.isFinite && millimetres > 0) {
+        scene.note("sensor focal_length '\(text)' is not read; 50mm used")
+        millimetres = 50
+      }
+      tanX = 43.2666 / 2 / millimetres / (1 + 1 / (aspect * aspect)).squareRoot()
+    }
+    let toWorld = sensor.transform("to_world")
+    let linear = simd_float3x3(columns: (toWorld.columns.0.xyz, toWorld.columns.1.xyz, toWorld.columns.2.xyz))
+    if simd_determinant(linear) < 0 { scene.note("sensor: a mirroring to_world is not represented; the image is not mirrored") }
+    let eye = toWorld.columns.3.xyz, direction = simd_normalize(toWorld.columns.2.xyz), up = simd_normalize(toWorld.columns.1.xyz)
+    var focus: Float?, aperture: Float?
+    if sensor.type == "thinlens" {
+      if let radius = sensor.float("aperture_radius"), radius.isFinite, radius >= 0 {
+        if radius > 0.5 { scene.note("thinlens aperture_radius \(radius) rendered as 0.5, the app's largest") }
+        aperture = min(radius, 0.5)
+      } else {
+        scene.note("thinlens has no usable aperture_radius; a pinhole is used")
+      }
+      focus = sensor.float("focus_distance") ?? 10000
+    }
+    let camera = USDImportSnapshot.Camera(name: "camera", eye: [eye.x, eye.y, eye.z], direction: [direction.x, direction.y, direction.z],
+      up: [up.x, up.y, up.z], fov: 2 * atan(tanX / aspect) * 180 / .pi, focus: focus)
+    func clamped(_ pixels: Int, _ name: String) -> Int {
+      if !(16...8192).contains(pixels) { scene.note("film \(name) \(pixels) rendered as \(min(max(pixels, 16), 8192)), the app's limit") }
+      return min(max(pixels, 16), 8192)
+    }
+    return (camera, clamped(width, "width"), clamped(height, "height"), aperture)
+  }
+
+  // The app's path depth from the integrator's max_depth.
+  private static func pathDepth(_ integrator: Node?, scene: inout Scene) -> Int {
+    var node = integrator
+    while let current = node, current.child("max_depth") == nil, let inner = current.children.first(where: { $0.tag == "integrator" }) {
+      node = inner
+    }
+    if let type = node?.type, !["path", "volpath", "volpathmis"].contains(type) {
+      scene.note("integrator \(type) is not supported; the path tracer renders with its max_depth")
+    }
+    guard let maxDepth = node?.float("max_depth"), maxDepth >= 0 else { return 64 }
+    let depth = Int(min(maxDepth, 1000)) - 1
+    if depth < 1 { scene.note("max_depth \(Int(maxDepth)) rendered at path depth 1, the app's smallest") }
+    if depth > 64 { scene.note("max_depth \(Int(maxDepth)) rendered at path depth 64, the app's largest") }
+    return min(max(depth, 1), 64)
+  }
+
+  // The first envmap or constant emitter as the environment; other scene emitters are reported.
+  private static func sceneEnvironment(_ emitters: [Node], folder: URL, scene: inout Scene) throws -> USDImportSnapshot.Environment? {
+    var environment: USDImportSnapshot.Environment?
+    for emitter in emitters {
+      let kind = emitter.type ?? "(no type)"
+      guard kind == "envmap" || kind == "constant" else {
+        scene.note("emitter \(kind) unsupported; skipped")
+        continue
+      }
+      guard environment == nil else {
+        scene.note("additional \(kind) skipped")
+        continue
+      }
+      if kind == "constant" {
+        var radiance = SIMD3<Float>(repeating: 1)
+        if emitter.child("radiance") != nil {
+          if let value = emitter.rgb("radiance") { radiance = value } else { scene.note("constant radiance is not read; 1 used") }
+        }
+        environment = USDImportSnapshot.Environment(file: try constantEnvironment(radiance, folder: folder).path, intensity: 1, rotation: nil)
+        continue
+      }
+      guard let file = emitter.url("filename") else { throw error("an envmap has no filename") }
+      guard FileManager.default.fileExists(atPath: file.path) else { throw error("envmap file \(file.lastPathComponent) is missing") }
+      let toWorld = emitter.transform("to_world")
+      let linear = simd_float3x3(columns: (toWorld.columns.0.xyz, toWorld.columns.1.xyz, toWorld.columns.2.xyz))
+      let front = linear * SIMD3(0, 0, 1)
+      let turn = atan2(front.x, front.z)
+      let pure = simd_float3x3(simd_quatf(angle: turn, axis: SIMD3(0, 1, 0)))
+      if (0..<3).contains(where: { simd_length(linear[$0] - pure[$0]) > 1e-3 }) {
+        scene.note("envmap: to_world is not a turn about +y; only its turn about +y is applied")
+      }
+      let degrees = turn * 180 / .pi - 90
+      let scale = emitter.float("scale") ?? 1
+      if !(0...100).contains(scale) { scene.note("envmap scale \(scale) rendered as \(min(max(scale, 0), 100)), the app's limit") }
+      environment = USDImportSnapshot.Environment(file: file.path, intensity: scale,
+        rotation: degrees < -180 ? degrees + 360 : degrees)
+    }
+    return environment
+  }
+
+  // A uniform latlong Radiance HDR (RGBE) image of a linear colour, as scripts/usd_bridge.py writes an untextured dome.
+  private static func constantEnvironment(_ colour: SIMD3<Float>, folder: URL) throws -> URL {
+    // Clamped to the emission limit of USDImporter.document, so the exponent fits its byte.
+    let c = simd_clamp(colour, .zero, SIMD3(repeating: 1e8))
+    var pixel: [UInt8] = [0, 0, 0, 0]
+    let m = c.max()
+    if m > 1e-32 {
+      let (fraction, exponent) = frexp(Double(m))
+      let s = fraction * 256 / Double(m)
+      pixel = (0..<3).map { UInt8(min(255, Int(Double(c[$0]) * s))) } + [UInt8(exponent + 128)]
+    }
+    var data = Data("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 4 +X 8\n".utf8)
+    for _ in 0..<32 { data.append(contentsOf: pixel) }
+    let file = folder.appendingPathComponent("constant.hdr")
+    try data.write(to: file)
+    return file
+  }
+}
+
 // Shapes as world-space triangles. REFERENCES.md: MITSUBA3 (the shape plugins and Mesh::recompute_vertex_normals,
 // v3.9.1), OBJ2026, PLY1994, OPENEXRLAYOUT (zlib streams).
 //   obj          v, vt, vn and f statements (negative indices count back from the last element read; polygons
@@ -400,6 +754,8 @@ enum MitsubaImporter {
 //                smooth normals, uv (angle about z / 2 pi, angle from +z / pi).
 //   A to_world with a negative determinant reverses the winding of the analytic shapes, whose front side is the
 //   analytic normal's; file meshes keep their winding, as Mitsuba does.
+//   flip_normals reverses the winding and negates the normals of any shape, so an area emitter emits from the other
+//   side; a to_uv on a shape other than the identity is reported and ignored.
 extension MitsubaImporter {
   struct Mesh {
     var positions: [SIMD3<Float>]
@@ -420,6 +776,7 @@ extension MitsubaImporter {
   // a mesh file names the shape (its id, else its type) and the file.
   static func mesh(_ shape: Node, scene: inout Scene) throws -> Mesh? {
     let type = shape.type ?? "(no type)"
+    let label = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? type
     let toWorld = shape.transform("to_world")
     let linear = simd_float3x3(columns: (toWorld.columns.0.xyz, toWorld.columns.1.xyz, toWorld.columns.2.xyz))
     let determinant = simd_determinant(linear)
@@ -427,10 +784,10 @@ extension MitsubaImporter {
       scene.note("shape \(type) has a singular to_world; skipped")
       return nil
     }
+    var mesh: Mesh
     switch type {
     case "obj", "ply", "serialized":
       let faceNormals = shape.bool("face_normals") ?? false
-      let label = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? type
       var fileName = ""
       let local: Mesh
       do {
@@ -463,18 +820,24 @@ extension MitsubaImporter {
         throw error("shape '\(label)': \(failure.message)")
       }
       var invalidNormals = false
-      let placed = world(local, toWorld, smoothNormals: !faceNormals, invalidNormals: &invalidNormals)
+      mesh = world(local, toWorld, smoothNormals: !faceNormals, invalidNormals: &invalidNormals)
       if invalidNormals { scene.note("shape '\(label)': invalid normals in \(fileName); smooth normals computed") }
-      return placed
     case "rectangle", "disk", "cube", "sphere":
       var unused = false
-      var mesh = world(unitShape(type, shape), toWorld, smoothNormals: false, invalidNormals: &unused)
+      mesh = world(unitShape(type, shape), toWorld, smoothNormals: false, invalidNormals: &unused)
       if determinant < 0 { mesh.triangles = mesh.triangles.map { SIMD3($0.x, $0.z, $0.y) } }
-      return mesh
     default:
       scene.note("shape \(type) is not supported; skipped")
       return nil
     }
+    if shape.bool("flip_normals") == true {
+      mesh.triangles = mesh.triangles.map { SIMD3($0.x, $0.z, $0.y) }
+      mesh.normals = mesh.normals?.map { -$0 }
+    }
+    if shape.child("to_uv")?.tag == "transform", shape.transform("to_uv") != matrix_identity_float4x4 {
+      scene.note("shape '\(label)': to_uv is not supported; ignored")
+    }
+    return mesh
   }
 
   // MARK: Placement and normals

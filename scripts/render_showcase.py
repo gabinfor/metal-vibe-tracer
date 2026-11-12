@@ -3,8 +3,8 @@
 Usage: python3 scripts/render_showcase.py [--shots FILE] [--only NAME ...] [--scale S] [--samples N] [--out DIR]
        python3 scripts/render_showcase.py --thumbnails [--only ID ...]
 
-Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD
-or glTF file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera
+Each shot in the JSON file (default scripts/showcase.json) selects a built-in scene, imports an OpenUSD,
+glTF or Mitsuba file, opens a .vtrace project or imports an OBJ with its MTL materials, optionally loads an HDRI, sets the camera
 (or picks an imported camera's saved view with "view"), lens and render modes, and exports
 through StudioController.startExport, exactly like Export in the app, from the raw accumulation: documentation
 and test images are not denoised. A shot with "denoise": true uses Open Image Denoise instead (on request, or
@@ -87,6 +87,14 @@ struct ExportFailure: LocalizedError {
   } else if let path = shot.gltf {
     let start = Date()
     let imported = try GLTFImporter.load(URL(fileURLWithPath: path), into: ProjectDocument())
+    p = imported.document
+    print("\(URL(fileURLWithPath: path).lastPathComponent): imported in \(String(format: "%.1f", Date().timeIntervalSince(start))) s, "
+      + "\(p.graph?.assets.reduce(0) { $0 + $1.geometry.count } ?? 0) triangles, \(p.scenes[6]?.materialX?.count ?? 0) MaterialX materials, "
+      + "views: \(p.views.keys.sorted().joined(separator: ", "))")
+    for line in imported.report { print("  " + line) }
+  } else if let path = shot.mitsuba {
+    let start = Date()
+    let imported = try MitsubaImporter.load(URL(fileURLWithPath: path), into: ProjectDocument())
     p = imported.document
     print("\(URL(fileURLWithPath: path).lastPathComponent): imported in \(String(format: "%.1f", Date().timeIntervalSince(start))) s, "
       + "\(p.graph?.assets.reduce(0) { $0 + $1.geometry.count } ?? 0) triangles, \(p.scenes[6]?.materialX?.count ?? 0) MaterialX materials, "
@@ -191,7 +199,7 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
     } else {
       fputs("FAIL: \(entry.id) names no shot in showcase.json\n", stderr); exit(1)
     }
-    if let path = shot.usd ?? shot.obj, !FileManager.default.fileExists(atPath: path) {
+    if let path = shot.usd ?? shot.mitsuba ?? shot.obj, !FileManager.default.fileExists(atPath: path) {
       print("\(entry.id): skipped, \(path) is missing")
       skipped.append(entry.id)
       continue

@@ -174,6 +174,8 @@ final class StudioController: NSViewController {
   var isBrowsingScenes: Bool { scenes.isVisible }
   // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
   var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
+  // Tests are told an import report would be shown through this instead of the modal alert.
+  var importReportShown: (() -> Void)?
   // Set while Restore Last Session restores the last session, which keeps its autosave file.
   fileprivate var restoringSession = false
   private(set) var errorMessage: String?

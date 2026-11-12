@@ -493,10 +493,10 @@
   controller.unsavedChangesAnswer = nil
 
   // Open Scene File: an OBJ opens as a new untitled scene; with unsaved changes the prompt comes first.
-  require(["glb", "gltf", "usdz", "usd", "obj"].allSatisfy(SceneFile.extensions.contains)
+  require(["glb", "gltf", "usdz", "usd", "xml", "obj"].allSatisfy(SceneFile.extensions.contains)
     && (MainMenuView().control("menu-open-scene") as? NSButton)?.title == "Open Scene File…"
     && SceneBrowserView.describe(.openScene(URL(fileURLWithPath: "/tmp/Chair.glb"))) == "Opening Chair.glb",
-    "the main menu and SceneFile offer one Open Scene File entry for USD, glTF and OBJ")
+    "the main menu and SceneFile offer one Open Scene File entry for USD, glTF, Mitsuba and OBJ")
   let sceneObj = folder.appendingPathComponent("quad.obj")
   try "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n".write(to: sceneObj, atomically: true, encoding: .utf8)
   let history = controller.history, groupsByEvent = history.groupsByEvent

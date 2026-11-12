@@ -80,7 +80,7 @@ Behaviour:
 | Inspector **Scene** selector | The current scene's name and a **Browse…** button |
 | **File › Open Example Scene** | **File › Browse Scenes…** |
 | Project & Export page example panels | Removed; credits are reached from the browser and the File menu |
-| **Import OBJ…** and **Open USD or glTF Scene…** | **Open Scene File…** in the File menu and the main menu: USD, glTF or OBJ, opened as a new untitled scene, by file extension |
+| **Import OBJ…** and **Open USD or glTF Scene…** | **Open Scene File…** in the File menu and the main menu: USD, glTF, Mitsuba (`.xml`) or OBJ, opened as a new untitled scene, by file extension |
 | Adding an OBJ to the current scene | **Add Model…** on the Objects page only (the former **Import OBJ…** behaviour) |
 
 ## 6. Thumbnails

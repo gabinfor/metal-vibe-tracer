@@ -657,3 +657,219 @@
   print("PASS: Mitsuba materials: BSDFs, textures, emitters and interior media as OpenPBR MaterialX")
 }
 try fixMitsubaChecks()
+
+// Mitsuba scene assembly (MitsubaImporter.load): shapes as assets and nodes, shared materials, the sensor as the saved
+// view "Mitsuba: camera" (field of view from fov, fov_axis and the film), the film size as the render size, max_depth
+// as the path depth, envmap and constant emitters as the environment, unsupported plugins in the report, Open Scene
+// File, and on the GPU an emitter that lights the floor in absolute units.
+@MainActor func fixMitsubaSceneChecks() throws {
+  let folder = testOutputDirectory.appendingPathComponent("mitsuba-scene", isDirectory: true)
+  try? FileManager.default.removeItem(at: folder)
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  var written = 0
+  func write(_ xml: String, name: String? = nil) throws -> URL {
+    written += 1
+    let url = folder.appendingPathComponent(name ?? "scene\(written).xml")
+    try xml.write(to: url, atomically: true, encoding: .utf8)
+    return url
+  }
+  func load(_ xml: String) throws -> USDImportResult { try MitsubaImporter.load(try write(xml), into: ProjectDocument()) }
+  try "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".write(to: folder.appendingPathComponent("tri.obj"), atomically: true, encoding: .utf8)
+  // A uniform 8 x 4 Radiance HDR sky of radiance 1 (RGBE 128 128 128 129).
+  var sky = Data("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 4 +X 8\n".utf8)
+  for _ in 0..<32 { sky.append(contentsOf: [128, 128, 128, 129]) }
+  try sky.write(to: folder.appendingPathComponent("sky.hdr"))
+
+  func sensor(_ inner: String = #"<float name="fov" value="90"/><string name="fov_axis" value="x"/>"#, type: String = "perspective",
+              width: Int = 1280, height: Int = 720) -> String {
+    """
+    <sensor type="\(type)">\(inner)
+      <transform name="to_world"><lookat origin="0, 2, 6" target="0, 0, 0" up="0, 1, 0"/></transform>
+      <film type="hdrfilm"><integer name="width" value="\(width)"/><integer name="height" value="\(height)"/></film>
+    </sensor>
+    """
+  }
+  let floor = #"<shape type="rectangle" id="floor"><transform name="to_world"><scale value="5"/><rotate x="1" angle="-90"/></transform><bsdf type="diffuse"/></shape>"#
+  let lamp = #"<shape type="sphere" id="lamp"><point name="center" x="0" y="1" z="0"/><float name="radius" value="0.5"/><emitter type="area"><rgb name="radiance" value="10"/></emitter></shape>"#
+  let envmap = #"<emitter type="envmap"><string name="filename" value="sky.hdr"/><float name="scale" value="2"/><transform name="to_world"><rotate y="1" angle="180"/></transform></emitter>"#
+  func synthetic(sensor camera: String? = sensor(), lamp light: String = lamp, environment: String = envmap) -> String {
+    """
+    <scene version="3.0.0">
+      <integrator type="path"><integer name="max_depth" value="7"/></integrator>
+      \(camera ?? "")
+      <bsdf type="roughplastic" id="shiny"><string name="distribution" value="ggx"/><float name="alpha" value="0.2"/></bsdf>
+      \(floor)
+      <shape type="obj" id="tri"><string name="filename" value="tri.obj"/><transform name="to_world"><translate x="3"/></transform><ref id="shiny"/></shape>
+      \(light)
+      \(environment)
+      <emitter type="point"><point name="position" x="0" y="3" z="0"/></emitter>
+    </scene>
+    """
+  }
+
+  // The synthetic scene: three shapes, the camera, render size, depth, environment and report.
+  let imported = try load(synthetic())
+  let p = imported.document
+  let view = p.views["Mitsuba: camera"]
+  require(p.graph?.assets.count == 3 && p.graph?.nodes.filter { $0.mesh != nil }.count == 3
+    && p.graph?.assets.map(\.name) == ["floor", "tri", "lamp"], "one asset and one node per shape, named by id")
+  require(view.map { abs($0.fov - 58.7155) < 0.01 } == true && p.camera.fov == view?.fov && p.camera.target == view?.target,
+    "the sensor is the active view 'Mitsuba: camera' with a vertical field of view of 58.72 degrees (\(String(describing: view?.fov)))")
+  require(p.options.outputWidth == 1280 && p.options.outputHeight == 720 && p.options.depth == 6,
+    "the film sets the render size and max_depth 7 the path depth 6")
+  require(abs(p.options.environmentRotation - 90) < 1e-3 && p.options.environmentIntensity == 2 && p.environmentName == "sky.hdr"
+    && p.environmentData == sky, "the envmap is the environment: file, scale and its turn about +y (\(p.options.environmentRotation))")
+  require(imported.report == ["emitter point unsupported; skipped"] && p.importReport == imported.report,
+    "the report lists the skipped point emitter and nothing about the supported plugins (\(imported.report))")
+  let eye = p.camera.target + p.camera.distance * SIMD3(cos(p.camera.pitch) * sin(p.camera.yaw), sin(p.camera.pitch), -cos(p.camera.pitch) * cos(p.camera.yaw))
+  require(simd_length(eye - SIMD3(0, 2, 6)) < 1e-3, "the camera sits at the sensor's origin (\(eye))")
+
+  // The envmap's turn: the app's rotation is the turn about +y minus 90 degrees (the image centre faces +z in Mitsuba).
+  for (angle, expected) in [(Float(0), Float(-90)), (90, 0), (-90, 180)] {
+    let turned = try load(synthetic(environment: #"<emitter type="envmap"><string name="filename" value="sky.hdr"/><transform name="to_world"><rotate y="1" angle="\#(angle)"/></transform></emitter>"#)).document
+    let difference = (turned.options.environmentRotation - expected).truncatingRemainder(dividingBy: 360)
+    require(min(abs(difference), 360 - abs(difference)) < 1e-3, "an envmap turned \(angle) degrees: rotation \(expected) (\(turned.options.environmentRotation))")
+  }
+  let tilted = try load(synthetic(environment: #"<emitter type="envmap"><string name="filename" value="sky.hdr"/><transform name="to_world"><rotate x="1" angle="30"/></transform></emitter>"#))
+  require(tilted.report.contains { $0.hasPrefix("envmap: to_world is not a turn about +y") }, "a tilted envmap is reported (\(tilted.report))")
+  let constant = try load(synthetic(environment: #"<emitter type="constant"><rgb name="radiance" value="0.5, 1, 2"/></emitter>"#)).document
+  require(constant.environmentData != nil && constant.options.environmentIntensity == 1 && constant.environmentName.hasSuffix(".hdr"),
+    "a constant emitter is a uniform environment")
+
+  // No sensor: the default camera and a report line.
+  let blind = try load(synthetic(sensor: nil))
+  require(blind.document.views.isEmpty && blind.report.contains { $0.hasPrefix("no supported sensor") }, "no sensor is reported (\(blind.report))")
+  // Field of view axes, the default focal length, and a thin lens.
+  func verticalFOV(_ inner: String, width: Int = 1280, height: Int = 720) throws -> Float {
+    try load(synthetic(sensor: sensor(inner, width: width, height: height))).document.views["Mitsuba: camera"]?.fov ?? 0
+  }
+  let axisY = try verticalFOV(#"<float name="fov" value="90"/><string name="fov_axis" value="y"/>"#)
+  let smaller = try verticalFOV(#"<float name="fov" value="90"/><string name="fov_axis" value="smaller"/>"#)
+  let larger = try verticalFOV(#"<float name="fov" value="90"/><string name="fov_axis" value="larger"/>"#, width: 720, height: 1280)
+  let diagonal = try verticalFOV(#"<float name="fov" value="90"/><string name="fov_axis" value="diagonal"/>"#)
+  let focal = try verticalFOV("", width: 768, height: 576)
+  require(abs(axisY - 90) < 0.01 && abs(smaller - 90) < 0.01 && abs(larger - 90) < 0.01 && abs(diagonal - 52.2338) < 0.01
+    && abs(focal - 29.1054) < 0.01, "fov_axis y, smaller, larger and diagonal, and the 50 mm default (\([axisY, smaller, larger, diagonal, focal]))")
+  let lens = try load(synthetic(sensor: sensor(#"<float name="fov" value="40"/><float name="aperture_radius" value="0.1"/><float name="focus_distance" value="3"/>"#, type: "thinlens"))).document
+  require(lens.views["Mitsuba: camera"] != nil && abs(lens.options.aperture - 0.1) < 1e-6 && abs(lens.options.focusDistance - 3) < 1e-5,
+    "a thinlens sensor sets the aperture radius and focus distance")
+  // Depth: max_depth -1 and an absent max_depth are the app's deepest path, 64.
+  let unbounded = try load(synthetic().replacingOccurrences(of: #"value="7""#, with: #"value="-1""#)).document
+  let absent = try load(synthetic().replacingOccurrences(of: #"<integrator type="path"><integer name="max_depth" value="7"/></integrator>"#, with: "")).document
+  require(unbounded.options.depth == 64 && absent.options.depth == 64, "max_depth -1 or absent gives depth 64")
+
+  // Materials: shared by BSDF id and emission.
+  let shared = try load("""
+    <scene version="3.0.0">
+      <bsdf type="diffuse" id="paint"/>
+      <shape type="rectangle" id="a"><ref id="paint"/></shape>
+      <shape type="rectangle" id="b"><ref id="paint"/></shape>
+      <shape type="rectangle" id="c"><ref id="paint"/><emitter type="area"><rgb name="radiance" value="1"/></emitter></shape>
+      <shape type="rectangle" id="d"><bsdf type="diffuse"/></shape>
+    </scene>
+    """).document
+  let bindings = shared.graph?.nodes.filter { $0.mesh != nil }.map { $0.bindings.first } ?? []
+  require(bindings.count == 4 && bindings[0] == bindings[1] && bindings[2] != bindings[0] && bindings[3] != bindings[0]
+    && shared.graph?.materials.count == 3, "shapes that reference one BSDF share a material; an emissive one gets its own")
+
+  // flip_normals reverses an emitter's facing; a shape's to_uv is reported.
+  func facing(_ document: ProjectDocument, _ name: String) -> SIMD3<Float>? {
+    guard let asset = document.graph?.assets.first(where: { $0.name == name }), asset.geometry.count > 0 else { return nil }
+    let t = asset.geometry.triangle(0)
+    let a = SIMD3(t.a.x, t.a.y, t.a.z)
+    return simd_normalize(simd_cross(SIMD3(t.b.x, t.b.y, t.b.z) - a, SIMD3(t.c.x, t.c.y, t.c.z) - a))
+  }
+  let panel = #"<emitter type="area"><rgb name="radiance" value="5"/></emitter><transform name="to_world"><rotate x="1" angle="90"/><translate y="2"/></transform>"#
+  let flipped = try load("""
+    <scene version="3.0.0">
+      <shape type="rectangle" id="down">\(panel)</shape>
+      <shape type="rectangle" id="up"><boolean name="flip_normals" value="true"/>\(panel)</shape>
+      <shape type="rectangle" id="mapped"><transform name="to_uv"><scale x="2"/></transform></shape>
+    </scene>
+    """)
+  let down = facing(flipped.document, "down"), up = facing(flipped.document, "up")
+  let upNormal = flipped.document.graph?.assets.first { $0.name == "up" }?.geometry.vertices.first
+  require((down?.y ?? 0) < -0.99 && (up?.y ?? 0) > 0.99 && (upNormal?[4] ?? 0) > 0.99,
+    "flip_normals reverses a rectangle's winding and normals, and so the side it emits from (\(String(describing: down)), \(String(describing: up)))")
+  require(flipped.report.contains("shape 'mapped': to_uv is not supported; ignored"), "a shape's to_uv is reported (\(flipped.report))")
+  print("PASS: Mitsuba scenes: shapes, shared materials, camera and field of view, render size, depth, environment, report")
+
+  // Open Scene File: a Mitsuba scene opens as an untitled document; an .xml that is not one fails and changes nothing.
+  func idle() { waitUntil({ !controller.isBusy }, seconds: 60) }
+  // Explicit undo groups, as in Fix_start-screen: the suite has no event loop grouping.
+  let history = controller.history, groupsByEvent = history.groupsByEvent
+  history.groupsByEvent = false
+  defer { history.groupsByEvent = groupsByEvent }
+  func open(_ url: URL) {
+    history.beginUndoGrouping()
+    controller.beginOpenSceneFile(url)
+    idle()
+    history.endUndoGrouping()
+  }
+  let sceneURL = try write(synthetic(), name: "open.xml")
+  var reports = 0
+  controller.importReportShown = { reports += 1 }
+  defer { controller.importReportShown = nil }
+  require(SceneFile.extensions.contains("xml"), "Open Scene File accepts .xml")
+  // Unedited, so that no Save / Don't Save / Cancel prompt comes first.
+  controller.associate(nil, edited: false, replaced: false)
+  open(sceneURL)
+  require(controller.projectURL == nil && controller.documentEdited && controller.project.graph?.assets.count == 3
+    && controller.project.meshName == "open.xml" && controller.project.views["Mitsuba: camera"] != nil && reports == 1,
+    "Open Scene File opens a Mitsuba scene as an untitled document (\(controller.errorMessage ?? "no error"), \(reports) reports)")
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = .sortedKeys
+  let before = try encoder.encode(controller.project)
+  controller.dismissError()
+  controller.associate(nil, edited: false, replaced: false)
+  open(try write("<svg/>", name: "drawing.xml"))
+  let after = try encoder.encode(controller.project)
+  require(controller.errorMessage?.contains("drawing.xml is not a Mitsuba scene") == true && after == before && reports == 1, "an .xml that is not a Mitsuba scene fails with the importer's error and leaves the document unchanged (\(controller.errorMessage ?? "no error"), \(before.count) vs \(after.count) bytes)")
+  controller.dismissError()
+  print("PASS: Mitsuba scenes open through Open Scene File")
+
+  // GPU: the floor under the emitting sphere is lit, and black without the sphere's emitter and the environment (the
+  // importer adds no inspection sky to a Mitsuba scene).
+  func floorRadiance(_ document: ProjectDocument, eye: SIMD3<Float>, samples: Int) throws -> SIMD3<Float> {
+    try controller.restore(document)
+    let o = document.options
+    var v = makeUniforms(scene: 6, mode: 1, width: 32, height: 32)
+    v.cameraPos = SIMD4(eye, 10); v.cameraTarget = SIMD4(0, 0, 0, 8)
+    v.currentViewProj = makePerspective(fovyRadians: 10 * .pi / 180, aspect: 1, near: 0.05, far: 100)
+      * makeLookAt(eye: eye, target: .zero, up: SIMD3(0, 1, 0))
+    v.prevViewProj = v.currentViewProj
+    v.environment = SIMD4(o.environmentIntensity, o.environmentRotation * .pi / 180, document.environmentData == nil ? 0 : 1,
+                          Float(testRenderer.materials.nodeCount))
+    v.sunParams.w = o.sunIntensity
+    v.lens = SIMD4(0, o.focusDistance, 1, 0)
+    let pixels = render(v, samples: samples)
+    let centre = pixels.indices.filter { abs($0 % 32 - 16) < 8 && abs($0 / 32 - 16) < 8 }
+    return centre.reduce(SIMD3<Float>()) { $0 + SIMD3(pixels[$1].x, pixels[$1].y, pixels[$1].z) } / Float(centre.count)
+  }
+  let lit = try floorRadiance(p, eye: SIMD3(0, 0.4, 1.5), samples: 64)
+  let dark = try load(synthetic(lamp: lamp.replacingOccurrences(of: #"<emitter type="area"><rgb name="radiance" value="10"/></emitter>"#, with: ""), environment: ""))
+  let unlit = try floorRadiance(dark.document, eye: SIMD3(0, 0.4, 1.5), samples: 16)
+  print("Mitsuba synthetic scene: floor radiance under the sphere \(lit), without emitters \(unlit)")
+  require(lit.min() > 0.01 && unlit.max() == 0 && dark.document.options.environmentIntensity == 0
+    && dark.report.contains("No supported authored lighting: the scene is unlit."),
+    "the emitting sphere lights the floor; without emitters the floor is black and the report says so (\(dark.report))")
+  // Units: a 2 x 2 rectangle of radiance L facing a diffuse floor (rho 0.5) 2 below it gives the floor beneath its centre
+  // radiance rho / pi x E, E = 4 L A / sqrt(1 + A^2) atan(A / sqrt(1 + A^2)), A = half-width / height (the form factor of a
+  // parallel rectangle), 0.4789 for L 4.
+  let units = try load("""
+    <scene version="3.0.0">
+      <shape type="rectangle" id="floor"><transform name="to_world"><scale value="20"/><rotate x="1" angle="-90"/></transform>
+        <bsdf type="diffuse"><rgb name="reflectance" value="0.5"/></bsdf></shape>
+      <shape type="rectangle" id="light"><transform name="to_world"><rotate x="1" angle="90"/><translate y="2"/></transform>
+        <emitter type="area"><rgb name="radiance" value="4"/></emitter></shape>
+    </scene>
+    """).document
+  let a: Float = 0.5, g = a / (1 + a * a).squareRoot() * atan(a / (1 + a * a).squareRoot())
+  let expected = 0.5 / Float.pi * 4 * 4 * g
+  let measured = try floorRadiance(units, eye: SIMD3(0, 0.6, 1), samples: 256)
+  print("Mitsuba area emitter over a diffuse floor: radiance \(measured), expected \(expected)")
+  require(abs(measured.x - expected) < 0.02 * expected && abs(measured.y - expected) < 0.02 * expected && abs(measured.z - expected) < 0.02 * expected,
+    "an area emitter's radiance lights a diffuse floor in absolute units")
+  print("PASS: Mitsuba scenes on the GPU: emitters light the floor, in absolute units")
+}
+try fixMitsubaSceneChecks()

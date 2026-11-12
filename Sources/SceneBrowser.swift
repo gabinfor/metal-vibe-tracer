@@ -1,9 +1,9 @@
 import Cocoa
 import UniformTypeIdentifiers
 
-// The scene file formats Open Scene File accepts: OpenUSD, glTF 2.0 and Wavefront OBJ.
+// The scene file formats Open Scene File accepts: OpenUSD, glTF 2.0, Mitsuba (.xml) and Wavefront OBJ.
 enum SceneFile {
-  static let extensions = ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions + ["obj"]
+  static let extensions = ["usd", "usda", "usdc", "usdz"] + GLTFImporter.fileExtensions + MitsubaImporter.fileExtensions + ["obj"]
 }
 
 // What the main menu and the scene browser ask for. A nil URL asks with an open panel first.

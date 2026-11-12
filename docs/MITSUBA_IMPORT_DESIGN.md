@@ -1,6 +1,6 @@
 # Mitsuba scene import and Bitterli's scenes as downloads
 
-Status: **2026-11-10. Proposed; nothing implemented.** Design approved in conversation on 2026-11-10. Depends on the scene browser ([SCENE_BROWSER_DESIGN.md](SCENE_BROWSER_DESIGN.md)) for the download entries (§6); §3–5 do not depend on it.
+Status: **2026-11-12. The importer (§3–§5) is implemented** on `feature/mitsuba-import`, and **Open Scene File…** opens Mitsuba scenes; the download entries (§6), the validation against Mitsuba (§7) and the converter's removal are not done yet. Design approved in conversation on 2026-11-10. Depends on the scene browser ([SCENE_BROWSER_DESIGN.md](SCENE_BROWSER_DESIGN.md)) for the download entries (§6); §3–5 do not depend on it.
 
 ## 1. Problem
 
@@ -22,19 +22,22 @@ Out of scope, reported on import: scattering media, `point`, `spot` and `directi
 
 `Sources/MitsubaImporter.swift` follows `GLTFImporter`: `MitsubaImporter.load(_:into:progress:)` builds a `USDImportSnapshot` with mesh sidecars and one OpenPBR MaterialX document per material, and `USDImporter.document` turns it into the project (`format: "Mitsuba"`). The BSDF mapping is `MitsubaImporter.material` in `Sources/MitsubaMaterials.swift`, which writes the documents with `GLTFImporter.Writer` and bakes checkerboards, nonlinear plastic textures and bump normal maps into the import folder; a bump map's normal map takes its UV stretch from the first mesh using the material.
 
-- **Detection:** an `.xml` file whose root element is `<scene>`. **Open Scene File…** accepts it.
+- **Detection:** an `.xml` file whose root element is `<scene>` (`MitsubaImporter.isMitsuba`). **Open Scene File…** offers `.xml` (`MitsubaImporter.fileExtensions` in `SceneFile.extensions`) and `StudioController.beginImportUSD` reads every `.xml` with `MitsubaImporter.load`, so another XML file fails with the importer's "is not a Mitsuba scene" error and the document is kept.
+- **Assembly:** one mesh asset and one node per shape (world space, identity node transform), named by the shape's id, else `<type><index>`; meshes are read in parallel. One material per BSDF id, area-emitter radiance and interior medium, shared by the shapes that have the same three. Zero-area triangles are dropped and counted in the report.
 - **XML layer:** `<default>` values and `$name` substitution; `<ref>` ids, which are global, including BSDFs nested in another BSDF; `<include>`; `<transform>` with `matrix`, `translate`, `rotate`, `scale` and `lookat`.
 - **Mitsuba 0.6:** a scene whose `version` is below 2 goes through a rename pass to Mitsuba 3 names (`toWorld`, `intIOR`, `extIOR`, `maxDepth`, `sampleCount`, `faceNormals`, and the other camelCase properties the supported plugins use), and BSDFs' `<srgb>` colours are linearized. Water Caustic ships only in this form.
-- **Camera:** the first `perspective` sensor becomes the saved view "Mitsuba: camera" and the active camera, with the vertical field of view derived from `fov`, `fov_axis` and the film size. Mitsuba's camera looks along +z with x to the left.
-- **Depth and size:** the integrator's `max_depth` sets the project's path depth and the film's size the render size. A `sppm` or other unknown integrator contributes only its depth.
-- **Report:** every unsupported plugin or property is listed once in the import report with what was used instead.
+- **Camera:** the first `perspective` or `thinlens` sensor becomes the saved view "Mitsuba: camera" and the active camera. Mitsuba's camera looks along +z with x to the left, so `to_world` × diag(−1, 1, −1, 1) is the camera (eye: the origin, direction: `to_world`'s z, up: its y), as `scripts/mitsuba_to_usd.py` writes it. The vertical field of view comes from `fov` and `fov_axis` (`x` by default; `smaller` and `larger` resolved against the film's aspect, `diagonal` over its diagonal) or, without `fov`, from `focal_length` (`50mm` by default, over 35 mm film's 43.27 mm diagonal), and the film's `width` and `height` (768 × 576 by default). A `thinlens`'s `aperture_radius` (up to 0.5) and `focus_distance` (10,000, Mitsuba's far clip, by default) are the lens. A scene without a supported sensor keeps the default camera, with a report line.
+- **Depth and size:** the film's size (clamped to 16–8,192) sets `StudioOptions.outputWidth` and `outputHeight`, and the integrator's `max_depth` sets `StudioOptions.depth` to `max_depth` − 1, clamped to 1–64; −1 or no `max_depth` gives 64 (the rule of `scripts/compare_scene.py`). A wrapper integrator gives its inner one's depth; a `sppm` or other integrator than `path`, `volpath` and `volpathmis` contributes only its depth, with a report line.
+- **Lighting:** an `envmap` is the environment (its file, `scale` as the intensity, and its turn about +y minus 90° as `environmentRotation`, the convention `scripts/usd_bridge.py` applies to the converter's dome, `REFERENCES.md` `OPENUSD`); a `to_world` that is not a turn about +y is reported. A `constant` emitter is a uniform 8 × 4 Radiance HDR image of its radiance. A scene without a supported emitter stays unlit (`USDImporter.document` with `inspectionSky` false), as Mitsuba renders it without them.
+- **Report:** every unsupported plugin or property is listed once in the import report with what was used instead: other emitters, other and additional sensors, media outside a shape's interior and exterior media, `shapegroup` and `instance`, a shape's `to_uv`, unknown elements.
 
 ## 4. What is read
 
 | Mitsuba | Becomes |
 | --- | --- |
 | `obj`, `ply`, `serialized` shapes | One mesh per shape, in world space (`MitsubaImporter.mesh`); `face_normals` gives flat normals, and a file without normals gets smooth ones, as in Mitsuba |
-| `rectangle`, `disk`, `cube`, `sphere` | Tessellated meshes (a 64 × 32 sphere, a 64-segment disk); a mirroring transform reverses the winding so the front side stays the analytic normal's, which is the emitting side |
+| `rectangle`, `disk`, `cube`, `sphere` | Tessellated meshes (a 64 × 32 sphere, a 64-segment disk with the converter's planar uv, where Mitsuba's is polar); a mirroring transform reverses the winding so the front side stays the analytic normal's, which is the emitting side |
+| `flip_normals`, shape `to_uv` | `flip_normals` reverses any shape's winding and negates its normals, so an emitter emits from the other side; a shape's `to_uv` is reported and ignored |
 | `diffuse` | `base_color`, `specular_weight` 0 |
 | `plastic`, `roughplastic` | `base_color` = reflectance × internal-scattering ratio (§5), `specular_ior`, `specular_roughness` = √alpha |
 | `conductor`, `roughconductor` | `base_metalness` 1, `base_color` = F0, `specular_color` = 82° edge tint, `specular_reflectance` as `specular_weight` |
@@ -43,7 +46,8 @@ Out of scope, reported on import: scattering media, `point`, `spot` and `directi
 | `twosided`, `mask`, `bumpmap`, `normalmap` | The inner BSDF; `geometry_opacity`; a normal map |
 | `bitmap`, `checkerboard` | Image nodes (sRGB unless `raw`) with `to_uv` scale; a checkerboard is baked to PNG; a missing file is an error |
 | `area` emitter on a shape | Emission on the shape's material; a shape with an emitter and no BSDF has a black surface |
-| `envmap`, `constant` scene emitters | The environment, with its rotation about the vertical axis |
+| `envmap`, `constant` scene emitters | The environment, with its rotation about the vertical axis; other scene emitters are reported |
+| `perspective`, `thinlens` sensor; film; integrator | The view "Mitsuba: camera", the output size and the path depth (§3) |
 | `homogeneous` interior medium with zero albedo (0.6: `sigma_s` 0) behind a refracting BSDF | `transmission_color` exp(−`sigma_t` × `scale`) at `transmission_depth` 1; other media are reported and ignored |
 
 The mappings are those of `scripts/mitsuba_to_usd.py` as validated in `REFERENCES.md` (`MITSUBA3`, `BITTERLI2016`), with two additions: the `sphere` (Little Lamp's emitter) and the absorbing interior medium (Modern Hall's glass). `ply` and `serialized` are not used by the ten scenes and are included because other Mitsuba scenes commonly use them.

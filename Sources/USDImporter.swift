@@ -239,12 +239,13 @@ enum USDImporter {
     }
     return try document(snapshot, assets: assets, folder: folder, url: url, into: source)
   }
-  // Builds the imported document from a scene snapshot (the OpenUSD helper's, or GLTFImporter's) and its
-  // mesh assets. MaterialX image paths resolve against `folder`. `format` names the source in saved
-  // views ("USD: Camera") and report lines; `lights` names its light schema.
+  // Builds the imported document from a scene snapshot (the OpenUSD helper's, GLTFImporter's or
+  // MitsubaImporter's) and its mesh assets. MaterialX image paths resolve against `folder`. `format` names
+  // the source in saved views ("USD: Camera") and report lines; `lights` names its light schema. Without
+  // `inspectionSky`, a scene with no supported lighting stays unlit instead of getting the neutral sky.
   static func document(
     _ snapshot: USDImportSnapshot, assets: [MeshAsset], folder: URL, url: URL, into source: ProjectDocument,
-    format: String = "USD", lights: String = "UsdLux"
+    format: String = "USD", lights: String = "UsdLux", inspectionSky: Bool = true
   ) throws -> USDImportResult {
     var snapshot = snapshot
     var p = source
@@ -404,6 +405,8 @@ enum USDImporter {
       if graphEmissive {
         snapshot.report.append(
           "No \(lights) lights: emissive materials light the scene; no environment or sun added.")
+      } else if !inspectionSky {
+        snapshot.report.append("No supported authored lighting: the scene is unlit.")
       } else {
         p.options.environmentIntensity = 1
         p.options.sunIntensity = 0
@@ -458,6 +461,7 @@ enum USDImporter {
 }
 extension StudioController {
   func showUSDReport() {
+    if let shown = importReportShown { return shown() }
     let alert = NSAlert()
     alert.messageText = "Import report"
     let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 320))
@@ -473,7 +477,7 @@ extension StudioController {
   func openSceneFile() {
     chooseOpen("Open scene file", extensions: SceneFile.extensions) { [weak self] url in self?.beginOpenSceneFile(url) }
   }
-  // USD and glTF files open as a new scene; an OBJ becomes a new untitled scene holding that model.
+  // USD, glTF and Mitsuba files open as a new scene; an OBJ becomes a new untitled scene holding that model.
   // Asks first when the current document has unsaved changes.
   func beginOpenSceneFile(_ url: URL) {
     confirmDiscardingChanges { [weak self] in
@@ -506,11 +510,15 @@ extension StudioController {
     DispatchQueue.global(qos: .userInitiated).async {
       // Resources are prepared off the main thread, reusing unchanged live resources.
       let result = Result { () -> (USDImportResult, MaterialLibrary) in
-        // glTF is read in process (GLTFImporter); OpenUSD composes in the helper that `job` controls.
+        // glTF and Mitsuba (any .xml) are read in process (GLTFImporter, MitsubaImporter); OpenUSD composes in the
+        // helper that `job` controls.
         var imported: USDImportResult
         if GLTFImporter.isGLTF(url) {
           defer { job.finish() }
           imported = try GLTFImporter.load(url, into: source, progress: progress)
+        } else if MitsubaImporter.fileExtensions.contains(url.pathExtension.lowercased()) {
+          defer { job.finish() }
+          imported = try MitsubaImporter.load(url, into: source, progress: progress)
         } else {
           imported = try USDImporter.load(url, into: source, job: job, progress: progress)
         }
