@@ -168,9 +168,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 `Sources/MitsubaImporter.swift` ports formulas and quadrature from Mitsuba 3.9.1
 (https://github.com/mitsuba-renderer/mitsuba3, tag v3.9.1: `ior.h`, `fresnel.h`, `microfacet.h`,
 `warp.h`, `frame.h`, `conductor.cpp`, `plastic.cpp`, `roughplastic.cpp`) and the `erfinv` approximation from Dr.Jit 1.5.0
-(https://github.com/mitsuba-renderer/drjit, tag v1.5.0: `include/drjit/math.h`), and
-`Sources/MitsubaTables.swift` holds values read from Mitsuba 3.9.1 (its IOR table and its
-conductor presets, `data/ior`); see REFERENCES.md (MITSUBA3). Mitsuba 3 notice:
+(https://github.com/mitsuba-renderer/drjit, tag v1.5.0: `include/drjit/math.h`); its shape
+readers follow `src/render/mesh.cpp` and `src/shapes/obj.cpp`, `ply.cpp`, `serialized.cpp`,
+`rectangle.cpp`, `disk.cpp`, `cube.cpp` and `sphere.cpp` of the same tag. `Sources/MitsubaTables.swift`
+holds values read from Mitsuba 3.9.1 (its IOR table and its conductor presets, `data/ior`) by
+`scripts/generate_mitsuba_tables.py`; see REFERENCES.md (MITSUBA3). Mitsuba 3 notice:
 
 ```text
 Copyright (c) 2017 Wenzel Jakob <wenzel.jakob@epfl.ch>, All rights reserved.

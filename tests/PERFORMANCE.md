@@ -30,7 +30,7 @@ Compiling both spectral libraries with `MTLMathMode.safe` instead of `.relaxed` 
 
 ## Bitterli caustic scenes at equal time — November 9, 2026
 
-Four `BITTERLI2016` scenes converted with `scripts/mitsuba_to_usd.py`, half resolution, each scene's Mitsuba path depth, Standard MIS on every side, spectral transport, no denoiser; visual comparison at about equal time (the light-traced side had the shorter time where they differ).
+Four `BITTERLI2016` scenes converted with `scripts/mitsuba_to_usd.py` (the converter, removed on 2026-11-12), half resolution, each scene's Mitsuba path depth, Standard MIS on every side, spectral transport, no denoiser; visual comparison at about equal time (the light-traced side had the shorter time where they differ).
 
 | Scene | Path tracing | + light tracing | + light tracing and photons | Observation |
 | --- | --- | --- | --- | --- |
@@ -41,7 +41,7 @@ Four `BITTERLI2016` scenes converted with `scripts/mitsuba_to_usd.py`, half reso
 
 # Mitsuba 3 at equal settings — November 5, 2026
 
-Apple M4, 16 GB, macOS 27. Bitterli's Mitsuba 3 versions (`BITTERLI2016`) of the Grey & White Room (the Fireplace Room, sky map `Sky 19.exr` turned 90°) and the White Room (the Living Room, four area lights), each rendered as the same scene by both renderers: Mitsuba 3.9.1 (`metal_ad_rgb`) from the XML, the app from `scripts/mitsuba_to_usd.py`'s USD through `scripts/render_showcase.py` (raw EXR export, Standard MIS, RGB transport, no denoiser). 640×360, 256 spp, path depth 64 and 32 (Mitsuba `max_depth` 65 and 33, the scenes' own). Mitsuba times are the median of three `mi.render` calls after a 1-spp warm-up (kernels compiled, scene loaded); the app's are its export wall time in whole seconds (scene restored, export set-up included). Noise is the luminance MSE weighted by 1/(L_ref² + 0.01), against each renderer's own reference (Mitsuba 16,384 spp `volpath`; the app 2,048 spp, corrected by 8/7 for its 256 samples being the reference's first 256: repeated renders are bit-identical). Bias is the app's 2,048-spp image against Mitsuba's reference.
+Apple M4, 16 GB, macOS 27. Bitterli's Mitsuba 3 versions (`BITTERLI2016`) of the Grey & White Room (the Fireplace Room, sky map `Sky 19.exr` turned 90°) and the White Room (the Living Room, four area lights), each rendered as the same scene by both renderers: Mitsuba 3.9.1 (`metal_ad_rgb`) from the XML, the app from `scripts/mitsuba_to_usd.py`'s USD (the converter, removed on 2026-11-12) through `scripts/render_showcase.py` (raw EXR export, Standard MIS, RGB transport, no denoiser). 640×360, 256 spp, path depth 64 and 32 (Mitsuba `max_depth` 65 and 33, the scenes' own). Mitsuba times are the median of three `mi.render` calls after a 1-spp warm-up (kernels compiled, scene loaded); the app's are its export wall time in whole seconds (scene restored, export set-up included). Noise is the luminance MSE weighted by 1/(L_ref² + 0.01), against each renderer's own reference (Mitsuba 16,384 spp `volpath`; the app 2,048 spp, corrected by 8/7 for its 256 samples being the reference's first 256: repeated renders are bit-identical). Bias is the app's 2,048-spp image against Mitsuba's reference.
 
 | Scene | Mitsuba `volpath` | Mitsuba `path` | App | Noise at 256 spp, Mitsuba tent / box / app | Mitsuba time to the app's noise, tent (box) | Mean ratio | 8×8-block ratio, 5–50–95th percentile |
 | --- | --- | --- | --- | --- | --- | --- | --- |
