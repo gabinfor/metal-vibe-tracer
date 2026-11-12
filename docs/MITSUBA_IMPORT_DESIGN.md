@@ -1,6 +1,6 @@
 # Mitsuba scene import and Bitterli's scenes as downloads
 
-Status: **2026-11-12. The importer (§3–§5) is implemented** on `feature/mitsuba-import`, and **Open Scene File…** opens Mitsuba scenes; the download entries (§6), the validation against Mitsuba (§7) and the converter's removal are not done yet. Design approved in conversation on 2026-11-10. Depends on the scene browser ([SCENE_BROWSER_DESIGN.md](SCENE_BROWSER_DESIGN.md)) for the download entries (§6); §3–5 do not depend on it.
+Status: **2026-11-12. The importer (§3–§5) is implemented** on `feature/mitsuba-import`, and **Open Scene File…** opens Mitsuba scenes; the ten download entries (§6) are implemented, opened through the importer, with thumbnails and specs; the validation against Mitsuba (§7) and the converter's removal are not done yet. Design approved in conversation on 2026-11-10. Depends on the scene browser ([SCENE_BROWSER_DESIGN.md](SCENE_BROWSER_DESIGN.md)) for the download entries (§6); §3–5 do not depend on it.
 
 ## 1. Problem
 
@@ -44,7 +44,7 @@ Out of scope, reported on import: scattering media, `point`, `spot` and `directi
 | `dielectric`, `roughdielectric` | `transmission_weight` 1, `specular_ior`, `transmission_color`; zero transmittance is a black reflector |
 | `thindielectric`, `principledthin` | `geometry_thin_walled`, as the converter's header documents |
 | `twosided`, `mask`, `bumpmap`, `normalmap` | The inner BSDF; `geometry_opacity`; a normal map |
-| `bitmap`, `checkerboard` | Image nodes (sRGB unless `raw`) with `to_uv` scale; a checkerboard is baked to PNG; a missing file is an error |
+| `bitmap`, `checkerboard` | Image nodes (sRGB unless `raw`), sampled as Mitsuba does at the `to_uv` scale (normal maps included); `to_uv` offsets and rotations are reported and ignored; a checkerboard is baked to PNG; a missing file is an error, and so is a source above 64 megapixels that would be baked (`MitsubaMaterials.bakeTexels`) |
 | `area` emitter on a shape | Emission on the shape's material; a shape with an emitter and no BSDF has a black surface |
 | `envmap`, `constant` scene emitters | The environment, with its rotation about the vertical axis; other scene emitters are reported |
 | `perspective`, `thinlens` sensor; film; integrator | The view "Mitsuba: camera", the output size and the path depth (§3) |
@@ -83,7 +83,10 @@ Ten `SceneEntry` values in a `.bitterli` collection (`format: .mitsuba`), each w
 - Each archive extracts into a folder of its own name, so the entry's storage folder is `bitterli-<archive name>` (the McGuire `living_room` storage stays separate from Bitterli's `living-room`) and its scene file is `<archive name>/scene_v3.xml`; Water Caustic's archive holds only `water-caustic/scene_v0.6.xml`.
 - Each has a shot in `scripts/showcase.json` with a new `"mitsuba"` source key, `"view": "Mitsuba: camera"`, and a caustics mode where the 2026-11-09 comparison needs one (Water Caustic: light tracing + photons).
 - CC0 entries state that credit is appreciated and not required; CC BY 3.0 entries use the existing credit terms.
-- Thumbnails follow the browser's rules.
+- Opening (`StudioController.beginMitsubaImport`, from `openScene`): after the unsaved-changes prompt it loads the installed scene file through `beginImportUSD(from:opened:adjust:)`, the path **Open Scene File…** and the bundled spectral examples use, as a new untitled document. `adjust` applies the shot (`ShowcaseShot.apply`: the saved view **Mitsuba: camera** and, for Water Caustic, caustics; the shots carry no size, depth or sample count, so the scene's own film size and path depth stand) and puts the entry's attribution first in the import report. Like the spectral examples it shows a status line ("Opened *title* *credit*, *license*. Credits: File > Credits and Licenses….") instead of the report sheet, which **Import report…** on the Objects page still shows.
+- Thumbnails follow the browser's rules: `render_showcase.py --thumbnails` renders each shot at 960 × 540 (replacing the scene's film size; a square film keeps its vertical field of view, so the 16:9 frame shows more to the sides), at most 256 spp, not denoised. The ten are listed in `Examples/Thumbnails/README.md`.
+- The catalog's `triangles` and `materials` are what the importer reports for each scene.
+- **Credits and Licenses…** names both archives (McGuire's imported unchanged, Bitterli's opened through this importer) and has a website button for each.
 - The McGuire Fireplace Room and Living Room entries stay.
 
 ## 7. Validation
