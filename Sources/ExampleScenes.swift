@@ -267,7 +267,7 @@ final class ExampleSceneDownload: NSObject, URLSessionDownloadDelegate, @uncheck
 }
 
 // A shot of scripts/showcase.json: the README images' scene, camera, lens, lighting and output settings.
-// scripts/render_showcase.py renders them; the scene browser opens the McGuire archive ones.
+// scripts/render_showcase.py renders them; the scene browser opens the catalog's scenes with theirs.
 struct ShowcaseShot: Decodable, Sendable {
   var name: String
   var scene: UInt32?
@@ -416,8 +416,7 @@ extension StudioController {
     switch entry.source {
     case .builtIn(let index): confirmDiscardingChanges { [weak self] in self?.startBuiltInScene(index) }
     case .bundled: openBundledScene(entry)
-    // Temporary placeholder: the Mitsuba importer's call replaces this line.
-    case .download where entry.format == .mitsuba: show("Opening Mitsuba scenes arrives with the importer.")
+    case .download where entry.format == .mitsuba: confirmDiscardingChanges { [weak self] in self?.beginMitsubaImport(entry) }
     case .download: confirmDiscardingChanges { [weak self] in self?.beginExampleImport(entry) }
     }
   }
@@ -476,21 +475,35 @@ extension StudioController {
       showError(message)
     }
   }
-  // Opens the extracted scene as a new, unsaved, untitled project with the showcase shot's settings.
-  func beginExampleImport(_ entry: SceneEntry) {
-    guard !isBusy, let shotName = entry.shot, let url = exampleLibrary.sceneFileURL(entry),
-      let attribution = entry.attribution, let credit = entry.credit, let license = entry.license
-    else { return }
-    let shot: ShowcaseShot
+  // The scene's showcase shot, or an error alert when showcase.json lacks it.
+  private func showcaseShot(_ entry: SceneEntry) -> ShowcaseShot? {
     do {
-      guard let found = try ShowcaseShot.bundled().first(where: { $0.name == shotName }) else {
-        throw MaterialLibrary.error("showcase.json has no shot named \(shotName).")
+      guard let found = try ShowcaseShot.bundled().first(where: { $0.name == entry.shot }) else {
+        throw MaterialLibrary.error("showcase.json has no shot named \(entry.shot ?? entry.id).")
       }
-      shot = found
+      return found
     } catch {
       showError(error.localizedDescription)
-      return
+      return nil
     }
+  }
+  // Opens the extracted Mitsuba scene through the Mitsuba importer as a new, unsaved, untitled project: the scene's own
+  // camera, film size and depth, with the showcase shot's view and settings, and the credit first in the import report.
+  // Like the bundled spectral examples, it shows a status line instead of the import report sheet.
+  func beginMitsubaImport(_ entry: SceneEntry) {
+    guard !isBusy, let url = exampleLibrary.sceneFileURL(entry), let attribution = entry.attribution,
+      let credit = entry.credit, let license = entry.license, let shot = showcaseShot(entry)
+    else { return }
+    beginImportUSD(from: url, opened: "Opened \(entry.title) \(credit), \(license). Credits: File > Credits and Licenses….") {
+      shot.apply(to: &$0)
+      $0.importReport = [attribution] + ($0.importReport ?? [])
+    }
+  }
+  // Opens the extracted OBJ scene as a new, unsaved, untitled project with the showcase shot's settings.
+  func beginExampleImport(_ entry: SceneEntry) {
+    guard !isBusy, let url = exampleLibrary.sceneFileURL(entry), let attribution = entry.attribution,
+      let credit = entry.credit, let license = entry.license, let shot = showcaseShot(entry)
+    else { return }
     openOBJAsNewDocument(url, activity: "Importing \(entry.title)…", undoName: "Open example scene", adjust: { document in
       shot.apply(to: &document)
       // The credit travels with the project in its import report.
@@ -549,15 +562,20 @@ extension StudioController {
       + "\n\nFrom Morgan McGuire's Computer Graphics Archive (casual-effects.com/data), July 2017, downloaded on "
       + "request and imported unchanged: Metal Vibe Tracer translates their MTL materials and sets its own camera, sky "
       + "and sun. From Benedikt Bitterli's Rendering Resources (benedikt-bitterli.me/resources), downloaded on request "
-      + "and opened through the Mitsuba importer, which translates their Mitsuba materials to OpenPBR. Renders are "
-      + "adapted works and must keep the credit and the license link, except for the public domain (CC0) scenes, "
-      + "where credit is appreciated but not required."
+      + "and opened through the Mitsuba importer, which translates their Mitsuba materials to OpenPBR and keeps their "
+      + "cameras and lights. Renders are adapted works and must keep the credit and the license link, except for the "
+      + "public domain (CC0) scenes, where credit is appreciated but not required."
     alert.addButton(withTitle: "OK")
-    alert.addButton(withTitle: "Open Archive Website")
+    alert.addButton(withTitle: "Open McGuire Archive Website")
+    alert.addButton(withTitle: "Open Bitterli Resources Website")
     alert.beginSheetModal(for: window) { response in
-      if response == .alertSecondButtonReturn, let website = SceneEntry.Collection.mcguire.website {
-        NSWorkspace.shared.open(website)
+      let collection: SceneEntry.Collection
+      switch response {
+      case .alertSecondButtonReturn: collection = .mcguire
+      case .alertThirdButtonReturn: collection = .bitterli
+      default: return
       }
+      if let website = collection.website { NSWorkspace.shared.open(website) }
     }
   }
   func revealExampleScenes() {

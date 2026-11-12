@@ -16,9 +16,12 @@ firefly control that the image notes must state; "raw": true exports linear radi
 
 --thumbnails renders the scene browser's thumbnails instead: for each entry of SceneCatalog.entries (read by the Swift
 driver, so there is no second list here) but the SceneCatalog.thumbnailExempt scenes, the entry's shot (a built-in
-scene: its scene index at the default view) at 960 x 540 with at most 256 spp and no denoiser, downsampled to
+scene: its scene index at the default view; an imported scene, Mitsuba included, with its own camera or the
+shot's view) at 960 x 540 with at most 256 spp and no denoiser, downsampled to
 480 x 270 and written as JPEG (quality 0.85) to Examples/Thumbnails/<id>.jpg, with the ids in
-Examples/Thumbnails/scene-ids.txt for scripts/check_bundle.py. --only then names catalog ids. A scene whose files are
+Examples/Thumbnails/scene-ids.txt for scripts/check_bundle.py. The thumbnail's size replaces the scene's own film
+size, and a camera of another aspect ratio, such as a square film, keeps its vertical field of view (the shot's
+sizes are applied after the importer's), so the 16:9 frame shows more to the sides. --only then names catalog ids. A scene whose files are
 not installed is skipped, and one whose render fails is reported, and both are listed at the end while the run goes
 on. A failed render removes that id's old JPEG and makes the exit status non-zero after every entry was tried; a
 skipped scene keeps its JPEG and the exit status is 0.

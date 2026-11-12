@@ -86,8 +86,11 @@
   let publicDomain = ["veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp"]
   let bitterli = entries.filter { $0.collection == .bitterli }
   require(bitterli.map(\.id) == bitterliIDs && entries.suffix(10).map(\.id) == bitterliIDs
-    && bitterli.allSatisfy { $0.format == .mitsuba && $0.isDownload && $0.triangles == nil && $0.materials == nil },
+    && bitterli.allSatisfy { $0.format == .mitsuba && $0.isDownload },
     "the ten Bitterli scenes follow the McGuire ones as Mitsuba downloads")
+  // What MitsubaImporter.load reports for each scene (measured 2026-11-12).
+  require(bitterli.map(\.triangles) == [11_544, 382_690, 405_709, 591_907, 103_487, 623_326, 1_443_298, 589_803, 142_998, 29_056]
+    && bitterli.map(\.materials) == [6, 13, 7, 33, 9, 11, 90, 66, 19, 21], "Bitterli triangle and material counts")
   require(bitterli.map(\.title) == ["Veach, Bidir Room", "Veach, Ajar", "Glass of Water", "Contemporary Bathroom",
     "Water Caustic", "Little Lamp", "Country Kitchen", "The White Room", "The Grey & White Room", "Modern Hall"]
     && bitterli.map(\.credit) == ["Benedikt Bitterli", "Benedikt Bitterli", "aXel", "Mareck", "Benedikt Bitterli", "UP3D",
@@ -493,12 +496,88 @@
   controller.unsavedChangesAnswer = nil
   controller.associate(nil, edited: false, replaced: false)
   controller.exampleLibrary = downloadLibrary
+  // A Mitsuba download: a locally made archive holding a floor, an emissive rectangle and a perspective sensor installs
+  // and opens through the Mitsuba importer with the Water Caustic shot (view "Mitsuba: camera", caustics 3) and the
+  // entry's credit first in the import report, without the report sheet.
+  let mitsubaSource = folder.appendingPathComponent("mitsuba-source", isDirectory: true)
+  try manager.createDirectory(at: mitsubaSource.appendingPathComponent("synthetic", isDirectory: true), withIntermediateDirectories: true)
+  try Data("""
+    <scene version="3.0.0">
+      <integrator type="path"><integer name="max_depth" value="6"/></integrator>
+      <sensor type="perspective">
+        <float name="fov" value="40"/>
+        <transform name="to_world"><lookat origin="0, 2, 6" target="0, 0, 0" up="0, 1, 0"/></transform>
+        <film type="hdrfilm"><integer name="width" value="64"/><integer name="height" value="48"/></film>
+      </sensor>
+      <bsdf type="diffuse" id="grey"><rgb name="reflectance" value="0.5"/></bsdf>
+      <shape type="rectangle"><transform name="to_world"><rotate x="1" angle="-90"/><scale value="3"/></transform><ref id="grey"/></shape>
+      <shape type="rectangle">
+        <emitter type="area"><rgb name="radiance" value="10"/></emitter>
+        <transform name="to_world"><rotate x="1" angle="90"/><translate y="2"/></transform>
+      </shape>
+    </scene>
+    """.utf8).write(to: mitsubaSource.appendingPathComponent("synthetic/scene.xml"))
+  let mitsubaZip = folder.appendingPathComponent("Synthetic.zip")
+  let mitsubaDitto = Process()
+  mitsubaDitto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+  mitsubaDitto.arguments = ["-c", "-k", mitsubaSource.path, mitsubaZip.path]
+  try mitsubaDitto.run()
+  mitsubaDitto.waitUntilExit()
+  require(mitsubaDitto.terminationStatus == 0, "ditto made the Mitsuba test archive")
+  let mitsubaBytes = Int64((try mitsubaZip.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0)
+  let mitsubaDigest = SHA256.hash(data: try Data(contentsOf: mitsubaZip)).map { String(format: "%02x", $0) }.joined()
+  var mitsubaEntry = SceneCatalog.entry("water-caustic")!
+  mitsubaEntry.source = .download(storage: "synthetic", file: "synthetic/scene.xml", archives: [ExampleArchive(
+    name: "Synthetic.zip", url: mitsubaZip, folder: "", bytes: mitsubaBytes, unpackedBytes: mitsubaBytes, sha256: mitsubaDigest)])
+  require(mitsubaEntry.format == .mitsuba && mitsubaEntry.shot == "bitterli-water-caustic", "the test entry is a Mitsuba download")
+  let mitsubaLibrary = ExampleLibrary(root: folder.appendingPathComponent("mitsuba-controller", isDirectory: true))
+  controller.exampleLibrary = mitsubaLibrary
+  try manager.createDirectory(at: mitsubaLibrary.storage(mitsubaEntry), withIntermediateDirectories: true)
+  try ExampleSceneDownload.installDownloaded(mitsubaZip, archive: mitsubaEntry.archives[0], storage: mitsubaLibrary.storage(mitsubaEntry), library: mitsubaLibrary)
+  require(controller.isInstalled(mitsubaEntry) && mitsubaLibrary.sceneFileURL(mitsubaEntry).map { manager.fileExists(atPath: $0.path) } == true,
+    "the Mitsuba archive extracts to its scene file")
+  var reportSheets = 0
+  controller.importReportShown = { reportSheets += 1 }
+  defer { controller.importReportShown = nil }
+  // An edited document with the prompt answered Cancel stays as it is, with the Scenes window shown.
+  controller.associate(nil, edited: true, replaced: false)
+  controller.browseScenes()
+  var mitsubaPrompts = 0
+  controller.unsavedChangesAnswer = { respond in mitsubaPrompts += 1; respond(.alertThirdButtonReturn) }
+  let beforeMitsuba = try encoder.encode(controller.project)
+  controller.openScene(mitsubaEntry)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  let cancelled = try encoder.encode(controller.project)
+  require(mitsubaPrompts == 1 && controller.documentEdited && scenes.isVisible && !controller.isBusy
+    && cancelled == beforeMitsuba && reportSheets == 0,
+    "Cancel at the unsaved-changes prompt leaves the document and the Scenes window as they are")
+  controller.unsavedChangesAnswer = nil
+  controller.associate(nil, edited: false, replaced: false)
+  let caustics = controller.project.caustics
+  grouped {
+    controller.openScene(mitsubaEntry)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  let opened = controller.project
+  require(opened.graph?.assets.map(\.geometry.count).reduce(0, +) == 4 && opened.views["Mitsuba: camera"] != nil
+    && opened.camera.yaw == opened.views["Mitsuba: camera"]?.yaw && opened.camera.distance == opened.views["Mitsuba: camera"]?.distance
+    && opened.camera.fov == opened.views["Mitsuba: camera"]?.fov && opened.options.outputWidth == 64 && opened.options.outputHeight == 48
+    && opened.options.depth == 5, "the Mitsuba scene opens with its triangles, its camera and its film size and depth")
+  require(caustics != 3 && opened.caustics == 3, "the shot's caustics mode applies (\(caustics) before)")
+  require(opened.importReport?.first == mitsubaEntry.attribution && controller.projectURL == nil && controller.documentEdited
+    && !scenes.isVisible && reportSheets == 0 && controller.history.canUndo
+    && controller.status.stringValue == "Opened \(mitsubaEntry.title) \(mitsubaEntry.credit!), \(mitsubaEntry.license!). Credits: File > Credits and Licenses….",
+    "the Mitsuba scene opens untitled with its credit first in the report, no report sheet and the Scenes window hidden: \(controller.status.stringValue)")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  controller.associate(nil, edited: false, replaced: false)
+  controller.exampleLibrary = downloadLibrary
+
   // Bundled thumbnails: one 480 x 270 image per scene but the exempt Stanford scans, listed in scene-ids.txt.
-  require(SceneCatalog.thumbnailExempt == Set(["buddha", "chinese-dragon"] + bitterliIDs),
-    "the Stanford scans and the Bitterli scenes, until their thumbnails are rendered, are exempt from thumbnails")
+  require(SceneCatalog.thumbnailExempt == Set(["buddha", "chinese-dragon"]), "the Stanford scans are exempt from thumbnails")
   let thumbnailIDs = SceneCatalog.entries.map(\.id).filter { !SceneCatalog.thumbnailExempt.contains($0) }
   let listed = SceneCatalog.bundledURL("Examples/Thumbnails/scene-ids.txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-  require(listed?.split(separator: "\n").map(String.init) == thumbnailIDs && thumbnailIDs.count == 19,
+  require(listed?.split(separator: "\n").map(String.init) == thumbnailIDs && thumbnailIDs.count == 29,
     "scene-ids.txt lists the scenes with a thumbnail")
   for entry in SceneCatalog.entries {
     let url = SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg")
