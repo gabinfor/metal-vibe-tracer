@@ -2,9 +2,8 @@ import Cocoa
 import simd
 
 // REFERENCES.md: MITSUBA3, BITTERLI2016, OPENPBR, MATERIALX, SRGB1999. A shape's BSDF, area emitter and interior
-// medium as one OpenPBR MaterialX document (the form GLTFImporter writes, with its Writer). The mapping is that of
-// scripts/mitsuba_to_usd.py (material, principled_thin, colour_input, texture, plastic_texture, bump_normal_map,
-// material_prim), whose report lines it keeps:
+// medium as one OpenPBR MaterialX document (the form GLTFImporter writes, with its Writer), compared with Mitsuba on
+// Bitterli's scenes (REFERENCES.md BITTERLI2016):
 //   diffuse              base_color = reflectance (0.5), specular_weight 0
 //   plastic/roughplastic base_color = diffuse_reflectance (0.5) x plasticRatio (int_ior 1.49, ext_ior 1.000277,
 //                        alpha 0.1, beckmann), specular_ior = int_ior / ext_ior, specular_roughness = sqrt(alpha)
@@ -23,8 +22,8 @@ import simd
 //   twosided             its (first) inner BSDF; mask: geometry_opacity = opacity (a texture, or a constant's mean)
 //   bumpmap              the inner BSDF with the height map as a tangent-space normal map, from the mesh's UV stretch
 //   normalmap            the inner BSDF with its texture as the normal map
-//   bitmap               an image node (sRGB unless raw) sampled at Mitsuba's (s_u u, s_v v) for the to_uv scale (the
-//                        converter's sampling differed for a non-integer s_v), normal maps too; checkerboard: a
+//   bitmap               an image node (sRGB unless raw) sampled at Mitsuba's (s_u u, s_v v) for the to_uv scale,
+//                        normal maps too; checkerboard: a
 //                        256 px 8-bit sRGB PNG of color0 (0.4) and color1 (0.2) in the import folder
 //   no BSDF              grey diffuse 0.5, or black when the shape emits (Mitsuba's Shape default)
 //   area emitter         emission_color x emission_luminance = the radiance
@@ -34,7 +33,7 @@ import simd
 // finite (the default used) or negative where that is meaningless (0 used). Baked images are at most bakeTexels.
 extension MitsubaImporter {
   // `name` labels the report lines and the baked images. `mesh` is the first mesh using the material: a bump map's
-  // normal map depends on its UV stretch, as in the converter; without UVs the bump map is dropped and reported.
+  // normal map depends on its UV stretch; without UVs the bump map is dropped and reported.
   static func material(bsdf: Node?, emission: SIMD3<Float>?, interior: Node?, name: String,
                        scene: inout Scene, folder: URL, mesh: Mesh? = nil) throws -> String {
     var builder = MaterialBuilder(name: name, folder: folder, scene: scene)
@@ -353,7 +352,7 @@ private struct MaterialBuilder {
     return m
   }
 
-  // Mitsuba principledthin as a thin-walled OpenPBR surface (see scripts/mitsuba_to_usd.py).
+  // Mitsuba principledthin as a thin-walled OpenPBR surface (REFERENCES.md MITSUBA3, principledthin).
   mutating func principledThin(_ node: MitsubaImporter.Node) throws -> Inputs {
     let base = try colour(node, "base_color", default: SIMD3(repeating: 0.5))
     let d = min(2, max(0, scalar(node, "diff_trans", 0)))
@@ -651,7 +650,7 @@ private struct MaterialBuilder {
 
   // Calls `body` with each texel's index (rows from the top) and linear RGB: integer formats are normalized and sRGB
   // decoded when `srgb`, float formats are read as stored; grey images repeat their channel and alpha is ignored, as
-  // the converter read them through Mitsuba's Bitmap. 8- and 16-bit RGB and grey images are read as stored (no
+  // Mitsuba's Bitmap reads them. 8- and 16-bit RGB and grey images are read as stored (no
   // colour management); others are drawn into a float context in their own colour space (sRGB when not RGB or grey)
   // and un-premultiplied.
   static func forEachTexel(_ image: CGImage, srgb: Bool, owner: String, _ body: (Int, Float, Float, Float) -> Void) throws {
@@ -746,7 +745,7 @@ private struct MaterialBuilder {
     }
   }
 
-  // A linear value as 8-bit sRGB (clamped to 0-1), rounded as the converter did.
+  // A linear value as 8-bit sRGB (clamped to 0-1), rounded to the nearest level.
   static func encoded(_ value: Float) -> UInt8 {
     let x = min(max(value, 0), 1)
     return UInt8((x <= 0.0031308 ? 12.92 * x : 1.055 * powf(x, 1 / 2.4) - 0.055) * 255 + 0.5)

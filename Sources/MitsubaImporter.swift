@@ -749,10 +749,10 @@ extension MitsubaImporter {
 //                normals gets Mitsuba's angle-weighted vertex normals; otherwise the file's normals, transformed
 //                by the inverse transpose of to_world's 3 x 3 and renormalized.
 //   texture      This project's v runs from the top of the image, as Mitsuba's does after its own OBJ flip, so
-//   coordinates  the other formats' coordinates and the analytic shapes' (Mitsuba's, and the converter's) are kept.
+//   coordinates  the other formats' coordinates and the analytic shapes' (Mitsuba's) are kept.
 //   rectangle    (-1, -1, 0) to (1, 1, 0), normal +z, uv 0 to 1.
-//   disk         radius 1, 64 triangles around the centre, normal +z, uv = 0.5 + 0.5 (x, y) (the converter's
-//                planar mapping; Mitsuba's own is polar).
+//   disk         radius 1, 64 triangles around the centre, normal +z, uv = 0.5 + 0.5 (x, y) (a planar mapping;
+//                Mitsuba's own is polar).
 //   cube         -1 to 1 in 24 vertices (Mitsuba's order, one uv square per face), 12 triangles, no normals.
 //   sphere       center and radius (0 and 1) applied before to_world; 64 segments by 32 rings from the +z pole,
 //                smooth normals, uv (angle about z / 2 pi, angle from +z / pi).
@@ -1533,8 +1533,7 @@ extension MitsubaImporter {
   }
 }
 
-// REFERENCES.md: MITSUBA3. Values Mitsuba computes when it loads a BSDF, which the converter
-// (scripts/mitsuba_to_usd.py) asked Mitsuba for and the importer computes itself:
+// REFERENCES.md: MITSUBA3. Values Mitsuba computes when it loads a BSDF, which the importer computes itself:
 //   ior            a number, or a name of include/mitsuba/render/ior.h's table (MitsubaTables.ior, any case)
 //   conductor      F0 and the OpenPBR 82-degree edge tint: a material preset from MitsubaTables.conductors, or
 //                  fresnel_conductor (fresnel.h) at the given eta and k (eta 0 and k 1 by default) when eta is

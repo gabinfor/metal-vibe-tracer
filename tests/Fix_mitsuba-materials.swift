@@ -1,5 +1,5 @@
 // Mitsuba materials (MitsubaImporter.material) beyond Fix_mitsuba.swift's mapping rows: the baked images' texels
-// against the converter's formulas (bump normal maps, nonlinear plastics), principledthin, textured masks and
+// against their formulas (bump normal maps, nonlinear plastics), principledthin, textured masks and
 // plastics, conductor chroma and textured specular_reflectance, normal maps, transmission colours, IOR ratios below 1,
 // values that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's
 // rows for any v scale) and the bake size limit.
@@ -74,8 +74,8 @@
   let quad = MitsubaImporter.Mesh(positions: [SIMD3(-1, -1, 0), SIMD3(1, -1, 0), SIMD3(1, 1, 0), SIMD3(-1, 1, 0)], normals: nil,
     uvs: [SIMD2(0, 0), SIMD2(1, 0), SIMD2(1, 1), SIMD2(0, 1)], triangles: [SIMD3(0, 1, 2), SIMD3(0, 2, 3)])
 
-  // Bump map: heights h = (40 x + 20 y) / 255 (raw) on a 4 x 4 image over a 2 x 2 quad (UV stretch 2). The converter's
-  // bump_normal_map at texel (1, 1): d_u = (h(2, 1) - h(0, 1)) / 2 x 4, d_v = (h(1, 2) - h(1, 0)) / 2 x 4, and the map
+  // Bump map: heights h = (40 x + 20 y) / 255 (raw) on a 4 x 4 image over a 2 x 2 quad (UV stretch 2). The bumpmap
+  // formula at texel (1, 1): d_u = (h(2, 1) - h(0, 1)) / 2 x 4, d_v = (h(1, 2) - h(1, 0)) / 2 x 4, and the map
   // holds normalize(-d_u / 2, +d_v / 2, 1) as 8-bit (n / 2 + 1 / 2).
   try png("ramp.png") { x, y in let v = UInt8(40 * x + 20 * y); return (v, v, v) }
   _ = try compiled(document("""
@@ -87,7 +87,7 @@
   let expectedNormal = SIMD3((0..<3).map { Int((n[$0] * 0.5 + 0.5) * 255 + 0.5) })
   let normal = try baked("-bump-normal.png", "ramp").flatMap { texel($0, 1, 1) }
   require(normal.map { simd_reduce_max(simd_abs($0 &- expectedNormal)) <= 1 } == true && (normal?.x ?? 255) < 128 && (normal?.y ?? 0) > 128,
-    "bump map: a texel's normal leans against the height's u slope and with its v slope, as bump_normal_map computes (\(String(describing: normal)), expected \(expectedNormal))")
+    "bump map: a texel's normal leans against the height's u slope and with its v slope, as MitsubaImporter.normalMap computes it (\(String(describing: normal)), expected \(expectedNormal))")
 
   // Nonlinear plastic: a uniform texel rho bakes to rho x plasticRatio(rho) in 8-bit sRGB; RGBA alpha is ignored.
   try png("grey.png") { _, _ in (128, 128, 128) }
@@ -111,7 +111,7 @@
   let bakedNames = try FileManager.default.contentsOfDirectory(atPath: bakes.path)
   require(bakedNames.allSatisfy { $0.utf8.count < 200 }, "a long material name still gives a short baked file name")
 
-  // principledthin against the converter's principled_thin.
+  // principledthin against its mapping (REFERENCES.md MITSUBA3, principledthin).
   let thin = try program("""
     <bsdf type="principledthin"><rgb name="base_color" value="0.8, 0.5, 0.3"/><float name="diff_trans" value="1.6"/>
       <float name="spec_trans" value="0.5"/><float name="roughness" value="0.4"/><float name="eta" value="1.33"/>
