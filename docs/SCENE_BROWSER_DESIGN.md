@@ -93,7 +93,7 @@ Behaviour:
 ## 7. Errors
 
 - A missing thumbnail shows the placeholder; it never blocks opening.
-- A failed download, a size or digest mismatch and a full disk show their message in the details pane, above **Download**, and in the usual error alert.
+- A failed download, a size or digest mismatch and a full disk show their message in the details pane, above **Download**, and in the status line and the ⚠ error button (which shows the full message).
 - A catalog scene that fails to open (an installed scene's file deleted or corrupt, a bundled scene missing from the bundle, a missing shot) leaves the document as it is and shows the error in the status line and the ⚠ error button, and, when the Scenes window is shown, in the details pane above **Open** (`SceneBrowserView.showOpenError`, from `StudioController.catalogOpenFailed`), where the window may be covering the status line. The Scenes window stays open; the next open of any scene clears the message. **Open Scene File…** and **Open Project…** report errors in the status line only.
 
 ## 8. Tests
