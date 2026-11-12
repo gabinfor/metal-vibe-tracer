@@ -3,7 +3,7 @@
 // plastics, conductor chroma and textured specular_reflectance (sRGB, raw, near-grey, and unreadable or too large to
 // check), normal maps, transmission colours, IOR ratios below 1 (dielectric, roughdielectric, thindielectric), values
 // that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's rows for
-// any v scale) and the bake size limit.
+// any v scale), the bake size limit, hostile values in baked images and BSDF wrapper depth.
 @MainActor func fixMitsubaMaterialChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba-materials", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -296,6 +296,49 @@
       && reported("\(label): coloured specular_reflectance texture scales F0 only"),
       "\(file) as a conductor's specular_reflectance: the coloured path, reported with the reason (\(scene.report.filter { $0.hasPrefix(label) }))")
   }
-  print("PASS: Mitsuba materials: baked texels, principledthin, value guards, texture reports, to_uv sampling, bake limit")
+  // Hostile values in baked images: a huge bump scale and NaN texels give finite texels (a flat normal, a 0 albedo)
+  // instead of trapping on the 8-bit conversion.
+  // Scale 3e38: slopes near Float's largest still give the bump's direction, normalize(-d_u, d_v, 0) at (1, 1).
+  _ = try compiled(document("""
+    <bsdf type="bumpmap"><texture type="bitmap" name="map"><string name="filename" value="ramp.png"/><boolean name="raw" value="true"/></texture>
+      <float name="scale" value="3e38"/><bsdf type="diffuse"/></bsdf>
+    """, name: "steep", mesh: quad))
+  let tangent = simd_normalize(SIMD3(-du, dv, 0))
+  let expectedSteep = SIMD3((0..<3).map { Int((tangent[$0] * 0.5 + 0.5) * 255 + 0.5) })
+  let steep = try baked("-bump-normal.png", "steep").flatMap { texel($0, 1, 1) }
+  require(steep.map { simd_reduce_max(simd_abs($0 &- expectedSteep)) <= 1 } == true,
+    "bump scale 3e38: the normal lies along the slope (\(String(describing: steep)), expected \(expectedSteep))")
+  // With a to_uv scale of 100 as well the slope overflows to infinity: the flat (0, 0, 1).
+  _ = try compiled(document("""
+    <bsdf type="bumpmap"><texture type="bitmap" name="map"><string name="filename" value="ramp.png"/><boolean name="raw" value="true"/>
+      <transform name="to_uv"><scale value="100"/></transform></texture>
+      <float name="scale" value="3e38"/><bsdf type="diffuse"/></bsdf>
+    """, name: "cliff", mesh: quad))
+  let cliff = try baked("-bump-normal.png", "cliff").flatMap { texel($0, 1, 1) }
+  require(cliff == SIMD3(128, 128, 255), "an overflowing bump slope is the flat (0, 0, 1) (\(String(describing: cliff)))")
+  // A 32-bit float TIFF with a NaN texel at (0, 0) and 0.5 elsewhere.
+  let floats = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4, bitsPerSample: 32, samplesPerPixel: 3, hasAlpha: false,
+    isPlanar: false, colorSpaceName: .deviceRGB, bitmapFormat: .floatingPointSamples, bytesPerRow: 48, bitsPerPixel: 96)!
+  floats.bitmapData!.withMemoryRebound(to: Float.self, capacity: 48) { texels in
+    for i in 0..<48 { texels[i] = i < 3 ? .nan : 0.5 }
+  }
+  try floats.tiffRepresentation!.write(to: folder.appendingPathComponent("nan.tif"))
+  _ = try compiled(document("""
+    <bsdf type="plastic"><boolean name="nonlinear" value="true"/>
+      <texture type="bitmap" name="diffuse_reflectance"><string name="filename" value="nan.tif"/><boolean name="raw" value="true"/></texture></bsdf>
+    """, name: "nanplastic"))
+  let nanPlastic = try baked("-plastic.png", "nanplastic").flatMap { texel($0, 0, 0) }
+  require(nanPlastic.map { $0.x < 255 } == true, "a NaN texel in a nonlinear plastic's float texture bakes to a finite texel (\(String(describing: nanPlastic)))")
+  _ = try compiled(document("""
+    <bsdf type="bumpmap"><texture type="bitmap" name="map"><string name="filename" value="nan.tif"/><boolean name="raw" value="true"/></texture>
+      <bsdf type="diffuse"/></bsdf>
+    """, name: "nanbump", mesh: quad))
+  let nanBump = try baked("-bump-normal.png", "nanbump")
+  require(nanBump != nil, "a NaN texel in a bump map's float texture bakes a normal map")
+  // BSDF wrappers 20 deep: an error, not a recursion per level.
+  let wrapped = String(repeating: #"<bsdf type="twosided">"#, count: 20) + #"<bsdf type="diffuse"/>"# + String(repeating: "</bsdf>", count: 20)
+  requireThrows("BSDF wrappers nested more than \(MitsubaImporter.maxWrapperDepth) deep") { _ = try document(wrapped, name: "onion") }
+
+  print("PASS: Mitsuba materials: baked texels, principledthin, value guards, texture reports, to_uv sampling, bake limit, hostile values")
 }
 try fixMitsubaMaterialChecks()

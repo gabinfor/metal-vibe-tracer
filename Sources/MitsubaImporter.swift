@@ -23,6 +23,11 @@ import Synchronization
 //                                             (MitsubaImporter.legacyNames), <lookAt> is <lookat>, a texture's
 //                                             uscale and vscale become a to_uv scale, and the <srgb> values of
 //                                             a BSDF are linearized into <rgb>
+//   limits                                    a file nested more than maxElementDepth elements deep (counted
+//                                             through includes and resolved references), references nested
+//                                             more than maxReferenceDepth deep, more than maxIncludeDepth files
+//                                             open at once and an attribute value longer than
+//                                             maxSubstitutedLength after substitution are errors
 //   #rrggbb, #rgb                             an sRGB hex colour in <rgb> or <srgb> (SRGB1999 transfer
 //                                             function), read as linear RGB
 //   lookat without a usable up                an up vector parallel to the view direction, or none, is
@@ -39,6 +44,23 @@ enum MitsubaImporter {
     "specularTransmittance": "specular_transmittance", "sigmaT": "sigma_t", "sigmaA": "sigma_a", "sigmaS": "sigma_s",
     "focusDistance": "focus_distance", "lookAt": "lookat",
   ]
+
+  // Limits on untrusted files: the open runs on a worker thread with a 512 KB stack, and the XML layer, Foundation's
+  // XMLDocument (whose release of a document about 3,000 elements deep overflows such a stack) and the material
+  // mapping recurse once per level. Bitterli's ten scenes nest at most 7 elements deep after references are
+  // resolved, follow references 1 deep, wrap BSDFs at most 2 deep and include no files.
+  // Elements nested deeper than this below and including <scene>, through includes and resolved references.
+  static let maxElementDepth = 128
+  // A reference to a definition that holds a reference, and so on.
+  static let maxReferenceDepth = 64
+  // Files open at once, the scene's own included: Mitsuba 3.9.1's limit ("Exceeded maximum include recursion depth
+  // of 15").
+  static let maxIncludeDepth = 15
+  // BSDF wrappers (twosided, mask, bumpmap, normalmap) around one another.
+  static let maxWrapperDepth = 16
+  // An attribute value after $variable substitution, in UTF-8 bytes: nested <default>s that repeat a variable grow
+  // exponentially.
+  static let maxSubstitutedLength = 1 << 20
 
   // One resolved XML element: its attributes after $ substitution and the 0.6 rename, and its children with
   // every <ref> replaced by its target.
@@ -175,8 +197,8 @@ enum MitsubaImporter {
       version = element.attribute(forName: "version")?.stringValue.flatMap { $0.split(separator: ".").first }.flatMap { Int($0) } ?? 3
       loader.legacy = version < 2
       loader.includeStack = [url.standardizedFileURL]
-      let raw = try loader.node(element, folder: folder)[0]
-      root = try loader.resolved(raw)
+      let raw = try loader.node(element, folder: url.deletingLastPathComponent(), depth: 1)[0]
+      root = try loader.resolved(raw, depth: 1).node
     }
 
     mutating func note(_ line: String) {
@@ -220,12 +242,38 @@ enum MitsubaImporter {
     var variables: [String: String] = [:]
     var includeStack: [URL] = []
     var definitions: [String: Node] = [:]
-    var resolvedDefinitions: [String: Node] = [:]
+    var resolvedDefinitions: [String: (node: Node, height: Int)] = [:]
     var resolving: Set<String> = []
 
+    // The file's elements, after a streaming pass has checked that they nest at most maxElementDepth deep, so that
+    // XMLDocument never holds (and releases) a deeper tree.
     static func document(_ url: URL) throws -> XMLDocument {
-      do { return try XMLDocument(contentsOf: url, options: [.nodeLoadExternalEntitiesNever]) } catch {
-        throw MitsubaImporter.error("cannot read \(url.lastPathComponent): \(error.localizedDescription)")
+      func failure(_ error: Error) -> Error { MitsubaImporter.error("cannot read \(url.lastPathComponent): \(error.localizedDescription)") }
+      let data: Data
+      do { data = try Data(contentsOf: url) } catch { throw failure(error) }
+      let parser = XMLParser(data: data), depth = DepthCheck()
+      parser.delegate = depth
+      parser.shouldResolveExternalEntities = false
+      parser.parse()
+      if depth.exceeded { throw MitsubaImporter.error("\(url.lastPathComponent): \(Loader.tooDeep)") }
+      do { return try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) } catch { throw failure(error) }
+    }
+
+    static let tooDeep = "elements are nested more than \(MitsubaImporter.maxElementDepth) deep"
+
+    // Stops the streaming pass at the first element deeper than maxElementDepth.
+    final class DepthCheck: NSObject, XMLParserDelegate {
+      var depth = 0, exceeded = false
+      func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName: String?,
+                  attributes: [String: String] = [:]) {
+        depth += 1
+        if depth > MitsubaImporter.maxElementDepth {
+          exceeded = true
+          parser.abortParsing()
+        }
+      }
+      func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName: String?) {
+        depth -= 1
       }
     }
 
@@ -241,14 +289,18 @@ enum MitsubaImporter {
           throw MitsubaImporter.error("undefined variable '$\(name)'")
         }
         result += value
+        guard result.utf8.count <= MitsubaImporter.maxSubstitutedLength else {
+          throw MitsubaImporter.error("a value with '$\(name)' expands beyond \(MitsubaImporter.maxSubstitutedLength >> 20) MB")
+        }
         rest = after.dropFirst(name.count)
       }
       return result + rest
     }
 
-    // The nodes one element stands for: none for <default>, the included file's children for <include>,
-    // otherwise the element itself.
-    mutating func node(_ element: XMLElement, folder: URL) throws -> [Node] {
+    // The nodes one element at `depth` (<scene> 1) stands for: none for <default>, the included file's children
+    // (at the include's depth) for <include>, otherwise the element itself.
+    mutating func node(_ element: XMLElement, folder: URL, depth: Int) throws -> [Node] {
+      guard depth <= MitsubaImporter.maxElementDepth else { throw MitsubaImporter.error(Loader.tooDeep) }
       var tag = element.name ?? ""
       var attributes: [String: String] = [:]
       for attribute in element.attributes ?? [] {
@@ -265,16 +317,19 @@ enum MitsubaImporter {
         guard let filename = attributes["filename"] else { throw MitsubaImporter.error("<include> needs a filename") }
         let url = URL(fileURLWithPath: filename, relativeTo: folder).standardizedFileURL
         guard !includeStack.contains(url) else { throw MitsubaImporter.error("include cycle at '\(filename)'") }
+        guard includeStack.count < MitsubaImporter.maxIncludeDepth else {
+          throw MitsubaImporter.error("includes nested more than \(MitsubaImporter.maxIncludeDepth) files deep at '\(filename)'")
+        }
         includeStack.append(url)
         defer { includeStack.removeLast() }
         guard let included = try Loader.document(url).rootElement(), included.name == "scene" else {
           throw MitsubaImporter.error("included file \(url.lastPathComponent) is not a Mitsuba scene")
         }
-        return try nodes(included.children, folder: url.deletingLastPathComponent())
+        return try nodes(included.children, folder: url.deletingLastPathComponent(), depth: depth)
       default:
         break
       }
-      var children = try nodes(element.children, folder: folder)
+      var children = try nodes(element.children, folder: folder, depth: depth + 1)
       if legacy {
         if let renamed = attributes["name"].flatMap({ MitsubaImporter.legacyNames[$0] }) { attributes["name"] = renamed }
         if tag == "lookAt" { tag = "lookat" }
@@ -298,9 +353,9 @@ enum MitsubaImporter {
       return [node]
     }
 
-    mutating func nodes(_ list: [XMLNode]?, folder: URL) throws -> [Node] {
+    mutating func nodes(_ list: [XMLNode]?, folder: URL, depth: Int) throws -> [Node] {
       var result: [Node] = []
-      for case let child as XMLElement in list ?? [] { result += try node(child, folder: folder) }
+      for case let child as XMLElement in list ?? [] { result += try node(child, folder: folder, depth: depth) }
       return result
     }
 
@@ -334,27 +389,42 @@ enum MitsubaImporter {
                   children: node.children, folder: node.folder)
     }
 
-    // The node with every <ref> below it replaced by the resolved node it names.
-    mutating func resolved(_ node: Node) throws -> Node {
+    // The node at `depth` with every <ref> below it replaced by the resolved node it names, and the height of the
+    // result (1 for a leaf). A resolved definition is reused wherever it is referenced, so its height is checked at
+    // each use: no element of the result lies deeper than maxElementDepth.
+    mutating func resolved(_ node: Node, depth: Int) throws -> (node: Node, height: Int) {
+      guard depth <= MitsubaImporter.maxElementDepth else { throw MitsubaImporter.error(Loader.tooDeep) }
       if node.tag == "ref" {
         guard let id = node.attributes["id"], definitions[id] != nil else {
           throw MitsubaImporter.error("undefined reference '\(node.attributes["id"] ?? "")'")
         }
-        let target = try resolvedDefinition(id)
+        let (target, height) = try resolvedDefinition(id, depth: depth)
+        guard depth - 1 + height <= MitsubaImporter.maxElementDepth else { throw MitsubaImporter.error(Loader.tooDeep) }
         var attributes = target.attributes
         attributes["name"] = node.name
-        return Node(tag: target.tag, type: target.type, name: node.name, id: target.id, attributes: attributes, children: target.children, folder: target.folder)
+        return (Node(tag: target.tag, type: target.type, name: node.name, id: target.id, attributes: attributes, children: target.children,
+                     folder: target.folder), height)
       }
-      var children: [Node] = []
-      for child in node.children { children.append(try resolved(child)) }
-      return Node(tag: node.tag, type: node.type, name: node.name, id: node.id, attributes: node.attributes, children: children, folder: node.folder)
+      var children: [Node] = [], height = 1
+      for child in node.children {
+        let result = try resolved(child, depth: depth + 1)
+        children.append(result.node)
+        height = max(height, result.height + 1)
+      }
+      return (Node(tag: node.tag, type: node.type, name: node.name, id: node.id, attributes: node.attributes, children: children,
+                   folder: node.folder), height)
     }
 
-    mutating func resolvedDefinition(_ id: String) throws -> Node {
+    // The definition with this id, resolved where a reference at `depth` first needs it; the definitions being
+    // resolved (`resolving`) are the chain of references that leads to it.
+    mutating func resolvedDefinition(_ id: String, depth: Int) throws -> (node: Node, height: Int) {
       if let done = resolvedDefinitions[id] { return done }
       guard resolving.insert(id).inserted else { throw MitsubaImporter.error("reference cycle through '\(id)'") }
       defer { resolving.remove(id) }
-      let done = try resolved(definitions[id]!)
+      guard resolving.count <= MitsubaImporter.maxReferenceDepth else {
+        throw MitsubaImporter.error("references nested too deeply (more than \(MitsubaImporter.maxReferenceDepth)) at '\(id)'")
+      }
+      let done = try resolved(definitions[id]!, depth: depth)
       resolvedDefinitions[id] = done
       return done
     }
@@ -367,7 +437,8 @@ enum MitsubaImporter {
 //                named by its id, else <type><index>; one material per BSDF, area-emitter radiance and interior
 //                medium (MitsubaImporter.material), shared by the shapes that reference the same BSDF id with the same
 //                emission; zero-area triangles are dropped. A shape whose dielectric (wrapped or not) has an IOR
-//                ratio below 1 is reversed (reversesFacing), unless it emits
+//                ratio below 1 is reversed (reversesFacing), unless it emits. Loading stops as soon as the meshes
+//                pass SceneLimits.triangles
 //   sensor       the first perspective or thinlens sensor is the saved view "Mitsuba: camera" and the active camera.
 //                Mitsuba's camera looks along +z with x to the left, so its to_world times diag(-1, 1, -1, 1) is a
 //                camera looking along -z (eye: the origin, direction: to_world's z, up: its y). The vertical field
@@ -376,7 +447,8 @@ enum MitsubaImporter {
 //                film's 43.2666 mm diagonal), and the film's width and height (768 x 576 by default), which are also
 //                the render size. A thinlens's aperture_radius (at most 0.5) and focus_distance (10000 by default,
 //                Mitsuba's far clip) are the lens.
-//   integrator   max_depth sets the path depth, max_depth - 1 from 1 to 64; -1 (unbounded) or none gives 64. A
+//   integrator   max_depth sets the path depth, max_depth - 1 from 1 to 64; -1 (unbounded), none or a value that
+//                is not finite (reported) gives 64. A
 //                wrapper (aov, moment) gives its inner integrator's; an integrator other than path, volpath and
 //                volpathmis contributes only its depth.
 //   envmap       the environment: its file, scale as the intensity, and its turn about +y minus 90 degrees as the
@@ -416,10 +488,6 @@ extension MitsubaImporter {
     }
 
     var meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
-    let triangles = meshes.reduce(0) { $0 + ($1?.triangles.count ?? 0) }
-    guard triangles <= SceneLimits.triangles else {
-      throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
-    }
 
     // Materials, in shape order: the first shape with a material passes its mesh (a bump map's UV stretch).
     var materials: [USDImportSnapshot.Material] = [], materialIndex: [String: Int] = [:], bindings: [Int?] = []
@@ -486,24 +554,32 @@ extension MitsubaImporter {
   }
 
   // Each shape's world-space mesh (nil for a skipped shape), read in parallel; report lines in shape order, and the
-  // first shape's error in shape order.
+  // first shape's error in shape order. The running triangle total fails the load as soon as it passes the scene
+  // limit: shapes not yet read are then skipped.
   private static func loadMeshes(_ shapes: [Node], scene: inout Scene, progress: OperationProgress?) throws -> [Mesh?] {
     guard !shapes.isEmpty else { return [] }
     var results = [(mesh: Mesh?, report: [String], error: Error?)](repeating: (nil, [], nil), count: shapes.count)
     var base = scene
     base.report = []
     let shared = base
+    let triangles = Atomic<Int>(0)
     results.withUnsafeMutableBufferPointer { buffer in
       let output = DisjointWrites(base: buffer.baseAddress!)  // Each worker writes only its own shape's entry.
       DispatchQueue.concurrentPerform(iterations: shapes.count) { i in
+        defer { progress?.advance("Loading Mitsuba meshes", total: shapes.count) }
+        guard triangles.load(ordering: .relaxed) <= SceneLimits.triangles else { return }
         var local = shared
         do {
-          output.base[i] = (try mesh(shapes[i], scene: &local), local.report, nil)
+          let mesh = try mesh(shapes[i], scene: &local)
+          if triangles.add(mesh?.triangles.count ?? 0, ordering: .relaxed).newValue > SceneLimits.triangles { return }
+          output.base[i] = (mesh, local.report, nil)
         } catch {
           output.base[i] = (nil, local.report, error)
         }
-        progress?.advance("Loading Mitsuba meshes", total: shapes.count)
       }
+    }
+    guard triangles.load(ordering: .relaxed) <= SceneLimits.triangles else {
+      throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
     }
     for result in results {
       for line in result.report { scene.note(line) }
@@ -668,10 +744,17 @@ extension MitsubaImporter {
     if let type = node?.type, !["path", "volpath", "volpathmis"].contains(type) {
       scene.note("integrator \(type) is not supported; the path tracer renders with its max_depth")
     }
-    guard let maxDepth = node?.float("max_depth"), maxDepth >= 0 else { return 64 }
+    guard let maxDepth = node?.float("max_depth") else { return 64 }
+    guard maxDepth.isFinite else {
+      scene.note("max_depth \(maxDepth) is not a finite number; path depth 64 used")
+      return 64
+    }
+    guard maxDepth >= 0 else { return 64 }
+    // Clamped before the conversion: Int traps on a Float beyond its range.
     let depth = Int(min(maxDepth, 1000)) - 1
-    if depth < 1 { scene.note("max_depth \(Int(maxDepth)) rendered at path depth 1, the app's smallest") }
-    if depth > 64 { scene.note("max_depth \(Int(maxDepth)) rendered at path depth 64, the app's largest") }
+    let shown = maxDepth < 1000 ? "\(Int(maxDepth))" : "\(maxDepth)"
+    if depth < 1 { scene.note("max_depth \(shown) rendered at path depth 1, the app's smallest") }
+    if depth > 64 { scene.note("max_depth \(shown) rendered at path depth 64, the app's largest") }
     return min(max(depth, 1), 64)
   }
 

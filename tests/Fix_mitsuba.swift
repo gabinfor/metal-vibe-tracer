@@ -1,8 +1,8 @@
 // Mitsuba scene import (MitsubaImporter), XML layer: <default> values and $variables, global <ref> ids
 // (including a BSDF nested in another), <include>, transforms in document order, the Mitsuba 0.6 property
-// names, and the not-a-scene error; shapes (mesh files and analytic shapes as world-space triangles); the values
-// taken from Mitsuba (IORs, conductors, plastic ratios); materials (BSDFs, textures, emitters and interior media as
-// OpenPBR MaterialX documents).
+// names, the depth and size limits on hostile files, and the not-a-scene error; shapes (mesh files and analytic
+// shapes as world-space triangles); the values taken from Mitsuba (IORs, conductors, plastic ratios); materials
+// (BSDFs, textures, emitters and interior media as OpenPBR MaterialX documents).
 @MainActor func fixMitsubaChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -247,7 +247,45 @@
   require(b.float("spaced") == 7, "whitespace around a number is trimmed")
   require(b.bool("yes") == true && b.bool("no") == false && b.bool("odd") == nil && b.bool("w") == nil, "bool reads true and false only")
   require(b.float("w") == 48 && b.float("v") == 32, "$resx is not $res followed by x; the first default wins")
-  print("PASS: Mitsuba XML layer: defaults, variables, references, includes, transforms, hex colours, 0.6 names")
+  // Depth and size bombs fail with an error instead of exhausting the 512 KB stack of the import worker or memory.
+  // References 5,000 deep, each definition naming the next: the chain of references is cut at maxReferenceDepth.
+  let links = 5000
+  let forward = (0..<links).map { #"<bsdf type="twosided" id="b\#($0)"><ref id="b\#($0 + 1)"/></bsdf>"# }.joined()
+  let forwardURL = try write("ref-chain.xml", #"<scene version="3.0.0">\#(forward)<bsdf type="diffuse" id="b\#(links)"/></scene>"#)
+  requireThrows("references nested too deeply") { _ = try MitsubaImporter.Scene(url: forwardURL) }
+  // The same chain defined from its end: every reference finds its target resolved, and the resolved tree's depth
+  // is what stops it.
+  let backward = (0..<links).reversed().map { #"<bsdf type="twosided" id="b\#($0)"><ref id="b\#($0 + 1)"/></bsdf>"# }.joined()
+  let backwardURL = try write("ref-chain-reversed.xml", #"<scene version="3.0.0"><bsdf type="diffuse" id="b\#(links)"/>\#(backward)</scene>"#)
+  requireThrows("nested more than \(MitsubaImporter.maxElementDepth) deep") { _ = try MitsubaImporter.Scene(url: backwardURL) }
+  // Elements 10,000 deep in the file: stopped before XMLDocument builds (and would release) the tree.
+  let deep = String(repeating: #"<bsdf type="twosided">"#, count: 10_000) + #"<bsdf type="diffuse"/>"# + String(repeating: "</bsdf>", count: 10_000)
+  let deepURL = try write("deep.xml", #"<scene version="3.0.0">\#(deep)</scene>"#)
+  requireThrows("nested more than \(MitsubaImporter.maxElementDepth) deep") { _ = try MitsubaImporter.Scene(url: deepURL) }
+  // Elements within the limit in each file, deeper together through an include.
+  let half = MitsubaImporter.maxElementDepth / 2 + 1
+  let halfDeep = String(repeating: "<bsdf type=\"twosided\">", count: half) + "<bsdf type=\"diffuse\"/>" + String(repeating: "</bsdf>", count: half)
+  _ = try write("half-inner.xml", #"<scene version="3.0.0">\#(halfDeep)</scene>"#)
+  let halfURL = try write("half-outer.xml", #"<scene version="3.0.0">\#(halfDeep.replacingOccurrences(of: "<bsdf type=\"diffuse\"/>", with: #"<include filename="half-inner.xml"/>"#))</scene>"#)
+  requireThrows("nested more than \(MitsubaImporter.maxElementDepth) deep") { _ = try MitsubaImporter.Scene(url: halfURL) }
+  // Includes 20 files deep: Mitsuba's limit of 15 files open at once.
+  for i in 0..<20 { _ = try write("chain\(i).xml", #"<scene version="3.0.0"><include filename="chain\#(i + 1).xml"/></scene>"#) }
+  _ = try write("chain20.xml", #"<scene version="3.0.0"/>"#)
+  requireThrows("includes nested more than 15 files deep") { _ = try MitsubaImporter.Scene(url: folder.appendingPathComponent("chain0.xml")) }
+  _ = try write("chain14.xml", #"<scene version="3.0.0"/>"#)
+  _ = try MitsubaImporter.Scene(url: folder.appendingPathComponent("chain0.xml"))
+  // Nested defaults that repeat a variable: 1,000 characters, then 1,000 copies (1,000,000 bytes, allowed), then 10 of
+  // those.
+  let bomb = try write("bomb.xml", """
+    <scene version="3.0.0">
+      <default name="a" value="\(String(repeating: "x", count: 1000))"/>
+      <default name="b" value="\(String(repeating: "$a", count: 1000))"/>
+      <default name="c" value="\(String(repeating: "$b", count: 10))"/>
+    </scene>
+    """)
+  requireThrows("a value with '$b' expands beyond 1 MB") { _ = try MitsubaImporter.Scene(url: bomb) }
+
+  print("PASS: Mitsuba XML layer: defaults, variables, references, includes, transforms, hex colours, 0.6 names, depth and size limits")
 
   // Shapes. tri.ply, tri-binary.ply and tri.serialized are written by Mitsuba (tests/fixtures/mitsuba/README.md);
   // the OBJ files are written here.
@@ -782,6 +820,12 @@ try fixMitsubaChecks()
   let unbounded = try load(synthetic().replacingOccurrences(of: #"value="7""#, with: #"value="-1""#)).document
   let absent = try load(synthetic().replacingOccurrences(of: #"<integrator type="path"><integer name="max_depth" value="7"/></integrator>"#, with: "")).document
   require(unbounded.options.depth == 64 && absent.options.depth == 64, "max_depth -1 or absent gives depth 64")
+  // Hostile values: a max_depth beyond Int's range or not finite.
+  let huge = try load(synthetic().replacingOccurrences(of: #"value="7""#, with: #"value="1e30""#))
+  let infinite = try load(synthetic().replacingOccurrences(of: #"value="7""#, with: #"value="inf""#))
+  require(huge.document.options.depth == 64 && huge.report.contains("max_depth 1e+30 rendered at path depth 64, the app's largest")
+    && infinite.document.options.depth == 64 && infinite.report.contains("max_depth inf is not a finite number; path depth 64 used"),
+    "max_depth 1e30 and inf give depth 64 with a report line (\(huge.report), \(infinite.report))")
 
   // Materials: shared by BSDF id and emission.
   let shared = try load("""

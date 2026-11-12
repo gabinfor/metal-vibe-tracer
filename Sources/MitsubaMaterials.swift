@@ -42,7 +42,7 @@ extension MitsubaImporter {
     defer { scene = builder.scene }
     var inputs: Inputs
     if let bsdf {
-      inputs = try builder.inputs(bsdf)
+      inputs = try builder.inputs(bsdf, wrappers: 0)
     } else {
       // Without a BSDF Mitsuba gives a shape a diffuse 0.5, or 0 if it is an emitter (Shape::Shape).
       inputs = Inputs()
@@ -176,7 +176,8 @@ private struct MaterialBuilder {
 
   // MARK: BSDFs
 
-  mutating func inputs(_ node: MitsubaImporter.Node) throws -> Inputs {
+  // `wrappers`: the wrapper BSDFs around this one (at most MitsubaImporter.maxWrapperDepth).
+  mutating func inputs(_ node: MitsubaImporter.Node, wrappers: Int) throws -> Inputs {
     let kind = node.type ?? "(no type)"
     if let known = Self.properties[kind] {
       for child in node.children where child.tag != "bsdf" {
@@ -192,7 +193,10 @@ private struct MaterialBuilder {
       guard let inner = MitsubaImporter.innerBSDF(node) else {
         throw MitsubaImporter.error("material '\(name)': \(kind) has no inner BSDF")
       }
-      m = try inputs(inner)
+      guard wrappers < MitsubaImporter.maxWrapperDepth else {
+        throw MitsubaImporter.error("material '\(name)': BSDF wrappers nested more than \(MitsubaImporter.maxWrapperDepth) deep")
+      }
+      m = try inputs(inner, wrappers: wrappers + 1)
     }
     switch kind {
     case "twosided":
@@ -546,7 +550,9 @@ private struct MaterialBuilder {
     var pixels = [UInt8](repeating: 0, count: 3 * image.width * image.height)
     try pixels.withUnsafeMutableBufferPointer { out in
       try ratios.withUnsafeBufferPointer { r in
-        func baked(_ x: Float) -> UInt8 {
+        func baked(_ value: Float) -> UInt8 {
+          // A float image's non-finite texel is 0 (Int traps on NaN).
+          let x = value.isFinite ? value : 0
           let s = min(max(x, 0), 1) * 16, i = min(Int(s), 15)
           return Self.encoded(x * (r[i] + (r[i + 1] - r[i]) * (s - Float(i))))
         }
@@ -598,7 +604,10 @@ private struct MaterialBuilder {
       for x in 0..<w {
         let du = (height[y * w + (x + 1) % w] - height[y * w + (x + w - 1) % w]) / 2 * Float(w) * su
         let dv = (height[(y + 1) % h * w + x] - height[(y + h - 1) % h * w + x]) / 2 * Float(h) * sv
-        let n = simd_normalize(SIMD3(-ku * du, kv * dv, 1))
+        // Scaled to its largest component first, so that a huge finite slope still normalizes; a non-finite height
+        // or an overflowing slope leaves the surface unbumped there (UInt8 traps on NaN).
+        let v = SIMD3(-ku * du, kv * dv, 1)
+        let n = v.x.isFinite && v.y.isFinite ? simd_normalize(v / simd_reduce_max(simd_abs(v))) : SIMD3(0, 0, 1)
         let o = 3 * (y * w + x)
         pixels[o] = UInt8(min(max(n.x * 0.5 + 0.5, 0), 1) * 255 + 0.5)
         pixels[o + 1] = UInt8(min(max(n.y * 0.5 + 0.5, 0), 1) * 255 + 0.5)
@@ -777,9 +786,9 @@ private struct MaterialBuilder {
     }
   }
 
-  // A linear value as 8-bit sRGB (clamped to 0-1), rounded to the nearest level.
+  // A linear value as 8-bit sRGB (clamped to 0-1; a non-finite value is 0), rounded to the nearest level.
   static func encoded(_ value: Float) -> UInt8 {
-    let x = min(max(value, 0), 1)
+    let x = value.isFinite ? min(max(value, 0), 1) : 0
     return UInt8((x <= 0.0031308 ? 12.92 * x : 1.055 * powf(x, 1 / 2.4) - 0.055) * 255 + 0.5)
   }
 
