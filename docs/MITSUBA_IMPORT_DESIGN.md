@@ -52,10 +52,10 @@ The mappings are those of `scripts/mitsuba_to_usd.py` as validated in `REFERENCE
 
 | Value | In Swift |
 | --- | --- |
-| Named IORs (`bk7`, `water`) | A table transcribed from Mitsuba's source at the pinned version, cited under `MITSUBA3` |
-| Named conductors (`Cu`, `Au`) | A checked-in table of F0 and edge tint per name, written by a new `scripts/generate_mitsuba_tables.py` that runs under the Mitsuba development environment |
-| Explicit conductor `eta`, `k` | The unpolarized conductor Fresnel formula at normal incidence and at μ = 1/7 |
-| Plastic internal-scattering ratio | Computed with the quadrature Mitsuba uses for its plastics; a fixture of ratios generated from Mitsuba at a grid of IOR, alpha, distribution and reflectance checks it |
+| Named IORs (`bk7`, `water`) | `MitsubaTables.ior` (`Sources/MitsubaTables.swift`): the 23 names of Mitsuba 3.9.1's `ior.h` table, read through Mitsuba by `scripts/generate_mitsuba_tables.py` (run by hand under the Mitsuba development environment; its outputs are checked in), looked up in any case by `MitsubaImporter.ior` (`REFERENCES.md`, `MITSUBA3`) |
+| Named conductors (`Cu`, `Au`) | `MitsubaTables.conductors`: F0 and edge tint of the 71 presets and `none`, written by the same script; `MitsubaImporter.conductor` uses Cu when a conductor names neither a material nor `eta`, as the converter does (Mitsuba's own default is `none`) |
+| Explicit conductor `eta`, `k` | The unpolarized conductor Fresnel formula (`fresnel_conductor`) at normal incidence and at μ = 1/7, `k` 1 when absent |
+| Plastic internal-scattering ratio | `MitsubaImporter.plasticRatio`, computed with the formulas and quadrature of Mitsuba's `plastic` and `roughplastic` (rough integrals cached per IOR, alpha and distribution); `tests/fixtures/mitsuba/plastic-ratios.json`, 126 ratios generated from Mitsuba at a grid of IOR, alpha, distribution, `nonlinear` and reflectance, checks it within 1% (largest 0.79%, the converter's sampling of the cosine-weighted hemisphere) |
 | Nonlinear plastic textures | Baked per texel and channel into the import folder, from the ratio at 17 reflectances |
 | Mesh loading | Readers in `MitsubaImporter` for the three formats (the app's OBJ reader splits by material and group, which Mitsuba's `obj` does not); welding and computed normals follow Mitsuba's plugins and agree with it on the Bitterli scenes' OBJ files (`REFERENCES.md`, `MITSUBA3`) |
 

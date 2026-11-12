@@ -1,6 +1,7 @@
 import Cocoa
 import Compression
 import simd
+import Synchronization
 
 // REFERENCES.md: MITSUBA3, BITTERLI2016, OPENPBR, MATERIALX, SRGB1999, OBJ2026, PLY1994, OPENEXRLAYOUT. Mitsuba scene files (.xml whose root element is
 // <scene>) open like OpenUSD stages. This layer reads and resolves the XML into a tree of Nodes; later
@@ -1120,6 +1121,297 @@ extension MitsubaImporter {
                   uvs: hasUVs ? (0..<vertexCount).map { SIMD2(uv[2 * $0], uv[2 * $0 + 1]) } : nil, triangles: triangles)
     }
   }
+}
+
+// REFERENCES.md: MITSUBA3. Values Mitsuba computes when it loads a BSDF, which the converter
+// (scripts/mitsuba_to_usd.py) asked Mitsuba for and the importer computes itself:
+//   ior            a number, or a name of include/mitsuba/render/ior.h's table (MitsubaTables.ior, any case)
+//   conductor      F0 and the OpenPBR 82-degree edge tint: a material preset from MitsubaTables.conductors
+//                  (Cu without one), or fresnel_conductor (fresnel.h) at the given eta and k (k 1 by default)
+//   plasticRatio   Mitsuba's plastic diffuse albedo over rho (1 - its specular albedo), averaged over incidence
+//                  cosines 0.3, 0.5, 0.7 and 0.9, from the formulas of plastic.cpp and roughplastic.cpp at
+//                  tag v3.9.1 (with microfacet.h's eval_reflectance and eval_transmittance and their
+//                  Gauss-Legendre quadrature over visible normals) in double precision
+extension MitsubaImporter {
+  static func ior(_ node: Node, _ name: String, default fallback: Float) throws -> Float {
+    guard node.child(name) != nil else { return fallback }
+    if let value = node.float(name) { return value }
+    guard let text = node.string(name) else { throw error("\(name) must be a number or an IOR name") }
+    guard let value = MitsubaTables.ior[text.lowercased()] else { throw error("unknown IOR '\(text)'") }
+    return value
+  }
+
+  static func conductor(_ node: Node) throws -> (f0: SIMD3<Float>, tint: SIMD3<Float>) {
+    let material = node.string("material")
+    guard node.child("eta") != nil else {
+      let name = material ?? "Cu"
+      guard let entry = MitsubaTables.conductors[name] else { throw error("unknown conductor '\(name)'") }
+      return entry
+    }
+    if let material, material != "none" { throw error("a conductor takes eta and k or a material, not both") }
+    guard let eta = node.rgb("eta"), let k = node.child("k") == nil ? SIMD3(repeating: 1) : node.rgb("k") else {
+      throw error("a conductor's eta and k must be numbers or RGB values")
+    }
+    var f0 = SIMD3<Float>(), tint = SIMD3<Float>()
+    for c in 0..<3 {
+      let eta = Double(eta[c]), k = Double(k[c])
+      var normal = conductorFresnel(1, eta: eta, k: k)
+      // eta = k = 0 makes the formula 0 / 0 at exactly normal incidence and 1 at every other angle.
+      if normal.isNaN { normal = conductorFresnel(0.99999, eta: eta, k: k) }
+      let mu = 1.0 / 7, schlick = normal + (1 - normal) * pow(1 - mu, 5)
+      f0[c] = Float(min(max(normal, 0), 1))
+      tint[c] = Float(min(max(conductorFresnel(mu, eta: eta, k: k) / max(schlick, 1e-6), 0), 1))
+    }
+    return (f0, tint)
+  }
+
+  // alpha nil: the smooth plastic. Rough plastics cache their integrals per (eta, alpha, distribution): the first
+  // call for a combination integrates, later ones (another rho or nonlinear) only combine the cached values.
+  static func plasticRatio(eta: Float, alpha: Float?, ggx: Bool, nonlinear: Bool, rho: Float) -> Float {
+    let rho = Double(rho)
+    guard let alpha else {
+      // plastic.cpp: diffuse albedo rho / (1 - x Fdr_int) / eta^2 (1 - F(mu_i)) times the cosine-weighted mean of
+      // 1 - F(mu_o), specular albedo F(mu_i); the ratio does not depend on mu_i.
+      let eta = Double(eta), fdrInt = fresnelDiffuseReflectance(1 / eta)
+      let transmitted = gaussLegendre64.nodes.indices.reduce(0.0) { sum, i in
+        let mu = 0.5 + 0.5 * gaussLegendre64.nodes[i]
+        return sum + 0.5 * gaussLegendre64.weights[i] * (1 - fresnel(mu, eta).r) * 2 * mu
+      }
+      return Float(transmitted / (eta * eta) / (1 - (nonlinear ? rho * fdrInt : fdrInt)))
+    }
+    let key = RoughPlasticKey(eta: eta, alpha: alpha, ggx: ggx)
+    let integrals: RoughPlasticIntegrals
+    if let cached = roughPlasticCache.withLock({ $0[key] }) {
+      integrals = cached
+    } else {
+      integrals = RoughPlasticIntegrals(eta: Double(eta), alpha: Double(alpha), ggx: ggx)
+      roughPlasticCache.withLock { $0[key] = integrals }
+    }
+    // roughplastic.cpp: diffuse albedo rho / (1 - x R_int) / eta^2 t(mu_i) times the cosine-weighted mean of
+    // t(mu_o), the external transmittance table interpolated as lerp_gather does; specular albedo E(mu_i).
+    let internalScattering = nonlinear ? rho * integrals.internalReflectance : integrals.internalReflectance
+    let sum = RoughPlasticIntegrals.incidences.indices.reduce(0.0) { sum, i in
+      sum + integrals.transmittance(RoughPlasticIntegrals.incidences[i]) / (1 - integrals.specularAlbedo[i])
+    }
+    let eta = Double(eta)
+    return Float(sum / 4 * integrals.meanTransmittance / (eta * eta) / (1 - internalScattering))
+  }
+
+  fileprivate struct RoughPlasticKey: Hashable { let eta: Float, alpha: Float, ggx: Bool }
+  fileprivate static let roughPlasticCache = Mutex<[RoughPlasticKey: RoughPlasticIntegrals]>([:])
+
+  fileprivate struct RoughPlasticIntegrals {
+    static let incidences: [Double] = [0.3, 0.5, 0.7, 0.9]
+    static let resolution = 64 // MI_ROUGH_TRANSMITTANCE_RES
+    // eval_transmittance at mu = max(1e-6, k / 63), k = 0...63.
+    let table: [Double]
+    // m_internal_reflectance: twice the mean over the table's mu of eval_reflectance(1 / eta) mu.
+    let internalReflectance: Double
+    // The cosine-weighted hemispherical mean of the interpolated table.
+    let meanTransmittance: Double
+    // eval_reflectance(eta) at each of `incidences`: the specular lobe's albedo.
+    let specularAlbedo: [Double]
+
+    init(eta: Double, alpha: Double, ggx: Bool) {
+      let microfacet = Microfacet(alpha: max(alpha, 1e-4), ggx: ggx)
+      let n = Self.resolution
+      var rows = [SIMD2<Double>](repeating: .zero, count: n)
+      rows.withUnsafeMutableBufferPointer { buffer in
+        let output = DisjointWrites(base: buffer.baseAddress!) // Each worker writes only its own table entry.
+        DispatchQueue.concurrentPerform(iterations: n) { k in
+          let mu = max(1e-6, Double(k) / Double(n - 1)), wi = SIMD3(sqrt(1 - mu * mu), 0, mu)
+          output.base[k] = SIMD2(microfacet.transmittance(wi, eta: eta), microfacet.reflectance(wi, eta: 1 / eta) * wi.z)
+        }
+      }
+      table = rows.map(\.x)
+      internalReflectance = rows.reduce(0) { $0 + $1.y } / Double(n) * 2
+      // The table is linear in mu between nodes, so 2 mu t(mu) integrates exactly per segment.
+      meanTransmittance = (0..<(n - 1)).reduce(0.0) { sum, k in
+        let a = Double(k) / Double(n - 1), b = Double(k + 1) / Double(n - 1), slope = (rows[k + 1].x - rows[k].x) / (b - a)
+        return sum + rows[k].x * (b * b - a * a) + slope * (2.0 / 3 * (b * b * b - a * a * a) - a * (b * b - a * a))
+      }
+      specularAlbedo = Self.incidences.map { microfacet.reflectance(SIMD3(sqrt(1 - $0 * $0), 0, $0), eta: eta) }
+    }
+
+    // lerp_gather: linear interpolation of the table at mu.
+    func transmittance(_ mu: Double) -> Double {
+      let x = mu * Double(Self.resolution - 1), index = min(Int(x), Self.resolution - 2)
+      return table[index] + (table[index + 1] - table[index]) * (x - Double(index))
+    }
+  }
+
+  // microfacet.h's isotropic MicrofacetDistribution with visible-normal sampling, and its eval_reflectance and
+  // eval_transmittance.
+  fileprivate struct Microfacet {
+    let alpha: Double, ggx: Bool
+
+    // Gauss-Legendre nodes on [0, 1]^2: 32 x 32 for eta > 1, else 128 x 128.
+    private func integrate(eta: Double, _ f: (SIMD2<Double>) -> Double) -> Double {
+      let rule = eta > 1 ? MitsubaImporter.gaussLegendre32 : MitsubaImporter.gaussLegendre128
+      var sum = 0.0
+      for i in rule.nodes.indices {
+        for j in rule.nodes.indices {
+          sum += f(SIMD2(rule.nodes[j], rule.nodes[i]) * 0.5 + 0.5) * rule.weights[i] * rule.weights[j] * 0.25
+        }
+      }
+      return sum
+    }
+
+    // eval_reflectance: the albedo of the specular lobe, F G1(wo) over visible normals.
+    func reflectance(_ wi: SIMD3<Double>, eta: Double) -> Double {
+      integrate(eta: eta) { sample in
+        let m = self.sample(wi, sample), wo = 2 * simd_dot(wi, m) * m - wi
+        guard wo.z > 0, wi.z > 0 else { return 0 }
+        return smithG1(wo, m) * MitsubaImporter.fresnel(simd_dot(wi, m), eta).r
+      }
+    }
+
+    // eval_transmittance: the share refracted through the rough interface, (1 - F) G1(wt) over visible normals.
+    func transmittance(_ wi: SIMD3<Double>, eta: Double) -> Double {
+      integrate(eta: eta) { sample in
+        let m = self.sample(wi, sample), cosine = simd_dot(wi, m)
+        let (r, cosT, etaTi) = MitsubaImporter.fresnel(cosine, eta)
+        let wt = m * (cosine * etaTi + cosT) - wi * etaTi
+        guard wt.z * wi.z < 0 else { return 0 }
+        return smithG1(wt, m) * (1 - r)
+      }
+    }
+
+    func smithG1(_ v: SIMD3<Double>, _ m: SIMD3<Double>) -> Double {
+      let xyAlpha2 = (alpha * v.x) * (alpha * v.x) + (alpha * v.y) * (alpha * v.y)
+      guard simd_dot(v, m) * v.z > 0 else { return 0 }
+      guard xyAlpha2 != 0 else { return 1 }
+      let tanThetaAlpha2 = xyAlpha2 / (v.z * v.z)
+      if ggx { return 2 / (1 + sqrt(1 + tanThetaAlpha2)) }
+      // Beckmann: the rational approximation of the shadowing-masking function.
+      let a = 1 / sqrt(tanThetaAlpha2)
+      return a >= 1.6 ? 1 : (3.535 * a + 2.181 * a * a) / (1 + 2.276 * a + 2.577 * a * a)
+    }
+
+    // sample() with sample_visible: stretch wi, sample the alpha = 1 slopes, rotate and unstretch.
+    func sample(_ wi: SIMD3<Double>, _ u: SIMD2<Double>) -> SIMD3<Double> {
+      let stretched = simd_normalize(SIMD3(alpha * wi.x, alpha * wi.y, wi.z))
+      let sinTheta2 = 1 - stretched.z * stretched.z
+      var phi = SIMD2<Double>(1, 0) // (cos, sin), Frame3f::sincos_phi
+      if abs(sinTheta2) > 4 * 0x1p-24 { phi = simd_clamp(SIMD2(stretched.x, stretched.y) / sqrt(sinTheta2), SIMD2(-1, -1), SIMD2(1, 1)) }
+      let slope = visibleSlope(stretched.z, u)
+      let x = (phi.x * slope.x - phi.y * slope.y) * alpha, y = (phi.y * slope.x + phi.x * slope.y) * alpha
+      return simd_normalize(SIMD3(-x, -y, 1))
+    }
+
+    // sample_visible_11.
+    func visibleSlope(_ cosThetaI: Double, _ u: SIMD2<Double>) -> SIMD2<Double> {
+      if ggx {
+        var p = MitsubaImporter.concentricDisk(u)
+        let s = 0.5 * (1 + cosThetaI)
+        p.y = sqrt(max(0, 1 - p.x * p.x)) * (1 - s) + p.y * s
+        let z = sqrt(max(0, 1 - simd_length_squared(p))), sinThetaI = sqrt(max(0, 1 - cosThetaI * cosThetaI))
+        let norm = 1 / (sinThetaI * p.y + cosThetaI * z)
+        return SIMD2(cosThetaI * p.y - sinThetaI * z, p.x) * norm
+      }
+      // Beckmann: Newton iterations in the erf domain.
+      let invSqrtPi = 1 / Double.pi.squareRoot()
+      let tanThetaI = sqrt(max(0, 1 - cosThetaI * cosThetaI)) / cosThetaI, cotThetaI = 1 / tanThetaI
+      let maxval = erf(cotThetaI)
+      var u = simd_clamp(u, SIMD2(repeating: 1e-6), SIMD2(repeating: 1 - 1e-6))
+      var x = maxval - (maxval + 1) * erf(sqrt(-log(u.x)))
+      u.x *= 1 + maxval + invSqrtPi * tanThetaI * exp(-cotThetaI * cotThetaI)
+      for _ in 0..<3 {
+        let slope = MitsubaImporter.erfinv(x)
+        let value = 1 + x + invSqrtPi * tanThetaI * exp(-slope * slope) - u.x, derivative = 1 - slope * tanThetaI
+        x -= value / derivative
+      }
+      return SIMD2(MitsubaImporter.erfinv(x), MitsubaImporter.erfinv(2 * u.y - 1))
+    }
+  }
+
+  // fresnel.h fresnel: the unpolarized dielectric Fresnel reflectance, the transmitted cosine (negative on the
+  // other side) and eta_ti.
+  fileprivate static func fresnel(_ cosThetaI: Double, _ eta: Double) -> (r: Double, cosThetaT: Double, etaTi: Double) {
+    let outside = cosThetaI >= 0
+    let etaIt = outside ? eta : 1 / eta, etaTi = outside ? 1 / eta : eta
+    let cosThetaTSqr = 1 - (1 - cosThetaI * cosThetaI) * etaTi * etaTi
+    let cosIAbs = abs(cosThetaI), cosTAbs = sqrt(max(0, cosThetaTSqr))
+    var r: Double
+    if eta == 1 {
+      r = 0
+    } else if cosIAbs == 0 {
+      r = 1
+    } else {
+      let s = (cosIAbs - etaIt * cosTAbs) / (cosIAbs + etaIt * cosTAbs), p = (cosTAbs - etaIt * cosIAbs) / (cosTAbs + etaIt * cosIAbs)
+      r = 0.5 * (s * s + p * p)
+    }
+    return (r, outside ? -cosTAbs : cosTAbs, etaTi)
+  }
+
+  // fresnel.h fresnel_conductor: the unpolarized reflectance of a conductor with complex IOR eta + i k.
+  fileprivate static func conductorFresnel(_ cosThetaI: Double, eta: Double, k: Double) -> Double {
+    let cos2 = cosThetaI * cosThetaI, sin2 = 1 - cos2, sin4 = sin2 * sin2
+    let temp1 = eta * eta - k * k - sin2
+    let a2pb2 = sqrt(max(0, temp1 * temp1 + 4 * k * k * eta * eta)), a = sqrt(max(0, 0.5 * (a2pb2 + temp1)))
+    let term1 = a2pb2 + cos2, term2 = 2 * cosThetaI * a
+    let rs = (term1 - term2) / (term1 + term2)
+    let term3 = a2pb2 * cos2 + sin4, term4 = term2 * sin2
+    let rp = rs * (term3 - term4) / (term3 + term4)
+    return 0.5 * (rs + rp)
+  }
+
+  // fresnel.h fresnel_diffuse_reflectance: Egan and Hilgeman's fit for eta < 1, d'Eon and Irving's otherwise.
+  fileprivate static func fresnelDiffuseReflectance(_ eta: Double) -> Double {
+    let inv = 1 / eta
+    if eta < 1 { return 0.0636 * inv + eta * (eta * -1.4399 + 0.7099) + 0.6681 }
+    return 0.919317 + inv * (-3.4793 + inv * (6.75335 + inv * (-7.80989 + inv * (4.98554 + inv * -1.36881))))
+  }
+
+  // Dr.Jit's erfinv (Giles' approximation, include/drjit/math.h at v1.5.0).
+  fileprivate static func erfinv(_ x: Double) -> Double {
+    let w = -log((1 - x) * (1 + x))
+    if w < 5 {
+      let v = w - 2.5
+      var p = 2.81022636e-08
+      p = p * v + 3.43273939e-07; p = p * v - 3.5233877e-06; p = p * v - 4.39150654e-06; p = p * v + 0.00021858087
+      p = p * v - 0.00125372503; p = p * v - 0.00417768164; p = p * v + 0.246640727; p = p * v + 1.50140941
+      return x * p
+    }
+    let v = sqrt(w) - 3
+    var p = -0.000200214257
+    p = p * v + 0.000100950558; p = p * v + 0.00134934322; p = p * v - 0.00367342844; p = p * v + 0.00573950773
+    p = p * v - 0.0076224613; p = p * v + 0.00943887047; p = p * v + 1.00167406; p = p * v + 2.83297682
+    return x * p
+  }
+
+  // warp.h square_to_uniform_disk_concentric.
+  fileprivate static func concentricDisk(_ u: SIMD2<Double>) -> SIMD2<Double> {
+    let x = 2 * u.x - 1, y = 2 * u.y - 1
+    if x == 0 && y == 0 { return .zero }
+    let swapped = abs(x) < abs(y)
+    let r = swapped ? y : x, rp = swapped ? x : y
+    var phi = 0.25 * Double.pi * rp / r
+    if swapped { phi = 0.5 * Double.pi - phi }
+    return SIMD2(r * cos(phi), r * sin(phi))
+  }
+
+  // n-point Gauss-Legendre nodes and weights on [-1, 1] (Newton iteration on the Legendre polynomial).
+  fileprivate static func gaussLegendre(_ n: Int) -> (nodes: [Double], weights: [Double]) {
+    var nodes = [Double](repeating: 0, count: n), weights = nodes
+    for i in 0..<n {
+      var x = cos(Double.pi * (Double(i) + 0.75) / (Double(n) + 0.5)), derivative = 0.0
+      for _ in 0..<100 {
+        var p0 = 1.0, p1 = x
+        for k in 2...n { (p0, p1) = (p1, ((2 * Double(k) - 1) * x * p1 - Double(k - 1) * p0) / Double(k)) }
+        derivative = Double(n) * (x * p1 - p0) / (x * x - 1)
+        let step = p1 / derivative
+        x -= step
+        if abs(step) < 1e-15 { break }
+      }
+      nodes[i] = x
+      weights[i] = 2 / ((1 - x * x) * derivative * derivative)
+    }
+    return (nodes, weights)
+  }
+  fileprivate static let gaussLegendre32 = gaussLegendre(32)
+  fileprivate static let gaussLegendre64 = gaussLegendre(64)
+  fileprivate static let gaussLegendre128 = gaussLegendre(128)
 }
 
 extension SIMD4 where Scalar == Float {

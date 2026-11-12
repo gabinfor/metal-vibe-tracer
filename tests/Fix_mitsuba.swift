@@ -437,5 +437,65 @@
     try serializedFails("offset table", "offset-\(name).serialized", patched, extra: #"<integer name="shape_index" value="1"/>"#)
   }
   print("PASS: Mitsuba shapes: obj, ply and serialized readers, analytic shapes, normals, winding, texture coordinates")
+
+  // Values taken from Mitsuba: MitsubaTables.swift and plastic-ratios.json are written by
+  // scripts/generate_mitsuba_tables.py under Mitsuba 3.9.1, which the tests do not need.
+  func nodeWith(_ name: String, _ value: String, tag: String = "string") throws -> MitsubaImporter.Node {
+    try shapeNode(#"<bsdf type="dielectric"><\#(tag) name="\#(name)" value="\#(value)"/></bsdf>"#)
+  }
+  func etaKNode(eta: [Float], k: [Float]) throws -> MitsubaImporter.Node {
+    func text(_ v: [Float]) -> String { v.map { "\($0)" }.joined(separator: " ") }
+    return try shapeNode(#"<bsdf type="conductor"><rgb name="eta" value="\#(text(eta))"/><rgb name="k" value="\#(text(k))"/></bsdf>"#)
+  }
+  struct PlasticRow: Decodable, CustomStringConvertible {
+    let eta: Float, alpha: Float?, distribution: String?, nonlinear: Bool, rho: Float, ratio: Float
+    var ggx: Bool { distribution == "ggx" }
+    var description: String { "eta \(eta) alpha \(alpha.map { "\($0)" } ?? "smooth") \(distribution ?? "") nonlinear \(nonlinear) rho \(rho)" }
+  }
+  struct PlasticFixture: Decodable { let mitsuba: String, rows: [PlasticRow] }
+  func plasticFixture() throws -> PlasticFixture {
+    try JSONDecoder().decode(PlasticFixture.self, from: Data(contentsOf: fixtures.appendingPathComponent("plastic-ratios.json")))
+  }
+
+  let ratios = try plasticFixture()
+  require(MitsubaTables.mitsubaVersion == "3.9.1" && ratios.mitsuba == "3.9.1", "the tables and the fixture come from Mitsuba 3.9.1")
+  let bk7 = try MitsubaImporter.ior(nodeWith("int_ior", "bk7"), "int_ior", default: 1)
+  require(abs(bk7 - 1.5046) < 1e-4, "named IOR")
+  let water = try MitsubaImporter.ior(nodeWith("ext_ior", "Water"), "ext_ior", default: 1)
+  require(abs(water - 1.333) < 1e-4, "IOR names ignore case, as Mitsuba's")
+  let number = try MitsubaImporter.ior(nodeWith("int_ior", "1.7", tag: "float"), "int_ior", default: 1)
+  let absent = try MitsubaImporter.ior(nodeWith("int_ior", "bk7"), "ext_ior", default: 1.000277)
+  require(number == 1.7 && absent == 1.000277, "a number, or the default when absent")
+  requireThrows("unknown IOR 'unobtainium'") { _ = try MitsubaImporter.ior(nodeWith("int_ior", "unobtainium"), "int_ior", default: 1) }
+  require(MitsubaTables.ior.count == 23 && ["Cu", "Au", "Ag", "Al", "none"].allSatisfy { MitsubaTables.conductors[$0] != nil },
+    "every IOR name and the common conductors")
+  require(MitsubaTables.conductors.values.allSatisfy { simd_reduce_min($0.f0) >= 0 && simd_reduce_max($0.f0) <= 1
+    && simd_reduce_min($0.tint) >= 0 && simd_reduce_max($0.tint) <= 1 }, "every conductor's F0 and tint are reflectances")
+  let gold = try MitsubaImporter.conductor(nodeWith("material", "Au"))
+  require(gold.f0.x > gold.f0.z && simd_reduce_max(gold.tint) <= 1, "gold is warm and its tint is a reflectance")
+  let mirror = try MitsubaImporter.conductor(nodeWith("material", "none"))
+  require(mirror.f0 == SIMD3(1, 1, 1) && mirror.tint == SIMD3(1, 1, 1), "the none conductor is a perfect mirror")
+  let unnamed = try MitsubaImporter.conductor(nodeWith("int_ior", "bk7"))
+  require(unnamed.f0 == MitsubaTables.conductors["Cu"]!.f0, "no material and no eta: Cu")
+  requireThrows("unknown conductor 'Kryptonite'") { _ = try MitsubaImporter.conductor(nodeWith("material", "Kryptonite")) }
+  let eta = SIMD3<Float>(0.2, 0.9, 1.1), k = SIMD3<Float>(3.9, 2.4, 2.2)
+  let explicit = try MitsubaImporter.conductor(etaKNode(eta: [eta.x, eta.y, eta.z], k: [k.x, k.y, k.z]))
+  let expectedF0 = ((eta - 1) * (eta - 1) + k * k) / ((eta + 1) * (eta + 1) + k * k)
+  require(simd_length(explicit.f0 - expectedF0) < 1e-4, "explicit eta, k through the Fresnel formula")
+  // Mitsuba 3.9.1's conductor at these eta and k, sampled at mu = 1/7 as conductor_colors does.
+  require(simd_length(explicit.tint - SIMD3(0.978395, 0.974457, 0.977413)) < 1e-4, "explicit eta, k: the 82-degree tint")
+  requireThrows("not both") {
+    _ = try MitsubaImporter.conductor(shapeNode(#"<bsdf type="conductor"><string name="material" value="Au"/><float name="eta" value="1"/></bsdf>"#))
+  }
+  // The fixture's ratios estimate the cosine-weighted mean transmittance with a 32 x 32 grid, about 0.8% above
+  // its integral at low roughness; plasticRatio integrates it.
+  var worst = (error: Float(0), row: "")
+  for row in ratios.rows {
+    let r = MitsubaImporter.plasticRatio(eta: row.eta, alpha: row.alpha, ggx: row.ggx, nonlinear: row.nonlinear, rho: row.rho)
+    require(abs(r / row.ratio - 1) < 0.01, "plastic ratio within 1% of Mitsuba at \(row)")
+    if abs(r / row.ratio - 1) > worst.error { worst = (abs(r / row.ratio - 1), "\(row)") }
+  }
+  print("Mitsuba plastic ratios: largest relative error \(worst.error) at \(worst.row)")
+  print("PASS: Mitsuba values: named IORs and conductors, conductor Fresnel, plastic internal scattering")
 }
 try fixMitsubaChecks()
