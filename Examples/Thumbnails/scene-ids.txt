@@ -17,3 +17,13 @@ bedroom
 breakfast-room
 fireplace-room
 living-room
+veach-bidir
+veach-ajar
+glass-of-water
+bathroom
+water-caustic
+lamp
+kitchen
+white-room
+grey-white-room
+modern-hall
