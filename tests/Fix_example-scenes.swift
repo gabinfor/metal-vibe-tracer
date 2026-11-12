@@ -113,6 +113,8 @@
       continue
     }
     let sceneFile = scene.id == "water-caustic" ? "water-caustic/scene_v0.6.xml" : "\(archiveName)/scene_v3.xml"
+    // The comparison scripts and the thumbnails read the same files from build/scenes/<archive>/<archive>/….
+    require(shot.mitsuba == "build/scenes/\(archiveName)/\(file)", "\(scene.id) shot unpacks to build/scenes/\(archiveName)/\(file): \(shot.mitsuba ?? "none")")
     require(scene.shot == "bitterli-\(scene.id)" && shot.mitsuba?.hasSuffix("/\(file)") == true && file == sceneFile
       && shot.view == "Mitsuba: camera" && shot.obj == nil && shot.usd == nil && shot.scene == nil
       && shot.width == nil && shot.height == nil && shot.samples == nil && shot.depth == nil
@@ -569,7 +571,7 @@
     && opened.camera.yaw == opened.views["Mitsuba: camera"]?.yaw && opened.camera.distance == opened.views["Mitsuba: camera"]?.distance
     && opened.camera.fov == opened.views["Mitsuba: camera"]?.fov && opened.options.outputWidth == 64 && opened.options.outputHeight == 48
     && opened.options.depth == 5, "the Mitsuba scene opens with its triangles, its camera and its film size and depth")
-  require(caustics != 3 && opened.caustics == 3, "the shot's caustics mode applies (\(caustics) before)")
+  require(caustics != 3 && opened.caustics == 3, "the shot's caustics mode applies (\(String(describing: caustics)) before)")
   require(opened.options.focusDistance == opened.views["Mitsuba: camera"]?.distance && opened.options.focusDistance != 3,
     "the shot's view sets the focus distance to the camera's (\(String(describing: opened.options.focusDistance)))")
   require(opened.importReport?.first == mitsubaEntry.attribution && controller.projectURL == nil && controller.documentEdited
@@ -580,12 +582,69 @@
   waitUntil({ !controller.isBusy }, seconds: 60)
   controller.associate(nil, edited: false, replaced: false)
 
+  // Open Scene File on a Mitsuba .xml over unsaved changes: one prompt, and the Scenes window hides once the scene is
+  // open. An .xml that is not a Mitsuba scene asks once too, then leaves the document and the Scenes window as they are.
+  let xmlScene = mitsubaSource.appendingPathComponent("synthetic/scene.xml")
+  let drawing = folder.appendingPathComponent("drawing.xml")
+  try Data("<svg/>".utf8).write(to: drawing)
+  controller.exampleLibrary = downloadLibrary
+  controller.associate(nil, edited: true, replaced: false)
+  controller.browseScenes()
+  var xmlPrompts = 0
+  controller.unsavedChangesAnswer = { respond in xmlPrompts += 1; respond(.alertSecondButtonReturn) }
+  let beforeDrawing = try encoder.encode(controller.project)
+  controller.beginOpenSceneFile(drawing)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  let afterDrawing = try encoder.encode(controller.project)
+  require(xmlPrompts == 1 && controller.errorMessage?.contains("drawing.xml is not a Mitsuba scene") == true
+    && afterDrawing == beforeDrawing && scenes.isVisible && controller.documentEdited,
+    "an .xml that is not a Mitsuba scene asks once and leaves the document and the Scenes window as they are: \(controller.errorMessage ?? "no error")")
+  controller.dismissError()
+  xmlPrompts = 0
+  let sheetsBefore = reportSheets
+  grouped {
+    controller.beginOpenSceneFile(xmlScene)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(xmlPrompts == 1 && controller.projectURL == nil && controller.documentEdited
+    && controller.project.views["Mitsuba: camera"] != nil && controller.project.graph?.assets.map(\.geometry.count).reduce(0, +) == 4
+    && reportSheets == sheetsBefore + 1 && !scenes.isVisible && controller.errorMessage == nil,
+    "Open Scene File opens a Mitsuba .xml after one prompt and hides the Scenes window (\(xmlPrompts) prompts, \(controller.errorMessage ?? "no error"))")
+  controller.unsavedChangesAnswer = nil
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  controller.associate(nil, edited: false, replaced: false)
+
+  // A Mitsuba download that finishes with the Scenes window shown and nothing to lose installs and opens the scene
+  // through the Mitsuba importer, like the OBJ download above.
+  let mitsubaDownloadLibrary = ExampleLibrary(root: folder.appendingPathComponent("mitsuba-download", isDirectory: true))
+  controller.exampleLibrary = mitsubaDownloadLibrary
+  controller.browseScenes()
+  browser.filter = .all; browser.search = ""
+  browser.selection = mitsubaEntry
+  require(!controller.isInstalled(mitsubaEntry), "the Mitsuba entry is not installed in a fresh library")
+  grouped {
+    controller.beginSceneDownload(mitsubaEntry)
+    waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(controller.isInstalled(mitsubaEntry) && controller.projectURL == nil && controller.documentEdited
+    && controller.project.importReport?.first == mitsubaEntry.attribution && controller.project.views["Mitsuba: camera"] != nil
+    && controller.project.caustics == 3 && controller.project.graph?.assets.map(\.geometry.count).reduce(0, +) == 4
+    && !scenes.isVisible && controller.errorMessage == nil
+    && controller.status.stringValue == "Opened \(mitsubaEntry.title) \(mitsubaEntry.credit!), \(mitsubaEntry.license!). Credits: File > Credits and Licenses….",
+    "a finished Mitsuba download opens the scene through the importer and hides the Scenes window: \(controller.status.stringValue)")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  controller.associate(nil, edited: false, replaced: false)
+  controller.exampleLibrary = mitsubaLibrary
+
   // An installed catalog scene whose file was deleted does not open: the document is unchanged, the Scenes window stays
   // shown and its details pane shows the error, as the status line does.
-  func failedOpen(_ entry: SceneEntry, _ library: ExampleLibrary, _ name: String) throws {
+  func failedOpen(_ entry: SceneEntry, _ library: ExampleLibrary, _ name: String, damaged: Bool = false) throws {
     controller.exampleLibrary = library
     guard let file = library.sceneFileURL(entry) else { return require(false, "\(name) is a download") }
-    try manager.removeItem(at: file)
+    if damaged { try Data("<scene version=\"3.0.0\"><shape".utf8).write(to: file) } else { try manager.removeItem(at: file) }
     require(controller.isInstalled(entry), "\(name) is still installed by its marker")
     controller.browseScenes()
     browser.filter = .all; browser.search = ""
@@ -598,8 +657,12 @@
     let after = try encoder.encode(controller.project)
     require(!message.isEmpty && controller.status.stringValue == message && scenes.isVisible
       && after == before && label?.isHidden == false && label?.stringValue == message,
-      "a deleted \(name) file leaves the document and the Scenes window as they are and shows the error in the details pane: \(message)")
+      "a \(damaged ? "damaged" : "deleted") \(name) file leaves the document and the Scenes window as they are and shows the error in the details pane: \(message)")
   }
+  try failedOpen(mitsubaEntry, mitsubaLibrary, "Mitsuba scene", damaged: true)
+  require(controller.errorMessage?.hasPrefix("Mitsuba: cannot read scene.xml") == true,
+    "a damaged Mitsuba scene file shows the importer's own error: \(controller.errorMessage ?? "none")")
+  controller.dismissError()
   try failedOpen(mitsubaEntry, mitsubaLibrary, "Mitsuba scene")
   let objLibrary = ExampleLibrary(root: folder.appendingPathComponent("obj-controller", isDirectory: true))
   try manager.createDirectory(at: objLibrary.storage(correct), withIntermediateDirectories: true)
