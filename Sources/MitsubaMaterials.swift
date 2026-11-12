@@ -129,10 +129,15 @@ private struct Inputs {
       case .color(let c): values.append((name, .color(c)))
       case .boolean(let b): values.append((name, .boolean(b)))
       case .texture(let t, let tint):
-        let type = name == "geometry_opacity" || name == "specular_weight" ? "float" : "color3"
+        // MaterialX leaves float images raw, so specular_weight is the red channel of the colour-managed image, as
+        // Mitsuba decodes a bitmap unless raw.
+        let weight = name == "specular_weight"
+        let type = name == "geometry_opacity" ? "float" : "color3"
         let node = w.image(t.file.path, type: type, colorspace: t.srgb ? "srgb_texture" : "raw", uv: coordinates(t.scale),
                            u: "periodic", v: "periodic")
-        if let tint {
+        if weight {
+          values.append((name, .node(w.op("extract", "float", [("in", .node(node, type)), ("index", .integer(0))]), "float")))
+        } else if let tint {
           values.append((name, .node(w.op("multiply", type, [("in1", .node(node, type)), ("in2", .color(tint))]), type)))
         } else {
           values.append((name, .node(node, type)))

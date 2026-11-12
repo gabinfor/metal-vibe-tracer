@@ -140,12 +140,15 @@
     "conductor: a coloured specular_reflectance splits into specular_weight (its maximum) and base_color chroma")
   // A textured specular_reflectance scales Mitsuba's whole Fresnel: a grey one (Veach Ajar's checkerboard floor) is a
   // connected specular_weight over the conductor's F0; a coloured one can only scale F0 and is reported.
-  let checker = try program("""
+  // MaterialX leaves float images raw, so the weight is the red channel of the colour-managed (sRGB) image.
+  let checkerText = try document("""
     <bsdf type="roughconductor"><string name="material" value="Cu"/><texture type="checkerboard" name="specular_reflectance">
       <rgb name="color0" value="0.8"/><rgb name="color1" value="0.2"/></texture></bsdf>
     """, name: "checker")
-  require(input(checker, "specular_weight") == nil && checker.images.count == 1 && near(input(checker, "base_color"), cu),
-    "a grey specular_reflectance texture: connected specular_weight, base_color F0 (\(String(describing: input(checker, "base_color"))))")
+  let checker = try compiled(checkerText)
+  require(input(checker, "specular_weight") == nil && checker.images.count == 1 && near(input(checker, "base_color"), cu)
+    && checkerText.contains(#"<image name="mitsuba_n"#) && checkerText.contains(#"type="color3""#) && checkerText.contains("<extract "),
+    "a grey specular_reflectance texture: specular_weight from the sRGB image's red channel, base_color F0 (\(String(describing: input(checker, "base_color"))))")
   try png("red.png") { _, _ in (200, 50, 50) }
   let tinted = try program("""
     <bsdf type="conductor"><string name="material" value="Cu"/><texture type="bitmap" name="specular_reflectance">
