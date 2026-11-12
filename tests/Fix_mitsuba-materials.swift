@@ -1,7 +1,8 @@
 // Mitsuba materials (MitsubaImporter.material) beyond Fix_mitsuba.swift's mapping rows: the baked images' texels
 // against the converter's formulas (bump normal maps, nonlinear plastics), principledthin, textured masks and
-// plastics, conductor chroma, normal maps, transmission colours, values that are not finite or negative, texture
-// properties the mapping does not read, to_uv sampling (Mitsuba's rows for any v scale) and the bake size limit.
+// plastics, conductor chroma, normal maps, transmission colours, IOR ratios below 1,
+// values that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's
+// rows for any v scale) and the bake size limit.
 @MainActor func fixMitsubaMaterialChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba-materials", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -148,6 +149,10 @@
   let bright = try program(#"<bsdf type="dielectric"><rgb name="specular_transmittance" value="1.5, 0.5, 0.5"/></bsdf>"#)
   require(pane.transmissionColor == SIMD3(0.9, 0.6, 0.3) && bright.transmissionColor == SIMD3(1, 0.5, 0.5),
     "thin transmission_color, and transmission_color clamped at 1")
+  // An IOR ratio below 1: specular_ior 1 / eta (the app's IOR is at least 1.01; MitsubaImporter.load reverses the shape).
+  let bubble = try program(#"<bsdf type="dielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf>"#, name: "bubble")
+  require(near(input(bubble, "specular_ior"), SIMD3(repeating: 1 / 0.763)) && reported(prefix: "bubble: int_ior / ext_ior 0.763 is below 1"),
+    "a dielectric with int_ior / ext_ior 0.763: specular_ior 1 / 0.763, reported (\(String(describing: input(bubble, "specular_ior"))))")
   _ = try program(#"<bsdf type="roughconductor"/>"#)
   require(reported("Beckmann microfacet distributions are rendered as GGX at the same alpha"), "a Beckmann distribution is reported")
   let dark = try program(nil, emission: .zero)

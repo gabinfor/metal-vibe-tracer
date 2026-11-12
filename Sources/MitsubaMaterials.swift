@@ -13,8 +13,9 @@ import simd
 //   conductor/rough...   base_metalness 1, base_color = F0 and specular_color = the 82-degree tint of
 //                        MitsubaImporter.conductor (none, a perfect mirror, by default), specular_reflectance as
 //                        specular_weight (its chroma kept in base_color; a texture multiplies base_color instead)
-//   dielectric/rough...  transmission_weight 1, specular_ior = int_ior (1.5046) / ext_ior (1.000277),
-//                        specular_transmittance as transmission_color, and zero as a black reflector
+//   dielectric/rough...  transmission_weight 1, specular_ior = int_ior (1.5046) / ext_ior (1.000277) (below 1: its
+//                        inverse, with the shape's facing reversed by MitsubaImporter.load), specular_transmittance
+//                        as transmission_color, and zero as a black reflector
 //   thindielectric       the same with geometry_thin_walled
 //   principledthin       thin-walled; base_color, diff_trans as subsurface weight and anisotropy, spec_trans as
 //                        transmission_weight and specular_weight, roughness, eta
@@ -298,7 +299,12 @@ private struct MaterialBuilder {
     let eta = try MitsubaImporter.ior(node, "int_ior", default: 1.5046) / MitsubaImporter.ior(node, "ext_ior", default: 1.000277)
     var m = Inputs()
     if eta.isFinite && eta > 0 {
-      m["specular_ior"] = .value(eta)
+      // Below 1, the same interface from its other side (MitsubaImporter.invertedDielectric).
+      m["specular_ior"] = .value(eta < 1 ? 1 / eta : eta)
+      if eta < 1 {
+        scene.note("\(name): int_ior / ext_ior \(eta) is below 1; rendered as \(1 / eta)"
+          + (kind == "thindielectric" ? "" : " with the shape's facing reversed"))
+      }
     } else {
       scene.note("\(name): int_ior / ext_ior \(eta) is not a finite positive IOR; specular_ior 1.5 used")
     }

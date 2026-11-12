@@ -792,6 +792,17 @@ try fixMitsubaChecks()
   require((down?.y ?? 0) < -0.99 && (up?.y ?? 0) > 0.99 && (upNormal?[4] ?? 0) > 0.99,
     "flip_normals reverses a rectangle's winding and normals, and so the side it emits from (\(String(describing: down)), \(String(describing: up)))")
   require(flipped.report.contains("shape 'mapped': to_uv is not supported; ignored"), "a shape's to_uv is reported (\(flipped.report))")
+  // A dielectric whose int_ior / ext_ior is below 1 (Glass of Water's air bubbles in ice) is the same interface seen from
+  // its other side: the shape's facing is reversed (the material takes 1 / eta, Fix_mitsuba-materials.swift).
+  let bubbles = try load("""
+    <scene version="3.0.0">
+      <shape type="rectangle" id="ice"><bsdf type="dielectric"><float name="int_ior" value="1.31"/><float name="ext_ior" value="1"/></bsdf></shape>
+      <shape type="rectangle" id="bubble"><bsdf type="roughdielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf></shape>
+      <shape type="rectangle" id="pane"><bsdf type="thindielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf></shape>
+    </scene>
+    """).document
+  require((facing(bubbles, "ice")?.z ?? 0) > 0.99 && (facing(bubbles, "bubble")?.z ?? 0) < -0.99 && (facing(bubbles, "pane")?.z ?? 0) > 0.99,
+    "an IOR ratio below 1 reverses a dielectric's facing, not a thin dielectric's (\(String(describing: facing(bubbles, "bubble"))))")
   print("PASS: Mitsuba scenes: shapes, shared materials, camera and field of view, render size, depth, environment, report")
 
   // Open Scene File: a Mitsuba scene opens as an untitled document; an .xml that is not one fails and changes nothing.
