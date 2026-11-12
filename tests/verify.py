@@ -50,6 +50,7 @@ PARTS = [
     ('Fix_project-format.swift', {'full', 'studio'}),
     ('Fix_obj-materials.swift', {'full', 'studio'}),
     ('Fix_gltf.swift', {'full', 'studio'}),
+    ('Fix_mitsuba.swift', {'full', 'studio'}),
     ('Fix_caustics.swift', {'full', 'studio'}),
     ('Fix_example-scenes.swift', {'full', 'studio'}),
     ('Fix_scaling.swift', {'full', 'studio'}),
