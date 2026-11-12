@@ -252,6 +252,19 @@
   }
 
   // Depth and size bombs fail with an error instead of exhausting the 512 KB stack of the import worker or memory.
+  // The scene read on a thread with the worker's 512 KB stack: its error, or nil.
+  func importStackError(_ url: URL) -> String? {
+    final class Outcome: @unchecked Sendable { var error: String? }
+    let outcome = Outcome(), done = DispatchSemaphore(value: 0)
+    let thread = Thread {
+      do { _ = try MitsubaImporter.Scene(url: url) } catch { outcome.error = "\(error) \(error.localizedDescription)" }
+      done.signal()
+    }
+    thread.stackSize = 512 * 1024
+    thread.start()
+    done.wait()
+    return outcome.error
+  }
   // References 5,000 deep, each definition naming the next: the chain of references is cut at maxReferenceDepth.
   let links = 5000
   let forward = (0..<links).map { #"<bsdf type="twosided" id="b\#($0)"><ref id="b\#($0 + 1)"/></bsdf>"# }.joined()
@@ -262,10 +275,21 @@
   let backward = (0..<links).reversed().map { #"<bsdf type="twosided" id="b\#($0)"><ref id="b\#($0 + 1)"/></bsdf>"# }.joined()
   let backwardURL = try write("ref-chain-reversed.xml", #"<scene version="3.0.0"><bsdf type="diffuse" id="b\#(links)"/>\#(backward)</scene>"#)
   requireThrows("nested more than \(MitsubaImporter.maxElementDepth) deep") { _ = try MitsubaImporter.Scene(url: backwardURL) }
-  // Elements 10,000 deep in the file: stopped before XMLDocument builds (and would release) the tree.
+  // Elements 10,000 deep in the file, read on the worker's stack: stopped before XMLDocument builds (and would release)
+  // the tree.
   let deep = String(repeating: #"<bsdf type="twosided">"#, count: 10_000) + #"<bsdf type="diffuse"/>"# + String(repeating: "</bsdf>", count: 10_000)
   let deepURL = try write("deep.xml", #"<scene version="3.0.0">\#(deep)</scene>"#)
-  requireThrows("nested more than \(MitsubaImporter.maxElementDepth) deep") { _ = try MitsubaImporter.Scene(url: deepURL) }
+  let deepError = importStackError(deepURL)
+  require(deepError?.contains("nested more than \(MitsubaImporter.maxElementDepth) deep") == true,
+    "elements 10,000 deep fail on a 512 KB stack (\(deepError ?? "no error"))")
+  // Nested internal entities (a6 is 10^7 characters), then elements 3,000 deep: the streaming pass stops at the entity
+  // declarations, so XMLDocument never expands them or builds the tree.
+  var entities = #"<!ENTITY a0 "xxxxxxxxxx">"#
+  for i in 1...6 { entities += "<!ENTITY a\(i) \"\(String(repeating: "&a\(i - 1);", count: 10))\">" }
+  let entityURL = try write("entity-bomb.xml", "<!DOCTYPE scene [\(entities)]><scene version=\"3.0.0\">&a6;"
+    + String(repeating: "<x>", count: 3000) + String(repeating: "</x>", count: 3000) + "</scene>")
+  let entityError = importStackError(entityURL)
+  require(entityError?.contains("cannot read entity-bomb.xml") == true, "nested entities fail cleanly on a 512 KB stack (\(entityError ?? "no error"))")
   // Elements within the limit in each file, deeper together through an include.
   let half = MitsubaImporter.maxElementDepth / 2 + 1
   let halfDeep = String(repeating: "<bsdf type=\"twosided\">", count: half) + "<bsdf type=\"diffuse\"/>" + String(repeating: "</bsdf>", count: half)
@@ -288,6 +312,27 @@
     </scene>
     """)
   requireThrows("a value with '$b' expands beyond 1 MB") { _ = try MitsubaImporter.Scene(url: bomb) }
+  // Values within that limit, beyond maxSubstitutedTotal together: $b (1,000,000 bytes) in one value more than the
+  // total holds.
+  let uses = MitsubaImporter.maxSubstitutedTotal / 1_000_000 + 1
+  let spread = try write("bomb-spread.xml", """
+    <scene version="3.0.0">
+      <default name="a" value="\(String(repeating: "x", count: 1000))"/>
+      <default name="b" value="\(String(repeating: "$a", count: 1000))"/>
+      \((0..<uses).map { #"<float name="x\#($0)" value="$b"/>"# }.joined())
+    </scene>
+    """)
+  requireThrows("variables expand beyond \(MitsubaImporter.maxSubstitutedTotal >> 20) MB in all") { _ = try MitsubaImporter.Scene(url: spread) }
+  // Includes that fan out: n includes of a file that includes 32 files are 33 n includes, at most maxIncludes.
+  _ = try write("fan-leaf.xml", #"<scene version="3.0.0"/>"#)
+  _ = try write("fan-middle.xml", #"<scene version="3.0.0">\#(String(repeating: #"<include filename="fan-leaf.xml"/>"#, count: 32))</scene>"#)
+  func fan(_ count: Int) throws -> URL {
+    try write("fan-\(count).xml", #"<scene version="3.0.0">\#(String(repeating: #"<include filename="fan-middle.xml"/>"#, count: count))</scene>"#)
+  }
+  let within = MitsubaImporter.maxIncludes / 33
+  _ = try MitsubaImporter.Scene(url: try fan(within))
+  let beyond = try fan(within + 1)
+  requireThrows("more than \(MitsubaImporter.maxIncludes) includes") { _ = try MitsubaImporter.Scene(url: beyond) }
 
   // The 0.6 names of the archives' properties and a texture's uoffset and voffset (a to_uv translation).
   let archive = try MitsubaImporter.Scene(url: try write("v06-archive.xml", """
@@ -561,6 +606,18 @@
   let secondMesh = Array(firstMesh.prefix(4)) + zlib([UInt8](repeating: 0, count: 60000))
   try serializedFails("compressed size can hold", "two-meshes.serialized", firstMesh + secondMesh + bytes(UInt64(0)) + bytes(UInt64(firstMesh.count)) + bytes(UInt32(2)))
   try serializedFails("memory budget", "budget.serialized", serialized(vertices: 3_000_000_000, faces: 1000, payload: triangle, flags: 0x2000 | 0x1 | 0x2))
+  // The scene's running totals over its meshes, with limits that three cubes (12 triangles each) fit exactly.
+  let cubes = try (0..<3).map { _ in try shapeNode(#"<shape type="cube"/>"#) }
+  var totals = shapeScene
+  let cubeBytes = try MitsubaImporter.mesh(cubes[0], index: 0, scene: &totals)!.bytes
+  let fitting = try MitsubaImporter.loadMeshes(cubes, scene: &totals, progress: nil, triangleLimit: 36, byteLimit: 3 * cubeBytes)
+  require(fitting.count == 3 && fitting.allSatisfy { $0 != nil }, "three cubes fit limits of 36 triangles and three cubes' bytes")
+  requireThrows("the meshes exceed the 20 triangle limit") {
+    _ = try MitsubaImporter.loadMeshes(cubes, scene: &totals, progress: nil, triangleLimit: 20)
+  }
+  requireThrows("the importer's memory budget") {
+    _ = try MitsubaImporter.loadMeshes(cubes, scene: &totals, progress: nil, byteLimit: 2 * cubeBytes)
+  }
   // An offset table pointing outside the file or near the end of the integer range.
   let fixture = Array(try Data(contentsOf: fixtures.appendingPathComponent("tri.serialized")))
   for (name, offset) in [("outside", UInt64(0xFFFF)), ("max", UInt64.max), ("int-max", UInt64(Int.max) - 3), ("end", UInt64(fixture.count - 4))] {
@@ -899,6 +956,9 @@ try fixMitsubaChecks()
     </scene>
     """)
   require(unsided.report.filter { $0 == oneSided }.count == 1, "one-sided BSDFs give one scene-level line (\(unsided.report))")
+  // A shape without a BSDF has Mitsuba's default diffuse, also one-sided; an emitter's black default is not reported.
+  let bare = try load(#"<scene version="3.0.0"><shape type="rectangle"/></scene>"#)
+  require(bare.report.contains(oneSided), "a shape without a BSDF is reported one-sided (\(bare.report))")
 
   // Materials: shared by BSDF id and emission.
   let shared = try load("""

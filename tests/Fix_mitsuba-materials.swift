@@ -341,7 +341,8 @@
   let wrapped = String(repeating: #"<bsdf type="twosided">"#, count: 20) + #"<bsdf type="diffuse"/>"# + String(repeating: "</bsdf>", count: 20)
   requireThrows("BSDF wrappers nested more than \(MitsubaImporter.maxWrapperDepth) deep") { _ = try document(wrapped, name: "onion") }
 
-  // Anisotropic roughness as its geometric mean; an IOR ratio below 1 on an opaque coating is 1.01.
+  // Anisotropic roughness as its geometric mean; an IOR ratio below 1 on a coating is its inverse (the same reflectance at
+  // normal incidence), and a plastic's internal-scattering ratio keeps Mitsuba's own ratio.
   let brushed = try program(#"<bsdf type="roughconductor"><float name="alpha_u" value="0.04"/><float name="alpha_v" value="0.16"/><string name="distribution" value="ggx"/></bsdf>"#, name: "brushed")
   require(near(input(brushed, "specular_roughness"), SIMD3<Float>(repeating: Float(0.08).squareRoot()))
     && reported(prefix: "brushed: anisotropic alpha_u 0.04 and alpha_v 0.16 rendered isotropic at alpha 0.08")
@@ -349,12 +350,16 @@
   let frosted = try program(#"<bsdf type="roughdielectric"><float name="alpha_u" value="0.09"/><string name="distribution" value="ggx"/></bsdf>"#, name: "frosted")
   require(near(input(frosted, "specular_roughness"), SIMD3(repeating: (0.09 * 0.1 as Float).squareRoot().squareRoot())),
     "a missing alpha_v is Mitsuba's 0.1")
-  for (xml, label, kind) in [(#"<bsdf type="plastic"><float name="int_ior" value="1"/><float name="ext_ior" value="1.5"/></bsdf>"#, "under", "plastic"),
-                             (#"<bsdf type="principledthin"><float name="eta" value="0.8"/></bsdf>"#, "underthin", "principledthin")] {
+  for (xml, label, kind, inverse) in [(#"<bsdf type="plastic"><float name="int_ior" value="1"/><float name="ext_ior" value="1.5"/></bsdf>"#, "under", "plastic", Float(1.5)),
+                                      (#"<bsdf type="principledthin"><float name="eta" value="0.8"/></bsdf>"#, "underthin", "principledthin", 1.25)] {
     let p = try program(xml, name: label)
-    require(near(input(p, "specular_ior"), SIMD3(repeating: 1.01)) && reported(prefix: "\(label): \(kind) IOR ratio 0.") ,
-      "\(kind) with an IOR ratio below 1: specular_ior 1.01, reported (\(scene.report.filter { $0.hasPrefix(label) }))")
+    require(near(input(p, "specular_ior"), SIMD3(repeating: inverse)) && reported(prefix: "\(label): \(kind) IOR ratio 0."),
+      "\(kind) with an IOR ratio below 1: specular_ior \(inverse), reported (\(String(describing: input(p, "specular_ior"))), \(scene.report.filter { $0.hasPrefix(label) }))")
   }
+  let underRatio = MitsubaImporter.plasticRatio(eta: 1 / 1.5, alpha: nil, ggx: false, nonlinear: false, rho: 0.5)
+  let under = try program(#"<bsdf type="plastic"><float name="int_ior" value="1"/><float name="ext_ior" value="1.5"/></bsdf>"#, name: "under2")
+  require(near(input(under, "base_color"), SIMD3(repeating: min(1, 0.5 * underRatio))),
+    "a plastic below 1 takes its internal-scattering ratio at int_ior / ext_ior (\(String(describing: input(under, "base_color"))))")
 
   // A 0.6 file shaped like Bitterli's archives: conductor extEta (1, dropped; 2, dividing eta and k), bitmap filterType,
   // checkerboard uoffset, and a medium's sigmaS and sigmaA. No "unsupported" line.

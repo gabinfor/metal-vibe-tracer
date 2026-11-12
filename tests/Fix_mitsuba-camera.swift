@@ -73,6 +73,13 @@
     """))
   require(flat.document.views["Mitsuba: camera"] == nil && flat.report.contains("sensor: a singular or non-finite to_world; the default camera is used"),
     "a singular sensor to_world falls back to the default camera (\(flat.report))")
+  // A determinant near 1 from scales of 1e-20 and 1e20: the view direction does not normalize (its squared length
+  // overflows), so the camera falls back as well.
+  let lopsided = try load(scene(sensor: """
+    <sensor type="perspective"><float name="fov" value="45"/><transform name="to_world"><scale x="1e-20" z="1e20"/></transform></sensor>
+    """))
+  require(lopsided.document.views["Mitsuba: camera"] == nil && lopsided.report.contains("sensor: a singular or non-finite to_world; the default camera is used"),
+    "a to_world whose direction does not normalize falls back to the default camera (\(lopsided.report))")
   print("PASS: Mitsuba camera: direction, up and handedness, quiet area-emitter report, unsupported film and sensor settings, singular to_world")
 }
 try fixMitsubaCameraChecks()

@@ -6,7 +6,7 @@ import simd
 // Bitterli's scenes (REFERENCES.md BITTERLI2016):
 //   diffuse              base_color = reflectance (0.5), specular_weight 0
 //   plastic/roughplastic base_color = diffuse_reflectance (0.5) x plasticRatio (int_ior 1.49, ext_ior 1.000277,
-//                        alpha 0.1, beckmann), specular_ior = int_ior / ext_ior (below 1: 1.01, reported),
+//                        alpha 0.1, beckmann), specular_ior = int_ior / ext_ior (below 1: its inverse, reported),
 //                        specular_roughness = sqrt(alpha) (0 when smooth); a texture is multiplied by the ratio at
 //                        rho 0.5, or for a nonlinear plastic baked per texel and channel from the ratio at 17
 //                        reflectances, linearly interpolated
@@ -22,7 +22,7 @@ import simd
 //                        specular_transmittance as transmission_color, and zero as a black reflector
 //   thindielectric       the same with geometry_thin_walled (below 1: its inverse, without total internal reflection)
 //   principledthin       thin-walled; base_color, diff_trans as subsurface weight and anisotropy, spec_trans as
-//                        transmission_weight and specular_weight, roughness, eta (below 1: 1.01, reported)
+//                        transmission_weight and specular_weight, roughness, eta (below 1: its inverse, reported)
 //   twosided             its (first) inner BSDF; mask: geometry_opacity = opacity (a texture, or a constant's mean)
 //   bumpmap              the inner BSDF with the height map as a tangent-space normal map, from the mesh's UV stretch
 //   normalmap            the inner BSDF with its texture as the normal map
@@ -248,7 +248,9 @@ private struct MaterialBuilder {
 
   mutating func plastic(_ node: MitsubaImporter.Node, rough: Bool) throws -> Inputs {
     // OpenPBR's coated base has diffuse albedo rho' (1 - E_spec(mu)); Mitsuba's plastic scatters inside its coating.
-    // rho' = rho r, with r = MitsubaImporter.plasticRatio (REFERENCES.md MITSUBA3).
+    // rho' = rho r, with r = MitsubaImporter.plasticRatio (REFERENCES.md MITSUBA3). r takes Mitsuba's eta, also below 1,
+    // where specular_ior is its inverse (coatingIOR): r assumes that both coatings let in the same 1 - F(mu_i), which
+    // eta and 1 / eta do at normal incidence.
     let eta = try MitsubaImporter.ior(node, "int_ior", default: 1.49) / MitsubaImporter.ior(node, "ext_ior", default: 1.000277)
     let nonlinear = node.bool("nonlinear") ?? false
     var alpha: Float?
@@ -278,7 +280,7 @@ private struct MaterialBuilder {
     default:
       break
     }
-    if validIOR { m["specular_ior"] = .value(lowestIOR(eta, kind: rough ? "roughplastic" : "plastic")) }
+    if validIOR { m["specular_ior"] = .value(coatingIOR(eta, kind: rough ? "roughplastic" : "plastic")) }
     m["specular_roughness"] = .value(alpha.map { ($0.isFinite ? $0 : 0.1).squareRoot() } ?? 0)
     return m
   }
@@ -394,7 +396,7 @@ private struct MaterialBuilder {
       scene.note("\(name): eta \(eta) is not positive; 1.5 used")
       eta = 1.5
     }
-    m["specular_ior"] = .value(lowestIOR(eta, kind: "principledthin"))
+    m["specular_ior"] = .value(coatingIOR(eta, kind: "principledthin"))
     m["specular_weight"] = .value(s)
     if d > 0 {
       m["subsurface_weight"] = .value(min(d, 1))
@@ -431,13 +433,15 @@ private struct MaterialBuilder {
     return value
   }
 
-  // An IOR ratio below 1 is reported and 1.01 used, the renderer's smallest (it clamps specular_ior to 1.01-2.5).
-  // The inverse ratio is not used as for a dielectric: an opaque coating has no other side to import, and Mitsuba's
-  // coating below 1 reflects totally beyond its critical angle, which neither value renders.
-  mutating func lowestIOR(_ eta: Float, kind: String) -> Float {
+  // A coating's specular_ior. A ratio below 1, which the renderer's IOR (1.01 to 2.5) cannot take, is rendered at
+  // its inverse, with a report line: the Fresnel reflectance at normal incidence, ((eta - 1) / (eta + 1))^2, is the
+  // same for eta and 1 / eta (0.04 for 1 / 1.5), while the clamp to 1.01 would make it 2.5e-5. Away from normal
+  // incidence the two differ, since Mitsuba's coating below 1 reflects totally beyond its critical angle. A plastic's
+  // internal-scattering ratio keeps Mitsuba's own eta (MaterialBuilder.plastic).
+  mutating func coatingIOR(_ eta: Float, kind: String) -> Float {
     guard eta < 1 else { return eta }
-    scene.note("\(name): \(kind) IOR ratio \(eta) is below 1; rendered at specular_ior 1.01, the app's smallest")
-    return 1.01
+    scene.note("\(name): \(kind) IOR ratio \(eta) is below 1; rendered at its inverse \(1 / eta), with the same reflectance at normal incidence")
+    return 1 / eta
   }
 
   // A value that cannot be negative; a negative one is reported and 0 used.

@@ -27,8 +27,10 @@ import Synchronization
 //   limits                                    a file nested more than maxElementDepth elements deep (counted
 //                                             through includes and resolved references), references nested
 //                                             more than maxReferenceDepth deep, more than maxIncludeDepth files
-//                                             open at once and an attribute value longer than
-//                                             maxSubstitutedLength after substitution are errors
+//                                             open at once, more than maxIncludes includes in all, an attribute
+//                                             value longer than maxSubstitutedLength after substitution, more
+//                                             than maxSubstitutedTotal bytes substituted in all, an entity
+//                                             declaration and any XML error are errors
 //   #rrggbb, #rgb                             an sRGB hex colour in <rgb> or <srgb> (SRGB1999 transfer
 //                                             function), read as linear RGB
 //   lookat without a usable up                an up vector parallel to the view direction, or none, is
@@ -63,6 +65,12 @@ enum MitsubaImporter {
   // An attribute value after $variable substitution, in UTF-8 bytes: nested <default>s that repeat a variable grow
   // exponentially.
   static let maxSubstitutedLength = 1 << 20
+  // All substituted variable values in the scene and its includes together, in UTF-8 bytes: many uses of one long
+  // variable.
+  static let maxSubstitutedTotal = 64 << 20
+  // Included files read for one scene, every inclusion counted: a file that includes another many times, which
+  // includes another many times, multiplies them.
+  static let maxIncludes = 1024
 
   // One resolved XML element: its attributes after $ substitution and the 0.6 rename, and its children with
   // every <ref> replaced by its target.
@@ -238,43 +246,62 @@ enum MitsubaImporter {
     var legacy = false
     var variables: [String: String] = [:]
     var includeStack: [URL] = []
+    // Included files read and variable bytes substituted so far, against maxIncludes and maxSubstitutedTotal.
+    var includes = 0, substituted = 0
     var definitions: [String: Node] = [:]
     var resolvedDefinitions: [String: (node: Node, height: Int)] = [:]
     var resolving: Set<String> = []
 
-    // The file's elements, after a streaming pass has checked that they nest at most maxElementDepth deep, so that
-    // XMLDocument never holds (and releases) a deeper tree.
+    // The file's elements, after a streaming pass has read the whole file: it fails on elements nested more than
+    // maxElementDepth deep, on an entity declaration (Mitsuba scenes declare none; nested entities expand
+    // exponentially) and on any XML error, so that XMLDocument only ever builds a tree the streaming pass accepted.
     static func document(_ url: URL) throws -> XMLDocument {
-      func failure(_ error: Error) -> Error { MitsubaImporter.error("cannot read \(url.lastPathComponent): \(error.localizedDescription)") }
+      func failure(_ reason: String) -> Error { MitsubaImporter.error("cannot read \(url.lastPathComponent): \(reason)") }
       let data: Data
-      do { data = try Data(contentsOf: url) } catch { throw failure(error) }
-      let parser = XMLParser(data: data), depth = DepthCheck()
-      parser.delegate = depth
+      do { data = try Data(contentsOf: url) } catch { throw failure(error.localizedDescription) }
+      let parser = XMLParser(data: data), check = StreamCheck()
+      parser.delegate = check
       parser.shouldResolveExternalEntities = false
-      parser.parse()
-      if depth.exceeded { throw MitsubaImporter.error("\(url.lastPathComponent): \(Loader.tooDeep)") }
-      do { return try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) } catch { throw failure(error) }
+      let parsed = parser.parse()
+      if check.tooDeep { throw MitsubaImporter.error("\(url.lastPathComponent): \(Loader.tooDeep)") }
+      if check.declaresEntity { throw failure("entity declarations are not supported") }
+      guard parsed else { throw failure(parser.parserError?.localizedDescription ?? "malformed XML") }
+      do { return try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) } catch { throw failure(error.localizedDescription) }
     }
 
     static let tooDeep = "elements are nested more than \(MitsubaImporter.maxElementDepth) deep"
 
-    // Stops the streaming pass at the first element deeper than maxElementDepth.
-    final class DepthCheck: NSObject, XMLParserDelegate {
-      var depth = 0, exceeded = false
+    // Stops the streaming pass at the first element deeper than maxElementDepth or the first entity declaration.
+    final class StreamCheck: NSObject, XMLParserDelegate {
+      var depth = 0, tooDeep = false, declaresEntity = false
       func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName: String?,
                   attributes: [String: String] = [:]) {
         depth += 1
         if depth > MitsubaImporter.maxElementDepth {
-          exceeded = true
+          tooDeep = true
           parser.abortParsing()
         }
       }
       func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName: String?) {
         depth -= 1
       }
+      func parser(_ parser: XMLParser, foundInternalEntityDeclarationWithName name: String, value: String?) { entity(parser) }
+      func parser(_ parser: XMLParser, foundExternalEntityDeclarationWithName name: String, publicID: String?, systemID: String?) {
+        entity(parser)
+      }
+      func parser(_ parser: XMLParser, foundUnparsedEntityDeclarationWithName name: String, publicID: String?, systemID: String?,
+                  notationName: String?) {
+        entity(parser)
+      }
+      private func entity(_ parser: XMLParser) {
+        declaresEntity = true
+        parser.abortParsing()
+      }
     }
 
-    func substitute(_ text: String) throws -> String {
+    // The text with every $name replaced by its value; the values substituted so far in the scene count toward
+    // maxSubstitutedTotal.
+    mutating func substitute(_ text: String) throws -> String {
       guard text.contains("$") else { return text }
       var result = ""
       var rest = Substring(text)
@@ -284,6 +311,10 @@ enum MitsubaImporter {
         let name = after.prefix { $0.isLetter || $0.isNumber || $0 == "_" }
         guard !name.isEmpty, let value = variables[String(name)] else {
           throw MitsubaImporter.error("undefined variable '$\(name)'")
+        }
+        substituted += value.utf8.count
+        guard substituted <= MitsubaImporter.maxSubstitutedTotal else {
+          throw MitsubaImporter.error("variables expand beyond \(MitsubaImporter.maxSubstitutedTotal >> 20) MB in all")
         }
         result += value
         guard result.utf8.count <= MitsubaImporter.maxSubstitutedLength else {
@@ -316,6 +347,10 @@ enum MitsubaImporter {
         guard !includeStack.contains(url) else { throw MitsubaImporter.error("include cycle at '\(filename)'") }
         guard includeStack.count < MitsubaImporter.maxIncludeDepth else {
           throw MitsubaImporter.error("includes nested more than \(MitsubaImporter.maxIncludeDepth) files deep at '\(filename)'")
+        }
+        includes += 1
+        guard includes <= MitsubaImporter.maxIncludes else {
+          throw MitsubaImporter.error("more than \(MitsubaImporter.maxIncludes) includes at '\(filename)'")
         }
         includeStack.append(url)
         defer { includeStack.removeLast() }
@@ -467,8 +502,9 @@ enum MitsubaImporter {
 //                medium (MitsubaImporter.material), shared by the shapes that reference the same BSDF id with the same
 //                emission; zero-area triangles are dropped. A shape whose dielectric (wrapped or not) has an IOR
 //                ratio below 1 is reversed (reversesFacing), unless it emits. Every surface is two-sided, so a BSDF
-//                that Mitsuba renders black from the back (isOneSided) adds one report line for the scene. Loading
-//                stops as soon as the meshes pass SceneLimits.triangles
+//                that Mitsuba renders black from the back (isOneSided), or no BSDF on a shape that does not emit
+//                (Mitsuba's default diffuse), adds one report line for the scene. Loading stops as soon as the meshes
+//                pass SceneLimits.triangles or meshMemoryBudget (loadMeshes)
 //   sensor       the first perspective or thinlens sensor is the saved view "Mitsuba: camera" and the active camera.
 //                Mitsuba's camera looks along +z with x to the left, so its to_world times diag(-1, 1, -1, 1) is a
 //                camera looking along -z (eye: the origin, direction: to_world's z, up: its y). The vertical field
@@ -476,8 +512,8 @@ enum MitsubaImporter {
 //                diagonal over the film's diagonal) or, without fov, focal_length (50mm by default, over a 35 mm
 //                film's 43.2666 mm diagonal), and the film's width and height (768 x 576 by default), which are also
 //                the render size. A thinlens's aperture_radius (at most 0.5) and focus_distance (10000 by default,
-//                Mitsuba's far clip) are the lens. A singular or non-finite to_world is reported and the default
-//                camera kept.
+//                Mitsuba's far clip) are the lens. A singular or non-finite to_world, or one whose z or y axis does
+//                not normalize to a unit vector, is reported and the default camera kept.
 //   integrator   max_depth sets the path depth, max_depth - 1 from 1 to 64; -1 (unbounded), none or a value that
 //                is not finite (reported) gives 64. A
 //                wrapper (aov, moment) gives its inner integrator's; an integrator other than path, volpath and
@@ -531,10 +567,11 @@ extension MitsubaImporter {
       let label = self.label(shape, i)
       let bsdf = shape.child("bsdf"), interior = shape.child("interior")
       if shape.child("exterior") != nil { scene.note("shape '\(label)': exterior medium is not supported; ignored") }
-      if let bsdf, isOneSided(bsdf) {
+      let emission = areaEmission(shape, label: label, scene: &scene)
+      // Without a BSDF, Mitsuba's default diffuse is one-sided too; an emitter's default is black from both sides.
+      if bsdf.map(isOneSided) ?? (emission == nil) {
         scene.note("BSDFs without twosided are one-sided in Mitsuba (black from the back); rendered two-sided")
       }
-      let emission = areaEmission(shape, label: label, scene: &scene)
       // A dielectric whose IOR ratio is below 1 is imported as 1 / eta (MitsubaImporter.material) from the other side.
       if reversesFacing(bsdf, emits: emission != nil) {
         mesh = mesh.flipped()
@@ -593,33 +630,45 @@ extension MitsubaImporter {
     shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? "\(shape.type ?? "(no type)")\(index)"
   }
 
+  // The most memory the arrays of a scene's meshes may hold together (loadMeshes): a quarter of this Mac's memory, as
+  // for one serialized sub-mesh (serializedBudget).
+  static let meshMemoryBudget = Int(ProcessInfo.processInfo.physicalMemory / 4)
+
   // Each shape's world-space mesh (nil for a skipped shape), read in parallel; report lines in shape order, and the
-  // first shape's error in shape order. The running triangle total fails the load as soon as it passes the scene
-  // limit: shapes not yet read are then skipped.
-  private static func loadMeshes(_ shapes: [Node], scene: inout Scene, progress: OperationProgress?) throws -> [Mesh?] {
+  // first shape's error in shape order. Running totals of the meshes' triangles and of the memory their arrays hold
+  // (Mesh.bytes) fail the load as soon as one passes its limit (SceneLimits.triangles and meshMemoryBudget by default):
+  // shapes not yet started are then skipped, so the totals pass a limit by at most the meshes being read at the time,
+  // one per worker.
+  static func loadMeshes(_ shapes: [Node], scene: inout Scene, progress: OperationProgress?,
+                         triangleLimit: Int = SceneLimits.triangles, byteLimit: Int = meshMemoryBudget) throws -> [Mesh?] {
     guard !shapes.isEmpty else { return [] }
     var results = [(mesh: Mesh?, report: [String], error: Error?)](repeating: (nil, [], nil), count: shapes.count)
     var base = scene
     base.report = []
     let shared = base
-    let triangles = Atomic<Int>(0)
+    let triangles = Atomic<Int>(0), bytes = Atomic<Int>(0)
     results.withUnsafeMutableBufferPointer { buffer in
       let output = DisjointWrites(base: buffer.baseAddress!)  // Each worker writes only its own shape's entry.
       DispatchQueue.concurrentPerform(iterations: shapes.count) { i in
         defer { progress?.advance("Loading Mitsuba meshes", total: shapes.count) }
-        guard triangles.load(ordering: .relaxed) <= SceneLimits.triangles else { return }
+        guard triangles.load(ordering: .relaxed) <= triangleLimit, bytes.load(ordering: .relaxed) <= byteLimit else { return }
         var local = shared
         do {
           let mesh = try mesh(shapes[i], index: i, scene: &local)
-          if triangles.add(mesh?.triangles.count ?? 0, ordering: .relaxed).newValue > SceneLimits.triangles { return }
+          let overTriangles = triangles.add(mesh?.triangles.count ?? 0, ordering: .relaxed).newValue > triangleLimit
+          let overBytes = bytes.add(mesh?.bytes ?? 0, ordering: .relaxed).newValue > byteLimit
+          if overTriangles || overBytes { return }
           output.base[i] = (mesh, local.report, nil)
         } catch {
           output.base[i] = (nil, local.report, error)
         }
       }
     }
-    guard triangles.load(ordering: .relaxed) <= SceneLimits.triangles else {
-      throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
+    guard triangles.load(ordering: .relaxed) <= triangleLimit else {
+      throw error("the meshes exceed the \(triangleLimit.formatted()) triangle limit")
+    }
+    guard bytes.load(ordering: .relaxed) <= byteLimit else {
+      throw error("the meshes need more than \(byteLimit.formatted()) bytes, the importer's memory budget")
     }
     for result in results {
       for line in result.report { scene.note(line) }
@@ -756,7 +805,10 @@ extension MitsubaImporter {
     let linear = simd_float3x3(columns: (toWorld.columns.0.xyz, toWorld.columns.1.xyz, toWorld.columns.2.xyz))
     let determinant = simd_determinant(linear)
     let eye = toWorld.columns.3.xyz, direction = simd_normalize(toWorld.columns.2.xyz), up = simd_normalize(toWorld.columns.1.xyz)
-    guard determinant.isFinite, determinant != 0, [eye, direction, up].allSatisfy({ v in (0..<3).allSatisfy { v[$0].isFinite } }) else {
+    // A determinant away from 0 can still come from axes of very different lengths (1e-20 and 1e20), whose squared
+    // length under- or overflows: their normalized direction and up must be unit vectors.
+    guard determinant.isFinite, determinant != 0, [eye, direction, up].allSatisfy({ v in (0..<3).allSatisfy { v[$0].isFinite } }),
+      abs(simd_length(direction) - 1) < 1e-3, abs(simd_length(up) - 1) < 1e-3 else {
       scene.note("sensor: a singular or non-finite to_world; the default camera is used")
       return nil
     }
@@ -904,6 +956,12 @@ extension MitsubaImporter {
     // v already flipped to this project's convention.
     var uvs: [SIMD2<Float>]?
     var triangles: [SIMD3<UInt32>]
+
+    // The memory its arrays hold.
+    var bytes: Int {
+      MemoryLayout<SIMD3<Float>>.stride * (positions.count + (normals?.count ?? 0)) + MemoryLayout<SIMD2<Float>>.stride * (uvs?.count ?? 0)
+        + MemoryLayout<SIMD3<UInt32>>.stride * triangles.count
+    }
 
     // The other side as the front: reversed winding and negated normals.
     func flipped() -> Mesh {
