@@ -20,12 +20,15 @@ before rendering when one is missing, with one line naming the shot and the file
 
 --thumbnails renders the scene browser's thumbnails instead: for each entry of SceneCatalog.entries (read by the Swift
 driver, so there is no second list here) but the SceneCatalog.thumbnailExempt scenes, the entry's shot (a built-in
-scene: its scene index at the default view; an imported scene, Mitsuba included, with its own camera or the
-shot's view) at 960 x 540 with at most 256 spp and no denoiser, downsampled to
+scene: its scene index at the default view, or the thumbnailOnly shot named like the entry, which sets its options
+(Cornell Fog: "fog": 1, the Atmosphere menu's Fog preview); an imported scene, Mitsuba included, with its own camera or the
+shot's view) at 960 x 540 with the shot's "thumbnailSamples", else at most 256 spp (the spectral scenes and the Veach Bidir
+Room set more) and no denoiser, downsampled to
 480 x 270 and written as JPEG (quality 0.85) to Examples/Thumbnails/<id>.jpg, with the ids in
 Examples/Thumbnails/scene-ids.txt for scripts/check_bundle.py. The thumbnail's size replaces the scene's own film
-size, and a camera of another aspect ratio, such as a square film, keeps its vertical field of view (the shot's
-sizes are applied after the importer's), so the 16:9 frame shows more to the sides. --only then names catalog ids. A scene whose files are
+size, and a camera whose film is narrower than 16:9, such as a square film, keeps its horizontal field of view (the
+vertical one shrinks to fill the 16:9 frame, which crops the film's horizontal band; a shot with its own "fov" is left as it
+is). The README showcase run skips thumbnailOnly shots. --only then names catalog ids. A scene whose files are
 not installed is skipped, and one whose render fails is reported, and both are listed at the end while the run goes
 on. A failed render removes that id's old JPEG and makes the exit status non-zero after every entry was tried; a
 skipped scene keeps its JPEG and the exit status is 0.
@@ -87,7 +90,9 @@ struct ExportFailure: LocalizedError {
 }
 
 // Imports the shot's scene, applies its settings and exports it to outputFolder (PNG, or EXR for a raw shot).
-@MainActor func render(_ shot: ShowcaseShot) throws -> URL {
+// With fillFrame, a camera whose film is narrower than 16:9 (a square film) keeps its horizontal field of view at the
+// shot's 16:9 size, so the frame crops the film's horizontal band instead of showing more to the sides.
+@MainActor func render(_ shot: ShowcaseShot, fillFrame: Bool = false) throws -> URL {
   var p: ProjectDocument
   if let path = shot.usd {
     p = try USDImporter.load(URL(fileURLWithPath: path), into: ProjectDocument()).document
@@ -132,7 +137,13 @@ struct ExportFailure: LocalizedError {
     p.environmentData = try Data(contentsOf: URL(fileURLWithPath: hdri))
     p.environmentName = URL(fileURLWithPath: hdri).lastPathComponent
   }
+  let film = Float(p.options.outputWidth) / Float(max(p.options.outputHeight, 1))
   shot.apply(to: &p)
+  if fillFrame, shot.fov == nil, film < 16.0 / 9.0, let width = shot.width, let height = shot.height {
+    let tanHalf = tan(p.camera.fov * .pi / 360) * film * Float(height) / Float(width)
+    p.camera.fov = 2 * atan(tanHalf) * 180 / .pi
+    print("\(shot.name): film aspect \(film) kept horizontally, vertical fov \(p.camera.fov)")
+  }
   if shot.samples == nil { p.options.exportSamples = 1024 }
   try controller.restore(p)
   if let side = testRenderer.materials.graphTextureSide {
@@ -199,7 +210,9 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
   var skipped: [String] = [], failed: [String] = []
   for entry in SceneCatalog.entries where ids.contains(entry.id) && (only.isEmpty || only.contains(entry.id)) {
     var shot: ShowcaseShot
-    if case .builtIn(let index) = entry.source {
+    if let found = shots.first(where: { $0.name == entry.id && $0.thumbnailOnly == true }) {
+      shot = found
+    } else if case .builtIn(let index) = entry.source {
       shot = try JSONDecoder().decode(ShowcaseShot.self, from: Data("{\"name\": \"\(entry.id)\", \"scene\": \(index)}".utf8))
     } else if let found = shots.first(where: { $0.name == entry.shot }) {
       shot = found
@@ -212,13 +225,14 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
       continue
     }
     shot.name = "thumbnail-" + entry.id
-    (shot.width, shot.height, shot.samples) = (960, 540, min(shot.samples ?? 256, 256))
+    (shot.width, shot.height) = (960, 540)
+    shot.samples = shot.thumbnailSamples ?? min(shot.samples ?? 256, 256)
     (shot.denoise, shot.raw, shot.keepRaw) = (false, false, nil)
     // A failed render leaves no image, so the bundle check and the tests see it instead of a stale one.
     let jpeg = thumbnailFolder.appendingPathComponent(entry.id + ".jpg")
     try? FileManager.default.removeItem(at: jpeg)
     do {
-      let png = try render(shot)
+      let png = try render(shot, fillFrame: true)
       try writeThumbnail(png, to: jpeg)
       try? FileManager.default.removeItem(at: png)
       print("\(entry.id): wrote Examples/Thumbnails/\(entry.id).jpg")
@@ -232,13 +246,13 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
   if skipped.isEmpty { print("All thumbnails rendered") }
 } else {
   // A shot whose scene file is not unpacked stops the run before any shot renders.
-  for shot in shots {
+  for shot in shots where shot.thumbnailOnly != true {
     if let path = shot.usd ?? shot.gltf ?? shot.mitsuba ?? shot.obj, !FileManager.default.fileExists(atPath: path) {
       fputs("FAIL: \(shot.name): scene file \(path) is missing\n", stderr)
       exit(1)
     }
   }
-  for shot in shots {
+  for shot in shots where shot.thumbnailOnly != true {
     do { _ = try render(shot) } catch let failure as ExportFailure {
       fputs((failure.errorDescription ?? "FAIL") + "\n", stderr)
       exit(1)

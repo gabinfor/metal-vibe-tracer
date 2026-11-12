@@ -2,17 +2,17 @@
 
 One 480 × 270 JPEG per scene of the scene browser (`SceneCatalog.entries`), shown on its card and in its details pane. They are bundled with the app (`build.sh` copies this folder to `Contents/Resources/Examples/Thumbnails`), and `scene-ids.txt` lists the ids that have one, which `scripts/check_bundle.py` checks.
 
-Metal Vibe Tracer rendered them on 2026-11-11 (the ten Bitterli scenes below on 2026-11-12) on an Apple M4 with
+Metal Vibe Tracer rendered them on 2026-11-11 (the ten Bitterli scenes below, Cornell Fog and the five spectral scenes on 2026-11-12) on an Apple M4 with
 
 ```
 python3 scripts/render_showcase.py --thumbnails
 ```
 
-at 960 × 540 from the scene's `scripts/showcase.json` shot (a built-in scene: its default view), spectral transport, not denoised, at the shot's sample count capped at 256 (256 spp for the built-in, spectral and Bitterli scenes, whose shots carry none, 128 spp for the McGuire scenes), downsampled to 480 × 270 and saved as JPEG at quality 0.85. The renderer code is the checkout of the commit that added this folder.
+at 960 × 540 from the scene's `scripts/showcase.json` shot (a built-in scene: its default view, except Cornell Fog, below), spectral transport, not denoised, at the shot's `thumbnailSamples` or else its sample count capped at 256 (256 spp for the built-in and Bitterli scenes, whose shots carry none, 128 spp for the McGuire scenes; 512 spp for Newton's Colour Series, Abbe Row, Lamp Spectra and Lantern Arcade, and 1,024 spp for Tyndall Tank and the Veach Bidir Room, whose noise 256 spp leaves visible after the downsample), downsampled to 480 × 270 and saved as JPEG at quality 0.85. The renderer code is the checkout of the commit that added this folder.
 
 ## Built-in and bundled scenes
 
-`pavilion`, `cornell-box`, `veach-mis`, `cornell-glass-mirror`, `cornell-fog` and `reflective-ring` are the application's built-in scenes. `newton-series`, `abbe-row`, `tyndall-tank`, `lamp-spectra` and `lantern-arcade` are the OpenUSD stages of [`Examples/Spectral`](../Spectral/README.md), whose notes give their sources. `cornell-fog.jpg` shows the Cornell Fog Study's default state, in which the fog preview is off, so it looks like the Cornell Box with a brighter light.
+`pavilion`, `cornell-box`, `veach-mis`, `cornell-glass-mirror`, `cornell-fog` and `reflective-ring` are the application's built-in scenes. `newton-series`, `abbe-row`, `tyndall-tank`, `lamp-spectra` and `lantern-arcade` are the OpenUSD stages of [`Examples/Spectral`](../Spectral/README.md), whose notes give their sources. The Cornell Fog Study opens with its atmosphere clear, so `cornell-fog.jpg` renders the `cornell-fog` shot (`"fog": 1`, a `thumbnailOnly` shot that the README showcase run skips): the default view with **Atmosphere: Fog preview** switched on, which is what the Lighting page's **Atmosphere** popup gives after opening the scene from the browser and choosing it. The preview is a mild single-scatter haze, seen as a halo around the light and a lifted, slightly desaturated wall colour.
 
 ## Morgan McGuire's Computer Graphics Archive scenes
 
@@ -47,7 +47,7 @@ Each of these images is an adapted work: a render of a scene from [Benedikt Bitt
 | `grey-white-room.jpg` | The Grey & White Room | © Wig42 | [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) |
 | `modern-hall.jpg` | Modern Hall | © NewSee2l035 | [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) |
 
-Changes: the scene files were opened through the Mitsuba importer, which translates their Mitsuba materials to OpenPBR and keeps the scene's own camera, area emitters and path depth, and rendered at 960 × 540 (five scenes have square films, the Veach Bidir Room, Contemporary Bathroom, Water Caustic, Little Lamp and Modern Hall, so the 16:9 frame keeps the camera's vertical field of view and shows more to the sides: the Veach Bidir Room and Water Caustic show black bars there, where the model ends) with the showcase shot's view; Water Caustic uses light tracing + photons caustics. Rendered on 2026-11-12 with 256 spp, spectral transport and no denoiser, so the images are grainy, the Veach Bidir Room most (its light is a small lamp and a spotlight).
+Changes: the scene files were opened through the Mitsuba importer, which translates their Mitsuba materials to OpenPBR and keeps the scene's own camera, area emitters and path depth, and rendered at 960 × 540 with the showcase shot's view. Five scenes have square films (the Veach Bidir Room, Contemporary Bathroom, Water Caustic, Little Lamp and Modern Hall): at 16:9 the thumbnail keeps the camera's horizontal field of view, so its vertical field of view shrinks and the image is the horizontal band of the square frame that 16:9 covers (the vertical field of view 20.1° for the Veach Bidir Room, 32.6° for Contemporary Bathroom, 11.0° for Water Caustic and 43.0° for Modern Hall); keeping the vertical one showed the model with black bars to its sides. `lamp.jpg` still shows the earlier framing (the camera's vertical field of view) until it is re-rendered, which uses this framing. Water Caustic uses light tracing + photons caustics. Rendered on 2026-11-12 with 256 spp (the Veach Bidir Room 1,024 spp), spectral transport and no denoiser, so the images keep some grain, Contemporary Bathroom and Water Caustic most.
 
 ## Withheld
 
