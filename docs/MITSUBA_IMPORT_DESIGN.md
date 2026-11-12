@@ -91,9 +91,9 @@ Ten `SceneEntry` values in a `.bitterli` collection (`format: .mitsuba`), each w
 
 ## 7. Validation
 
-- `scripts/compare_scene.py` renders each XML through the native import (a `"mitsuba"` shot through `scripts/render_showcase.py`) against Mitsuba's render of the same file, at the settings recorded under `BITTERLI2016`.
-- Acceptance: each scene's mean radiance ratio matches the recorded ratio to within noise. Modern Hall and Little Lamp may move because of the medium and the sphere; a change is explained and recorded.
-- Once the ten match, `scripts/mitsuba_to_usd.py` is removed and `scripts/mitsuba_probes.py` uses the native import.
+- `scripts/compare_scene.py SCENE.xml [--reference V3.xml]` renders the file through the native import (a `"mitsuba"` shot through `scripts/render_showcase.py`, with the film size times `--scale` and the importer's path depth, checked against the reference's `max_depth`) and compares it with Mitsuba 3.9.1's `volpath` render of the same file, or of `--reference` when Mitsuba cannot load it (Water Caustic's 0.6 file, against the hand-written `scene_v3.xml`). A cached reference is reused only when its recorded settings match.
+- `scripts/mitsuba_probes.py` writes flattened variants (with links to the scene's files) and probe plates for the same comparison.
+- Results of 2026-11-12, at the settings recorded under `BITTERLI2016`, are in REFERENCES.md: two importer fixes (IOR ratios below 1, grey textured conductor `specular_reflectance`), and every remaining difference from the recorded ratios measured: the rough-metal energy compensation, an emitter inside a dielectric (Little Lamp), Mitsuba's ray offset through Country Kitchen's double-layer blind, the black-reflector dielectrics of 2026-11-05 (The White Room), the medium and the converged plastic ratio. Open: Modern Hall's −1.2% and Veach Bidir's +0.3 to +0.8% since the 2026-10-21 renderer, the first localized to commit `125b557`; the converter, `scripts/mitsuba_to_usd.py`, stays until they are accepted.
 
 ## 8. Tests
 

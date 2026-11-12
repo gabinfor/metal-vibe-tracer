@@ -409,7 +409,11 @@ extension MitsubaImporter {
       scene.note("medium \(medium.type ?? "(no type)") outside a shape's interior is not supported; ignored")
     }
 
-    let meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
+    var meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
+    // A dielectric whose IOR ratio is below 1 is imported as 1 / eta (MitsubaImporter.material) from the other side.
+    for (i, shape) in shapes.enumerated() where invertedDielectric(shape.child("bsdf")) {
+      meshes[i] = meshes[i]?.flipped()
+    }
     let triangles = meshes.reduce(0) { $0 + ($1?.triangles.count ?? 0) }
     guard triangles <= SceneLimits.triangles else {
       throw error("the meshes exceed the \(SceneLimits.triangles.formatted()) triangle limit")
@@ -737,17 +741,18 @@ extension MitsubaImporter {
 //                normals gets Mitsuba's angle-weighted vertex normals; otherwise the file's normals, transformed
 //                by the inverse transpose of to_world's 3 x 3 and renormalized.
 //   texture      This project's v runs from the top of the image, as Mitsuba's does after its own OBJ flip, so
-//   coordinates  the other formats' coordinates and the analytic shapes' (Mitsuba's, and the converter's) are kept.
+//   coordinates  the other formats' coordinates and the analytic shapes' (Mitsuba's) are kept.
 //   rectangle    (-1, -1, 0) to (1, 1, 0), normal +z, uv 0 to 1.
-//   disk         radius 1, 64 triangles around the centre, normal +z, uv = 0.5 + 0.5 (x, y) (the converter's
-//                planar mapping; Mitsuba's own is polar).
+//   disk         radius 1, 64 triangles around the centre, normal +z, uv = 0.5 + 0.5 (x, y) (a planar mapping;
+//                Mitsuba's own is polar).
 //   cube         -1 to 1 in 24 vertices (Mitsuba's order, one uv square per face), 12 triangles, no normals.
 //   sphere       center and radius (0 and 1) applied before to_world; 64 segments by 32 rings from the +z pole,
 //                smooth normals, uv (angle about z / 2 pi, angle from +z / pi).
 //   A to_world with a negative determinant reverses the winding of the analytic shapes, whose front side is the
 //   analytic normal's; file meshes keep their winding, as Mitsuba does.
 //   flip_normals reverses the winding and negates the normals of any shape, so an area emitter emits from the other
-//   side; a to_uv on a shape other than the identity is reported and ignored.
+//   side, and so does a dielectric or roughdielectric whose int_ior / ext_ior is below 1 (imported as 1 / eta);
+//   a to_uv on a shape other than the identity is reported and ignored.
 extension MitsubaImporter {
   struct Mesh {
     var positions: [SIMD3<Float>]
@@ -756,6 +761,14 @@ extension MitsubaImporter {
     // v already flipped to this project's convention.
     var uvs: [SIMD2<Float>]?
     var triangles: [SIMD3<UInt32>]
+
+    // The other side as the front: reversed winding and negated normals.
+    func flipped() -> Mesh {
+      var mesh = self
+      mesh.triangles = triangles.map { SIMD3($0.x, $0.z, $0.y) }
+      mesh.normals = normals?.map { -$0 }
+      return mesh
+    }
   }
 
   // A mesh file that cannot be read, with the file's name; `mesh` adds the shape's.
@@ -822,10 +835,7 @@ extension MitsubaImporter {
       scene.note("shape \(type) is not supported; skipped")
       return nil
     }
-    if shape.bool("flip_normals") == true {
-      mesh.triangles = mesh.triangles.map { SIMD3($0.x, $0.z, $0.y) }
-      mesh.normals = mesh.normals?.map { -$0 }
-    }
+    if shape.bool("flip_normals") == true { mesh = mesh.flipped() }
     if shape.child("to_uv")?.tag == "transform", shape.transform("to_uv") != matrix_identity_float4x4 {
       scene.note("shape '\(label)': to_uv is not supported; ignored")
     }
@@ -1515,8 +1525,7 @@ extension MitsubaImporter {
   }
 }
 
-// REFERENCES.md: MITSUBA3. Values Mitsuba computes when it loads a BSDF, which the converter
-// (scripts/mitsuba_to_usd.py) asked Mitsuba for and the importer computes itself:
+// REFERENCES.md: MITSUBA3. Values Mitsuba computes when it loads a BSDF, which the importer computes itself:
 //   ior            a number, or a name of include/mitsuba/render/ior.h's table (MitsubaTables.ior, any case)
 //   conductor      F0 and the OpenPBR 82-degree edge tint: a material preset from MitsubaTables.conductors, or
 //                  fresnel_conductor (fresnel.h) at the given eta and k (eta 0 and k 1 by default) when eta is
@@ -1526,6 +1535,16 @@ extension MitsubaImporter {
 //                  tag v3.9.1 (with microfacet.h's eval_reflectance and eval_transmittance and their
 //                  Gauss-Legendre quadrature over visible normals) in double precision
 extension MitsubaImporter {
+  // A dielectric or roughdielectric with int_ior / ext_ior below 1 (an air bubble in ice, with the denser side
+  // outside): the app's IOR is at least 1.01, so the interface is imported from its other side, as 1 / eta with the
+  // shape's facing reversed. A thindielectric's two interfaces reflect the same for eta and 1 / eta.
+  static func invertedDielectric(_ bsdf: Node?) -> Bool {
+    guard let bsdf, bsdf.type == "dielectric" || bsdf.type == "roughdielectric",
+      let eta = try? ior(bsdf, "int_ior", default: 1.5046) / ior(bsdf, "ext_ior", default: 1.000277)
+    else { return false }
+    return eta.isFinite && eta > 0 && eta < 1
+  }
+
   static func ior(_ node: Node, _ name: String, default fallback: Float) throws -> Float {
     guard node.child(name) != nil else { return fallback }
     if let value = node.float(name) { return value }

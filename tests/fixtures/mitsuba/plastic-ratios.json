@@ -1,7 +1,7 @@
 {
  "mitsuba": "3.9.1",
  "variant": "scalar_rgb",
- "method": "Mitsuba diffuse albedo / (rho (1 - specular albedo)), averaged over incidence cosines 0.3, 0.5, 0.7, 0.9 (the quantity of scripts/mitsuba_to_usd.py plastic_ratio, converged): specular albedo from the sampled weight on a 1024 x 1024 midpoint grid (one sample for the smooth plastic), diffuse albedo by integrating bsdf.eval over mu_o with 4-point Gauss-Legendre on 2048 intervals; int_ior = eta, ext_ior = 1; distribution null for the smooth plastic. At half that resolution the ratios differ by at most 1.6e-04 (relative).",
+ "method": "Mitsuba diffuse albedo / (rho (1 - specular albedo)), averaged over incidence cosines 0.3, 0.5, 0.7, 0.9 (converged): specular albedo from the sampled weight on a 1024 x 1024 midpoint grid (one sample for the smooth plastic), diffuse albedo by integrating bsdf.eval over mu_o with 4-point Gauss-Legendre on 2048 intervals; int_ior = eta, ext_ior = 1; distribution null for the smooth plastic. At half that resolution the ratios differ by at most 1.6e-04 (relative).",
  "rows": [
   {
    "eta": 1.3,

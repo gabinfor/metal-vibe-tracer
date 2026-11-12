@@ -11,16 +11,16 @@ Run by hand (Mitsuba is not available to the build or the tests); both outputs a
                                            uses. MitsubaTables.conductors: every material preset the
                                            conductor plugin accepts (each pair of data/ior/<name>.eta.spd and
                                            .k.spd files in the package, and "none"), with F0 and the OpenPBR
-                                           82-degree edge tint as scripts/mitsuba_to_usd.py conductor_colors
-                                           computes them, without specular_reflectance.
+                                           82-degree edge tint of Mitsuba's smooth conductor, without
+                                           specular_reflectance.
   tests/fixtures/mitsuba/plastic-ratios.json
-                                           the quantity scripts/mitsuba_to_usd.py plastic_ratio estimates (with
-                                           a 32 x 32 grid), computed to convergence from Mitsuba's BSDF on a
+                                           Mitsuba's plastic diffuse albedo over rho (1 - its specular albedo),
+                                           computed to convergence from Mitsuba's BSDF on a
                                            grid of IOR, alpha, distribution, nonlinear and reflectance;
                                            tests/Fix_mitsuba.swift checks MitsubaImporter.plasticRatio against
                                            them.
 
-The scalar_rgb variant is used, as the converter does. The script stops unless Mitsuba is 3.9.1.
+The scalar_rgb variant is used. The script stops unless Mitsuba is 3.9.1.
 """
 import json
 import math
@@ -59,7 +59,7 @@ def conductor_names():
 
 
 def conductor_colors(material):
-    """F0 and the OpenPBR 82-degree tint of a named conductor (scripts/mitsuba_to_usd.py conductor_colors)."""
+    """F0 and the OpenPBR 82-degree tint of a named conductor."""
     b = mi.load_dict({'type': 'conductor', 'material': material})
 
     def reflectance(mu):
@@ -83,7 +83,7 @@ GAUSS_LEGENDRE_4 = np.polynomial.legendre.leggauss(4)
 
 def plastic_ratio(kind, eta, alpha, distribution, nonlinear, rho, n, segments):
     """Mitsuba's plastic diffuse albedo / (rho (1 - specular albedo)), averaged over incidence cosines 0.3, 0.5, 0.7
-    and 0.9: the quantity scripts/mitsuba_to_usd.py plastic_ratio estimates, computed to convergence.
+    and 0.9, computed to convergence.
     Specular albedo: the mean of Mitsuba's sampled weight for the specular component over an n x n midpoint grid
     (one sample for the smooth plastic's delta lobe). Diffuse albedo: 2 pi times the integral over mu_o of
     bsdf.eval for the diffuse component (which depends only on mu_o), by 4-point Gauss-Legendre on `segments`
@@ -158,7 +158,7 @@ for eta in (1.3, 1.49, 1.9):
                                  'nonlinear': nonlinear, 'rho': rho, 'ratio': ratio})
 fixture = {'mitsuba': VERSION, 'variant': 'scalar_rgb',
            'method': f'Mitsuba diffuse albedo / (rho (1 - specular albedo)), averaged over incidence cosines 0.3, 0.5, '
-                     f'0.7, 0.9 (the quantity of scripts/mitsuba_to_usd.py plastic_ratio, converged): specular albedo '
+                     f'0.7, 0.9 (converged): specular albedo '
                      f'from the sampled weight on a {N} x {N} midpoint grid (one sample for the smooth plastic), '
                      f'diffuse albedo by integrating bsdf.eval over mu_o with 4-point Gauss-Legendre on {SEGMENTS} '
                      f'intervals; int_ior = eta, ext_ior = 1; distribution null for the smooth plastic. '

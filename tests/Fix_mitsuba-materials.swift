@@ -1,7 +1,8 @@
 // Mitsuba materials (MitsubaImporter.material) beyond Fix_mitsuba.swift's mapping rows: the baked images' texels
-// against the converter's formulas (bump normal maps, nonlinear plastics), principledthin, textured masks and
-// plastics, conductor chroma, normal maps, transmission colours, values that are not finite or negative, texture
-// properties the mapping does not read, to_uv sampling (Mitsuba's rows for any v scale) and the bake size limit.
+// against their formulas (bump normal maps, nonlinear plastics), principledthin, textured masks and
+// plastics, conductor chroma and textured specular_reflectance, normal maps, transmission colours, IOR ratios below 1,
+// values that are not finite or negative, texture properties the mapping does not read, to_uv sampling (Mitsuba's
+// rows for any v scale) and the bake size limit.
 @MainActor func fixMitsubaMaterialChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba-materials", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -73,8 +74,8 @@
   let quad = MitsubaImporter.Mesh(positions: [SIMD3(-1, -1, 0), SIMD3(1, -1, 0), SIMD3(1, 1, 0), SIMD3(-1, 1, 0)], normals: nil,
     uvs: [SIMD2(0, 0), SIMD2(1, 0), SIMD2(1, 1), SIMD2(0, 1)], triangles: [SIMD3(0, 1, 2), SIMD3(0, 2, 3)])
 
-  // Bump map: heights h = (40 x + 20 y) / 255 (raw) on a 4 x 4 image over a 2 x 2 quad (UV stretch 2). The converter's
-  // bump_normal_map at texel (1, 1): d_u = (h(2, 1) - h(0, 1)) / 2 x 4, d_v = (h(1, 2) - h(1, 0)) / 2 x 4, and the map
+  // Bump map: heights h = (40 x + 20 y) / 255 (raw) on a 4 x 4 image over a 2 x 2 quad (UV stretch 2). The bumpmap
+  // formula at texel (1, 1): d_u = (h(2, 1) - h(0, 1)) / 2 x 4, d_v = (h(1, 2) - h(1, 0)) / 2 x 4, and the map
   // holds normalize(-d_u / 2, +d_v / 2, 1) as 8-bit (n / 2 + 1 / 2).
   try png("ramp.png") { x, y in let v = UInt8(40 * x + 20 * y); return (v, v, v) }
   _ = try compiled(document("""
@@ -86,7 +87,7 @@
   let expectedNormal = SIMD3((0..<3).map { Int((n[$0] * 0.5 + 0.5) * 255 + 0.5) })
   let normal = try baked("-bump-normal.png", "ramp").flatMap { texel($0, 1, 1) }
   require(normal.map { simd_reduce_max(simd_abs($0 &- expectedNormal)) <= 1 } == true && (normal?.x ?? 255) < 128 && (normal?.y ?? 0) > 128,
-    "bump map: a texel's normal leans against the height's u slope and with its v slope, as bump_normal_map computes (\(String(describing: normal)), expected \(expectedNormal))")
+    "bump map: a texel's normal leans against the height's u slope and with its v slope, as MitsubaImporter.normalMap computes it (\(String(describing: normal)), expected \(expectedNormal))")
 
   // Nonlinear plastic: a uniform texel rho bakes to rho x plasticRatio(rho) in 8-bit sRGB; RGBA alpha is ignored.
   try png("grey.png") { _, _ in (128, 128, 128) }
@@ -110,7 +111,7 @@
   let bakedNames = try FileManager.default.contentsOfDirectory(atPath: bakes.path)
   require(bakedNames.allSatisfy { $0.utf8.count < 200 }, "a long material name still gives a short baked file name")
 
-  // principledthin against the converter's principled_thin.
+  // principledthin against its mapping (REFERENCES.md MITSUBA3, principledthin).
   let thin = try program("""
     <bsdf type="principledthin"><rgb name="base_color" value="0.8, 0.5, 0.3"/><float name="diff_trans" value="1.6"/>
       <float name="spec_trans" value="0.5"/><float name="roughness" value="0.4"/><float name="eta" value="1.33"/>
@@ -137,6 +138,25 @@
   let cu = MitsubaTables.conductors["Cu"]!.f0
   require(near(input(chroma, "specular_weight"), SIMD3(repeating: 0.5)) && near(input(chroma, "base_color"), cu * SIMD3(1, 0.5, 0.25)),
     "conductor: a coloured specular_reflectance splits into specular_weight (its maximum) and base_color chroma")
+  // A textured specular_reflectance scales Mitsuba's whole Fresnel: a grey one (Veach Ajar's checkerboard floor) is a
+  // connected specular_weight over the conductor's F0; a coloured one can only scale F0 and is reported.
+  // MaterialX leaves float images raw, so the weight is the red channel of the colour-managed (sRGB) image.
+  let checkerText = try document("""
+    <bsdf type="roughconductor"><string name="material" value="Cu"/><texture type="checkerboard" name="specular_reflectance">
+      <rgb name="color0" value="0.8"/><rgb name="color1" value="0.2"/></texture></bsdf>
+    """, name: "checker")
+  let checker = try compiled(checkerText)
+  require(input(checker, "specular_weight") == nil && checker.images.count == 1 && near(input(checker, "base_color"), cu)
+    && checkerText.contains(#"<image name="mitsuba_n"#) && checkerText.contains(#"type="color3""#) && checkerText.contains("<extract "),
+    "a grey specular_reflectance texture: specular_weight from the sRGB image's red channel, base_color F0 (\(String(describing: input(checker, "base_color"))))")
+  try png("red.png") { _, _ in (200, 50, 50) }
+  let tinted = try program("""
+    <bsdf type="conductor"><string name="material" value="Cu"/><texture type="bitmap" name="specular_reflectance">
+      <string name="filename" value="red.png"/></texture></bsdf>
+    """, name: "tinted")
+  require(input(tinted, "base_color") == nil && tinted.images.count == 1
+    && reported("tinted: coloured specular_reflectance texture scales F0 only"),
+    "a coloured specular_reflectance texture multiplies base_color and is reported")
   try png("normal.png") { _, _ in (128, 128, 255) }
   let mapped = try document("""
     <bsdf type="normalmap"><texture type="bitmap" name="normalmap"><string name="filename" value="normal.png"/><boolean name="raw" value="true"/></texture>
@@ -148,6 +168,10 @@
   let bright = try program(#"<bsdf type="dielectric"><rgb name="specular_transmittance" value="1.5, 0.5, 0.5"/></bsdf>"#)
   require(pane.transmissionColor == SIMD3(0.9, 0.6, 0.3) && bright.transmissionColor == SIMD3(1, 0.5, 0.5),
     "thin transmission_color, and transmission_color clamped at 1")
+  // An IOR ratio below 1: specular_ior 1 / eta (the app's IOR is at least 1.01; MitsubaImporter.load reverses the shape).
+  let bubble = try program(#"<bsdf type="dielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf>"#, name: "bubble")
+  require(near(input(bubble, "specular_ior"), SIMD3(repeating: 1 / 0.763)) && reported(prefix: "bubble: int_ior / ext_ior 0.763 is below 1"),
+    "a dielectric with int_ior / ext_ior 0.763: specular_ior 1 / 0.763, reported (\(String(describing: input(bubble, "specular_ior"))))")
   _ = try program(#"<bsdf type="roughconductor"/>"#)
   require(reported("Beckmann microfacet distributions are rendered as GGX at the same alpha"), "a Beckmann distribution is reported")
   let dark = try program(nil, emission: .zero)

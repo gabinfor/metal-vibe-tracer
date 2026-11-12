@@ -2,9 +2,8 @@ import Cocoa
 import simd
 
 // REFERENCES.md: MITSUBA3, BITTERLI2016, OPENPBR, MATERIALX, SRGB1999. A shape's BSDF, area emitter and interior
-// medium as one OpenPBR MaterialX document (the form GLTFImporter writes, with its Writer). The mapping is that of
-// scripts/mitsuba_to_usd.py (material, principled_thin, colour_input, texture, plastic_texture, bump_normal_map,
-// material_prim), whose report lines it keeps:
+// medium as one OpenPBR MaterialX document (the form GLTFImporter writes, with its Writer), compared with Mitsuba on
+// Bitterli's scenes (REFERENCES.md BITTERLI2016):
 //   diffuse              base_color = reflectance (0.5), specular_weight 0
 //   plastic/roughplastic base_color = diffuse_reflectance (0.5) x plasticRatio (int_ior 1.49, ext_ior 1.000277,
 //                        alpha 0.1, beckmann), specular_ior = int_ior / ext_ior, specular_roughness = sqrt(alpha)
@@ -12,17 +11,19 @@ import simd
 //                        baked per texel and channel from the ratio at 17 reflectances, linearly interpolated
 //   conductor/rough...   base_metalness 1, base_color = F0 and specular_color = the 82-degree tint of
 //                        MitsubaImporter.conductor (none, a perfect mirror, by default), specular_reflectance as
-//                        specular_weight (its chroma kept in base_color; a texture multiplies base_color instead)
-//   dielectric/rough...  transmission_weight 1, specular_ior = int_ior (1.5046) / ext_ior (1.000277),
-//                        specular_transmittance as transmission_color, and zero as a black reflector
+//                        specular_weight (its chroma kept in base_color; a grey texture is connected to
+//                        specular_weight, a coloured one multiplies base_color instead)
+//   dielectric/rough...  transmission_weight 1, specular_ior = int_ior (1.5046) / ext_ior (1.000277) (below 1: its
+//                        inverse, with the shape's facing reversed by MitsubaImporter.load), specular_transmittance
+//                        as transmission_color, and zero as a black reflector
 //   thindielectric       the same with geometry_thin_walled
 //   principledthin       thin-walled; base_color, diff_trans as subsurface weight and anisotropy, spec_trans as
 //                        transmission_weight and specular_weight, roughness, eta
 //   twosided             its (first) inner BSDF; mask: geometry_opacity = opacity (a texture, or a constant's mean)
 //   bumpmap              the inner BSDF with the height map as a tangent-space normal map, from the mesh's UV stretch
 //   normalmap            the inner BSDF with its texture as the normal map
-//   bitmap               an image node (sRGB unless raw) sampled at Mitsuba's (s_u u, s_v v) for the to_uv scale (the
-//                        converter's sampling differed for a non-integer s_v), normal maps too; checkerboard: a
+//   bitmap               an image node (sRGB unless raw) sampled at Mitsuba's (s_u u, s_v v) for the to_uv scale,
+//                        normal maps too; checkerboard: a
 //                        256 px 8-bit sRGB PNG of color0 (0.4) and color1 (0.2) in the import folder
 //   no BSDF              grey diffuse 0.5, or black when the shape emits (Mitsuba's Shape default)
 //   area emitter         emission_color x emission_luminance = the radiance
@@ -32,7 +33,7 @@ import simd
 // finite (the default used) or negative where that is meaningless (0 used). Baked images are at most bakeTexels.
 extension MitsubaImporter {
   // `name` labels the report lines and the baked images. `mesh` is the first mesh using the material: a bump map's
-  // normal map depends on its UV stretch, as in the converter; without UVs the bump map is dropped and reported.
+  // normal map depends on its UV stretch; without UVs the bump map is dropped and reported.
   static func material(bsdf: Node?, emission: SIMD3<Float>?, interior: Node?, name: String,
                        scene: inout Scene, folder: URL, mesh: Mesh? = nil) throws -> String {
     var builder = MaterialBuilder(name: name, folder: folder, scene: scene)
@@ -127,10 +128,15 @@ private struct Inputs {
       case .color(let c): values.append((name, .color(c)))
       case .boolean(let b): values.append((name, .boolean(b)))
       case .texture(let t, let tint):
+        // MaterialX leaves float images raw, so specular_weight is the red channel of the colour-managed image, as
+        // Mitsuba decodes a bitmap unless raw.
+        let weight = name == "specular_weight"
         let type = name == "geometry_opacity" ? "float" : "color3"
         let node = w.image(t.file.path, type: type, colorspace: t.srgb ? "srgb_texture" : "raw", uv: coordinates(t.scale),
                            u: "periodic", v: "periodic")
-        if let tint {
+        if weight {
+          values.append((name, .node(w.op("extract", "float", [("in", .node(node, type)), ("index", .integer(0))]), "float")))
+        } else if let tint {
           values.append((name, .node(w.op("multiply", type, [("in1", .node(node, type)), ("in2", .color(tint))]), type)))
         } else {
           values.append((name, .node(node, type)))
@@ -280,10 +286,17 @@ private struct MaterialBuilder {
     // OpenPBR's metal Fresnel is Schlick from F0 with its 82-degree value tinted by specular_color.
     if tint.min() < 0.999 { m["specular_color"] = .color(tint) }
     // specular_reflectance scales Mitsuba's whole Fresnel, grazing angles included; OpenPBR's specular_weight scales
-    // the metal lobe the same way. A colour keeps its chroma in base_color; a texture can only scale base_color (F0).
+    // the metal lobe the same way. A colour keeps its chroma in base_color; a grey texture is a connected
+    // specular_weight, while a coloured one can only scale base_color (F0).
     switch try colour(node, "specular_reflectance", default: SIMD3(repeating: 1)) {
     case .texture(let t, _):
-      m["base_color"] = .texture(t, tint: f0)
+      if try Self.isGrey(t, owner: name) {
+        m["base_color"] = .color(f0)
+        m["specular_weight"] = .texture(t, tint: nil)
+      } else {
+        m["base_color"] = .texture(t, tint: f0)
+        scene.note("\(name): coloured specular_reflectance texture scales F0 only")
+      }
     case .color(let s):
       let weight = min(1, s.max())
       m["base_color"] = .color(f0 * (weight > 0 ? s / weight : SIMD3(repeating: 1)))
@@ -298,7 +311,12 @@ private struct MaterialBuilder {
     let eta = try MitsubaImporter.ior(node, "int_ior", default: 1.5046) / MitsubaImporter.ior(node, "ext_ior", default: 1.000277)
     var m = Inputs()
     if eta.isFinite && eta > 0 {
-      m["specular_ior"] = .value(eta)
+      // Below 1, the same interface from its other side (MitsubaImporter.invertedDielectric).
+      m["specular_ior"] = .value(eta < 1 ? 1 / eta : eta)
+      if eta < 1 {
+        scene.note("\(name): int_ior / ext_ior \(eta) is below 1; rendered as \(1 / eta)"
+          + (kind == "thindielectric" ? "" : " with the shape's facing reversed"))
+      }
     } else {
       scene.note("\(name): int_ior / ext_ior \(eta) is not a finite positive IOR; specular_ior 1.5 used")
     }
@@ -334,7 +352,7 @@ private struct MaterialBuilder {
     return m
   }
 
-  // Mitsuba principledthin as a thin-walled OpenPBR surface (see scripts/mitsuba_to_usd.py).
+  // Mitsuba principledthin as a thin-walled OpenPBR surface (REFERENCES.md MITSUBA3, principledthin).
   mutating func principledThin(_ node: MitsubaImporter.Node) throws -> Inputs {
     let base = try colour(node, "base_color", default: SIMD3(repeating: 0.5))
     let d = min(2, max(0, scalar(node, "diff_trans", 0)))
@@ -621,9 +639,18 @@ private struct MaterialBuilder {
     return image
   }
 
+  // Whether every texel of the texture has equal red, green and blue.
+  static func isGrey(_ t: Inputs.Texture, owner: String) throws -> Bool {
+    var grey = true
+    try forEachTexel(try image(t.file, owner: owner), srgb: t.srgb, owner: owner) { _, red, green, blue in
+      if red != green || green != blue { grey = false }
+    }
+    return grey
+  }
+
   // Calls `body` with each texel's index (rows from the top) and linear RGB: integer formats are normalized and sRGB
   // decoded when `srgb`, float formats are read as stored; grey images repeat their channel and alpha is ignored, as
-  // the converter read them through Mitsuba's Bitmap. 8- and 16-bit RGB and grey images are read as stored (no
+  // Mitsuba's Bitmap reads them. 8- and 16-bit RGB and grey images are read as stored (no
   // colour management); others are drawn into a float context in their own colour space (sRGB when not RGB or grey)
   // and un-premultiplied.
   static func forEachTexel(_ image: CGImage, srgb: Bool, owner: String, _ body: (Int, Float, Float, Float) -> Void) throws {
@@ -718,7 +745,7 @@ private struct MaterialBuilder {
     }
   }
 
-  // A linear value as 8-bit sRGB (clamped to 0-1), rounded as the converter did.
+  // A linear value as 8-bit sRGB (clamped to 0-1), rounded to the nearest level.
   static func encoded(_ value: Float) -> UInt8 {
     let x = min(max(value, 0), 1)
     return UInt8((x <= 0.0031308 ? 12.92 * x : 1.055 * powf(x, 1 / 2.4) - 0.055) * 255 + 0.5)
