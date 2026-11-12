@@ -493,7 +493,10 @@
   let mirror = try MitsubaImporter.conductor(nodeWith("material", "none"))
   require(mirror.f0 == SIMD3(1, 1, 1) && mirror.tint == SIMD3(1, 1, 1), "the none conductor is a perfect mirror")
   let unnamed = try MitsubaImporter.conductor(nodeWith("int_ior", "bk7"))
-  require(unnamed.f0 == MitsubaTables.conductors["Cu"]!.f0, "no material and no eta: Cu")
+  require(unnamed.f0 == SIMD3(1, 1, 1) && unnamed.tint == SIMD3(1, 1, 1), "no material and no eta: none, as Mitsuba's default")
+  // Mitsuba 3.9.1 with k (3.9, 2.4, 2.2) and no eta (eta 0): F0 (1, 1, 1) and tint (1, 1, 1), measured on the package.
+  let kOnly = try MitsubaImporter.conductor(nodeWith("k", "3.9 2.4 2.2", tag: "rgb"))
+  require(kOnly.f0 == SIMD3(1, 1, 1) && kOnly.tint == SIMD3(1, 1, 1), "k without eta: eta 0, as Mitsuba's")
   requireThrows("unknown conductor 'Kryptonite'") { _ = try MitsubaImporter.conductor(nodeWith("material", "Kryptonite")) }
   let eta = SIMD3<Float>(0.2, 0.9, 1.1), k = SIMD3<Float>(3.9, 2.4, 2.2)
   let explicit = try MitsubaImporter.conductor(etaKNode(eta: [eta.x, eta.y, eta.z], k: [k.x, k.y, k.z]))
@@ -504,15 +507,22 @@
   requireThrows("not both") {
     _ = try MitsubaImporter.conductor(shapeNode(#"<bsdf type="conductor"><string name="material" value="Au"/><float name="eta" value="1"/></bsdf>"#))
   }
-  // The fixture's ratios estimate the cosine-weighted mean transmittance with a 32 x 32 grid, about 0.8% above
-  // its integral at low roughness; plasticRatio integrates it.
   var worst = (error: Float(0), row: "")
   for row in ratios.rows {
     let r = MitsubaImporter.plasticRatio(eta: row.eta, alpha: row.alpha, ggx: row.ggx, nonlinear: row.nonlinear, rho: row.rho)
-    require(abs(r / row.ratio - 1) < 0.01, "plastic ratio within 1% of Mitsuba at \(row)")
+    require(abs(r / row.ratio - 1) < 1e-3, "plastic ratio within 0.1% of Mitsuba at \(row)")
     if abs(r / row.ratio - 1) > worst.error { worst = (abs(r / row.ratio - 1), "\(row)") }
   }
   print("Mitsuba plastic ratios: largest relative error \(worst.error) at \(worst.row)")
+  let neutral = [MitsubaImporter.plasticRatio(eta: .nan, alpha: 0.1, ggx: true, nonlinear: false, rho: 0.5),
+                 MitsubaImporter.plasticRatio(eta: 1.5, alpha: .nan, ggx: true, nonlinear: false, rho: 0.5),
+                 MitsubaImporter.plasticRatio(eta: 0, alpha: nil, ggx: false, nonlinear: false, rho: 0.5),
+                 MitsubaImporter.plasticRatio(eta: -1.5, alpha: 0.1, ggx: false, nonlinear: false, rho: 0.5),
+                 MitsubaImporter.plasticRatio(eta: .infinity, alpha: nil, ggx: false, nonlinear: false, rho: 0.5)]
+  require(neutral.allSatisfy { $0 == 1 }, "a non-finite or non-positive eta, or a non-finite alpha, gives the neutral ratio 1")
+  let clamped = MitsubaImporter.plasticRatio(eta: 1.5, alpha: 0, ggx: true, nonlinear: false, rho: 0.5)
+  require(clamped.isFinite && clamped > 0 && clamped == MitsubaImporter.plasticRatio(eta: 1.5, alpha: -1, ggx: true, nonlinear: false, rho: 0.5)
+    && clamped == MitsubaImporter.plasticRatio(eta: 1.5, alpha: 1e-4, ggx: true, nonlinear: false, rho: 0.5), "alpha 0 and below clamp to 1e-4")
   print("PASS: Mitsuba values: named IORs and conductors, conductor Fresnel, plastic internal scattering")
 }
 try fixMitsubaChecks()

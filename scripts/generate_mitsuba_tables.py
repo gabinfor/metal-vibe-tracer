@@ -14,10 +14,11 @@ Run by hand (Mitsuba is not available to the build or the tests); both outputs a
                                            82-degree edge tint as scripts/mitsuba_to_usd.py conductor_colors
                                            computes them, without specular_reflectance.
   tests/fixtures/mitsuba/plastic-ratios.json
-                                           plastic ratios measured as scripts/mitsuba_to_usd.py plastic_ratio
-                                           measures them, on a grid of IOR, alpha, distribution, nonlinear
-                                           and reflectance; tests/Fix_mitsuba.swift checks
-                                           MitsubaImporter.plasticRatio against them.
+                                           the quantity scripts/mitsuba_to_usd.py plastic_ratio estimates (with
+                                           a 32 x 32 grid), computed to convergence from Mitsuba's BSDF on a
+                                           grid of IOR, alpha, distribution, nonlinear and reflectance;
+                                           tests/Fix_mitsuba.swift checks MitsubaImporter.plasticRatio against
+                                           them.
 
 The scalar_rgb variant is used, as the converter does. The script stops unless Mitsuba is 3.9.1.
 """
@@ -77,29 +78,40 @@ def conductor_colors(material):
     return np.clip(f0, 0, 1).tolist(), tint.tolist()
 
 
-def plastic_ratio(kind, eta, alpha, distribution, nonlinear, rho):
-    """Mitsuba's plastic diffuse albedo / (rho (1 - specular albedo)), averaged over four incidences
-    (scripts/mitsuba_to_usd.py plastic_ratio)."""
+GAUSS_LEGENDRE_4 = np.polynomial.legendre.leggauss(4)
+
+
+def plastic_ratio(kind, eta, alpha, distribution, nonlinear, rho, n, segments):
+    """Mitsuba's plastic diffuse albedo / (rho (1 - specular albedo)), averaged over incidence cosines 0.3, 0.5, 0.7
+    and 0.9: the quantity scripts/mitsuba_to_usd.py plastic_ratio estimates, computed to convergence.
+    Specular albedo: the mean of Mitsuba's sampled weight for the specular component over an n x n midpoint grid
+    (one sample for the smooth plastic's delta lobe). Diffuse albedo: 2 pi times the integral over mu_o of
+    bsdf.eval for the diffuse component (which depends only on mu_o), by 4-point Gauss-Legendre on `segments`
+    equal intervals of [0, 1]."""
     spec = {'type': kind, 'int_ior': eta, 'ext_ior': 1.0, 'nonlinear': nonlinear,
             'diffuse_reflectance': {'type': 'rgb', 'value': [rho] * 3}}
     if kind == 'roughplastic':
         spec.update(alpha=alpha, distribution=distribution)
     b = mi.load_dict(spec)
-    n = 32
-    grid = [((i + 0.5) / n, (j + 0.5) / n) for i in range(n) for j in range(n)]
+    specular = mi.BSDFContext(mi.TransportMode.Radiance, mi.BSDFFlags.All, 0)
+    diffuse = mi.BSDFContext(mi.TransportMode.Radiance, mi.BSDFFlags.All, 1)
+    grid = 1 if kind == 'plastic' else n
     ratios = []
     for mu in (0.3, 0.5, 0.7, 0.9):
         si = mi.SurfaceInteraction3f()
         si.wi = mi.Vector3f(math.sqrt(1 - mu * mu), 0, mu)
-        albedo = []
-        for component in (0, 1):  # specular, diffuse
-            ctx = mi.BSDFContext(mi.TransportMode.Radiance, mi.BSDFFlags.All, component)
-            total = 0.0
-            for u, v in grid:
-                _, w = b.sample(ctx, si, u, mi.Point2f(u, v))
-                total += float(w[0])
-            albedo.append(total / len(grid))
-        ratios.append(albedo[1] / max(1e-6, rho * (1 - albedo[0])))
+        total = 0.0
+        for i in range(grid):
+            u = (i + 0.5) / grid
+            for j in range(grid):
+                total += float(b.sample(specular, si, u, mi.Point2f(u, (j + 0.5) / grid))[1][0])
+        specular_albedo = total / (grid * grid)
+        integral = 0.0
+        for k in range(segments):
+            for x, w in zip(*GAUSS_LEGENDRE_4):
+                m = (k + 0.5 + 0.5 * x) / segments
+                integral += 0.5 * w / segments * float(b.eval(diffuse, si, mi.Vector3f(math.sqrt(1 - m * m), 0, m))[0])
+        ratios.append(2 * math.pi * integral / (rho * (1 - specular_albedo)))
     return float(np.mean(ratios))
 
 
@@ -129,21 +141,30 @@ lines += [f'    "{name}": ({swift_vector(f0)}, {swift_vector(tint)}),' for name,
 lines += ['  ]', '}', '']
 (ROOT / 'Sources/MitsubaTables.swift').write_text('\n'.join(lines))
 
-# Plastic ratios on the grid of the importer's tests.
+# Plastic ratios on the grid of the importer's tests, and at half the resolution to estimate their error.
+N, SEGMENTS = 1024, 2048
 rows = []
+change = 0.0
 for eta in (1.3, 1.49, 1.9):
     for alpha in (None, 0.01, 0.1, 0.3):
         for distribution in ((None,) if alpha is None else ('beckmann', 'ggx')):
             for nonlinear in (False, True):
                 for rho in (0.05, 0.5, 0.95):
                     kind = 'plastic' if alpha is None else 'roughplastic'
-                    ratio = plastic_ratio(kind, eta, alpha, distribution, nonlinear, rho)
+                    ratio = plastic_ratio(kind, eta, alpha, distribution, nonlinear, rho, N, SEGMENTS)
+                    coarse = plastic_ratio(kind, eta, alpha, distribution, nonlinear, rho, N // 2, SEGMENTS // 2)
+                    change = max(change, abs(coarse / ratio - 1))
                     rows.append({'eta': eta, 'alpha': alpha, 'distribution': distribution,
                                  'nonlinear': nonlinear, 'rho': rho, 'ratio': ratio})
 fixture = {'mitsuba': VERSION, 'variant': 'scalar_rgb',
-           'method': 'scripts/mitsuba_to_usd.py plastic_ratio: 32 x 32 BSDF samples per component at incidence '
-                     'cosines 0.3, 0.5, 0.7, 0.9; int_ior = eta, ext_ior = 1; distribution null for the smooth plastic',
+           'method': f'Mitsuba diffuse albedo / (rho (1 - specular albedo)), averaged over incidence cosines 0.3, 0.5, '
+                     f'0.7, 0.9 (the quantity of scripts/mitsuba_to_usd.py plastic_ratio, converged): specular albedo '
+                     f'from the sampled weight on a {N} x {N} midpoint grid (one sample for the smooth plastic), '
+                     f'diffuse albedo by integrating bsdf.eval over mu_o with 4-point Gauss-Legendre on {SEGMENTS} '
+                     f'intervals; int_ior = eta, ext_ior = 1; distribution null for the smooth plastic. '
+                     f'At half that resolution the ratios differ by at most {change:.1e} (relative).',
            'rows': rows}
 (ROOT / 'tests/fixtures/mitsuba/plastic-ratios.json').write_text(json.dumps(fixture, indent=1) + '\n')
-print(f'Mitsuba {mi.__version__}: {len(iors)} IOR names, {len(conductors)} conductors, {len(rows)} plastic ratios')
+print(f'Mitsuba {mi.__version__}: {len(iors)} IOR names, {len(conductors)} conductors, {len(rows)} plastic ratios '
+      f'(half-resolution change {change:.1e})')
 print('bk7', iors['bk7'], 'water', iors['water'], 'Au', conductors['Au'], 'none', conductors['none'])

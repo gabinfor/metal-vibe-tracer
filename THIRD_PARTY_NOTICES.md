@@ -166,8 +166,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ## Mitsuba 3 and Dr.Jit (Mitsuba scene import)
 
 `Sources/MitsubaImporter.swift` ports formulas and quadrature from Mitsuba 3.9.1
-(https://github.com/mitsuba-renderer/mitsuba3, tag v3.9.1: `fresnel.h`, `microfacet.h`,
-`warp.h`, `plastic.cpp`, `roughplastic.cpp`) and the `erfinv` approximation from Dr.Jit 1.5.0
+(https://github.com/mitsuba-renderer/mitsuba3, tag v3.9.1: `ior.h`, `fresnel.h`, `microfacet.h`,
+`warp.h`, `frame.h`, `conductor.cpp`, `plastic.cpp`, `roughplastic.cpp`) and the `erfinv` approximation from Dr.Jit 1.5.0
 (https://github.com/mitsuba-renderer/drjit, tag v1.5.0: `include/drjit/math.h`), and
 `Sources/MitsubaTables.swift` holds values read from Mitsuba 3.9.1 (its IOR table and its
 conductor presets, `data/ior`); see REFERENCES.md (MITSUBA3). Mitsuba 3 notice:

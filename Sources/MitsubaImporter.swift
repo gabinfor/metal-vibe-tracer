@@ -1163,8 +1163,9 @@ extension MitsubaImporter {
 // REFERENCES.md: MITSUBA3. Values Mitsuba computes when it loads a BSDF, which the converter
 // (scripts/mitsuba_to_usd.py) asked Mitsuba for and the importer computes itself:
 //   ior            a number, or a name of include/mitsuba/render/ior.h's table (MitsubaTables.ior, any case)
-//   conductor      F0 and the OpenPBR 82-degree edge tint: a material preset from MitsubaTables.conductors
-//                  (Cu without one), or fresnel_conductor (fresnel.h) at the given eta and k (k 1 by default)
+//   conductor      F0 and the OpenPBR 82-degree edge tint: a material preset from MitsubaTables.conductors, or
+//                  fresnel_conductor (fresnel.h) at the given eta and k (eta 0 and k 1 by default) when eta is
+//                  given or the material is none, Mitsuba's default (a perfect mirror)
 //   plasticRatio   Mitsuba's plastic diffuse albedo over rho (1 - its specular albedo), averaged over incidence
 //                  cosines 0.3, 0.5, 0.7 and 0.9, from the formulas of plastic.cpp and roughplastic.cpp at
 //                  tag v3.9.1 (with microfacet.h's eval_reflectance and eval_transmittance and their
@@ -1179,14 +1180,14 @@ extension MitsubaImporter {
   }
 
   static func conductor(_ node: Node) throws -> (f0: SIMD3<Float>, tint: SIMD3<Float>) {
-    let material = node.string("material")
-    guard node.child("eta") != nil else {
-      let name = material ?? "Cu"
-      guard let entry = MitsubaTables.conductors[name] else { throw error("unknown conductor '\(name)'") }
+    let material = node.string("material") ?? "none"
+    guard node.child("eta") != nil || material == "none" else {
+      guard let entry = MitsubaTables.conductors[material] else { throw error("unknown conductor '\(material)'") }
       return entry
     }
-    if let material, material != "none" { throw error("a conductor takes eta and k or a material, not both") }
-    guard let eta = node.rgb("eta"), let k = node.child("k") == nil ? SIMD3(repeating: 1) : node.rgb("k") else {
+    if material != "none" { throw error("a conductor takes eta and k or a material, not both") }
+    guard let eta = node.child("eta") == nil ? SIMD3(repeating: 0) : node.rgb("eta"),
+      let k = node.child("k") == nil ? SIMD3(repeating: 1) : node.rgb("k") else {
       throw error("a conductor's eta and k must be numbers or RGB values")
     }
     var f0 = SIMD3<Float>(), tint = SIMD3<Float>()
@@ -1202,11 +1203,14 @@ extension MitsubaImporter {
     return (f0, tint)
   }
 
-  // alpha nil: the smooth plastic. Rough plastics cache their integrals per (eta, alpha, distribution): the first
-  // call for a combination integrates, later ones (another rho or nonlinear) only combine the cached values.
+  // alpha nil: the smooth plastic; an alpha below 1e-4 is 1e-4, as microfacet.h clamps it. Rough plastics cache
+  // their integrals per (eta, clamped alpha, distribution): the first call for a combination integrates, later ones
+  // (another rho or nonlinear) only combine the cached values. A non-finite or non-positive eta, or a non-finite
+  // alpha, gives the neutral ratio 1 (the caller reports the property).
   static func plasticRatio(eta: Float, alpha: Float?, ggx: Bool, nonlinear: Bool, rho: Float) -> Float {
+    guard eta.isFinite, eta > 0, alpha?.isFinite ?? true else { return 1 }
     let rho = Double(rho)
-    guard let alpha else {
+    guard let alpha = alpha.map({ max($0, 1e-4) }) else {
       // plastic.cpp: diffuse albedo rho / (1 - x Fdr_int) / eta^2 (1 - F(mu_i)) times the cosine-weighted mean of
       // 1 - F(mu_o), specular albedo F(mu_i); the ratio does not depend on mu_i.
       let eta = Double(eta), fdrInt = fresnelDiffuseReflectance(1 / eta)
@@ -1246,11 +1250,12 @@ extension MitsubaImporter {
     let internalReflectance: Double
     // The cosine-weighted hemispherical mean of the interpolated table.
     let meanTransmittance: Double
-    // eval_reflectance(eta) at each of `incidences`: the specular lobe's albedo.
+    // The specular lobe's albedo at each of `incidences`: eval_reflectance(eta) with 128 x 128 nodes. Mitsuba's
+    // BSDF integrates this lobe exactly (no table), and 32 x 32 nodes are 2.5e-4 off at eta 1.9, alpha 0.1, GGX.
     let specularAlbedo: [Double]
 
     init(eta: Double, alpha: Double, ggx: Bool) {
-      let microfacet = Microfacet(alpha: max(alpha, 1e-4), ggx: ggx)
+      let microfacet = Microfacet(alpha: alpha, ggx: ggx)
       let n = Self.resolution
       var rows = [SIMD2<Double>](repeating: .zero, count: n)
       rows.withUnsafeMutableBufferPointer { buffer in
@@ -1267,7 +1272,7 @@ extension MitsubaImporter {
         let a = Double(k) / Double(n - 1), b = Double(k + 1) / Double(n - 1), slope = (rows[k + 1].x - rows[k].x) / (b - a)
         return sum + rows[k].x * (b * b - a * a) + slope * (2.0 / 3 * (b * b * b - a * a * a) - a * (b * b - a * a))
       }
-      specularAlbedo = Self.incidences.map { microfacet.reflectance(SIMD3(sqrt(1 - $0 * $0), 0, $0), eta: eta) }
+      specularAlbedo = Self.incidences.map { microfacet.reflectance(SIMD3(sqrt(1 - $0 * $0), 0, $0), eta: eta, fine: true) }
     }
 
     // lerp_gather: linear interpolation of the table at mu.
@@ -1282,9 +1287,9 @@ extension MitsubaImporter {
   fileprivate struct Microfacet {
     let alpha: Double, ggx: Bool
 
-    // Gauss-Legendre nodes on [0, 1]^2: 32 x 32 for eta > 1, else 128 x 128.
-    private func integrate(eta: Double, _ f: (SIMD2<Double>) -> Double) -> Double {
-      let rule = eta > 1 ? MitsubaImporter.gaussLegendre32 : MitsubaImporter.gaussLegendre128
+    // Gauss-Legendre nodes on [0, 1]^2: Mitsuba's 32 x 32 for eta > 1, else 128 x 128; `fine` always takes 128 x 128.
+    private func integrate(eta: Double, fine: Bool, _ f: (SIMD2<Double>) -> Double) -> Double {
+      let rule = eta > 1 && !fine ? MitsubaImporter.gaussLegendre32 : MitsubaImporter.gaussLegendre128
       var sum = 0.0
       for i in rule.nodes.indices {
         for j in rule.nodes.indices {
@@ -1295,8 +1300,8 @@ extension MitsubaImporter {
     }
 
     // eval_reflectance: the albedo of the specular lobe, F G1(wo) over visible normals.
-    func reflectance(_ wi: SIMD3<Double>, eta: Double) -> Double {
-      integrate(eta: eta) { sample in
+    func reflectance(_ wi: SIMD3<Double>, eta: Double, fine: Bool = false) -> Double {
+      integrate(eta: eta, fine: fine) { sample in
         let m = self.sample(wi, sample), wo = 2 * simd_dot(wi, m) * m - wi
         guard wo.z > 0, wi.z > 0 else { return 0 }
         return smithG1(wo, m) * MitsubaImporter.fresnel(simd_dot(wi, m), eta).r
@@ -1305,7 +1310,7 @@ extension MitsubaImporter {
 
     // eval_transmittance: the share refracted through the rough interface, (1 - F) G1(wt) over visible normals.
     func transmittance(_ wi: SIMD3<Double>, eta: Double) -> Double {
-      integrate(eta: eta) { sample in
+      integrate(eta: eta, fine: false) { sample in
         let m = self.sample(wi, sample), cosine = simd_dot(wi, m)
         let (r, cosT, etaTi) = MitsubaImporter.fresnel(cosine, eta)
         let wt = m * (cosine * etaTi + cosT) - wi * etaTi

@@ -1,7 +1,7 @@
 {
  "mitsuba": "3.9.1",
  "variant": "scalar_rgb",
- "method": "scripts/mitsuba_to_usd.py plastic_ratio: 32 x 32 BSDF samples per component at incidence cosines 0.3, 0.5, 0.7, 0.9; int_ior = eta, ext_ior = 1; distribution null for the smooth plastic",
+ "method": "Mitsuba diffuse albedo / (rho (1 - specular albedo)), averaged over incidence cosines 0.3, 0.5, 0.7, 0.9 (the quantity of scripts/mitsuba_to_usd.py plastic_ratio, converged): specular albedo from the sampled weight on a 1024 x 1024 midpoint grid (one sample for the smooth plastic), diffuse albedo by integrating bsdf.eval over mu_o with 4-point Gauss-Legendre on 2048 intervals; int_ior = eta, ext_ior = 1; distribution null for the smooth plastic. At half that resolution the ratios differ by at most 1.6e-04 (relative).",
  "rows": [
   {
    "eta": 1.3,
@@ -9,7 +9,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 1.008636929929963
+   "ratio": 1.0006996854838526
   },
   {
    "eta": 1.3,
@@ -17,7 +17,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 1.008636911548683
+   "ratio": 1.0006996694557082
   },
   {
    "eta": 1.3,
@@ -25,7 +25,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 1.0086368753754353
+   "ratio": 1.0006996376001602
   },
   {
    "eta": 1.3,
@@ -33,7 +33,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.5726875994226244
+   "ratio": 0.5681809631255137
   },
   {
    "eta": 1.3,
@@ -41,7 +41,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.7201208863901718
+   "ratio": 0.7144540550903085
   },
   {
    "eta": 1.3,
@@ -49,7 +49,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.9697825439139909
+   "ratio": 0.9621510586111587
   },
   {
    "eta": 1.3,
@@ -57,7 +57,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9959655925256362
+   "ratio": 0.988186429122753
   },
   {
    "eta": 1.3,
@@ -65,7 +65,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9959655793064366
+   "ratio": 0.9881864124128341
   },
   {
    "eta": 1.3,
@@ -73,7 +73,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9959655623571448
+   "ratio": 0.9881863982439494
   },
   {
    "eta": 1.3,
@@ -81,7 +81,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.5724311095828625
+   "ratio": 0.5679600347097108
   },
   {
    "eta": 1.3,
@@ -89,7 +89,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.7168240921671077
+   "ratio": 0.7112252076441886
   },
   {
    "eta": 1.3,
@@ -97,7 +97,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.9586348779095496
+   "ratio": 0.9511472914829918
   },
   {
    "eta": 1.3,
@@ -105,7 +105,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9948926175731386
+   "ratio": 0.9873767599968273
   },
   {
    "eta": 1.3,
@@ -113,7 +113,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9948926087056305
+   "ratio": 0.9873767431906526
   },
   {
    "eta": 1.3,
@@ -121,7 +121,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9948925892951546
+   "ratio": 0.9873767294450644
   },
   {
    "eta": 1.3,
@@ -129,7 +129,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.5723985993671742
+   "ratio": 0.5680744499135463
   },
   {
    "eta": 1.3,
@@ -137,7 +137,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.7165337564221257
+   "ratio": 0.7111207357008158
   },
   {
    "eta": 1.3,
@@ -145,7 +145,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.9576883703452561
+   "ratio": 0.9504535705772009
   },
   {
    "eta": 1.3,
@@ -153,7 +153,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9819516665169732
+   "ratio": 0.976407694473168
   },
   {
    "eta": 1.3,
@@ -161,7 +161,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9819516147232915
+   "ratio": 0.9764076445436058
   },
   {
    "eta": 1.3,
@@ -169,7 +169,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9819516300386797
+   "ratio": 0.9764076550477797
   },
   {
    "eta": 1.3,
@@ -177,7 +177,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.5716724946445547
+   "ratio": 0.5684449023248874
   },
   {
    "eta": 1.3,
@@ -185,7 +185,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.7127328715438758
+   "ratio": 0.7087088711677186
   },
   {
    "eta": 1.3,
@@ -193,7 +193,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.9462106999341389
+   "ratio": 0.9408685079095381
   },
   {
    "eta": 1.3,
@@ -201,7 +201,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.926647278111012
+   "ratio": 0.9228677359755382
   },
   {
    "eta": 1.3,
@@ -209,7 +209,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9266472131276347
+   "ratio": 0.922867669941095
   },
   {
    "eta": 1.3,
@@ -217,7 +217,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9266472146002216
+   "ratio": 0.9228676666339368
   },
   {
    "eta": 1.3,
@@ -225,7 +225,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.566584483291576
+   "ratio": 0.5642735354072466
   },
   {
    "eta": 1.3,
@@ -233,7 +233,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.6943923447817063
+   "ratio": 0.6915601059196823
   },
   {
    "eta": 1.3,
@@ -241,7 +241,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.8966564868878868
+   "ratio": 0.8929992739458851
   },
   {
    "eta": 1.3,
@@ -249,7 +249,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.8824821511788239
+   "ratio": 0.8812750457252765
   },
   {
    "eta": 1.3,
@@ -257,7 +257,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.882482163837619
+   "ratio": 0.8812750621884461
   },
   {
    "eta": 1.3,
@@ -265,7 +265,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.8824821590818422
+   "ratio": 0.8812750585840334
   },
   {
    "eta": 1.3,
@@ -273,7 +273,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.5630569658571123
+   "ratio": 0.5622867905528676
   },
   {
    "eta": 1.3,
@@ -281,7 +281,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.6795737868492526
+   "ratio": 0.6786442312202424
   },
   {
    "eta": 1.3,
@@ -289,7 +289,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.8568967201754785
+   "ratio": 0.8557246122401181
   },
   {
    "eta": 1.3,
@@ -297,7 +297,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.7235861461473996
+   "ratio": 0.7223105682455058
   },
   {
    "eta": 1.3,
@@ -305,7 +305,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.7235861713789342
+   "ratio": 0.7223105996406177
   },
   {
    "eta": 1.3,
@@ -313,7 +313,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.7235861692378666
+   "ratio": 0.7223105928320448
   },
   {
    "eta": 1.3,
@@ -321,7 +321,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.5327154456576153
+   "ratio": 0.5317763486629491
   },
   {
    "eta": 1.3,
@@ -329,7 +329,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.608783164102642
+   "ratio": 0.6077099652844604
   },
   {
    "eta": 1.3,
@@ -337,7 +337,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.7101934137444805
+   "ratio": 0.7089414460396813
   },
   {
    "eta": 1.49,
@@ -345,7 +345,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 1.0090018674660448
+   "ratio": 1.001187776929714
   },
   {
    "eta": 1.49,
@@ -353,7 +353,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 1.0090018372789402
+   "ratio": 1.0011877529726505
   },
   {
    "eta": 1.49,
@@ -361,7 +361,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 1.0090018464794293
+   "ratio": 1.0011877579555537
   },
   {
    "eta": 1.49,
@@ -369,7 +369,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.42552000185412114
+   "ratio": 0.4222246180513901
   },
   {
    "eta": 1.49,
@@ -377,7 +377,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.5860514226043052
+   "ratio": 0.5815128206433654
   },
   {
    "eta": 1.49,
@@ -385,7 +385,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.9410841415798218
+   "ratio": 0.9337960375438004
   },
   {
    "eta": 1.49,
@@ -393,7 +393,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9856535234166275
+   "ratio": 0.9780766648573205
   },
   {
    "eta": 1.49,
@@ -401,7 +401,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.985653552152388
+   "ratio": 0.9780766893318056
   },
   {
    "eta": 1.49,
@@ -409,7 +409,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9856535022451482
+   "ratio": 0.9780766327184168
   },
   {
    "eta": 1.49,
@@ -417,7 +417,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.42526959130821096
+   "ratio": 0.42200048158955605
   },
   {
    "eta": 1.49,
@@ -425,7 +425,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.5820099115702733
+   "ratio": 0.5775359137991335
   },
   {
    "eta": 1.49,
@@ -433,7 +433,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.9217284528744931
+   "ratio": 0.914642988753523
   },
   {
    "eta": 1.49,
@@ -441,7 +441,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9844136480906808
+   "ratio": 0.9770832746686703
   },
   {
    "eta": 1.49,
@@ -449,7 +449,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9844136073749727
+   "ratio": 0.977083238742961
   },
   {
    "eta": 1.49,
@@ -457,7 +457,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9844136073313517
+   "ratio": 0.9770832331100913
   },
   {
    "eta": 1.49,
@@ -465,7 +465,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.4252594786862546
+   "ratio": 0.42209280989144987
   },
   {
    "eta": 1.49,
@@ -473,7 +473,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.5817949666135108
+   "ratio": 0.5774626656358237
   },
   {
    "eta": 1.49,
@@ -481,7 +481,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.9206987002689733
+   "ratio": 0.9138427791811288
   },
   {
    "eta": 1.49,
@@ -489,7 +489,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9705072272644929
+   "ratio": 0.9649246800893322
   },
   {
    "eta": 1.49,
@@ -497,7 +497,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9705071800734619
+   "ratio": 0.9649246314161832
   },
   {
    "eta": 1.49,
@@ -505,7 +505,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9705071940157639
+   "ratio": 0.964924641634244
   },
   {
    "eta": 1.49,
@@ -513,7 +513,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.42475949677777897
+   "ratio": 0.42231619752020727
   },
   {
    "eta": 1.49,
@@ -521,7 +521,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.5789817075328481
+   "ratio": 0.5756512886121674
   },
   {
    "eta": 1.49,
@@ -529,7 +529,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.909035321106977
+   "ratio": 0.9038063671765684
   },
   {
    "eta": 1.49,
@@ -537,7 +537,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9016866419595054
+   "ratio": 0.8976433037501279
   },
   {
    "eta": 1.49,
@@ -545,7 +545,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9016866013920224
+   "ratio": 0.8976432552519702
   },
   {
    "eta": 1.49,
@@ -553,7 +553,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.901686627231391
+   "ratio": 0.8976432913175377
   },
   {
    "eta": 1.49,
@@ -561,7 +561,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.42105484443369173
+   "ratio": 0.4191667521554642
   },
   {
    "eta": 1.49,
@@ -569,7 +569,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.5632772046133842
+   "ratio": 0.5607513593377174
   },
   {
    "eta": 1.49,
@@ -577,7 +577,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.8505845900189563
+   "ratio": 0.8467704042437381
   },
   {
    "eta": 1.49,
@@ -585,7 +585,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.853644063095389
+   "ratio": 0.8524128124059732
   },
   {
    "eta": 1.49,
@@ -593,7 +593,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.8536441014502225
+   "ratio": 0.8524128487233165
   },
   {
    "eta": 1.49,
@@ -601,7 +601,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.8536440804278471
+   "ratio": 0.8524128284505146
   },
   {
    "eta": 1.49,
@@ -609,7 +609,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.4175326328882665
+   "ratio": 0.41693040874574816
   },
   {
    "eta": 1.49,
@@ -617,7 +617,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.5508322472599678
+   "ratio": 0.5500377562736476
   },
   {
    "eta": 1.49,
@@ -625,7 +625,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.8091615547755507
+   "ratio": 0.8079944626813755
   },
   {
    "eta": 1.49,
@@ -633,7 +633,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.6570265723211428
+   "ratio": 0.6563364540018833
   },
   {
    "eta": 1.49,
@@ -641,7 +641,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.6570265648906288
+   "ratio": 0.6563364541177961
   },
   {
    "eta": 1.49,
@@ -649,7 +649,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.6570265574333365
+   "ratio": 0.6563364421355844
   },
   {
    "eta": 1.49,
@@ -657,7 +657,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.39640405121224986
+   "ratio": 0.39598768542850704
   },
   {
    "eta": 1.49,
@@ -665,7 +665,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.4881198953848803
+   "ratio": 0.48760719334340846
   },
   {
    "eta": 1.49,
@@ -673,7 +673,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.6350515775485028
+   "ratio": 0.6343845425298293
   },
   {
    "eta": 1.9,
@@ -681,7 +681,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 1.007026244898013
+   "ratio": 0.9994231917424883
   },
   {
    "eta": 1.9,
@@ -689,7 +689,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 1.0070262115238342
+   "ratio": 0.9994231635460429
   },
   {
    "eta": 1.9,
@@ -697,7 +697,7 @@
    "distribution": null,
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 1.0070262784083779
+   "ratio": 0.9994232285077798
   },
   {
    "eta": 1.9,
@@ -705,7 +705,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.24739997281383386
+   "ratio": 0.2455321032008946
   },
   {
    "eta": 1.9,
@@ -713,7 +713,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.3849459443731519
+   "ratio": 0.3820396052536744
   },
   {
    "eta": 1.9,
@@ -721,7 +721,7 @@
    "distribution": null,
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.86692885003821
+   "ratio": 0.8603835408526255
   },
   {
    "eta": 1.9,
@@ -729,7 +729,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.960537299222056
+   "ratio": 0.9533384966647478
   },
   {
    "eta": 1.9,
@@ -737,7 +737,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9605372199254014
+   "ratio": 0.9533384262488841
   },
   {
    "eta": 1.9,
@@ -745,7 +745,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9605372212406548
+   "ratio": 0.9533384263026242
   },
   {
    "eta": 1.9,
@@ -753,7 +753,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.24723132478327728
+   "ratio": 0.2453784363231996
   },
   {
    "eta": 1.9,
@@ -761,7 +761,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.38139052237778803
+   "ratio": 0.37853216753971003
   },
   {
    "eta": 1.9,
@@ -769,7 +769,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.8339072959028645
+   "ratio": 0.8276575341768364
   },
   {
    "eta": 1.9,
@@ -777,7 +777,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9597333458385239
+   "ratio": 0.9527621185122425
   },
   {
    "eta": 1.9,
@@ -785,7 +785,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9597333296822079
+   "ratio": 0.9527621040597082
   },
   {
    "eta": 1.9,
@@ -793,7 +793,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9597332928776718
+   "ratio": 0.9527620629091783
   },
   {
    "eta": 1.9,
@@ -801,7 +801,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.24723159496525954
+   "ratio": 0.24543577499144598
   },
   {
    "eta": 1.9,
@@ -809,7 +809,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.3813307889581516
+   "ratio": 0.3785609133888598
   },
   {
    "eta": 1.9,
@@ -817,7 +817,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.8333332375573294
+   "ratio": 0.8272801421849338
   },
   {
    "eta": 1.9,
@@ -825,7 +825,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.9415560745725484
+   "ratio": 0.9361429517982602
   },
   {
    "eta": 1.9,
@@ -833,7 +833,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.9415560115047787
+   "ratio": 0.9361428953852621
   },
   {
    "eta": 1.9,
@@ -841,7 +841,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.9415560452171485
+   "ratio": 0.9361429221467334
   },
   {
    "eta": 1.9,
@@ -849,7 +849,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.24692359747656978
+   "ratio": 0.2455040033628365
   },
   {
    "eta": 1.9,
@@ -857,7 +857,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.37956726533155055
+   "ratio": 0.3773850871758509
   },
   {
    "eta": 1.9,
@@ -865,7 +865,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.820127594785639
+   "ratio": 0.8154125801544667
   },
   {
    "eta": 1.9,
@@ -873,7 +873,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.8434340422946217
+   "ratio": 0.8389246649404561
   },
   {
    "eta": 1.9,
@@ -881,7 +881,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.8434340405651287
+   "ratio": 0.8389246648855537
   },
   {
    "eta": 1.9,
@@ -889,7 +889,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.843434053306251
+   "ratio": 0.8389246795907297
   },
   {
    "eta": 1.9,
@@ -897,7 +897,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.24468227433127673
+   "ratio": 0.24337409628164297
   },
   {
    "eta": 1.9,
@@ -905,7 +905,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.36864576183698416
+   "ratio": 0.3666748185421526
   },
   {
    "eta": 1.9,
@@ -913,7 +913,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.7472002672481981
+   "ratio": 0.743205402443076
   },
   {
    "eta": 1.9,
@@ -921,7 +921,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.786019985995995
+   "ratio": 0.7848873241740414
   },
   {
    "eta": 1.9,
@@ -929,7 +929,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.7860200256139995
+   "ratio": 0.7848873660482829
   },
   {
    "eta": 1.9,
@@ -937,7 +937,7 @@
    "distribution": "beckmann",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.7860199826719801
+   "ratio": 0.7848873279528392
   },
   {
    "eta": 1.9,
@@ -945,7 +945,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.241913935628808
+   "ratio": 0.24156533754224205
   },
   {
    "eta": 1.9,
@@ -953,7 +953,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.3599364102764956
+   "ratio": 0.3594177395912467
   },
   {
    "eta": 1.9,
@@ -961,7 +961,7 @@
    "distribution": "beckmann",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.702821649412284
+   "ratio": 0.701808879387769
   },
   {
    "eta": 1.9,
@@ -969,7 +969,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.05,
-   "ratio": 0.5330112550998072
+   "ratio": 0.5330420826230173
   },
   {
    "eta": 1.9,
@@ -977,7 +977,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.5,
-   "ratio": 0.5330112343952829
+   "ratio": 0.5330420692553606
   },
   {
    "eta": 1.9,
@@ -985,7 +985,7 @@
    "distribution": "ggx",
    "nonlinear": false,
    "rho": 0.95,
-   "ratio": 0.5330112520012263
+   "ratio": 0.5330420861008702
   },
   {
    "eta": 1.9,
@@ -993,7 +993,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.05,
-   "ratio": 0.22907156604702678
+   "ratio": 0.22908481798033165
   },
   {
    "eta": 1.9,
@@ -1001,7 +1001,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.5,
-   "ratio": 0.3138437584299265
+   "ratio": 0.3138619141374016
   },
   {
    "eta": 1.9,
@@ -1009,7 +1009,7 @@
    "distribution": "ggx",
    "nonlinear": true,
    "rho": 0.95,
-   "ratio": 0.49821897386781233
+   "ratio": 0.4982477953225901
   }
  ]
 }
