@@ -10,6 +10,14 @@
 
 **Spec:** `docs/MITSUBA_IMPORT_DESIGN.md`
 
+**Status:** implemented on `feature/mitsuba-import` (2026-11-12); the code and `docs/MITSUBA_IMPORT_DESIGN.md` describe what was built. The plan is kept as written; where it says something the code does not do:
+
+- Detection: there is no `isMitsuba`; every `.xml` goes to `MitsubaImporter.load`, which fails with "is not a Mitsuba scene" when the root element is not `<scene>`. `mesh` takes the shape's index (`mesh(_:index:scene:)`), and `material` is in `Sources/MitsubaMaterials.swift`.
+- The mapping is not the converter's unchanged: the default conductor is Mitsuba 3.9.1's `none` (a perfect mirror), not `Cu`; the plastic ratio is computed to convergence and checked against the fixture within 0.1%, not 1%; v is flipped as Mitsuba's `flip_tex_coords` says (by default for `obj` only), while serialized and analytic shapes keep Mitsuba's coordinates; `serialized` reads versions 3 and 4. The design's §4 lists the other deliberate differences.
+- Task 6's acceptance (within ±0.01 of the 2026-10-21 ratios) was replaced by the user's rule of 2026-11-12: every difference measured and explained (design §2, §7).
+- Added beyond the plan: limits on hostile scene files, dielectrics with an IOR ratio below 1, the conversion of area emitters inside glass, and the area-averaged mip filter (`METALTEXTURES`) that Modern Hall's validation led to.
+- Task 8: `CHANGELOG.md` keeps the entries under Unreleased; the version is set at release.
+
 ## Global Constraints
 
 - Starts after the scene browser plan (`docs/superpowers/plans/2026-11-10-scene-browser.md`) is merged; Task 7 needs `SceneEntry`, Tasks 1–6 do not.

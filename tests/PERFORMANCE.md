@@ -37,7 +37,7 @@ Four `BITTERLI2016` scenes converted with `scripts/mitsuba_to_usd.py` (the conve
 | Water Caustic (5 mm light, water volume) | 256 spp, 62 s | 170 spp, 69 s | 128 spp, 68 s | Path tracing and light tracing leave the region seen through the water nearly black (light tracing adds the ceiling's reflected caustics); photons, gathered at up to two receivers per pixel, render the caustic web on the walls and boxes and its interreflection. At 1,024 spp (449 s, spectral photons at shared wavelengths, November 10) the mean luminance of each tenth of the image height is 0.89 to 1.10 times that of Bitterli's Tungsten EXR (0.99 on average, leaving out the top tenth, which holds the lamp). |
 | Veach Bidir Room (light in a glass egg) | 256 spp, 31 s | 205 spp, 30 s | — | Walls and ceiling visibly less grainy with light tracing. |
 | Glass of Water (large area light) | 256 spp, 35 s | 170 spp, 30 s | — | Little difference. |
-| Little Lamp | 256 spp, 21 s | 170 spp, 16 s | — | No visible difference: its bulb sphere is not converted, and its caustics are slight. |
+| Little Lamp | 256 spp, 21 s | 170 spp, 16 s | — | No visible difference: the converter skipped its emitting sphere, and its caustics are slight. |
 
 # Mitsuba 3 at equal settings — November 5, 2026
 
@@ -60,7 +60,7 @@ Apple M4, 16 GB, macOS 27. Bitterli's Mitsuba 3 versions (`BITTERLI2016`) of the
   | Ceiling (y 0–48, x 184–296) | 1.031 | 0.998 |
   | 8×8 blocks more than 10% bright | 152 of 2,919 | 9 |
 
-  At 256 spp the two plant boxes measure 0.998 and 1.004 (the app's defaults, ReSTIR PT and spectral: 0.991 and 0.975, from 1.311 and 1.196); the app's noise (2.96e-2 → 2.93e-2 by the same measure on both images) and its time (26 s) are unchanged. The fix uncovers a residual at the left window's reveal (y 120–184, x 120–136; `roughplastic` panelling): 0.967 at 2,048 spp and 0.961 at 256, where the plants' excess light had made it 1.02. It is within the rough-plastic difference recorded in `BITTERLI2016` and was not investigated further.
+  At 256 spp the two plant boxes measure 0.998 and 1.004 (the app's defaults, ReSTIR PT and spectral: 0.991 and 0.975, from 1.311 and 1.196); the app's noise (2.96e-2 → 2.93e-2 by the same measure on both images) and its time (26 s) are unchanged. The fix uncovers a residual at the left window's reveal (y 120–184, x 120–136; `roughplastic` panelling): 0.967 at 2,048 spp and 0.961 at 256, where the plants' excess light had made it 1.02. It is within the rough-plastic difference recorded in `BITTERLI2016` (2026-10-21 probes at alpha 0.1–0.3: 0.955–0.997).
 
 # Light tree — November 4, 2026
 

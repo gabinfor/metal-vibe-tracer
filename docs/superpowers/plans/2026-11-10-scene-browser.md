@@ -10,6 +10,13 @@
 
 **Spec:** `docs/SCENE_BROWSER_DESIGN.md`
 
+**Status:** implemented (2026-11-12); the code and `docs/SCENE_BROWSER_DESIGN.md` describe what was built. The plan is kept as written; where it says something the code does not do:
+
+- The browser is not the launch screen and does not open over the viewport: it lives in its own **Scenes** window (2026-11-11), which opens only on request, and the main window opens on a main menu (`MainMenuView`, `Sources/MainMenu.swift`, 2026-11-12). `StartScreenView` is gone; the window has no **Close** button (its close button or Esc closes it), and showing it neither pauses the viewport nor touches the autosave (`isBrowsingScenes` remains; there is no `closeSceneBrowser`).
+- **Credits and licenses…** is so labelled in the browser and on the main menu; the File menu item reads **Credits and Licenses…**.
+- Thumbnails: a shot's `thumbnailSamples` overrides the 256 spp cap, Cornell Fog renders a `thumbnailOnly` shot with the fog preview, and a film narrower than 16:9 keeps its horizontal field of view.
+- The catalog has a fourth collection, `.bitterli`, with the `.mitsuba` format (`docs/MITSUBA_IMPORT_DESIGN.md` §6).
+
 ## Global Constraints
 
 - Start on a branch cut after the glTF work on `feature/gltf-import` is committed. Do not commit onto `feature/gltf-import`'s uncommitted tree.
