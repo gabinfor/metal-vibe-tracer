@@ -22,7 +22,7 @@ import Synchronization
 //   version below 2 (Mitsuba 0.6)             camelCase property names take their Mitsuba 3 names
 //                                             (MitsubaImporter.legacyNames), <lookAt> is <lookat>, a texture's
 //                                             uscale and vscale become a to_uv scale, and the <srgb> values of
-//                                             the diffuse plugin are linearized into <rgb>
+//                                             a BSDF are linearized into <rgb>
 //   #rrggbb, #rgb                             an sRGB hex colour in <rgb> or <srgb> (SRGB1999 transfer
 //                                             function), read as linear RGB
 //   lookat without a usable up                an up vector parallel to the view direction, or none, is
@@ -297,7 +297,7 @@ enum MitsubaImporter {
         if let renamed = attributes["name"].flatMap({ MitsubaImporter.legacyNames[$0] }) { attributes["name"] = renamed }
         if tag == "lookAt" { tag = "lookat" }
         if tag == "texture" { children = Self.uvScale(children, folder: folder) }
-        if tag == "bsdf", attributes["type"] == "diffuse" { children = children.map(Self.linearized) }
+        if tag == "bsdf" { children = children.map(Self.linearized) }
       }
       if tag == "lookat", let origin = attributes["origin"].flatMap({ MitsubaImporter.numbers($0) }),
          origin == attributes["target"].flatMap({ MitsubaImporter.numbers($0) }) {

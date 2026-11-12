@@ -1,6 +1,8 @@
 // Mitsuba scene import (MitsubaImporter), XML layer: <default> values and $variables, global <ref> ids
 // (including a BSDF nested in another), <include>, transforms in document order, the Mitsuba 0.6 property
-// names, and detection by root element; shapes (mesh files and analytic shapes as world-space triangles).
+// names, and detection by root element; shapes (mesh files and analytic shapes as world-space triangles); the values
+// taken from Mitsuba (IORs, conductors, plastic ratios); materials (BSDFs, textures, emitters and interior media as
+// OpenPBR MaterialX documents).
 @MainActor func fixMitsubaChecks() throws {
   let folder = testOutputDirectory.appendingPathComponent("mitsuba", isDirectory: true)
   try? FileManager.default.removeItem(at: folder)
@@ -524,5 +526,134 @@
   require(clamped.isFinite && clamped > 0 && clamped == MitsubaImporter.plasticRatio(eta: 1.5, alpha: -1, ggx: true, nonlinear: false, rho: 0.5)
     && clamped == MitsubaImporter.plasticRatio(eta: 1.5, alpha: 1e-4, ggx: true, nonlinear: false, rho: 0.5), "alpha 0 and below clamp to 1e-4")
   print("PASS: Mitsuba values: named IORs and conductors, conductor Fresnel, plastic internal scattering")
+
+  // Materials: each document is compiled by the app's MaterialX compiler and its OpenPBR inputs read from the
+  // compiled program, as Fix_gltf.swift reads its imported materials.
+  let bakes = folder.appendingPathComponent("bakes", isDirectory: true)
+  try FileManager.default.createDirectory(at: bakes, withIntermediateDirectories: true)
+  var materials = try MitsubaImporter.Scene(url: try write("materials.xml", #"<scene version="3.0.0"/>"#))
+  func bsdf(_ xml: String, version: String = "3.0.0") throws -> MitsubaImporter.Node {
+    shapeCount += 1
+    return try MitsubaImporter.Scene(url: try write("bsdf\(shapeCount).xml", #"<scene version="\#(version)">\#(xml)</scene>"#)).root.children[0]
+  }
+  func document(_ node: MitsubaImporter.Node?, emission: SIMD3<Float>? = nil, interior: MitsubaImporter.Node? = nil,
+                name: String = "m", mesh: MitsubaImporter.Mesh? = nil) throws -> String {
+    try MitsubaImporter.material(bsdf: node, emission: emission, interior: interior, name: name, scene: &materials, folder: bakes, mesh: mesh)
+  }
+  func compiled(_ text: String) throws -> MaterialXProgram {
+    let result = try MaterialXImporter.read(Data(text.utf8), baseURL: bakes, source: "mitsuba")
+    guard let program = result.materials.first else { throw MaterialLibrary.error("the document does not compile: \(result.report)") }
+    return program
+  }
+  func program(_ xml: String, emission: SIMD3<Float>? = nil, interior: String? = nil, name: String = "m") throws -> MaterialXProgram {
+    try compiled(document(try bsdf(xml), emission: emission, interior: try interior.map { try bsdf($0) }, name: name))
+  }
+  // A surface input's constant (unauthored inputs read their OpenPBR default); nil when connected to a node.
+  func input(_ p: MaterialXProgram, _ name: String) -> SIMD3<Float>? {
+    p.parameters.first { $0.name.hasSuffix("/" + name) }.flatMap { $0.defaultValue }.map { SIMD3($0.x, $0.y, $0.z) }
+  }
+  func near(_ a: SIMD3<Float>?, _ b: SIMD3<Float>, _ tolerance: Float = 1e-5) -> Bool { a.map { simd_length($0 - b) < tolerance } ?? false }
+  func near(_ a: SIMD3<Float>?, _ b: Float, _ tolerance: Float = 1e-5) -> Bool { a.map { abs($0.x - b) < tolerance } ?? false }
+  func image(_ data: Data) -> CGImage? { CGImageSourceCreateWithData(data as CFData, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) } }
+  func texture(_ name: String, _ texel: (Int, Int) -> (UInt8, UInt8, UInt8), size: Int = 4) throws {
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size, bitsPerSample: 8, samplesPerPixel: 3,
+      hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 3 * size, bitsPerPixel: 24)!
+    for y in 0..<size { for x in 0..<size { let c = texel(x, y); rep.bitmapData![3 * (y * size + x)] = c.0; rep.bitmapData![3 * (y * size + x) + 1] = c.1; rep.bitmapData![3 * (y * size + x) + 2] = c.2 } }
+    try rep.representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent(name))
+  }
+
+  let diffuse = try program(#"<bsdf type="diffuse"><rgb name="reflectance" value="0.2, 0.4, 0.6"/></bsdf>"#)
+  require(near(input(diffuse, "base_color"), SIMD3(0.2, 0.4, 0.6)) && near(input(diffuse, "specular_weight"), 0), "diffuse: base_color, specular_weight 0")
+  let copper = try program("""
+    <bsdf type="roughconductor"><string name="material" value="Cu"/><float name="alpha" value="0.25"/>
+      <rgb name="specular_reflectance" value="0.5"/></bsdf>
+    """)
+  let cu = MitsubaTables.conductors["Cu"]!
+  require(near(input(copper, "base_metalness"), 1) && near(input(copper, "specular_roughness"), 0.5) && near(input(copper, "specular_weight"), 0.5)
+    && near(input(copper, "base_color"), cu.f0) && copper.specularColor.map { simd_length($0 - cu.tint) < 1e-5 } == true,
+    "roughconductor: metalness 1, roughness sqrt(alpha), specular_reflectance as specular_weight, F0 and the edge tint")
+  let waterGlass = try program(#"<bsdf type="dielectric"><string name="int_ior" value="water"/></bsdf>"#)
+  require(near(input(waterGlass, "transmission_weight"), 1) && near(input(waterGlass, "specular_ior"), 1.333 / 1.000277), "dielectric: transmission and IOR ratio")
+  let screen = try program(#"<bsdf type="dielectric"><string name="int_ior" value="water"/><rgb name="specular_transmittance" value="0"/></bsdf>"#)
+  require(near(input(screen, "base_color"), SIMD3(repeating: 0)) && near(input(screen, "transmission_weight"), 0), "dielectric without transmittance: a black reflector")
+  let pane = try program(#"<bsdf type="thindielectric"/>"#)
+  require(pane.thinWalled == true && near(input(pane, "transmission_weight"), 1), "thindielectric: thin-walled transmission")
+  let plastic = try program(#"<bsdf type="plastic"><rgb name="diffuse_reflectance" value="0.5"/><boolean name="nonlinear" value="true"/></bsdf>"#)
+  let ratio = MitsubaImporter.plasticRatio(eta: 1.49 / 1.000277, alpha: nil, ggx: false, nonlinear: true, rho: 0.5)
+  require(near(input(plastic, "base_color"), SIMD3(repeating: 0.5 * ratio)) && near(input(plastic, "specular_ior"), 1.49 / 1.000277)
+    && near(input(plastic, "specular_roughness"), 0), "plastic: base_color rho x the internal-scattering ratio")
+  let masked = try program(#"<bsdf type="mask"><float name="opacity" value="0.61"/><bsdf type="diffuse"/></bsdf>"#)
+  require(masked.opacity != nil && near(input(masked, "geometry_opacity"), 0.61) && near(input(masked, "base_color"), SIMD3(repeating: 0.5)),
+    "mask: geometry_opacity over the inner BSDF")
+  let inner = #"<bsdf type="diffuse"><rgb name="reflectance" value="0.3"/></bsdf>"#
+  let twosided = try document(bsdf("<bsdf type=\"twosided\">\(inner)</bsdf>")), single = try document(bsdf(inner))
+  require(twosided == single, "twosided: its inner BSDF's inputs")
+  let checker = try program(#"<bsdf type="diffuse"><texture type="checkerboard" name="reflectance"/></bsdf>"#)
+  let baked = try FileManager.default.contentsOfDirectory(atPath: bakes.path).filter { $0.contains("checker") }
+  require(checker.images.count == 1 && image(checker.images[0].data).map { $0.width == 256 && $0.height == 256 } == true && baked.count == 1
+    && input(checker, "base_color") == nil, "checkerboard: a 256 x 256 PNG baked into the folder")
+  let lamp = try compiled(document(nil, emission: SIMD3(repeating: 5)))
+  require(lamp.emission != nil && near(input(lamp, "emission_color").map { $0 * (input(lamp, "emission_luminance")?.x ?? 0) }, SIMD3(repeating: 5))
+    && near(input(lamp, "base_color"), SIMD3(repeating: 0)), "an emitter without a BSDF: its radiance as emission over a black surface")
+  let bare = try compiled(document(nil))
+  require(near(input(bare, "base_color"), SIMD3(repeating: 0.5)) && bare.emission == nil, "no BSDF and no emitter: grey 0.5")
+  let medium = #"<medium type="homogeneous" name="interior"><rgb name="albedo" value="0"/><rgb name="sigma_t" value="0.5, 0.2, 0.4"/></medium>"#
+  let tinted = try program(#"<bsdf type="dielectric"/>"#, interior: medium)
+  require(tinted.medium?.w == 1 && tinted.transmissionColor.map { simd_length($0 - SIMD3(0.6065, 0.8187, 0.6703)) < 1e-4 } == true,
+    "an absorbing interior: transmission_color exp(-sigma_t) at transmission_depth 1")
+  let oldMedium = #"<medium type="homogeneous" name="interior"><rgb name="sigmaS" value="0"/><rgb name="sigmaA" value="0.5, 0.2, 0.4"/></medium>"#
+  let oldTinted = try compiled(document(try bsdf(#"<bsdf type="dielectric"/>"#), interior: try bsdf(oldMedium, version: "0.6.0")))
+  require(oldTinted.transmissionColor.map { simd_length($0 - SIMD3(0.6065, 0.8187, 0.6703)) < 1e-4 } == true, "a 0.6 medium with sigma_s 0 absorbs by sigma_a")
+  let foggy = try program(#"<bsdf type="dielectric"/>"#, interior: #"<medium type="homogeneous" name="interior"><rgb name="albedo" value="0.5"/></medium>"#, name: "fog")
+  let opaque = try program(#"<bsdf type="diffuse"/>"#, interior: medium, name: "wall")
+  require(foggy.medium == nil && opaque.medium == nil && materials.report.contains { $0.hasPrefix("fog: interior medium") }
+    && materials.report.contains { $0.hasPrefix("wall: interior medium") }, "a scattering medium, or one behind an opaque BSDF, is reported and ignored")
+  let fur = try program(#"<bsdf type="hair"/>"#, name: "fur")
+  require(near(input(fur, "base_color"), SIMD3(repeating: 0.5)) && materials.report.contains { $0.contains("BSDF hair unsupported") },
+    "an unsupported BSDF: grey diffuse and a report line")
+
+  let defaultMirror = try program(#"<bsdf type="conductor"/>"#)
+  require(near(input(defaultMirror, "base_color"), SIMD3(repeating: 1)) && near(input(defaultMirror, "base_metalness"), 1) && defaultMirror.specularColor == nil,
+    "a conductor without a material: Mitsuba's default, a perfect mirror")
+  let kOnlyNode = try bsdf(#"<bsdf type="conductor"><rgb name="k" value="3.9, 2.4, 2.2"/></bsdf>"#)
+  let kOnlyProgram = try compiled(document(kOnlyNode)), kOnlyF0 = try MitsubaImporter.conductor(kOnlyNode).f0
+  require(near(input(kOnlyProgram, "base_color"), kOnlyF0) && near(input(kOnlyProgram, "base_metalness"), 1), "a k-only conductor: eta 0, as Mitsuba's")
+  let invalid = try program(#"<bsdf type="roughplastic"><float name="alpha" value="nan"/><rgb name="diffuse_reflectance" value="0.5"/></bsdf>"#, name: "glossy")
+  require(near(input(invalid, "base_color"), SIMD3(repeating: 0.5)) && materials.report.contains { $0.hasPrefix("glossy: alpha") },
+    "a non-finite alpha: reported, with the neutral plastic ratio")
+  let oldPlastic = try compiled(document(try bsdf(#"<bsdf type="plastic"><srgb name="diffuseReflectance" value="0.5, 0.5, 0.5"/></bsdf>"#, version: "0.6.0")))
+  let linear = srgbToLinear(0.5)
+  require(near(input(oldPlastic, "base_color"), SIMD3(repeating: linear * MitsubaImporter.plasticRatio(eta: 1.49 / 1.000277, alpha: nil, ggx: false, nonlinear: false, rho: linear))),
+    "a 0.6 srgb colour on a plastic is linearized")
+  _ = try program(#"<bsdf type="plastic"><srgb name="diffuse_reflectance" value="0.5, 0.5, 0.5"/></bsdf>"#, name: "v3")
+  require(materials.report.contains("v3: srgb colour on plastic is not read; default used"), "an srgb colour in a Mitsuba 3 file is reported")
+  try texture("wood.png") { x, y in (UInt8(x * 60), UInt8(y * 60), 128) }
+  let tiled = try document(bsdf("""
+    <bsdf type="diffuse"><texture type="bitmap" name="reflectance"><string name="filename" value="wood.png"/>
+      <transform name="to_uv"><scale x="2" y="3"/></transform></texture></bsdf>
+    """))
+  let tiledProgram = try compiled(tiled)
+  require(tiledProgram.images.count == 1 && tiledProgram.images[0].srgb && tiled.contains(#"type="vector2" value="2.0, 3.0""#),
+    "a textured diffuse: an sRGB image sampled at texcoord x the to_uv scale")
+  requireThrows("material 'shelf'") {
+    _ = try document(bsdf(#"<bsdf type="diffuse"><texture type="bitmap" name="reflectance"><string name="filename" value="lost.png"/></texture></bsdf>"#), name: "shelf")
+  }
+  requireThrows("lost.png") {
+    _ = try document(bsdf(#"<bsdf type="diffuse"><texture type="bitmap" name="reflectance"><string name="filename" value="lost.png"/></texture></bsdf>"#), name: "shelf")
+  }
+  let tiles = try compiled(document(bsdf("""
+    <bsdf type="roughplastic"><boolean name="nonlinear" value="true"/>
+      <texture type="bitmap" name="diffuse_reflectance"><string name="filename" value="wood.png"/></texture></bsdf>
+    """), name: "tiles"))
+  require(tiles.images.count == 1 && tiles.images[0].name.hasSuffix("-plastic.png") && materials.report.contains { $0.hasPrefix("tiles: nonlinear plastic texture baked") },
+    "a textured nonlinear plastic is baked per texel")
+  try texture("bumps.png") { x, _ in (UInt8(x * 80), UInt8(x * 80), UInt8(x * 80)) }
+  let bumpNode = try bsdf(#"<bsdf type="bumpmap"><texture type="bitmap" name="map"><string name="filename" value="bumps.png"/></texture><bsdf type="diffuse"/></bsdf>"#)
+  let bumped = try compiled(document(bumpNode, name: "bumpy", mesh: plain))
+  require(bumped.images.count == 1 && materials.report.contains { $0.hasPrefix("bumpy: bump map converted to a normal map (UV stretch 2 x 2)") },
+    "a bump map becomes a tangent-space normal map from the mesh's UV stretch")
+  _ = try compiled(document(bumpNode, name: "flat"))
+  require(materials.report.contains("flat: bump map dropped (its mesh has no UVs)"), "a bump map without a mesh's UVs is dropped and reported")
+  print("PASS: Mitsuba materials: BSDFs, textures, emitters and interior media as OpenPBR MaterialX")
 }
 try fixMitsubaChecks()

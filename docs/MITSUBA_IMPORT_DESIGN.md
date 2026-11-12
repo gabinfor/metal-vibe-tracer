@@ -20,11 +20,11 @@ Out of scope, reported on import: scattering media, `point`, `spot` and `directi
 
 ## 3. Importer structure
 
-`Sources/MitsubaImporter.swift` follows `GLTFImporter`: `MitsubaImporter.load(_:into:progress:)` builds a `USDImportSnapshot` with mesh sidecars and one OpenPBR MaterialX document per material, and `USDImporter.document` turns it into the project (`format: "Mitsuba"`). If the BSDF mapping makes the file long, it goes in `Sources/MitsubaMaterials.swift`.
+`Sources/MitsubaImporter.swift` follows `GLTFImporter`: `MitsubaImporter.load(_:into:progress:)` builds a `USDImportSnapshot` with mesh sidecars and one OpenPBR MaterialX document per material, and `USDImporter.document` turns it into the project (`format: "Mitsuba"`). The BSDF mapping is `MitsubaImporter.material` in `Sources/MitsubaMaterials.swift`, which writes the documents with `GLTFImporter.Writer` and bakes checkerboards, nonlinear plastic textures and bump normal maps into the import folder; a bump map's normal map takes its UV stretch from the first mesh using the material.
 
 - **Detection:** an `.xml` file whose root element is `<scene>`. **Open Scene File…** accepts it.
 - **XML layer:** `<default>` values and `$name` substitution; `<ref>` ids, which are global, including BSDFs nested in another BSDF; `<include>`; `<transform>` with `matrix`, `translate`, `rotate`, `scale` and `lookat`.
-- **Mitsuba 0.6:** a scene whose `version` is below 2 goes through a rename pass to Mitsuba 3 names (`toWorld`, `intIOR`, `extIOR`, `maxDepth`, `sampleCount`, `faceNormals`, and the other camelCase properties the supported plugins use). Water Caustic ships only in this form.
+- **Mitsuba 0.6:** a scene whose `version` is below 2 goes through a rename pass to Mitsuba 3 names (`toWorld`, `intIOR`, `extIOR`, `maxDepth`, `sampleCount`, `faceNormals`, and the other camelCase properties the supported plugins use), and BSDFs' `<srgb>` colours are linearized. Water Caustic ships only in this form.
 - **Camera:** the first `perspective` sensor becomes the saved view "Mitsuba: camera" and the active camera, with the vertical field of view derived from `fov`, `fov_axis` and the film size. Mitsuba's camera looks along +z with x to the left.
 - **Depth and size:** the integrator's `max_depth` sets the project's path depth and the film's size the render size. A `sppm` or other unknown integrator contributes only its depth.
 - **Report:** every unsupported plugin or property is listed once in the import report with what was used instead.
@@ -41,10 +41,10 @@ Out of scope, reported on import: scattering media, `point`, `spot` and `directi
 | `dielectric`, `roughdielectric` | `transmission_weight` 1, `specular_ior`, `transmission_color`; zero transmittance is a black reflector |
 | `thindielectric`, `principledthin` | `geometry_thin_walled`, as the converter's header documents |
 | `twosided`, `mask`, `bumpmap`, `normalmap` | The inner BSDF; `geometry_opacity`; a normal map |
-| `bitmap`, `checkerboard` | Image nodes with `to_uv` scale; a checkerboard is baked to PNG |
+| `bitmap`, `checkerboard` | Image nodes (sRGB unless `raw`) with `to_uv` scale; a checkerboard is baked to PNG; a missing file is an error |
 | `area` emitter on a shape | Emission on the shape's material; a shape with an emitter and no BSDF has a black surface |
 | `envmap`, `constant` scene emitters | The environment, with its rotation about the vertical axis |
-| `homogeneous` interior medium with zero albedo | `transmission_color` and `transmission_depth` from `sigma_t` |
+| `homogeneous` interior medium with zero albedo (0.6: `sigma_s` 0) behind a refracting BSDF | `transmission_color` exp(−`sigma_t` × `scale`) at `transmission_depth` 1; other media are reported and ignored |
 
 The mappings are those of `scripts/mitsuba_to_usd.py` as validated in `REFERENCES.md` (`MITSUBA3`, `BITTERLI2016`), with two additions: the `sphere` (Little Lamp's emitter) and the absorbing interior medium (Modern Hall's glass). `ply` and `serialized` are not used by the ten scenes and are included because other Mitsuba scenes commonly use them.
 
