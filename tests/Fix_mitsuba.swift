@@ -351,6 +351,7 @@
   requireThrows("truncated") { _ = try MitsubaImporter.mesh(try meshNode("truncated.ply"), scene: &shapeScene) }
   requireThrows("missing.obj") { _ = try MitsubaImporter.mesh(try meshNode("missing.obj"), scene: &shapeScene) }
   requireThrows("shape 'wall'") { _ = try MitsubaImporter.mesh(try meshNode("missing.obj", id: "wall"), scene: &shapeScene) }
+  requireThrows("shape 'obj'") { _ = try MitsubaImporter.mesh(try meshNode("missing.obj", id: ""), scene: &shapeScene) }
   requireThrows("shape 'floor'") { _ = try MitsubaImporter.mesh(try meshNode("bad.obj", id: "floor"), scene: &shapeScene) }
   requireThrows("shape 'ply'") { _ = try MitsubaImporter.mesh(try meshNode("truncated.ply"), scene: &shapeScene) }
   let hair = try shapeNode(#"<shape type="hair"/>"#)
@@ -369,7 +370,7 @@
     try (Data(edit(String(decoding: binaryPLY[..<headerEnd], as: UTF8.self)).utf8) + Data(bytes)).write(to: folder.appendingPathComponent(name))
   }
   try ply("many-vertices.ply", header: { $0.replacingOccurrences(of: "element vertex 3", with: "element vertex 1000") })
-  fails("truncated", "many-vertices.ply")
+  fails("declares more vertices than the file holds", "many-vertices.ply")
   try ply("many-faces.ply", header: { $0.replacingOccurrences(of: "element face 1", with: "element face 5") })
   fails("truncated", "many-faces.ply")
   try ply("unknown-type.ply", header: { $0.replacingOccurrences(of: "property float x", with: "property floot x") })
@@ -401,7 +402,8 @@
   require(lf.positions == crlf.positions && lf.uvs == crlf.uvs && lf.triangles == crlf.triangles && lf.normals == crlf.normals,
     "CRLF line endings, tabs and trailing comments read as the same mesh")
   _ = try write("zero-normal.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 0\nf 1//1 2//1 3//1\n")
-  let zeroNormal = try MitsubaImporter.mesh(try meshNode("zero-normal.obj"), scene: &shapeScene)!
+  let zeroNormal = try MitsubaImporter.mesh(try meshNode("zero-normal.obj", id: "zn"), scene: &shapeScene)!
+  require(shapeScene.report.contains("shape 'zn': invalid normals in zero-normal.obj; smooth normals computed"), "dropped normals are reported")
   require(zeroNormal.normals?.allSatisfy { simd_length($0 - SIMD3(0, 0, 1)) < 1e-6 } == true, "a zero vn gives computed smooth normals")
 
   // Serialized files built here: a stored (uncompressed) DEFLATE block in a zlib stream.
@@ -409,8 +411,8 @@
   func zlib(_ body: [UInt8]) -> [UInt8] {
     [0x78, 0x01, 0x01] + bytes(UInt16(body.count)) + bytes(~UInt16(body.count)) + body + [0, 0, 0, 0]
   }
-  func serialized(vertices: UInt64, faces: UInt64, payload: [UInt8], version: UInt16 = 4) -> [UInt8] {
-    bytes(UInt16(0x041C)) + bytes(version) + zlib(bytes(UInt32(0x1000)) + Array("m\0".utf8) + bytes(vertices) + bytes(faces) + payload)
+  func serialized(vertices: UInt64, faces: UInt64, payload: [UInt8], version: UInt16 = 4, flags: UInt32 = 0x1000) -> [UInt8] {
+    bytes(UInt16(0x041C)) + bytes(version) + zlib(bytes(flags) + Array("m\0".utf8) + bytes(vertices) + bytes(faces) + payload)
   }
   let positions = [Float](arrayLiteral: 0, 0, 0, 1, 0, 0, 0, 1, 0).flatMap { bytes($0.bitPattern) }
   let triangle = positions + bytes(UInt32(0)) + bytes(UInt32(1)) + bytes(UInt32(2))
@@ -429,6 +431,21 @@
   try serializedFails("version 5", "version5.serialized", serialized(vertices: 3, faces: 1, payload: triangle, version: 5))
   try serializedFails("compressed mesh data", "cut.serialized", Array(good.prefix(30)))
   try serializedFails("compressed mesh data", "not-zlib.serialized", Array(good.prefix(4)) + [0xFF, 0xFF, 1, 2, 3])
+  // PLY counts that the file cannot hold are rejected before anything is reserved.
+  for (kind, header, body) in [
+    ("vertices", "ply\nformat binary_little_endian 1.0\nelement vertex 4611686018427387904\nproperty float x\nproperty float y\nproperty float z\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n", [UInt8](repeating: 0, count: 20)),
+    ("vertices", "ply\nformat ascii 1.0\nelement vertex 4611686018427387904\nproperty float x\nproperty float y\nproperty float z\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n", [UInt8]()),
+    ("faces", "ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nelement face 4611686018427387904\nproperty list uchar int vertex_indices\nend_header\n", [UInt8](repeating: 0, count: 20)),
+  ] {
+    try (Data(header.utf8) + Data(body)).write(to: folder.appendingPathComponent("huge-\(kind).ply"))
+    fails("declares more \(kind) than the file holds", "huge-\(kind).ply")
+  }
+
+  // A serialized sub-mesh is bounded by its own compressed bytes, not by the rest of the file.
+  let firstMesh = serialized(vertices: 1, faces: 1_000_000, payload: [UInt8](repeating: 0, count: 12))
+  let secondMesh = Array(firstMesh.prefix(4)) + zlib([UInt8](repeating: 0, count: 60000))
+  try serializedFails("compressed size can hold", "two-meshes.serialized", firstMesh + secondMesh + bytes(UInt64(0)) + bytes(UInt64(firstMesh.count)) + bytes(UInt32(2)))
+  try serializedFails("memory budget", "budget.serialized", serialized(vertices: 3_000_000_000, faces: 1000, payload: triangle, flags: 0x2000 | 0x1 | 0x2))
   // An offset table pointing outside the file or near the end of the integer range.
   let fixture = Array(try Data(contentsOf: fixtures.appendingPathComponent("tri.serialized")))
   for (name, offset) in [("outside", UInt64(0xFFFF)), ("max", UInt64.max), ("int-max", UInt64(Int.max) - 3), ("end", UInt64(fixture.count - 4))] {

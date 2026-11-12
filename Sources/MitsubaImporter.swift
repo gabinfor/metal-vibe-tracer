@@ -430,10 +430,13 @@ extension MitsubaImporter {
     switch type {
     case "obj", "ply", "serialized":
       let faceNormals = shape.bool("face_normals") ?? false
+      let label = shape.id.flatMap { $0.isEmpty ? nil : $0 } ?? type
+      var fileName = ""
       let local: Mesh
       do {
         guard let url = shape.url("filename") else { throw ReadError("the shape has no filename") }
         let name = url.lastPathComponent
+        fileName = name
         let data: Data
         do { data = try Data(contentsOf: url, options: .alwaysMapped) } catch {
           throw ReadError("cannot read \(name): \(error.localizedDescription)")
@@ -457,11 +460,15 @@ extension MitsubaImporter {
           }
         }
       } catch let failure as ReadError {
-        throw error("shape '\(shape.id ?? type)': \(failure.message)")
+        throw error("shape '\(label)': \(failure.message)")
       }
-      return world(local, toWorld, smoothNormals: !faceNormals)
+      var invalidNormals = false
+      let placed = world(local, toWorld, smoothNormals: !faceNormals, invalidNormals: &invalidNormals)
+      if invalidNormals { scene.note("shape '\(label)': invalid normals in \(fileName); smooth normals computed") }
+      return placed
     case "rectangle", "disk", "cube", "sphere":
-      var mesh = world(unitShape(type, shape), toWorld, smoothNormals: false)
+      var unused = false
+      var mesh = world(unitShape(type, shape), toWorld, smoothNormals: false, invalidNormals: &unused)
       if determinant < 0 { mesh.triangles = mesh.triangles.map { SIMD3($0.x, $0.z, $0.y) } }
       return mesh
     default:
@@ -474,7 +481,8 @@ extension MitsubaImporter {
 
   // The mesh in world space. A mesh without usable normals gets smooth ones when asked; one with them has them
   // transformed by the inverse transpose of the matrix's 3 x 3 and renormalized.
-  fileprivate static func world(_ local: Mesh, _ matrix: simd_float4x4, smoothNormals: Bool) -> Mesh {
+  // `invalidNormals` is set when the file's normals were dropped for a zero or non-finite one.
+  fileprivate static func world(_ local: Mesh, _ matrix: simd_float4x4, smoothNormals: Bool, invalidNormals: inout Bool) -> Mesh {
     var mesh = local
     mesh.positions = local.positions.map { (matrix * SIMD4($0, 1)).xyz }
     mesh.normals = nil
@@ -487,7 +495,7 @@ extension MitsubaImporter {
       }
       // One zero or non-finite normal (a zero vn, a near-singular to_world) drops them all, and smooth normals
       // are computed instead.
-      if transformed.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) { mesh.normals = transformed }
+      if transformed.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) { mesh.normals = transformed } else { invalidNormals = true }
     }
     if mesh.normals == nil, smoothNormals {
       mesh.normals = vertexNormals(mesh.positions, mesh.triangles)
@@ -926,7 +934,14 @@ extension MitsubaImporter {
     var triangles: [SIMD3<UInt32>] = []
     var hasNormals = false, hasUVs = false, maxIndex = -1
     for element in elements {
-      guard element.count <= bytes.count else { throw reader.truncated() }
+      // The declared count must fit the importer's limits and the bytes left in the file, before anything is
+      // reserved: a binary element takes at least its properties' sizes (a list its length's), an ASCII value
+      // at least two bytes (a digit and a separator).
+      let limit = element.name == "face" ? SceneLimits.triangles : 3 * SceneLimits.triangles
+      let minimum = ascii ? 2 * element.properties.count : element.properties.reduce(0) { $0 + ($1.count ?? $1.type).size }
+      guard element.count <= limit, element.count * minimum <= bytes.count - reader.cursor + (ascii ? 1 : 0) else {
+        throw failure("the PLY declares more \(element.name == "vertex" ? "vertices" : element.name == "face" ? "faces" : element.name + " elements") than the file holds")
+      }
       if element.name == "vertex" {
         // Property index -> slot of (x y z nx ny nz u v).
         let names = element.properties.map(\.name)
@@ -980,6 +995,10 @@ extension MitsubaImporter {
 
   // MARK: Serialized
 
+  // The most a serialized sub-mesh may declare: a quarter of this Mac's memory. (The renderer's own mesh budget,
+  // `MaterialLibrary.meshBudget`'s GPU working-set figure, needs a Metal device, which the importer has not.)
+  fileprivate static let serializedBudget = ProcessInfo.processInfo.physicalMemory / 4
+
   // A sub-mesh's header inside its decompressed stream, and the exact size of the stream it declares.
   fileprivate struct SerializedHeader {
     let flags: Int
@@ -1013,6 +1032,9 @@ extension MitsubaImporter {
     let width = flags & 0x2000 != 0 ? 8 : 4
     let components = 3 + (flags & 0x1 != 0 ? 3 : 0) + (flags & 0x2 != 0 ? 2 : 0) + (flags & 0x8 != 0 ? 3 : 0)
     let size = cursor + 16 + width * vertexCount * components + 12 * faceCount
+    guard UInt64(size) <= serializedBudget else {
+      throw ReadError("\(name): the serialized sub-mesh declares \(size >> 20) MiB of data, over the memory budget")
+    }
     guard size <= 1032 * compressed + 1024 else {
       throw ReadError("\(name): the serialized sub-mesh declares more data than its compressed size can hold")
     }
@@ -1082,7 +1104,22 @@ extension MitsubaImporter {
         : try integer(UInt32.self, in: raw, at: raw.count - 4 * (count - index + 1))
       guard start >= 0, start < raw.count - 4 else { throw failure("the serialized offset table is damaged") }
     }
-    let input = UnsafeRawBufferPointer(rebasing: raw[(start + 4)...])
+    // The sub-mesh's compressed bytes end where the next one starts, or at the offset table. A file whose table
+    // cannot be read this way (the first sub-mesh does not need it) extends to the end of the file.
+    var end = raw.count
+    if let count = try? integer(UInt32.self, in: raw, at: raw.count - 4), index < count {
+      let entry = version == 4 ? 8 : 4
+      let tableStart = raw.count - 4 - entry * count
+      var next: Int? = tableStart
+      if index + 1 < count {
+        let at = tableStart + entry * (index + 1)
+        next = try? (version == 4 ? integer(UInt64.self, in: raw, at: at) : integer(UInt32.self, in: raw, at: at))
+      }
+      if let next, next > start + 4, next <= raw.count { end = next } else if index != 0 { throw failure("the serialized offset table is damaged") }
+    } else if index != 0 {
+      throw failure("the serialized offset table is damaged")
+    }
+    let input = UnsafeRawBufferPointer(rebasing: raw[(start + 4)..<end])
     var header: SerializedHeader?
     let body = try inflate(input, name: name) { prefix in
       header = try serializedHeader(prefix, version: version, compressed: input.count - 2, name: name)
