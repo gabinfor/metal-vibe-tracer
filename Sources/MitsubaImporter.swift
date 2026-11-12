@@ -1,7 +1,7 @@
 import Cocoa
 import simd
 
-// REFERENCES.md: MITSUBA3, BITTERLI2016, OPENPBR, MATERIALX. Mitsuba scene files (.xml whose root element is
+// REFERENCES.md: MITSUBA3, BITTERLI2016, OPENPBR, MATERIALX, SRGB1999. Mitsuba scene files (.xml whose root element is
 // <scene>) open like OpenUSD stages. This layer reads and resolves the XML into a tree of Nodes; later
 // stages map the shapes, BSDFs and sensor onto the project. The XML layer's rules:
 //   <default name value>                      a $name variable, substituted in every attribute value, also
@@ -21,11 +21,29 @@ import simd
 //                                             (MitsubaImporter.legacyNames), <lookAt> is <lookat>, a texture's
 //                                             uscale and vscale become a to_uv scale, and the <srgb> values of
 //                                             the diffuse plugin are linearized into <rgb>
+//   #rrggbb, #rgb                             an sRGB hex colour in <rgb> or <srgb> (SRGB1999 transfer
+//                                             function), read as linear RGB
+//   lookat without a usable up                an up vector parallel to the view direction, or none, is
+//                                             replaced by the world axis least aligned with it (y when tied)
 // A missing version counts as Mitsuba 3.
 enum MitsubaImporter {
+  // Reads only up to the first element, so a large file is not parsed whole.
   static func isMitsuba(_ url: URL) -> Bool {
-    guard url.pathExtension.lowercased() == "xml", let document = try? XMLDocument(contentsOf: url, options: []) else { return false }
-    return document.rootElement()?.name == "scene"
+    guard url.pathExtension.lowercased() == "xml", let parser = XMLParser(contentsOf: url) else { return false }
+    let finder = RootFinder()
+    parser.delegate = finder
+    parser.shouldResolveExternalEntities = false
+    parser.parse()
+    return finder.root == "scene"
+  }
+
+  private final class RootFinder: NSObject, XMLParserDelegate {
+    var root: String?
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName: String?, attributes: [String: String]) {
+      root = elementName
+      parser.abortParsing()
+    }
   }
 
   static func error(_ message: String) -> Error { MaterialLibrary.error("Mitsuba: " + message) }
@@ -48,6 +66,8 @@ enum MitsubaImporter {
     let id: String?
     let attributes: [String: String]
     let children: [Node]
+    // The folder of the file this element was read from (an included file's own folder), for relative paths.
+    let folder: URL
 
     // The child with this name attribute, or else an unnamed child with this tag (a shape's BSDF is
     // `child("bsdf")`, whether nested or referenced).
@@ -56,15 +76,19 @@ enum MitsubaImporter {
     }
     func float(_ name: String) -> Float? {
       guard let node = child(name), node.tag == "float" || node.tag == "integer" else { return nil }
-      return node.attributes["value"].flatMap { Float($0) }
+      return node.attributes["value"].flatMap { MitsubaImporter.number($0) }
     }
     func string(_ name: String) -> String? {
       guard let node = child(name), node.tag == "string" else { return nil }
       return node.attributes["value"]
     }
+    // A string property as a file URL: relative paths start at the folder of the file that holds this element.
+    func url(_ name: String) -> URL? {
+      string(name).map { URL(fileURLWithPath: $0, relativeTo: folder).standardizedFileURL }
+    }
     func bool(_ name: String) -> Bool? {
       guard let node = child(name), node.tag == "boolean" else { return nil }
-      switch node.attributes["value"]?.lowercased() {
+      switch node.attributes["value"]?.trimmingCharacters(in: .whitespaces).lowercased() {
       case "true": return true
       case "false": return false
       default: return nil
@@ -75,11 +99,12 @@ enum MitsubaImporter {
       guard let node = child(name), let text = node.attributes["value"] else { return nil }
       switch node.tag {
       case "rgb", "spectrum":
+        if let linear = MitsubaImporter.hexColor(text) { return SIMD3(linear[0], linear[1], linear[2]) }
         guard let values = MitsubaImporter.numbers(text) else { return nil }
         if values.count == 1 { return SIMD3(repeating: values[0]) }
         return values.count == 3 ? SIMD3(values[0], values[1], values[2]) : nil
       case "float":
-        return Float(text).map { SIMD3(repeating: $0) }
+        return MitsubaImporter.number(text).map { SIMD3(repeating: $0) }
       default:
         return nil
       }
@@ -101,8 +126,9 @@ enum MitsubaImporter {
       }
       func axes(_ fallback: Float) -> SIMD3<Float> {
         if let v = attributes["value"].flatMap({ MitsubaImporter.numbers($0) }), v.count == 3 { return SIMD3(v[0], v[1], v[2]) }
-        return SIMD3(attributes["x"].flatMap { Float($0) } ?? fallback, attributes["y"].flatMap { Float($0) } ?? fallback,
-                     attributes["z"].flatMap { Float($0) } ?? fallback)
+        return SIMD3(attributes["x"].flatMap { MitsubaImporter.number($0) } ?? fallback,
+                     attributes["y"].flatMap { MitsubaImporter.number($0) } ?? fallback,
+                     attributes["z"].flatMap { MitsubaImporter.number($0) } ?? fallback)
       }
       switch tag {
       case "matrix":
@@ -127,12 +153,18 @@ enum MitsubaImporter {
         return simd_float4x4(diagonal: SIMD4(s, 1))
       case "rotate":
         let axis = attributes["value"] != nil ? (vector("value", 0) ?? .zero) : axes(0)
-        let angle = (attributes["angle"].flatMap { Float($0) } ?? 0) * .pi / 180
+        let angle = (attributes["angle"].flatMap { MitsubaImporter.number($0) } ?? 0) * .pi / 180
         guard simd_length(axis) > 0 else { return matrix_identity_float4x4 }
         return simd_float4x4(simd_quatf(angle: angle, axis: simd_normalize(axis)))
       case "lookat":
-        guard let origin = vector("origin", 0), let target = vector("target", 0), let up = vector("up", 0) else { return matrix_identity_float4x4 }
+        guard let origin = vector("origin", 0), let target = vector("target", 0), let given = vector("up", 0) else { return matrix_identity_float4x4 }
         let direction = simd_normalize(target - origin)
+        var up = given
+        if simd_length(simd_cross(up, direction)) < 1e-6 * max(simd_length(up), 1) {
+          // No usable up: take the world axis least aligned with the direction (y when tied).
+          let a = simd_abs(direction)
+          up = a.y <= a.x && a.y <= a.z ? SIMD3(0, 1, 0) : (a.x <= a.z ? SIMD3(1, 0, 0) : SIMD3(0, 0, 1))
+        }
         let left = simd_normalize(simd_cross(up, direction))
         let newUp = simd_cross(direction, left)
         return simd_float4x4(columns: (SIMD4(left, 0), SIMD4(newUp, 0), SIMD4(direction, 0), SIMD4(origin, 1)))
@@ -169,11 +201,33 @@ enum MitsubaImporter {
     }
   }
 
+  // A number with surrounding whitespace allowed.
+  fileprivate static func number(_ text: String) -> Float? {
+    Float(text.trimmingCharacters(in: .whitespacesAndNewlines))
+  }
+
+  // A list separated by commas, whitespace or both.
   fileprivate static func numbers(_ text: String) -> [Float]? {
     let parts = text.split(whereSeparator: { $0 == "," || $0.isWhitespace })
     let values = parts.compactMap { Float($0) }
     return values.count == parts.count && !values.isEmpty ? values : nil
   }
+
+  // "#rrggbb" or "#rgb" as gamma-encoded components in 0...1; nil for anything else.
+  fileprivate static func hexComponents(_ text: String) -> [Float]? {
+    let digits = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard digits.hasPrefix("#"), digits.count == 4 || digits.count == 7, let hex = Int(digits.dropFirst(), radix: 16) else { return nil }
+    if digits.count == 4 { return [Float((hex >> 8) & 15) / 15, Float((hex >> 4) & 15) / 15, Float(hex & 15) / 15] }
+    return [Float((hex >> 16) & 255) / 255, Float((hex >> 8) & 255) / 255, Float(hex & 255) / 255]
+  }
+
+  // The sRGB electro-optical transfer function (SRGB1999) per component.
+  fileprivate static func linearized(_ encoded: [Float]) -> [Float] {
+    encoded.map { $0 <= 0.04045 ? $0 / 12.92 : powf(($0 + 0.055) / 1.055, 2.4) }
+  }
+
+  // A hex colour decoded from sRGB to linear RGB.
+  fileprivate static func hexColor(_ text: String) -> [Float]? { hexComponents(text).map(linearized) }
 
   // The tree in one pass: variables, includes and renames applied in document order, with every element that
   // carries an id recorded, then a second pass replaces <ref> nodes (an id may be defined after its use).
@@ -186,7 +240,7 @@ enum MitsubaImporter {
     var resolving: Set<String> = []
 
     static func document(_ url: URL) throws -> XMLDocument {
-      do { return try XMLDocument(contentsOf: url, options: []) } catch {
+      do { return try XMLDocument(contentsOf: url, options: [.nodeLoadExternalEntitiesNever]) } catch {
         throw MitsubaImporter.error("cannot read \(url.lastPathComponent): \(error.localizedDescription)")
       }
     }
@@ -229,8 +283,10 @@ enum MitsubaImporter {
         guard !includeStack.contains(url) else { throw MitsubaImporter.error("include cycle at '\(filename)'") }
         includeStack.append(url)
         defer { includeStack.removeLast() }
-        let included = try Loader.document(url).rootElement()
-        return try nodes(included?.children, folder: url.deletingLastPathComponent())
+        guard let included = try Loader.document(url).rootElement(), included.name == "scene" else {
+          throw MitsubaImporter.error("included file \(url.lastPathComponent) is not a Mitsuba scene")
+        }
+        return try nodes(included.children, folder: url.deletingLastPathComponent())
       default:
         break
       }
@@ -238,12 +294,19 @@ enum MitsubaImporter {
       if legacy {
         if let renamed = attributes["name"].flatMap({ MitsubaImporter.legacyNames[$0] }) { attributes["name"] = renamed }
         if tag == "lookAt" { tag = "lookat" }
-        if tag == "texture" { children = Self.uvScale(children) }
+        if tag == "texture" { children = Self.uvScale(children, folder: folder) }
         if tag == "bsdf", attributes["type"] == "diffuse" { children = children.map(Self.linearized) }
       }
+      if tag == "lookat", let origin = attributes["origin"].flatMap({ MitsubaImporter.numbers($0) }),
+         origin == attributes["target"].flatMap({ MitsubaImporter.numbers($0) }) {
+        throw MitsubaImporter.error("lookat needs distinct origin and target")
+      }
       let node = Node(tag: tag, type: attributes["type"], name: attributes["name"], id: attributes["id"],
-                      attributes: attributes, children: children)
-      if let id = node.id, tag != "ref", definitions[id] == nil { definitions[id] = node }
+                      attributes: attributes, children: children, folder: folder)
+      if let id = node.id, tag != "ref" {
+        guard definitions[id] == nil else { throw MitsubaImporter.error("duplicate id '\(id)'") }
+        definitions[id] = node
+      }
       return [node]
     }
 
@@ -254,39 +317,33 @@ enum MitsubaImporter {
     }
 
     // Mitsuba 0.6's uscale and vscale on a texture are a scale of its uv transform.
-    static func uvScale(_ children: [Node]) -> [Node] {
+    static func uvScale(_ children: [Node], folder: URL) -> [Node] {
       func scale(_ name: String) -> Float? {
-        children.first { $0.name == name && $0.tag == "float" }?.attributes["value"].flatMap { Float($0) }
+        children.first { $0.name == name && $0.tag == "float" }?.attributes["value"].flatMap { MitsubaImporter.number($0) }
       }
       let u = scale("uscale"), v = scale("vscale")
       guard u != nil || v != nil else { return children }
       let step = Node(tag: "scale", type: nil, name: nil, id: nil,
-                      attributes: ["x": "\(u ?? 1)", "y": "\(v ?? 1)", "z": "1"], children: [])
+                      attributes: ["x": "\(u ?? 1)", "y": "\(v ?? 1)", "z": "1"], children: [], folder: folder)
       var rest = children.filter { $0.name != "uscale" && $0.name != "vscale" }
       if let index = rest.firstIndex(where: { $0.tag == "transform" && $0.name == "to_uv" }) {
         let existing = rest[index]
         rest[index] = Node(tag: existing.tag, type: existing.type, name: existing.name, id: existing.id,
-                           attributes: existing.attributes, children: existing.children + [step])
+                           attributes: existing.attributes, children: existing.children + [step], folder: existing.folder)
       } else {
-        rest.append(Node(tag: "transform", type: nil, name: "to_uv", id: nil, attributes: ["name": "to_uv"], children: [step]))
+        rest.append(Node(tag: "transform", type: nil, name: "to_uv", id: nil, attributes: ["name": "to_uv"], children: [step], folder: folder))
       }
       return rest
     }
 
-    // Mitsuba 0.6's <srgb> is gamma encoded ("#rrggbb" or floats); the result is a linear <rgb>.
+    // Mitsuba 0.6's <srgb> is gamma encoded ("#rrggbb", "#rgb" or floats); the result is a linear <rgb>.
     static func linearized(_ node: Node) -> Node {
-      guard node.tag == "srgb", let text = node.attributes["value"] else { return node }
-      var values: [Float]?
-      if text.hasPrefix("#"), text.count == 7, let hex = Int(text.dropFirst(), radix: 16) {
-        values = [Float((hex >> 16) & 255) / 255, Float((hex >> 8) & 255) / 255, Float(hex & 255) / 255]
-      } else {
-        values = MitsubaImporter.numbers(text)
-      }
-      guard let encoded = values else { return node }
-      let linear = encoded.map { $0 <= 0.04045 ? $0 / 12.92 : powf(($0 + 0.055) / 1.055, 2.4) }
+      guard node.tag == "srgb", let text = node.attributes["value"],
+            let encoded = MitsubaImporter.hexComponents(text) ?? MitsubaImporter.numbers(text) else { return node }
       var attributes = node.attributes
-      attributes["value"] = linear.map { "\($0)" }.joined(separator: ", ")
-      return Node(tag: "rgb", type: node.type, name: node.name, id: node.id, attributes: attributes, children: node.children)
+      attributes["value"] = MitsubaImporter.linearized(encoded).map { "\($0)" }.joined(separator: ", ")
+      return Node(tag: "rgb", type: node.type, name: node.name, id: node.id, attributes: attributes,
+                  children: node.children, folder: node.folder)
     }
 
     // The node with every <ref> below it replaced by the resolved node it names.
@@ -298,11 +355,11 @@ enum MitsubaImporter {
         let target = try resolvedDefinition(id)
         var attributes = target.attributes
         attributes["name"] = node.name
-        return Node(tag: target.tag, type: target.type, name: node.name, id: target.id, attributes: attributes, children: target.children)
+        return Node(tag: target.tag, type: target.type, name: node.name, id: target.id, attributes: attributes, children: target.children, folder: target.folder)
       }
       var children: [Node] = []
       for child in node.children { children.append(try resolved(child)) }
-      return Node(tag: node.tag, type: node.type, name: node.name, id: node.id, attributes: node.attributes, children: children)
+      return Node(tag: node.tag, type: node.type, name: node.name, id: node.id, attributes: node.attributes, children: children, folder: node.folder)
     }
 
     mutating func resolvedDefinition(_ id: String) throws -> Node {

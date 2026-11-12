@@ -141,6 +141,86 @@
   let selfRef = try write("selfref.xml", #"<scene version="3.0.0"><bsdf type="twosided" id="a"><ref id="a"/></bsdf></scene>"#)
   requireThrows("reference cycle") { _ = try MitsubaImporter.Scene(url: selfRef) }
   requireThrows("Mitsuba:") { _ = try MitsubaImporter.Scene(url: folder.appendingPathComponent("nothing.xml")) }
-  print("PASS: Mitsuba XML layer: defaults, variables, references, includes, transforms, 0.6 names")
+
+  // Review fixes: degenerate lookat, hex colours, hostile files, include roots, duplicate ids, source folders,
+  // number parsing and the remaining variable forms.
+  func isFinite(_ m: simd_float4x4) -> Bool { (0..<4).allSatisfy { c in (0..<4).allSatisfy { m[c][$0].isFinite } } }
+  let looks = try MitsubaImporter.Scene(url: try write("lookat.xml", """
+    <scene version="3.0.0">
+      <sensor type="perspective"><transform name="to_world"><lookat origin="0, 0, 0" target="0, 1, 0"/></transform></sensor>
+      <sensor type="perspective"><transform name="to_world"><lookat origin="1 2 3" target="1 2 8" up="0 0 2"/></transform></sensor>
+      <sensor type="perspective"><transform name="to_world"><lookat origin="0, 0, 0" target="0, 0, 1" up="0, 1, 0"/></transform></sensor>
+    </scene>
+    """))
+  let sensors = looks.root.children
+  let noUp = sensors[0].transform("to_world"), parallelUp = sensors[1].transform("to_world")
+  require(isFinite(noUp) && isFinite(parallelUp), "lookat without an up, or with an up parallel to the direction, is finite")
+  require(noUp * SIMD4(0, 0, 1, 0) == SIMD4(0, 1, 0, 0) && abs(simd_dot(noUp.columns.0, noUp.columns.1)) < 1e-6,
+    "the replaced up keeps the view direction and an orthogonal frame")
+  require(parallelUp * SIMD4(0, 0, 0, 1) == SIMD4(1, 2, 3, 1) && parallelUp * SIMD4(0, 0, 1, 0) == SIMD4(0, 0, 1, 0), "parallel up keeps origin and direction")
+  requireThrows("lookat needs distinct origin and target") {
+    _ = try MitsubaImporter.Scene(url: try write("lookat-same.xml", #"<scene version="3.0.0"><sensor type="perspective"><transform name="to_world"><lookat origin="1, 2, 3" target="1 2 3" up="0 1 0"/></transform></sensor></scene>"#))
+  }
+
+  let colours = try MitsubaImporter.Scene(url: try write("hex.xml", """
+    <scene version="3.0.0">
+      <bsdf type="diffuse" id="long"><rgb name="reflectance" value="#6d7185"/></bsdf>
+      <bsdf type="diffuse" id="short"><rgb name="reflectance" value="#f80"/></bsdf>
+      <bsdf type="diffuse" id="bad"><rgb name="reflectance" value="#12"/></bsdf>
+      <bsdf type="diffuse" id="spaced"><rgb name="reflectance" value=" 0.5 , 0.25  0.125 "/></bsdf>
+    </scene>
+    """))
+  func colour(_ id: String) -> SIMD3<Float>? { colours.root.children.first { $0.id == id }?.rgb("reflectance") }
+  func srgbToLinear(_ v: Float) -> Float { v <= 0.04045 ? v / 12.92 : powf((v + 0.055) / 1.055, 2.4) }
+  let long = colour("long") ?? .zero, short = colour("short") ?? .zero
+  require(simd_length(long - SIMD3(srgbToLinear(0x6d / 255), srgbToLinear(0x71 / 255), srgbToLinear(0x85 / 255))) < 1e-6, "#rrggbb is sRGB decoded")
+  require(simd_length(short - SIMD3(1, srgbToLinear(8 / 15), 0)) < 1e-6, "#rgb is sRGB decoded")
+  require(colour("bad") == nil && colour("spaced") == SIMD3(0.5, 0.25, 0.125), "a bad hex colour is nil; commas and spaces mix")
+  let hexOld = try MitsubaImporter.Scene(url: try write("hex06.xml", ##"<scene version="0.6.0"><bsdf type="diffuse" id="d"><srgb name="reflectance" value="#f80"/></bsdf></scene>"##))
+  require(hexOld.root.children[0].rgb("reflectance").map { simd_length($0 - short) < 1e-6 } == true, "a 0.6 srgb accepts #rgb")
+
+  let outer = try write("outer.xml", """
+    <scene version="3.0.0">
+      <include filename="sub/inc.xml"/>
+      <shape type="obj"><string name="filename" value="own.obj"/></shape>
+    </scene>
+    """)
+  try FileManager.default.createDirectory(at: folder.appendingPathComponent("sub"), withIntermediateDirectories: true)
+  _ = try write("sub/inc.xml", #"<scene version="3.0.0"><shape type="obj"><string name="filename" value="meshes/part.obj"/></shape></scene>"#)
+  let nested = try MitsubaImporter.Scene(url: outer)
+  require(nested.root.children[0].url("filename")?.standardizedFileURL == folder.appendingPathComponent("sub/meshes/part.obj").standardizedFileURL
+    && nested.root.children[1].url("filename")?.standardizedFileURL == folder.appendingPathComponent("own.obj").standardizedFileURL
+    && nested.root.children[1].url("missing") == nil, "url resolves against the folder of the file the element came from")
+
+  requireThrows("is not a Mitsuba scene") {
+    _ = try MitsubaImporter.Scene(url: try write("inc-bad.xml", #"<scene version="3.0.0"><include filename="other.xml"/></scene>"#))
+  }
+  requireThrows("duplicate id 'a'") {
+    _ = try MitsubaImporter.Scene(url: try write("dup-top.xml", #"<scene version="3.0.0"><bsdf type="diffuse" id="a"/><bsdf type="plastic" id="a"/></scene>"#))
+  }
+  requireThrows("duplicate id 'n'") {
+    _ = try MitsubaImporter.Scene(url: try write("dup-nested.xml", #"<scene version="3.0.0"><bsdf type="diffuse" id="n"/><bsdf type="twosided"><bsdf type="plastic" id="n"/></bsdf></scene>"#))
+  }
+  requireThrows("cannot read") {
+    _ = try MitsubaImporter.Scene(url: try write("malformed.xml", "<scene version=\"3.0.0\"><bsdf></scene>"))
+  }
+  requireThrows("cannot read") {
+    _ = try MitsubaImporter.Scene(url: try write("entity.xml", #"<!DOCTYPE scene [<!ENTITY x SYSTEM "file:///etc/hosts">]><scene version="3.0.0"><string name="s" value="&x;"/></scene>"#))
+  }
+
+  let misc = try MitsubaImporter.Scene(url: try write("misc.xml", """
+    <scene version="3.0.0">
+      <default name="res" value="32"/><default name="resx" value="48"/><default name="res" value="99"/>
+      <default name="kind" value="diffuse"/>
+      <bsdf type="$kind" id="b"><integer name="spaced" value=" 7 "/><boolean name="yes" value="true"/><boolean name="no" value=" False "/>
+        <float name="w" value="$resx"/><float name="v" value="$res"/><boolean name="odd" value="maybe"/></bsdf>
+    </scene>
+    """))
+  let b = misc.root.children[0]
+  require(b.type == "diffuse" && b.attributes["type"] == "diffuse", "a variable in a type attribute")
+  require(b.float("spaced") == 7, "whitespace around a number is trimmed")
+  require(b.bool("yes") == true && b.bool("no") == false && b.bool("odd") == nil && b.bool("w") == nil, "bool reads true and false only")
+  require(b.float("w") == 48 && b.float("v") == 32, "$resx is not $res followed by x; the first default wins")
+  print("PASS: Mitsuba XML layer: defaults, variables, references, includes, transforms, hex colours, 0.6 names")
 }
 try fixMitsubaChecks()
