@@ -21,13 +21,15 @@ import simd
 //   twosided             its (first) inner BSDF; mask: geometry_opacity = opacity (a texture, or a constant's mean)
 //   bumpmap              the inner BSDF with the height map as a tangent-space normal map, from the mesh's UV stretch
 //   normalmap            the inner BSDF with its texture as the normal map
-//   bitmap               an image node (sRGB unless raw), its texcoord scaled by the to_uv scale; checkerboard: a
+//   bitmap               an image node (sRGB unless raw) sampled at Mitsuba's (s_u u, s_v v) for the to_uv scale (the
+//                        converter's sampling differed for a non-integer s_v), normal maps too; checkerboard: a
 //                        256 px 8-bit sRGB PNG of color0 (0.4) and color1 (0.2) in the import folder
 //   no BSDF              grey diffuse 0.5, or black when the shape emits (Mitsuba's Shape default)
 //   area emitter         emission_color x emission_luminance = the radiance
 //   interior medium      homogeneous with albedo 0 (Mitsuba 0.6: sigma_s 0) behind a refracting BSDF:
 //                        transmission_color exp(-sigma_t x scale) at transmission_depth 1
-// Unsupported BSDFs, textures and properties, and every approximation, add a report line.
+// Unsupported BSDFs, textures and properties, and every approximation, add a report line, as do values that are not
+// finite (the default used) or negative where that is meaningless (0 used). Baked images are at most bakeTexels.
 extension MitsubaImporter {
   // `name` labels the report lines and the baked images. `mesh` is the first mesh using the material: a bump map's
   // normal map depends on its UV stretch, as in the converter; without UVs the bump map is dropped and reported.
@@ -51,10 +53,20 @@ extension MitsubaImporter {
         builder.scene.note("\(name): bump map dropped (its mesh has no UVs)")
       }
     }
-    if let emission {
-      let scale = max(emission.max(), 1e-12)
-      inputs["emission_color"] = .color(emission / scale)
-      inputs["emission_luminance"] = .value(scale)
+    if var radiance = emission {
+      if (0..<3).contains(where: { !radiance[$0].isFinite }) {
+        builder.scene.note("\(name): radiance is not a finite number; 0 used for those channels")
+        radiance = SIMD3((0..<3).map { radiance[$0].isFinite ? radiance[$0] : 0 })
+      }
+      if radiance.min() < 0 {
+        builder.scene.note("\(name): radiance is negative; 0 used for those channels")
+        radiance = simd_max(radiance, .zero)
+      }
+      let scale = max(radiance.max(), 1e-12)
+      // The compiler accepts constants below 1e8, which the renderer's emission clamp also is.
+      if scale >= 1e8 { builder.scene.note("\(name): radiance above 1e8 is clamped to it") }
+      inputs["emission_color"] = .color(radiance / scale)
+      inputs["emission_luminance"] = .value(min(scale, 99_999_992))
     }
     if let interior { builder.medium(interior, into: &inputs) }
     return inputs.document()
@@ -99,11 +111,14 @@ private struct Inputs {
 
   func document() -> String {
     var w = GLTFImporter.Writer(prefix: "mitsuba")
-    // A texcoord scaled by the to_uv scale, as the converter wrote it (nil for no scale).
+    // Texture coordinates for a to_uv scale (nil for none). MaterialX's t is (u, 1 - v) and the image is sampled at
+    // (t'x, 1 - t'y), so t' = s t + (0, 1 - s_v) samples the image at Mitsuba's (s_u u, s_v v), whatever s_v.
     func coordinates(_ scale: SIMD2<Float>) -> String? {
       guard scale != SIMD2(1, 1) else { return nil }
       let uv = w.op("texcoord", "vector2", [])
-      return w.op("multiply", "vector2", [("in1", .node(uv, "vector2"))], extra: [("in2", "vector2", "\(scale.x), \(scale.y)")])
+      let scaled = w.op("multiply", "vector2", [("in1", .node(uv, "vector2"))], extra: [("in2", "vector2", "\(scale.x), \(scale.y)")])
+      guard scale.y != 1 else { return scaled }
+      return w.op("add", "vector2", [("in1", .node(scaled, "vector2"))], extra: [("in2", "vector2", "0.0, \(1 - scale.y)")])
     }
     var values: [(String, GLTFImporter.Writer.Value)] = []
     for (name, input) in list {
@@ -121,7 +136,7 @@ private struct Inputs {
           values.append((name, .node(node, type)))
         }
       case .normalMap(let t):
-        let node = w.image(t.file.path, type: "vector3", colorspace: "raw", uv: nil, u: "periodic", v: "periodic")
+        let node = w.image(t.file.path, type: "vector3", colorspace: "raw", uv: coordinates(t.scale), u: "periodic", v: "periodic")
         values.append((name, .node(w.op("normalmap", "vector3", [("in", .node(node, "vector3"))]), "vector3")))
       }
     }
@@ -170,11 +185,15 @@ private struct MaterialBuilder {
     var m = Inputs()
     switch kind {
     case "twosided":
+      let sides = node.children.filter { $0.tag == "bsdf" }
+      if sides.count > 1, sides[0].id == nil || sides[1].id != sides[0].id {
+        scene.note("\(name): twosided back-side BSDF unsupported; the front BSDF used on both sides")
+      }
       return try inputs(inner())
     case "bumpmap", "normalmap":
       m = try inputs(inner())
       let map = node.children.first { $0.tag == "texture" }
-      guard let t = try map.flatMap({ try texture($0) }) else {
+      guard let t = try map.flatMap({ try texture($0, property: $0.name ?? "map") }) else {
         scene.note("\(name): \(kind) texture unsupported; dropped")
         return m
       }
@@ -182,7 +201,7 @@ private struct MaterialBuilder {
         // Mitsuba's normal map is tangent-space (dp/du, dp/dv, n), as the app's normalmap node.
         m["geometry_normal"] = .normalMap(t)
       } else {
-        m.bump = Inputs.Bump(texture: t, scale: node.float("scale") ?? 1)
+        m.bump = Inputs.Bump(texture: t, scale: scalar(node, "scale", 1))
       }
     case "mask":
       // OpenPBR geometry_opacity: coverage, stochastic in both renderers.
@@ -219,9 +238,13 @@ private struct MaterialBuilder {
     var alpha: Float?
     var ggx = false
     if rough {
-      let a = scalar(node, "alpha", 0.1)
-      if !a.isFinite { scene.note("\(name): alpha \(a) is not finite; the neutral plastic ratio 1 and alpha 0.1 used") }
-      alpha = a
+      // A non-finite alpha gives the neutral ratio (plasticRatio) and the default roughness.
+      if node.child("alpha")?.tag != "texture", let a = node.float("alpha"), !a.isFinite {
+        scene.note("\(name): alpha \(a) is not finite; the neutral plastic ratio 1 and alpha 0.1 used")
+        alpha = a
+      } else {
+        alpha = nonNegative(scalar(node, "alpha", 0.1), "alpha")
+      }
       ggx = try distribution(node)
     }
     let validIOR = eta.isFinite && eta > 0
@@ -240,12 +263,16 @@ private struct MaterialBuilder {
       break
     }
     if validIOR { m["specular_ior"] = .value(eta) }
-    m["specular_roughness"] = .value(alpha.map { max($0.isFinite ? $0 : 0.1, 0).squareRoot() } ?? 0)
+    m["specular_roughness"] = .value(alpha.map { ($0.isFinite ? $0 : 0.1).squareRoot() } ?? 0)
     return m
   }
 
   mutating func conductor(_ node: MitsubaImporter.Node, rough: Bool) throws -> Inputs {
-    let (f0, tint) = try MitsubaImporter.conductor(node)
+    var (f0, tint) = try MitsubaImporter.conductor(node)
+    if !(0..<3).allSatisfy({ f0[$0].isFinite && tint[$0].isFinite }) {
+      scene.note("\(name): conductor eta or k is not a finite number; the default conductor (a mirror) used")
+      (f0, tint) = (SIMD3(repeating: 1), SIMD3(repeating: 1))
+    }
     var m = Inputs()
     m["base_metalness"] = .value(1)
     m["specular_roughness"] = .value(rough ? roughness(node) : 0)
@@ -315,8 +342,13 @@ private struct MaterialBuilder {
     var m = Inputs()
     m["geometry_thin_walled"] = .boolean(true)
     m["base_color"] = base
-    m["specular_roughness"] = .value(scalar(node, "roughness", 0.5))
-    m["specular_ior"] = .value(scalar(node, "eta", 1.5))
+    m["specular_roughness"] = .value(nonNegative(scalar(node, "roughness", 0.5), "roughness"))
+    var eta = scalar(node, "eta", 1.5)
+    if eta <= 0 {
+      scene.note("\(name): eta \(eta) is not positive; 1.5 used")
+      eta = 1.5
+    }
+    m["specular_ior"] = .value(eta)
     m["specular_weight"] = .value(s)
     if d > 0 {
       m["subsurface_weight"] = .value(min(d, 1))
@@ -339,23 +371,30 @@ private struct MaterialBuilder {
 
   // MARK: Properties
 
-  // A constant float property; a texture is reported and replaced by the default.
+  // A constant float property; a texture or a non-finite value is reported and replaced by the default.
   mutating func scalar(_ node: MitsubaImporter.Node, _ property: String, _ fallback: Float) -> Float {
     if node.child(property)?.tag == "texture" {
       scene.note("\(name): \(property) texture unsupported; \(fallback) used")
       return fallback
     }
-    return node.float(property) ?? fallback
+    guard let value = node.float(property) else { return fallback }
+    guard value.isFinite else {
+      scene.note("\(name): \(property) is not a finite number; \(fallback) used")
+      return fallback
+    }
+    return value
   }
 
-  // sqrt(alpha), alpha 0.1 when absent; a non-finite alpha is reported and 0.1 used.
+  // A value that cannot be negative; a negative one is reported and 0 used.
+  mutating func nonNegative(_ value: Float, _ property: String) -> Float {
+    guard value < 0 else { return value }
+    scene.note("\(name): \(property) \(value) is negative; 0 used")
+    return 0
+  }
+
+  // sqrt(alpha), alpha 0.1 when absent.
   mutating func roughness(_ node: MitsubaImporter.Node) -> Float {
-    let alpha = scalar(node, "alpha", 0.1)
-    guard alpha.isFinite else {
-      scene.note("\(name): alpha \(alpha) is not finite; 0.1 used")
-      return Float(0.1).squareRoot()
-    }
-    return max(alpha, 0).squareRoot()
+    nonNegative(scalar(node, "alpha", 0.1), "alpha").squareRoot()
   }
 
   // Whether the microfacet distribution is GGX. OpenPBR's is, so Beckmann (Mitsuba's default) is reported.
@@ -369,37 +408,84 @@ private struct MaterialBuilder {
     }
   }
 
-  // A colour property: a texture, or a constant (the default when absent or unreadable, which is reported).
+  // A colour property: a texture, or a constant (constant(_:_:default:)).
   mutating func colour(_ node: MitsubaImporter.Node, _ property: String, default fallback: SIMD3<Float>) throws -> Inputs.Input {
-    guard let p = node.child(property) else { return .color(fallback) }
-    if p.tag == "texture" {
-      if let t = try texture(p) { return .texture(t, tint: nil) }
+    if let p = node.child(property), p.tag == "texture" {
+      if let t = try texture(p, property: property) { return .texture(t, tint: nil) }
       return .color(fallback)
     }
+    return .color(constant(node, property, default: fallback))
+  }
+
+  // A constant colour: the default when absent; an unreadable or non-finite one is reported and the default used,
+  // negative components are reported and 0 used.
+  mutating func constant(_ node: MitsubaImporter.Node, _ property: String, default fallback: SIMD3<Float>) -> SIMD3<Float> {
+    guard let p = node.child(property) else { return fallback }
     guard let c = node.rgb(property) else {
       scene.note("\(name): \(p.tag) colour on \(node.type ?? "a BSDF") is not read; default used")
-      return .color(fallback)
+      return fallback
     }
-    return .color(c)
+    guard (0..<3).allSatisfy({ c[$0].isFinite }) else {
+      scene.note("\(name): \(property) is not a finite number; default used")
+      return fallback
+    }
+    guard c.min() < 0 else { return c }
+    scene.note("\(name): \(property) is negative; 0 used for those channels")
+    return simd_max(c, .zero)
   }
 
   // MARK: Textures
 
-  // A bitmap (sRGB unless raw) or a baked checkerboard, with its to_uv scale; nil, reported, for other textures.
-  mutating func texture(_ node: MitsubaImporter.Node) throws -> Inputs.Texture? {
+  // The texture properties each type's mapping reads; others are reported.
+  static let textureProperties: [String: Set<String>] = [
+    "bitmap": ["filename", "raw", "to_uv", "wrap_mode", "filter_type"], "checkerboard": ["color0", "color1", "to_uv"],
+  ]
+
+  // A bitmap (sRGB unless raw) or a baked checkerboard, with the scale of its to_uv; nil, reported, for other textures.
+  // `property` is the BSDF property it feeds, for the report.
+  mutating func texture(_ node: MitsubaImporter.Node, property: String) throws -> Inputs.Texture? {
+    let kind = node.type ?? "(no type)"
+    guard let known = Self.textureProperties[kind] else {
+      scene.note("\(name): texture \(kind) unsupported; constant used")
+      return nil
+    }
+    for child in node.children {
+      guard let other = child.name, !known.contains(other) else { continue }
+      scene.note("\(name): \(property) texture \(kind) \(other) unsupported; ignored")
+    }
     let toUV = node.transform("to_uv")
-    let scale = SIMD2(toUV[0][0], toUV[1][1])
-    switch node.type {
+    var scale = SIMD2(toUV[0][0], toUV[1][1])
+    if !(scale.x.isFinite && scale.y.isFinite) {
+      scene.note("\(name): \(property) texture to_uv is not a finite number; scale 1 used")
+      scale = SIMD2(1, 1)
+    } else if toUV[1][0] != 0 || toUV[0][1] != 0 || toUV[3][0] != 0 || toUV[3][1] != 0 {
+      scene.note("\(name): \(property) texture to_uv offset or rotation unsupported; only its scale (\(scale.x), \(scale.y)) used")
+    }
+    switch kind {
     case "bitmap":
       guard let file = node.url("filename") else { throw MitsubaImporter.error("material '\(name)': a bitmap texture has no filename") }
       guard FileManager.default.fileExists(atPath: file.path) else {
         throw MitsubaImporter.error("material '\(name)': texture file \(file.lastPathComponent) is missing")
       }
+      if let mode = node.string("wrap_mode"), mode != "repeat" {
+        scene.note("\(name): \(property) texture wrap_mode \(mode) unsupported; repeat used")
+      }
+      if node.string("filter_type") == "nearest" {
+        scene.note("\(name): \(property) texture filter_type nearest unsupported; bilinear used")
+      }
       return Inputs.Texture(file: file, srgb: node.bool("raw") != true, scale: scale)
-    case "checkerboard":
-      let c0 = node.rgb("color0") ?? SIMD3(repeating: 0.4), c1 = node.rgb("color1") ?? SIMD3(repeating: 0.2)
+    default:
+      // A 256 px checkerboard of 128 px squares, color0 at the top left.
+      func colour(_ key: String, _ fallback: Float) -> SIMD3<Float> {
+        guard node.child(key)?.tag != "texture" else {
+          scene.note("\(name): checkerboard \(key) texture unsupported; \(fallback) used")
+          return SIMD3(repeating: fallback)
+        }
+        return constant(node, key, default: SIMD3(repeating: fallback))
+      }
+      let c0 = colour("color0", 0.4), c1 = colour("color1", 0.2)
       let n = 256
-      let even = Self.encoded(c0), odd = Self.encoded(c1)
+      let even = (0..<3).map { Self.encoded(c0[$0]) }, odd = (0..<3).map { Self.encoded(c1[$0]) }
       var pixels = [UInt8](repeating: 0, count: 3 * n * n)
       for y in 0..<n {
         for x in 0..<n {
@@ -411,24 +497,28 @@ private struct MaterialBuilder {
       try Self.writePNG(pixels, width: n, height: n, to: file, owner: name)
       scene.note("\(name): checkerboard baked to \(file.lastPathComponent) (\(n) px, 8-bit sRGB)")
       return Inputs.Texture(file: file, srgb: true, scale: scale)
-    default:
-      scene.note("\(name): texture \(node.type ?? "(no type)") unsupported; constant used")
-      return nil
     }
   }
 
   // A nonlinear plastic's diffuse texture with rho' = rho r(rho) per texel and channel, r interpolated between
   // its values at 17 reflectances (an 8-bit sRGB PNG).
   mutating func plasticTexture(_ t: Inputs.Texture, factor: (Float) -> Float) throws -> Inputs.Texture {
-    let image = try Self.texels(t.file, srgb: t.srgb, owner: name)
+    let image = try Self.image(t.file, owner: name)
     let ratios = (0...16).map { factor(max(Float($0) / 16, 1e-3)) }
-    func interpolated(_ x: Float) -> Float {
-      let s = min(max(x, 0), 1) * 16, i = min(Int(s), 15)
-      return ratios[i] + (ratios[i + 1] - ratios[i]) * (s - Float(i))
+    var pixels = [UInt8](repeating: 0, count: 3 * image.width * image.height)
+    try pixels.withUnsafeMutableBufferPointer { out in
+      try ratios.withUnsafeBufferPointer { r in
+        func baked(_ x: Float) -> UInt8 {
+          let s = min(max(x, 0), 1) * 16, i = min(Int(s), 15)
+          return Self.encoded(x * (r[i] + (r[i + 1] - r[i]) * (s - Float(i))))
+        }
+        try Self.forEachTexel(image, srgb: t.srgb, owner: name) { i, red, green, blue in
+          out[3 * i] = baked(red); out[3 * i + 1] = baked(green); out[3 * i + 2] = baked(blue)
+        }
+      }
     }
-    let pixels = image.values.flatMap { c in Self.encoded(SIMD3((0..<3).map { c[$0] * interpolated(c[$0]) })) }
-    let file = folder.appendingPathComponent(
-      "\(Self.identifier(name))-\(t.file.deletingPathExtension().lastPathComponent)-\(Self.digest("\(t.file.path) \(ratios)"))-plastic.png")
+    let file = folder.appendingPathComponent(Self.fileName(
+      [name, t.file.deletingPathExtension().lastPathComponent], Self.digest("\(t.file.path) \(ratios)"), "plastic"))
     try Self.writePNG(pixels, width: image.width, height: image.height, to: file, owner: name)
     scene.note("\(name): nonlinear plastic texture baked with its internal-scattering factor")
     return Inputs.Texture(file: file, srgb: true, scale: t.scale)
@@ -438,10 +528,16 @@ private struct MaterialBuilder {
   // sRGB decoding unless raw) and shades with n' ~ n - (d_u / |dp/du|) T_u - (d_v / |dp/dv|) T_v (bumpmap.cpp).
   // |dp/du| and |dp/dv| are the area-weighted UV stretch of the mesh; the map holds (-d_u / |dp/du|,
   // +d_v / |dp/dv|, 1), since the app's bitangent follows v down the image and its normal map's green points up.
+  // It is sampled with the height map's to_uv scale, which the derivatives include.
   mutating func normalMap(_ bump: Inputs.Bump, mesh: MitsubaImporter.Mesh, uvs: [SIMD2<Float>]) throws -> Inputs.Texture {
-    let image = try Self.texels(bump.texture.file, srgb: bump.texture.srgb, owner: name)
+    let image = try Self.image(bump.texture.file, owner: name)
     let w = image.width, h = image.height
-    let height = image.values.map { simd_dot($0, SIMD3(0.2126, 0.7152, 0.0722)) }
+    var height = [Float](repeating: 0, count: w * h)
+    try height.withUnsafeMutableBufferPointer { out in
+      try Self.forEachTexel(image, srgb: bump.texture.srgb, owner: name) { i, red, green, blue in
+        out[i] = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+      }
+    }
     var lu = 0.0, lv = 0.0, area = 0.0
     for t in mesh.triangles {
       let p0 = mesh.positions[Int(t.x)], e1 = mesh.positions[Int(t.y)] - p0, e2 = mesh.positions[Int(t.z)] - p0
@@ -465,14 +561,17 @@ private struct MaterialBuilder {
         let du = (height[y * w + (x + 1) % w] - height[y * w + (x + w - 1) % w]) / 2 * Float(w) * su
         let dv = (height[(y + 1) % h * w + x] - height[(y + h - 1) % h * w + x]) / 2 * Float(h) * sv
         let n = simd_normalize(SIMD3(-ku * du, kv * dv, 1))
-        for k in 0..<3 { pixels[3 * (y * w + x) + k] = UInt8(min(max(n[k] * 0.5 + 0.5, 0), 1) * 255 + 0.5) }
+        let o = 3 * (y * w + x)
+        pixels[o] = UInt8(min(max(n.x * 0.5 + 0.5, 0), 1) * 255 + 0.5)
+        pixels[o + 1] = UInt8(min(max(n.y * 0.5 + 0.5, 0), 1) * 255 + 0.5)
+        pixels[o + 2] = UInt8(min(max(n.z * 0.5 + 0.5, 0), 1) * 255 + 0.5)
       }
     }
-    let file = folder.appendingPathComponent(
-      "\(Self.identifier(name))-\(Self.digest("\(bump.texture.file.path) \(bump.scale) \(su) \(sv) \(lu) \(lv)"))-bump-normal.png")
+    let file = folder.appendingPathComponent(Self.fileName(
+      [name], Self.digest("\(bump.texture.file.path) \(bump.scale) \(su) \(sv) \(lu) \(lv)"), "bump-normal"))
     try Self.writePNG(pixels, width: w, height: h, to: file, owner: name)
     scene.note("\(name): bump map converted to a normal map (UV stretch \(String(format: "%.3g", lu)) x \(String(format: "%.3g", lv)))")
-    return Inputs.Texture(file: file, srgb: false, scale: SIMD2(1, 1))
+    return Inputs.Texture(file: file, srgb: false, scale: bump.texture.scale)
   }
 
   // MARK: Interior medium
@@ -489,7 +588,8 @@ private struct MaterialBuilder {
       } else if node.rgb("albedo") == .zero {
         extinction = node.child("sigma_t") == nil ? SIMD3(repeating: 1) : node.rgb("sigma_t")
       }
-      extinction = extinction.map { $0 * (node.float("scale") ?? 1) }
+      let scale = scalar(node, "scale", 1)
+      extinction = extinction.map { $0 * scale }
     }
     guard let sigma = extinction, (0..<3).allSatisfy({ sigma[$0].isFinite && sigma[$0] >= 0 }) else {
       scene.note("\(name): interior medium \(kind) unsupported (only an absorbing homogeneous medium is read); ignored")
@@ -506,42 +606,122 @@ private struct MaterialBuilder {
 
   // MARK: Images
 
-  // A texture's linear RGB texels, rows from the top: integer formats are normalized and sRGB decoded when `srgb`,
-  // float formats are read as stored; grey images repeat their channel and alpha is dropped, as the converter read
-  // them through Mitsuba's Bitmap.
-  static func texels(_ url: URL, srgb: Bool, owner: String) throws -> (width: Int, height: Int, values: [SIMD3<Float>]) {
+  // Images baked from a texture are at most 64 megapixels (8192 x 8192): a bake holds the decoded image and an
+  // 8-bit output (about 700 MB for 16-bit RGBA sources at the limit).
+  static let bakeTexels = 1 << 26
+
+  // A texture to bake, checked against bakeTexels.
+  static func image(_ url: URL, owner: String) throws -> CGImage {
     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
-      image.width > 0, image.height > 0, image.width <= 16384, image.height <= 16384
+      image.width > 0, image.height > 0
     else { throw MitsubaImporter.error("material '\(owner)': cannot decode \(url.lastPathComponent)") }
+    guard image.width * image.height <= bakeTexels else {
+      throw MitsubaImporter.error("material '\(owner)': texture \(url.lastPathComponent) is too large to bake (\(image.width) × \(image.height))")
+    }
+    return image
+  }
+
+  // Calls `body` with each texel's index (rows from the top) and linear RGB: integer formats are normalized and sRGB
+  // decoded when `srgb`, float formats are read as stored; grey images repeat their channel and alpha is ignored, as
+  // the converter read them through Mitsuba's Bitmap. 8- and 16-bit RGB and grey images are read as stored (no
+  // colour management); others are drawn into a float context in their own colour space (sRGB when not RGB or grey)
+  // and un-premultiplied.
+  static func forEachTexel(_ image: CGImage, srgb: Bool, owner: String, _ body: (Int, Float, Float, Float) -> Void) throws {
     let w = image.width, h = image.height
-    let gray = image.colorSpace?.model == .monochrome
-    let own = image.colorSpace.flatMap { [.monochrome, .rgb].contains($0.model) ? $0 : nil }
-    let space = own ?? CGColorSpace(name: CGColorSpace.sRGB)!
-    let channels = gray ? 1 : 4
-    var stored = [Float](repeating: 0, count: channels * w * h)
+    if let layout = StoredLayout(image), let data = image.dataProvider?.data {
+      let maximum = layout.bits == 8 ? 255 : 65535
+      let table = (0...maximum).map { v -> Float in
+        let x = Float(v) / Float(maximum)
+        return srgb ? (x <= 0.04045 ? x / 12.92 : powf((x + 0.055) / 1.055, 2.4)) : x
+      }
+      let rowBytes = image.bytesPerRow, pixelBytes = image.bitsPerPixel / 8, colourCount = layout.colours
+      guard CFDataGetLength(data) >= (h - 1) * rowBytes + w * pixelBytes else {
+        throw MitsubaImporter.error("material '\(owner)': cannot read a texture's pixels")
+      }
+      let bytes = CFDataGetBytePtr(data)!
+      table.withUnsafeBufferPointer { table in
+        for y in 0..<h {
+          for x in 0..<w {
+            let pixel = bytes + y * rowBytes + x * pixelBytes
+            func component(_ k: Int) -> Int {
+              let m = layout.memoryIndex[k]
+              if layout.bits == 8 { return Int(pixel[m]) }
+              let hi = Int(pixel[2 * m]), lo = Int(pixel[2 * m + 1])
+              return layout.littleEndian ? lo << 8 | hi : hi << 8 | lo
+            }
+            var c = SIMD3<Float>(repeating: table[component(0)])
+            if colourCount == 3 { c = SIMD3(table[component(0)], table[component(1)], table[component(2)]) }
+            if layout.premultiplied {
+              // Stored values times alpha: undo it before decoding.
+              let a = Float(component(colourCount)) / Float(maximum)
+              func value(_ k: Int) -> Float {
+                let x = Float(component(k)) / Float(maximum), u = a > 0 ? min(1, x / a) : x
+                return srgb ? (u <= 0.04045 ? u / 12.92 : powf((u + 0.055) / 1.055, 2.4)) : u
+              }
+              c = colourCount == 3 ? SIMD3(value(0), value(1), value(2)) : SIMD3(repeating: value(0))
+            }
+            body(y * w + x, c.x, c.y, c.z)
+          }
+        }
+      }
+      return
+    }
+    // Other formats (float, palette, other colour spaces): drawn as premultiplied float RGBA.
+    let space = image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.sRGB)!
+    var stored = [Float](repeating: 0, count: 4 * w * h)
     let drawn = stored.withUnsafeMutableBytes { bytes -> Bool in
-      let alpha = gray ? CGImageAlphaInfo.none : CGImageAlphaInfo.noneSkipLast
-      guard let context = CGContext(data: bytes.baseAddress, width: w, height: h, bitsPerComponent: 32, bytesPerRow: 4 * channels * w,
-        space: space, bitmapInfo: alpha.rawValue | CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+      guard let context = CGContext(data: bytes.baseAddress, width: w, height: h, bitsPerComponent: 32, bytesPerRow: 16 * w, space: space,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
       else { return false }
       context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
       return true
     }
-    guard drawn else { throw MitsubaImporter.error("material '\(owner)': cannot read \(url.lastPathComponent)") }
+    guard drawn else { throw MitsubaImporter.error("material '\(owner)': cannot read a texture's pixels") }
     let decode = srgb && !image.bitmapInfo.contains(.floatComponents)
     func linear(_ v: Float) -> Float { decode ? (v <= 0.04045 ? v / 12.92 : powf((v + 0.055) / 1.055, 2.4)) : v }
-    let values = (0..<(w * h)).map { i in
-      gray ? SIMD3(repeating: linear(stored[i])) : SIMD3(linear(stored[4 * i]), linear(stored[4 * i + 1]), linear(stored[4 * i + 2]))
+    for i in 0..<(w * h) {
+      let a = stored[4 * i + 3], scale: Float = a > 0 ? 1 / a : 1
+      body(i, linear(stored[4 * i] * scale), linear(stored[4 * i + 1] * scale), linear(stored[4 * i + 2] * scale))
     }
-    return (w, h, values)
   }
 
-  // A linear colour as 8-bit sRGB (clamped to 0-1), rounded as the converter did.
-  static func encoded(_ c: SIMD3<Float>) -> [UInt8] {
-    (0..<3).map { k in
-      let x = min(max(c[k], 0), 1)
-      return UInt8((x <= 0.0031308 ? 12.92 * x : 1.055 * powf(x, 1 / 2.4) - 0.055) * 255 + 0.5)
+  // Where an 8- or 16-bit RGB or grey image keeps its components: memoryIndex[k] is the slot of colour k (then alpha).
+  struct StoredLayout {
+    let bits: Int, colours: Int, premultiplied: Bool, littleEndian: Bool
+    let memoryIndex: [Int]
+
+    init?(_ image: CGImage) {
+      let model = image.colorSpace?.model
+      guard !image.bitmapInfo.contains(.floatComponents), image.bitsPerComponent == 8 || image.bitsPerComponent == 16,
+        model == .rgb || model == .monochrome
+      else { return nil }
+      bits = image.bitsPerComponent
+      colours = model == .rgb ? 3 : 1
+      let info = image.alphaInfo
+      let slots = colours + (info == .none ? 0 : 1)
+      guard image.bitsPerPixel == slots * bits else { return nil }
+      premultiplied = info == .premultipliedFirst || info == .premultipliedLast
+      let alphaFirst = info == .first || info == .premultipliedFirst || info == .noneSkipFirst
+      // Logical order: colours then alpha, or alpha first.
+      var logical = Array(0..<slots)
+      if alphaFirst { logical = Array(1..<slots) + [0] }
+      let order = image.bitmapInfo.intersection(.byteOrderMask)
+      var reversed = false, little = false
+      switch (bits, order) {
+      case (_, []), (_, .byteOrder32Big), (16, .byteOrder16Big), (8, .byteOrder16Big): break
+      case (8, .byteOrder32Little) where slots == 4, (8, .byteOrder16Little) where slots == 2: reversed = true
+      case (16, .byteOrder16Little): little = true
+      default: return nil
+      }
+      littleEndian = little
+      memoryIndex = logical.map { reversed ? slots - 1 - $0 : $0 }
     }
+  }
+
+  // A linear value as 8-bit sRGB (clamped to 0-1), rounded as the converter did.
+  static func encoded(_ value: Float) -> UInt8 {
+    let x = min(max(value, 0), 1)
+    return UInt8((x <= 0.0031308 ? 12.92 * x : 1.055 * powf(x, 1 / 2.4) - 0.055) * 255 + 0.5)
   }
 
   static func writePNG(_ pixels: [UInt8], width: Int, height: Int, to url: URL, owner: String) throws {
@@ -554,9 +734,11 @@ private struct MaterialBuilder {
     try png.write(to: url)
   }
 
-  // A file-name fragment: characters other than letters, digits and underscores become underscores.
-  static func identifier(_ text: String) -> String {
-    String(text.map { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") ? $0 : "_" })
+  // A baked image's file name: the readable parts (letters, digits and underscores kept, the rest underscores),
+  // shortened to keep the name well within 255 bytes, then the digest that makes it unique, then the kind.
+  static func fileName(_ parts: [String], _ digest: String, _ kind: String) -> String {
+    let readable = parts.map { String($0.map { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") ? $0 : "_" }) }
+    return "\(String(readable.joined(separator: "-").prefix(120)))-\(digest)-\(kind).png"
   }
 
   // FNV-1a (64-bit) of the inputs a baked image is made from, so images with different contents get different names.
