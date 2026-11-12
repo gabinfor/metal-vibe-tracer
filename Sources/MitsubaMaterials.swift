@@ -128,10 +128,10 @@ private struct Inputs {
       case .color(let c): values.append((name, .color(c)))
       case .boolean(let b): values.append((name, .boolean(b)))
       case .texture(let t, let tint):
-        // MaterialX leaves float images raw, so specular_weight is the red channel of the colour-managed image, as
-        // Mitsuba decodes a bitmap unless raw.
-        let weight = name == "specular_weight"
-        let type = name == "geometry_opacity" ? "float" : "color3"
+        // MaterialX leaves float images raw, so specular_weight and an sRGB opacity are the red channel of the
+        // colour-managed image, as Mitsuba decodes a bitmap unless raw.
+        let weight = name == "specular_weight" || (name == "geometry_opacity" && t.srgb)
+        let type = name == "geometry_opacity" && !t.srgb ? "float" : "color3"
         let node = w.image(t.file.path, type: type, colorspace: t.srgb ? "srgb_texture" : "raw", uv: coordinates(t.scale),
                            u: "periodic", v: "periodic")
         if weight {
@@ -275,6 +275,10 @@ private struct MaterialBuilder {
 
   mutating func conductor(_ node: MitsubaImporter.Node, rough: Bool) throws -> Inputs {
     var (f0, tint) = try MitsubaImporter.conductor(node)
+    // Mitsuba rejects a named material with k alone (an unreferenced property); the table entry is used.
+    if let material = node.string("material"), material != "none", node.child("eta") == nil, node.child("k") != nil {
+      scene.note("\(name): k ignored with a named conductor material")
+    }
     if !(0..<3).allSatisfy({ f0[$0].isFinite && tint[$0].isFinite }) {
       scene.note("\(name): conductor eta or k is not a finite number; the default conductor (a mirror) used")
       (f0, tint) = (SIMD3(repeating: 1), SIMD3(repeating: 1))
@@ -614,7 +618,7 @@ private struct MaterialBuilder {
       return
     }
     guard (m.value("transmission_weight") ?? 0) > 0, m["geometry_thin_walled"] == nil else {
-      scene.note("\(name): interior medium ignored (its BSDF does not refract)")
+      scene.note("\(name): interior medium ignored (its BSDF \(m["geometry_thin_walled"] == nil ? "does not refract" : "is thin-walled"))")
       return
     }
     if m["transmission_color"] != nil { scene.note("\(name): specular_transmittance replaced by the interior medium's absorption") }
@@ -625,7 +629,9 @@ private struct MaterialBuilder {
   // MARK: Images
 
   // Images baked from a texture are at most 64 megapixels (8192 x 8192): a bake holds the decoded image and an
-  // 8-bit output (about 700 MB for 16-bit RGBA sources at the limit).
+  // 8-bit RGB output (3 bytes a texel). At the limit that is about 704 MiB for 16-bit RGBA sources (8 bytes a texel
+  // decoded, read as stored), and 1.25 GiB (8-bit palette sources) to 2.2 GiB (32-bit float RGBA sources) when
+  // forEachTexel draws the image into its 16-byte-a-texel float RGBA buffer.
   static let bakeTexels = 1 << 26
 
   // A texture to bake, checked against bakeTexels.

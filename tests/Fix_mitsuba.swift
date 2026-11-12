@@ -162,12 +162,23 @@
     _ = try MitsubaImporter.Scene(url: try write("lookat-same.xml", #"<scene version="3.0.0"><sensor type="perspective"><transform name="to_world"><lookat origin="1, 2, 3" target="1 2 3" up="0 1 0"/></transform></sensor></scene>"#))
   }
 
+  for (name, origin, target) in [("origin-only", #"origin="0 0 0""#, ""), ("target-only", "", #"target="0, 0, 0""#)] {
+    requireThrows("lookat needs distinct origin and target") {
+      _ = try MitsubaImporter.Scene(url: try write("lookat-\(name).xml", #"<scene version="3.0.0"><sensor type="perspective"><transform name="to_world"><lookat \#(origin) \#(target)/></transform></sensor></scene>"#))
+    }
+  }
+  let offOrigin = try MitsubaImporter.Scene(url: try write("lookat-off.xml", #"<scene version="3.0.0"><sensor type="perspective"><transform name="to_world"><lookat origin="0 0 1"/></transform></sensor></scene>"#))
+  require(isFinite(offOrigin.root.children[0].transform("to_world")), "a lookat with only an origin away from 0 0 0 is finite")
+
   let colours = try MitsubaImporter.Scene(url: try write("hex.xml", """
     <scene version="3.0.0">
       <bsdf type="diffuse" id="long"><rgb name="reflectance" value="#6d7185"/></bsdf>
       <bsdf type="diffuse" id="short"><rgb name="reflectance" value="#f80"/></bsdf>
       <bsdf type="diffuse" id="bad"><rgb name="reflectance" value="#12"/></bsdf>
       <bsdf type="diffuse" id="spaced"><rgb name="reflectance" value=" 0.5 , 0.25  0.125 "/></bsdf>
+      <bsdf type="diffuse" id="plus"><rgb name="reflectance" value="#+ff"/></bsdf>
+      <bsdf type="diffuse" id="minus"><rgb name="reflectance" value="#-12"/></bsdf>
+      <bsdf type="diffuse" id="plusLong"><rgb name="reflectance" value="#+12345"/></bsdf>
     </scene>
     """))
   func colour(_ id: String) -> SIMD3<Float>? { colours.root.children.first { $0.id == id }?.rgb("reflectance") }
@@ -176,6 +187,7 @@
   require(simd_length(long - SIMD3(srgbToLinear(0x6d / 255), srgbToLinear(0x71 / 255), srgbToLinear(0x85 / 255))) < 1e-6, "#rrggbb is sRGB decoded")
   require(simd_length(short - SIMD3(1, srgbToLinear(8 / 15), 0)) < 1e-6, "#rgb is sRGB decoded")
   require(colour("bad") == nil && colour("spaced") == SIMD3(0.5, 0.25, 0.125), "a bad hex colour is nil; commas and spaces mix")
+  require(colour("plus") == nil && colour("minus") == nil && colour("plusLong") == nil, "a sign after # is not a hex digit")
   let hexOld = try MitsubaImporter.Scene(url: try write("hex06.xml", ##"<scene version="0.6.0"><bsdf type="diffuse" id="d"><srgb name="reflectance" value="#f80"/></bsdf></scene>"##))
   require(hexOld.root.children[0].rgb("reflectance").map { simd_length($0 - short) < 1e-6 } == true, "a 0.6 srgb accepts #rgb")
 
@@ -191,6 +203,20 @@
   require(nested.root.children[0].url("filename")?.standardizedFileURL == folder.appendingPathComponent("sub/meshes/part.obj").standardizedFileURL
     && nested.root.children[1].url("filename")?.standardizedFileURL == folder.appendingPathComponent("own.obj").standardizedFileURL
     && nested.root.children[1].url("missing") == nil, "url resolves against the folder of the file the element came from")
+
+  require(nested.root.children[1].url("filename") != nil, "a non-empty string is a URL")
+  let emptyPath = try MitsubaImporter.Scene(url: try write("empty-path.xml", #"<scene version="3.0.0"><shape type="obj"><string name="filename" value=""/></shape></scene>"#))
+  require(emptyPath.root.children[0].url("filename") == nil, "an empty string is not a URL (it would resolve to the folder itself)")
+  let refMain = try write("ref-main.xml", """
+    <scene version="3.0.0">
+      <include filename="sub/defs.xml"/>
+      <shape type="obj"><ref id="wood"/></shape>
+    </scene>
+    """)
+  _ = try write("sub/defs.xml", #"<scene version="3.0.0"><bsdf type="diffuse" id="wood"><string name="filename" value="wood.png"/></bsdf></scene>"#)
+  let referenced = try MitsubaImporter.Scene(url: refMain)
+  require(referenced.root.children.first { $0.tag == "shape" }?.child("bsdf")?.url("filename")?.standardizedFileURL == folder.appendingPathComponent("sub/wood.png").standardizedFileURL,
+    "a <ref> to a target defined in an included file carries that file's folder")
 
   requireThrows("is not a Mitsuba scene") {
     _ = try MitsubaImporter.Scene(url: try write("inc-bad.xml", #"<scene version="3.0.0"><include filename="other.xml"/></scene>"#))
@@ -769,6 +795,29 @@ try fixMitsubaChecks()
   let bindings = shared.graph?.nodes.filter { $0.mesh != nil }.map { $0.bindings.first } ?? []
   require(bindings.count == 4 && bindings[0] == bindings[1] && bindings[2] != bindings[0] && bindings[3] != bindings[0]
     && shared.graph?.materials.count == 3, "shapes that reference one BSDF share a material; an emissive one gets its own")
+
+  // One BSDF id with two emitter radiances or two interiors: the materials get distinct names.
+  let lamps = try load("""
+    <scene version="3.0.0">
+      <bsdf type="diffuse" id="paint"/>
+      <shape type="rectangle" id="a"><ref id="paint"/><emitter type="area"><rgb name="radiance" value="1"/></emitter></shape>
+      <shape type="rectangle" id="b"><ref id="paint"/><emitter type="area"><rgb name="radiance" value="2"/></emitter></shape>
+      <shape type="rectangle" id="c"><ref id="paint"/><emitter type="area"><rgb name="radiance" value="3"/></emitter></shape>
+      <shape type="rectangle" id="d"><ref id="paint"/></shape>
+    </scene>
+    """).document
+  let litNames = lamps.graph?.materials.map(\.name) ?? []
+  require(litNames == ["paint_emitter", "paint_emitter 2", "paint_emitter 3", "paint"], "materials of one BSDF id with different radiances: suffixed names (\(litNames))")
+  let murky = try load("""
+    <scene version="3.0.0">
+      <bsdf type="dielectric" id="glass"/>
+      <medium type="homogeneous" id="fog"><rgb name="albedo" value="0"/><rgb name="sigma_t" value="1"/></medium>
+      <medium type="homogeneous" id="soup"><rgb name="albedo" value="0"/><rgb name="sigma_t" value="2"/></medium>
+      <shape type="rectangle" id="a"><ref id="glass"/><ref name="interior" id="fog"/></shape>
+      <shape type="rectangle" id="b"><ref id="glass"/><ref name="interior" id="soup"/></shape>
+    </scene>
+    """).document
+  require(murky.graph?.materials.map(\.name) == ["glass", "glass 2"], "materials of one BSDF id with different interiors: suffixed names (\(String(describing: murky.graph?.materials.map(\.name))))")
 
   // flip_normals reverses an emitter's facing; a shape's to_uv is reported.
   func facing(_ document: ProjectDocument, _ name: String) -> SIMD3<Float>? {

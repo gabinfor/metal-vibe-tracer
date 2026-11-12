@@ -65,9 +65,9 @@ enum MitsubaImporter {
       guard let node = child(name), node.tag == "string" else { return nil }
       return node.attributes["value"]
     }
-    // A string property as a file URL: relative paths start at the folder of the file that holds this element.
+    // A string property as a file URL (nil when empty): relative paths start at the folder of the file that holds this element.
     func url(_ name: String) -> URL? {
-      string(name).map { URL(fileURLWithPath: $0, relativeTo: folder).standardizedFileURL }
+      string(name).flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, relativeTo: folder).standardizedFileURL }
     }
     func bool(_ name: String) -> Bool? {
       guard let node = child(name), node.tag == "boolean" else { return nil }
@@ -199,7 +199,8 @@ enum MitsubaImporter {
   // "#rrggbb" or "#rgb" as gamma-encoded components in 0...1; nil for anything else.
   fileprivate static func hexComponents(_ text: String) -> [Float]? {
     let digits = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard digits.hasPrefix("#"), digits.count == 4 || digits.count == 7, let hex = Int(digits.dropFirst(), radix: 16) else { return nil }
+    guard digits.hasPrefix("#"), digits.count == 4 || digits.count == 7, digits.dropFirst().allSatisfy(\.isHexDigit),
+          let hex = Int(digits.dropFirst(), radix: 16) else { return nil }
     if digits.count == 4 { return [Float((hex >> 8) & 15) / 15, Float((hex >> 4) & 15) / 15, Float(hex & 15) / 15] }
     return [Float((hex >> 16) & 255) / 255, Float((hex >> 8) & 255) / 255, Float(hex & 255) / 255]
   }
@@ -280,9 +281,13 @@ enum MitsubaImporter {
         if tag == "texture" { children = Self.uvScale(children, folder: folder) }
         if tag == "bsdf" { children = children.map(Self.linearized) }
       }
-      if tag == "lookat", let origin = attributes["origin"].flatMap({ MitsubaImporter.numbers($0) }),
-         origin == attributes["target"].flatMap({ MitsubaImporter.numbers($0) }) {
-        throw MitsubaImporter.error("lookat needs distinct origin and target")
+      if tag == "lookat" {
+        // An absent origin or target is the point 0 0 0.
+        func point(_ key: String) -> [Float]? {
+          guard let text = attributes[key] else { return [0, 0, 0] }
+          return MitsubaImporter.numbers(text)
+        }
+        if let origin = point("origin"), origin == point("target") { throw MitsubaImporter.error("lookat needs distinct origin and target") }
       }
       let node = Node(tag: tag, type: attributes["type"], name: attributes["name"], id: attributes["id"],
                       attributes: attributes, children: children, folder: folder)
@@ -421,6 +426,7 @@ extension MitsubaImporter {
 
     // Materials, in shape order: the first shape with a material passes its mesh (a bump map's UV stretch).
     var materials: [USDImportSnapshot.Material] = [], materialIndex: [String: Int] = [:], bindings: [Int?] = []
+    var materialNames = Set<String>()
     for (i, shape) in shapes.enumerated() {
       progress?.update("Building Mitsuba materials", completed: i, of: shapes.count)
       guard let mesh = meshes[i] else { bindings.append(nil); continue }
@@ -432,7 +438,10 @@ extension MitsubaImporter {
       let key = [bsdf?.id ?? "shape \(i)", emission.map { "\($0)" } ?? "", interior.map { $0.id ?? "shape \(i)" } ?? ""]
         .joined(separator: "|")
       if let index = materialIndex[key] { bindings.append(index); continue }
-      let name = (bsdf?.id ?? "\(type)\(i)") + (emission == nil ? "" : "_emitter")
+      // One BSDF id with different radiances or interiors gives several materials: the second and later get " 2", " 3" ...
+      let base = (bsdf?.id ?? "\(type)\(i)") + (emission == nil ? "" : "_emitter")
+      var name = base, copy = 1
+      while !materialNames.insert(name).inserted { copy += 1; name = "\(base) \(copy)" }
       let mtlx = try material(bsdf: bsdf, emission: emission, interior: interior, name: name, scene: &scene, folder: folder, mesh: mesh)
       materialIndex[key] = materials.count
       bindings.append(materials.count)
@@ -479,7 +488,6 @@ extension MitsubaImporter {
   private static func loadMeshes(_ shapes: [Node], scene: inout Scene, progress: OperationProgress?) throws -> [Mesh?] {
     guard !shapes.isEmpty else { return [] }
     var results = [(mesh: Mesh?, report: [String], error: Error?)](repeating: (nil, [], nil), count: shapes.count)
-    let done = Mutex(0)
     var base = scene
     base.report = []
     let shared = base
@@ -492,8 +500,7 @@ extension MitsubaImporter {
         } catch {
           output.base[i] = (nil, local.report, error)
         }
-        let count = done.withLock { $0 += 1; return $0 }
-        progress?.update("Loading Mitsuba meshes", completed: count, of: shapes.count)
+        progress?.advance("Loading Mitsuba meshes", total: shapes.count)
       }
     }
     for result in results {

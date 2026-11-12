@@ -18,9 +18,10 @@
   let sceneURL = folder.appendingPathComponent("scene.xml")
   try #"<scene version="3.0.0"/>"#.write(to: sceneURL, atomically: true, encoding: .utf8)
   var scene = try MitsubaImporter.Scene(url: sceneURL)
-  func document(_ xml: String?, emission: SIMD3<Float>? = nil, name: String = "m", mesh: MitsubaImporter.Mesh? = nil) throws -> String {
+  func document(_ xml: String?, emission: SIMD3<Float>? = nil, name: String = "m", interior: MitsubaImporter.Node? = nil,
+                mesh: MitsubaImporter.Mesh? = nil) throws -> String {
     let node = try xml.map { try bsdf($0) }
-    return try MitsubaImporter.material(bsdf: node, emission: emission, interior: nil, name: name, scene: &scene, folder: bakes, mesh: mesh)
+    return try MitsubaImporter.material(bsdf: node, emission: emission, interior: interior, name: name, scene: &scene, folder: bakes, mesh: mesh)
   }
   func compiled(_ text: String) throws -> MaterialXProgram {
     let result = try MaterialXImporter.read(Data(text.utf8), baseURL: bakes, source: "mitsuba")
@@ -130,6 +131,15 @@
     <bsdf type="mask"><texture type="bitmap" name="opacity"><string name="filename" value="grey.png"/></texture><bsdf type="diffuse"/></bsdf>
     """)
   require(mask.opacity != nil && mask.images.count == 1 && input(mask, "geometry_opacity") == nil, "mask: a texture becomes connected geometry_opacity")
+  // Mitsuba decodes a bitmap opacity as sRGB unless raw (probed in 3.9.1: a grey 128 PNG gives opacity 0.2159, raw 0.5020).
+  let maskText = try document("""
+    <bsdf type="mask"><texture type="bitmap" name="opacity"><string name="filename" value="grey.png"/></texture><bsdf type="diffuse"/></bsdf>
+    """, name: "veil")
+  let rawMaskText = try document("""
+    <bsdf type="mask"><texture type="bitmap" name="opacity"><string name="filename" value="grey.png"/><boolean name="raw" value="true"/></texture><bsdf type="diffuse"/></bsdf>
+    """, name: "rawveil")
+  require(maskText.contains(#"colorspace="srgb_texture""#) && maskText.contains("<extract ") && !rawMaskText.contains("<extract ")
+    && !rawMaskText.contains("srgb_texture"), "a mask's bitmap opacity is the red channel of the sRGB image unless raw")
   let linear = try program(#"<bsdf type="plastic"><texture type="bitmap" name="diffuse_reflectance"><string name="filename" value="grey.png"/></texture></bsdf>"#)
   let tint = MitsubaImporter.plasticRatio(eta: 1.49 / 1.000277, alpha: nil, ggx: false, nonlinear: false, rho: 0.5)
   require(linear.images.count == 1 && linear.parameters.contains { $0.name.hasSuffix("/in2") && $0.defaultValue.map { abs($0.x - tint) < 1e-5 && $0.x == $0.z } == true },
@@ -172,6 +182,15 @@
   let bubble = try program(#"<bsdf type="dielectric"><float name="int_ior" value="0.763"/><float name="ext_ior" value="1"/></bsdf>"#, name: "bubble")
   require(near(input(bubble, "specular_ior"), SIMD3(repeating: 1 / 0.763)) && reported(prefix: "bubble: int_ior / ext_ior 0.763 is below 1"),
     "a dielectric with int_ior / ext_ior 0.763: specular_ior 1 / 0.763, reported (\(String(describing: input(bubble, "specular_ior"))))")
+  // A named conductor material with k alone: Mitsuba rejects the unused property; the importer reports it.
+  _ = try program(#"<bsdf type="conductor"><string name="material" value="Au"/><rgb name="k" value="1"/></bsdf>"#, name: "gold")
+  require(reported("gold: k ignored with a named conductor material"), "a named conductor material with k is reported")
+  _ = try program(#"<bsdf type="conductor"><string name="material" value="Au"/></bsdf>"#, name: "plainGold")
+  require(!reported(prefix: "plainGold:"), "a named conductor material alone is not reported")
+  // A thin dielectric with an interior medium is thin-walled, not unrefracting.
+  let slab = #"<medium type="homogeneous" name="interior"><rgb name="albedo" value="0"/><rgb name="sigma_t" value="0.5"/></medium>"#
+  _ = try compiled(document(#"<bsdf type="thindielectric"/>"#, name: "film", interior: try bsdf(slab)))
+  require(reported("film: interior medium ignored (its BSDF is thin-walled)"), "a thin dielectric's interior medium is reported as thin-walled")
   _ = try program(#"<bsdf type="roughconductor"/>"#)
   require(reported("Beckmann microfacet distributions are rendered as GGX at the same alpha"), "a Beckmann distribution is reported")
   let dark = try program(nil, emission: .zero)
