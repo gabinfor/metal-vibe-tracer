@@ -5,7 +5,7 @@
 **A spectral GPU path tracer for macOS, built with Swift and Metal.**<br>
 Real-time ReSTIR, OpenPBR materials, OpenUSD import, and denoised exports.
 
-![macOS 26+](https://img.shields.io/badge/macOS-26%2B-000000?logo=apple&logoColor=white) ![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white) ![Metal](https://img.shields.io/badge/Metal-ray%20tracing-8A8A8A) ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-000000?logo=apple&logoColor=white) ![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white) ![Metal](https://img.shields.io/badge/Metal-ray%20tracing-8A8A8A) ![License: MIT](https://img.shields.io/badge/license-MIT-blue) [![Latest release](https://img.shields.io/github/v/release/gabinfor/metal-vibe-tracer)](https://github.com/gabinfor/metal-vibe-tracer/releases/latest)
 
 </div>
 
@@ -150,6 +150,12 @@ Every reference scene is rendered by both Metal Vibe Tracer and [Mitsuba 3](http
 </details>
 
 ## Getting started
+
+### Download
+
+Ready-to-run builds for Apple silicon Macs with macOS 26 or later are on the [latest release](https://github.com/gabinfor/metal-vibe-tracer/releases/latest). Download `MetalVibeTracer-<version>-macos-arm64-unsigned.zip` and its `.sha256` file, check the archive with `shasum -a 256 -c MetalVibeTracer-<version>-macos-arm64-unsigned.zip.sha256` in the folder that holds both, unzip it and open the app. The app is not signed or notarized, so macOS blocks the first launch: open it once, then choose **Open Anyway** in **System Settings › Privacy & Security**. [CHANGELOG.md](CHANGELOG.md) lists what each release changed.
+
+### Build from source
 
 **Requirements:** macOS 26 or later, a Metal-capable GPU (tested on Apple M4), Xcode 27 command-line tools (Swift 6.4), and internet access for the first build.
 
