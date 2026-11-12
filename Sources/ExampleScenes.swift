@@ -316,6 +316,11 @@ struct ShowcaseShot: Decodable, Sendable {
   // A saved view of the imported scene ("glTF: camera_front") as the camera, before yaw, pitch and the
   // other camera fields adjust it.
   var view: String?
+  // The sample count of the scene browser's thumbnail (scripts/render_showcase.py --thumbnails), instead of the
+  // shot's own capped at 256.
+  var thumbnailSamples: UInt32?
+  // A shot for the thumbnail run alone, which the README showcase run skips (a built-in scene's thumbnail settings).
+  var thumbnailOnly: Bool?
 
   static func load(_ url: URL) throws -> [ShowcaseShot] {
     try JSONDecoder().decode([ShowcaseShot].self, from: Data(contentsOf: url))
