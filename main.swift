@@ -8841,8 +8841,6 @@ final class MaterialLibrary {
     private var settingsBuffer: MTLBuffer?
     var images: [MTLTexture] = []
     private var defaultTextures: [MTLTexture] = []
-    // The material textures' mip filter (StudioModel.swift encodeMipmaps), compiled on first use.
-    var areaMipmapPipeline: MTLComputePipelineState?
     var fileNames = Array(repeating: "None", count: SceneLimits.materials * 4)
     var argumentBuffer: MTLBuffer!
     let device: MTLDevice
