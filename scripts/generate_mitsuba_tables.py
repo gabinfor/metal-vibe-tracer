@@ -2,7 +2,7 @@
 
 Usage: build/mitsuba-venv/bin/python -I scripts/generate_mitsuba_tables.py
 
-Run by hand (Mitsuba is not available to the build or the tests); both outputs are checked in
+Run by hand (Mitsuba is not available to the build or the tests); it takes about 3 minutes on an M4. Both outputs are checked in
 (docs/MITSUBA_IMPORT_DESIGN.md section 5, REFERENCES.md MITSUBA3):
 
   Sources/MitsubaTables.swift              MitsubaTables.ior: every name Mitsuba's dielectric plugins accept

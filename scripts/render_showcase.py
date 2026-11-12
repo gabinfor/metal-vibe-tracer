@@ -11,6 +11,10 @@ and test images are not denoised. A shot with "denoise": true uses Open Image De
 for a high-sample showcase render); "indirectClamp": c caps each sample's indirect luminance at c, a biased
 firefly control that the image notes must state; "raw": true exports linear radiance as OpenEXR (renderer comparisons);
 "keepRaw": true with "denoise": true also saves the undenoised image of the same render as NAME-raw.png.
+A normal run needs every shot's scene file: the McGuire scenes unpacked under build/scenes (build/scenes/download.sh)
+and Bitterli's archives unpacked as build/scenes/<stem>/<stem>/scene_v3.xml (the ten bitterli-* shots). The run stops
+before rendering when one is missing, with one line naming the shot and the file and a non-zero exit status;
+--only (the shots it names) or --thumbnails (which skips scenes that are not installed) avoids that.
 --scale and --samples override every shot for quick framing previews. Images go to --out
 (default build/showcase); copy the chosen ones to docs/images by hand.
 
@@ -227,6 +231,13 @@ if CommandLine.arguments.count > 4, CommandLine.arguments[3] == "--thumbnails" {
   if !failed.isEmpty { print("FAILED: " + failed.joined(separator: ", ")); exit(1) }
   if skipped.isEmpty { print("All thumbnails rendered") }
 } else {
+  // A shot whose scene file is not unpacked stops the run before any shot renders.
+  for shot in shots {
+    if let path = shot.usd ?? shot.gltf ?? shot.mitsuba ?? shot.obj, !FileManager.default.fileExists(atPath: path) {
+      fputs("FAIL: \(shot.name): scene file \(path) is missing\n", stderr)
+      exit(1)
+    }
+  }
   for shot in shots {
     do { _ = try render(shot) } catch let failure as ExportFailure {
       fputs((failure.errorDescription ?? "FAIL") + "\n", stderr)
