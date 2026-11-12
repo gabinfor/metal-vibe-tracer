@@ -498,14 +498,17 @@
   controller.exampleLibrary = downloadLibrary
   // A Mitsuba download: a locally made archive holding a floor, an emissive rectangle and a perspective sensor installs
   // and opens through the Mitsuba importer with the Water Caustic shot (view "Mitsuba: camera", caustics 3) and the
-  // entry's credit first in the import report, without the report sheet.
+  // entry's credit first in the import report, without the report sheet. Its thinlens focus distance (3) differs
+  // from the camera's distance, so the shot's saved view, which sets the focus to its distance, is observable.
   let mitsubaSource = folder.appendingPathComponent("mitsuba-source", isDirectory: true)
   try manager.createDirectory(at: mitsubaSource.appendingPathComponent("synthetic", isDirectory: true), withIntermediateDirectories: true)
   try Data("""
     <scene version="3.0.0">
       <integrator type="path"><integer name="max_depth" value="6"/></integrator>
-      <sensor type="perspective">
+      <sensor type="thinlens">
         <float name="fov" value="40"/>
+        <float name="aperture_radius" value="0.1"/>
+        <float name="focus_distance" value="3"/>
         <transform name="to_world"><lookat origin="0, 2, 6" target="0, 0, 0" up="0, 1, 0"/></transform>
         <film type="hdrfilm"><integer name="width" value="64"/><integer name="height" value="48"/></film>
       </sensor>
@@ -551,19 +554,24 @@
   require(mitsubaPrompts == 1 && controller.documentEdited && scenes.isVisible && !controller.isBusy
     && cancelled == beforeMitsuba && reportSheets == 0,
     "Cancel at the unsaved-changes prompt leaves the document and the Scenes window as they are")
-  controller.unsavedChangesAnswer = nil
-  controller.associate(nil, edited: false, replaced: false)
+  // Don't Save at the prompt proceeds: one prompt, then the scene opens.
   let caustics = controller.project.caustics
+  mitsubaPrompts = 0
+  controller.unsavedChangesAnswer = { respond in mitsubaPrompts += 1; respond(.alertSecondButtonReturn) }
   grouped {
     controller.openScene(mitsubaEntry)
     waitUntil({ !controller.isBusy }, seconds: 60)
   }
+  require(mitsubaPrompts == 1, "Don't Save at the unsaved-changes prompt asks once (\(mitsubaPrompts))")
+  controller.unsavedChangesAnswer = nil
   let opened = controller.project
   require(opened.graph?.assets.map(\.geometry.count).reduce(0, +) == 4 && opened.views["Mitsuba: camera"] != nil
     && opened.camera.yaw == opened.views["Mitsuba: camera"]?.yaw && opened.camera.distance == opened.views["Mitsuba: camera"]?.distance
     && opened.camera.fov == opened.views["Mitsuba: camera"]?.fov && opened.options.outputWidth == 64 && opened.options.outputHeight == 48
     && opened.options.depth == 5, "the Mitsuba scene opens with its triangles, its camera and its film size and depth")
   require(caustics != 3 && opened.caustics == 3, "the shot's caustics mode applies (\(caustics) before)")
+  require(opened.options.focusDistance == opened.views["Mitsuba: camera"]?.distance && opened.options.focusDistance != 3,
+    "the shot's view sets the focus distance to the camera's (\(String(describing: opened.options.focusDistance)))")
   require(opened.importReport?.first == mitsubaEntry.attribution && controller.projectURL == nil && controller.documentEdited
     && !scenes.isVisible && reportSheets == 0 && controller.history.canUndo
     && controller.status.stringValue == "Opened \(mitsubaEntry.title) \(mitsubaEntry.credit!), \(mitsubaEntry.license!). Credits: File > Credits and Licenses….",
@@ -571,6 +579,34 @@
   history.undo()
   waitUntil({ !controller.isBusy }, seconds: 60)
   controller.associate(nil, edited: false, replaced: false)
+
+  // An installed catalog scene whose file was deleted does not open: the document is unchanged, the Scenes window stays
+  // shown and its details pane shows the error, as the status line does.
+  func failedOpen(_ entry: SceneEntry, _ library: ExampleLibrary, _ name: String) throws {
+    controller.exampleLibrary = library
+    guard let file = library.sceneFileURL(entry) else { return require(false, "\(name) is a download") }
+    try manager.removeItem(at: file)
+    require(controller.isInstalled(entry), "\(name) is still installed by its marker")
+    controller.browseScenes()
+    browser.filter = .all; browser.search = ""
+    browser.selection = entry
+    let before = try encoder.encode(controller.project)
+    controller.openScene(entry)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+    let message = controller.errorMessage ?? ""
+    let label = browser.control("scene-download-error") as? NSTextField
+    let after = try encoder.encode(controller.project)
+    require(!message.isEmpty && controller.status.stringValue == message && scenes.isVisible
+      && after == before && label?.isHidden == false && label?.stringValue == message,
+      "a deleted \(name) file leaves the document and the Scenes window as they are and shows the error in the details pane: \(message)")
+  }
+  try failedOpen(mitsubaEntry, mitsubaLibrary, "Mitsuba scene")
+  let objLibrary = ExampleLibrary(root: folder.appendingPathComponent("obj-controller", isDirectory: true))
+  try manager.createDirectory(at: objLibrary.storage(correct), withIntermediateDirectories: true)
+  try ExampleSceneDownload.installDownloaded(payloadZip, archive: correct.archives[0], storage: objLibrary.storage(correct), library: objLibrary)
+  try failedOpen(correct, objLibrary, "OBJ scene")
+  controller.dismissError()
+  scenes.hide()
   controller.exampleLibrary = downloadLibrary
 
   // Bundled thumbnails: one 480 x 270 image per scene but the exempt Stanford scans, listed in scene-ids.txt.

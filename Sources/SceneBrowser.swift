@@ -77,6 +77,8 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
   private var download: (id: String, fraction: Double?, status: String?)?
   // The last failed download (showDownloadError), shown under its entry until the next attempt.
   private var downloadError: (id: String, message: String)?
+  // The last failed open of an installed scene (showOpenError), shown under its entry in the same line.
+  private var openError: (id: String, message: String)?
   private static let cardIdentifier = NSUserInterfaceItemIdentifier("scene-card")
 
   init(library: ExampleLibrary = ExampleLibrary()) {
@@ -300,6 +302,11 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     downloadError = message.map { (entry.id, $0) }
     fillDetails()
   }
+  // A failed open of the installed `entry`: the pane shows `message` above its Open button; nil clears it.
+  func showOpenError(_ entry: SceneEntry, _ message: String?) {
+    openError = message.map { (entry.id, $0) }
+    fillDetails()
+  }
   // The control with this accessibility identifier.
   func control(_ id: String) -> NSControl? {
     func find(_ view: NSView) -> NSControl? {
@@ -425,7 +432,7 @@ final class SceneBrowserView: NSView, NSCollectionViewDataSource, NSCollectionVi
     }
     consentLabel.isHidden = missing == 0 || running != nil
     consentLabel.stringValue = consentText(entry)
-    let failed = downloadError.flatMap { $0.id == entry.id && running == nil && missing > 0 ? $0.message : nil }
+    let failed = (missing > 0 ? downloadError : openError).flatMap { $0.id == entry.id && running == nil ? $0.message : nil }
     downloadErrorLabel.isHidden = failed == nil
     downloadErrorLabel.stringValue = failed ?? ""
     openButton.isHidden = missing > 0

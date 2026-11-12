@@ -413,6 +413,7 @@ extension StudioController {
   // scene that is not installed does nothing: its Download button in the scene browser installs it first.
   func openScene(_ entry: SceneEntry) {
     guard !isBusy, isInstalled(entry) else { return }
+    scenes.browser.showOpenError(entry, nil)
     switch entry.source {
     case .builtIn(let index): confirmDiscardingChanges { [weak self] in self?.startBuiltInScene(index) }
     case .bundled: openBundledScene(entry)
@@ -475,7 +476,13 @@ extension StudioController {
       showError(message)
     }
   }
-  // The scene's showcase shot, or an error alert when showcase.json lacks it.
+  // A failed open of the catalog entry: the status line and, with the Scenes window shown, its details pane, which the
+  // window may be covering the status line of.
+  private func catalogOpenFailed(_ entry: SceneEntry, _ message: String) {
+    showError(message)
+    if scenes.isVisible { scenes.browser.showOpenError(entry, message) }
+  }
+  // The scene's showcase shot, or an error when showcase.json lacks it.
   private func showcaseShot(_ entry: SceneEntry) -> ShowcaseShot? {
     do {
       guard let found = try ShowcaseShot.bundled().first(where: { $0.name == entry.shot }) else {
@@ -483,7 +490,7 @@ extension StudioController {
       }
       return found
     } catch {
-      showError(error.localizedDescription)
+      catalogOpenFailed(entry, error.localizedDescription)
       return nil
     }
   }
@@ -494,17 +501,21 @@ extension StudioController {
     guard !isBusy, let url = exampleLibrary.sceneFileURL(entry), let attribution = entry.attribution,
       let credit = entry.credit, let license = entry.license, let shot = showcaseShot(entry)
     else { return }
-    beginImportUSD(from: url, opened: "Opened \(entry.title) \(credit), \(license). Credits: File > Credits and Licenses….") {
-      shot.apply(to: &$0)
-      $0.importReport = [attribution] + ($0.importReport ?? [])
-    }
+    beginImportUSD(
+      from: url, opened: "Opened \(entry.title) \(credit), \(license). Credits: File > Credits and Licenses….",
+      failed: { [weak self] in self?.catalogOpenFailed(entry, $0) },
+      adjust: {
+        shot.apply(to: &$0)
+        $0.importReport = [attribution] + ($0.importReport ?? [])
+      })
   }
   // Opens the extracted OBJ scene as a new, unsaved, untitled project with the showcase shot's settings.
   func beginExampleImport(_ entry: SceneEntry) {
     guard !isBusy, let url = exampleLibrary.sceneFileURL(entry), let attribution = entry.attribution,
       let credit = entry.credit, let license = entry.license, let shot = showcaseShot(entry)
     else { return }
-    openOBJAsNewDocument(url, activity: "Importing \(entry.title)…", undoName: "Open example scene", adjust: { document in
+    openOBJAsNewDocument(url, activity: "Importing \(entry.title)…", undoName: "Open example scene",
+      failed: { [weak self] in self?.catalogOpenFailed(entry, $0) }, adjust: { document in
       shot.apply(to: &document)
       // The credit travels with the project in its import report.
       document.importReport = [attribution] + (document.importReport ?? [])
@@ -525,7 +536,8 @@ extension StudioController {
   // Builds a new document from the OBJ off the main thread (`adjust` edits it before its resources are
   // prepared), replaces the current one with it and runs `finish`.
   private func openOBJAsNewDocument(
-    _ url: URL, activity: String, undoName: String, adjust: @escaping @Sendable (inout ProjectDocument) -> Void,
+    _ url: URL, activity: String, undoName: String, failed: (@MainActor @Sendable (String) -> Void)? = nil,
+    adjust: @escaping @Sendable (inout ProjectDocument) -> Void,
     finish: @escaping @MainActor () -> Void
   ) {
     guard !isBusy else { return }
@@ -549,7 +561,9 @@ extension StudioController {
         self.associate(nil, edited: true, replaced: true)
         self.selectedNode = nil
         finish()
-      case .failure(let error): self.showError(error.localizedDescription)
+      case .failure(let error):
+        self.showError(error.localizedDescription)
+        failed?(error.localizedDescription)
       }
     }
   }
@@ -563,7 +577,7 @@ extension StudioController {
       + "request and imported unchanged: Metal Vibe Tracer translates their MTL materials and sets its own camera, sky "
       + "and sun. From Benedikt Bitterli's Rendering Resources (benedikt-bitterli.me/resources), downloaded on request "
       + "and opened through the Mitsuba importer, which translates their Mitsuba materials to OpenPBR and keeps their "
-      + "cameras and lights. Renders are adapted works and must keep the credit and the license link, except for the "
+      + "cameras, area lights and environment maps. Renders are adapted works and must keep the credit and the license link, except for the "
       + "public domain (CC0) scenes, where credit is appreciated but not required."
     alert.addButton(withTitle: "OK")
     alert.addButton(withTitle: "Open McGuire Archive Website")
@@ -594,13 +608,12 @@ extension StudioController {
       else { throw MaterialLibrary.error("\(example.title) is missing from the application bundle.") }
       (shot, url) = (found, stage)
     } catch {
-      showError(error.localizedDescription)
+      catalogOpenFailed(example, error.localizedDescription)
       return
     }
     confirmDiscardingChanges { [weak self] in
-      self?.beginImportUSD(from: url, opened: "Opened \(example.title). Spectral light transport renders its effects.") {
-        shot.apply(to: &$0)
-      }
+      self?.beginImportUSD(from: url, opened: "Opened \(example.title). Spectral light transport renders its effects.",
+        adjust: { shot.apply(to: &$0) })
     }
   }
   @objc func exampleCreditsAction() { showExampleCredits() }
