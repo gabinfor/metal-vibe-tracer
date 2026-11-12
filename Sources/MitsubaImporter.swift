@@ -409,8 +409,14 @@ extension MitsubaImporter {
     var triangles: [SIMD3<UInt32>]
   }
 
-  // The shape as one world-space mesh; nil, with a report line, for a shape type that is not read. Errors name
-  // the file for an unreadable or malformed mesh.
+  // A mesh file that cannot be read, with the file's name; `mesh` adds the shape's.
+  fileprivate struct ReadError: Error {
+    let message: String
+    init(_ message: String) { self.message = message }
+  }
+
+  // The shape as one world-space mesh; nil, with a report line, for a shape type that is not read. An error for
+  // a mesh file names the shape (its id, else its type) and the file.
   static func mesh(_ shape: Node, scene: inout Scene) throws -> Mesh? {
     let type = shape.type ?? "(no type)"
     let toWorld = shape.transform("to_world")
@@ -422,22 +428,35 @@ extension MitsubaImporter {
     }
     switch type {
     case "obj", "ply", "serialized":
-      guard let url = shape.url("filename") else { throw error("shape \(type) has no filename") }
-      let name = url.lastPathComponent
-      let data: Data
-      do { data = try Data(contentsOf: url, options: .alwaysMapped) } catch {
-        throw MitsubaImporter.error("cannot read \(name): \(error.localizedDescription)")
-      }
       let faceNormals = shape.bool("face_normals") ?? false
-      let local: Mesh = try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-        switch type {
-        case "obj":
-          return try readOBJ(raw.bindMemory(to: UInt8.self), name: name, normals: !faceNormals, flipV: shape.bool("flip_tex_coords") ?? true)
-        case "ply":
-          return try readPLY(raw, name: name, normals: !faceNormals, flipV: shape.bool("flip_tex_coords") ?? false)
-        default:
-          return try readSerialized(raw, name: name, normals: !faceNormals, index: Int(shape.float("shape_index") ?? 0))
+      let local: Mesh
+      do {
+        guard let url = shape.url("filename") else { throw ReadError("the shape has no filename") }
+        let name = url.lastPathComponent
+        let data: Data
+        do { data = try Data(contentsOf: url, options: .alwaysMapped) } catch {
+          throw ReadError("cannot read \(name): \(error.localizedDescription)")
         }
+        // shape_index: a non-negative whole number, below Int32.max.
+        var index = 0
+        if type == "serialized", let value = shape.float("shape_index") {
+          guard value.isFinite, value >= 0, value < 2_147_483_648, value == value.rounded() else {
+            throw ReadError("shape_index must be a non-negative integer")
+          }
+          index = Int(value)
+        }
+        local = try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+          switch type {
+          case "obj":
+            return try readOBJ(raw.bindMemory(to: UInt8.self), name: name, normals: !faceNormals, flipV: shape.bool("flip_tex_coords") ?? true)
+          case "ply":
+            return try readPLY(raw, name: name, normals: !faceNormals, flipV: shape.bool("flip_tex_coords") ?? false)
+          default:
+            return try readSerialized(raw, name: name, normals: !faceNormals, index: index)
+          }
+        }
+      } catch let failure as ReadError {
+        throw error("shape '\(shape.id ?? type)': \(failure.message)")
       }
       return world(local, toWorld, smoothNormals: !faceNormals)
     case "rectangle", "disk", "cube", "sphere":
@@ -452,20 +471,24 @@ extension MitsubaImporter {
 
   // MARK: Placement and normals
 
-  // The mesh in world space. A mesh without normals gets smooth ones when asked; one with them has them
+  // The mesh in world space. A mesh without usable normals gets smooth ones when asked; one with them has them
   // transformed by the inverse transpose of the matrix's 3 x 3 and renormalized.
   fileprivate static func world(_ local: Mesh, _ matrix: simd_float4x4, smoothNormals: Bool) -> Mesh {
     var mesh = local
     mesh.positions = local.positions.map { (matrix * SIMD4($0, 1)).xyz }
+    mesh.normals = nil
     if let normals = local.normals {
       let linear = simd_float3x3(columns: (matrix.columns.0.xyz, matrix.columns.1.xyz, matrix.columns.2.xyz))
       let normalMatrix = linear.inverse.transpose
-      mesh.normals = normals.map { n in
-        let transformed = normalMatrix * n
-        let length = simd_length(transformed)
-        return length > 0 ? transformed / length : transformed
+      let transformed = normals.map { n -> SIMD3<Float> in
+        let t = normalMatrix * n
+        return t / simd_length(t)
       }
-    } else if smoothNormals {
+      // One zero or non-finite normal (a zero vn, a near-singular to_world) drops them all, and smooth normals
+      // are computed instead.
+      if transformed.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) { mesh.normals = transformed }
+    }
+    if mesh.normals == nil, smoothNormals {
       mesh.normals = vertexNormals(mesh.positions, mesh.triangles)
     }
     return mesh
@@ -669,10 +692,13 @@ extension MitsubaImporter {
       }
       defer { cursor = end + 1 }
       var i = cursor
-      func failure(_ what: String) -> Error { MitsubaImporter.error("\(name): line \(line): \(what)") }
+      func failure(_ what: String) -> Error { ReadError("\(name): line \(line): \(what)") }
       func number() throws -> Float {
         while i < end, isBlank(p[i]) { i += 1 }
-        guard let value = scanFloat(p, &i, end), value.isFinite else { throw failure("cannot read a number") }
+        // A number ends at a blank, a comment or the end of the line.
+        guard let value = scanFloat(p, &i, end), value.isFinite, i >= end || isBlank(p[i]) || p[i] == 0x23 else {
+          throw failure("cannot read a number")
+        }
         return value
       }
       // A 1-based element index (0 for none) for an index that counts from the start or, when negative, back
@@ -723,6 +749,7 @@ extension MitsubaImporter {
           if let id = welded[key] {
             corners.append(id)
           } else {
+            guard positions.count < Int(UInt32.max) else { throw failure("too many vertices") }
             let id = UInt32(positions.count)
             welded[key] = id
             positions.append(fileVertices[Int(key.x) - 1])
@@ -736,7 +763,7 @@ extension MitsubaImporter {
         }
       }
     }
-    guard !triangles.isEmpty else { throw MitsubaImporter.error("\(name) contains no triangles") }
+    guard !triangles.isEmpty else { throw ReadError("\(name) contains no triangles") }
     return Mesh(positions: positions, normals: wantNormals && !fileNormals.isEmpty && !missingNormal ? normals : nil,
                 uvs: fileUVs.isEmpty ? nil : uvs, triangles: triangles)
   }
@@ -758,6 +785,7 @@ extension MitsubaImporter {
       default: return nil
       }
     }
+    var isFloat: Bool { self == .float32 || self == .float64 }
     var size: Int {
       switch self {
       case .int8, .uint8: return 1
@@ -788,7 +816,7 @@ extension MitsubaImporter {
     let name: String
     var cursor: Int
 
-    func truncated() -> Error { MitsubaImporter.error("\(name): the PLY data is truncated or malformed") }
+    func truncated() -> Error { ReadError("\(name): the PLY data is truncated or malformed") }
 
     mutating func scalar(_ type: PLYType) throws -> Float {
       if ascii {
@@ -827,8 +855,7 @@ extension MitsubaImporter {
       case .uint16: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: UInt16.self))
       case .int32: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Int32.self))
       case .uint32: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: UInt32.self))
-      case .float32: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Float.self))
-      case .float64: return Int(raw.loadUnaligned(fromByteOffset: cursor, as: Double.self))
+      case .float32, .float64: throw truncated()
       }
     }
 
@@ -843,7 +870,7 @@ extension MitsubaImporter {
   }
 
   fileprivate static func readPLY(_ raw: UnsafeRawBufferPointer, name: String, normals wantNormals: Bool, flipV: Bool) throws -> Mesh {
-    func failure(_ what: String) -> Error { MitsubaImporter.error("\(name): \(what)") }
+    func failure(_ what: String) -> Error { ReadError("\(name): \(what)") }
     let bytes = raw.bindMemory(to: UInt8.self)
     var elements: [PLYElement] = []
     var ascii = false, cursor = 0, first = true, finished = false
@@ -875,6 +902,10 @@ extension MitsubaImporter {
       case "property":
         guard !elements.isEmpty else { throw failure("a PLY property outside an element") }
         if words.count == 5, words[1] == "list", let count = PLYType(words[2]), let item = PLYType(words[3]) {
+          // List lengths and vertex indices are integers; a float one is not a valid file.
+          guard !count.isFloat, !(item.isFloat && (words[4] == "vertex_indices" || words[4] == "vertex_index")) else {
+            throw failure("PLY list lengths and vertex indices must have integer types")
+          }
           elements[elements.count - 1].properties.append(PLYProperty(name: words[4], type: item, count: count))
         } else if words.count == 3, let type = PLYType(words[1]) {
           elements[elements.count - 1].properties.append(PLYProperty(name: words[2], type: type, count: nil))
@@ -912,7 +943,7 @@ extension MitsubaImporter {
           for (k, property) in element.properties.enumerated() {
             if let slot = roles[k] { row[slot] = try reader.scalar(property.type) } else { try reader.skip(property) }
           }
-          guard row[0].isFinite, row[1].isFinite, row[2].isFinite else { throw failure("mesh contains invalid vertex position data") }
+          guard row.allSatisfy({ $0.isFinite }) else { throw failure("mesh contains invalid vertex data") }
           positions.append(SIMD3(row[0], row[1], row[2]))
           if hasNormals { normals.append(SIMD3(row[3], row[4], row[5])) }
           if hasUVs { uvs.append(SIMD2(row[6], flipV ? 1 - row[7] : row[7])) }
@@ -948,10 +979,52 @@ extension MitsubaImporter {
 
   // MARK: Serialized
 
+  // A sub-mesh's header inside its decompressed stream, and the exact size of the stream it declares.
+  fileprivate struct SerializedHeader {
+    let flags: Int
+    let dataStart: Int
+    let vertexCount: Int
+    let faceCount: Int
+    let size: Int
+  }
+
+  // The header at the start of the decompressed bytes `data`; nil while more bytes are needed. Counts above the
+  // scene limits, and sizes that the compressed stream (`compressed` bytes) could not hold (DEFLATE expands at
+  // most about 1032 to 1), are errors.
+  fileprivate static func serializedHeader(_ data: UnsafeRawBufferPointer, version: Int, compressed: Int, name: String) throws -> SerializedHeader? {
+    guard data.count >= 4 else { return nil }
+    let flags = Int(data.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
+    var cursor = 4
+    if version == 4 {
+      // The sub-mesh's name, null-terminated.
+      guard let terminator = data[4...].firstIndex(of: 0) else {
+        if data.count > 4 + 4096 { throw ReadError("\(name): the serialized sub-mesh name is too long") }
+        return nil
+      }
+      cursor = terminator + 1
+    }
+    guard data.count >= cursor + 16 else { return nil }
+    let vertices = data.loadUnaligned(fromByteOffset: cursor, as: UInt64.self), faces = data.loadUnaligned(fromByteOffset: cursor + 8, as: UInt64.self)
+    guard faces > 0, faces <= UInt64(SceneLimits.triangles), vertices <= 3 * UInt64(SceneLimits.triangles) else {
+      throw ReadError("\(name): the serialized sub-mesh declares \(vertices) vertices and \(faces) triangles, outside the importer's limits")
+    }
+    let vertexCount = Int(vertices), faceCount = Int(faces)
+    let width = flags & 0x2000 != 0 ? 8 : 4
+    let components = 3 + (flags & 0x1 != 0 ? 3 : 0) + (flags & 0x2 != 0 ? 2 : 0) + (flags & 0x8 != 0 ? 3 : 0)
+    let size = cursor + 16 + width * vertexCount * components + 12 * faceCount
+    guard size <= 1032 * compressed + 1024 else {
+      throw ReadError("\(name): the serialized sub-mesh declares more data than its compressed size can hold")
+    }
+    return SerializedHeader(flags: flags, dataStart: cursor + 16, vertexCount: vertexCount, faceCount: faceCount, size: size)
+  }
+
   // The zlib stream (RFC 1950: a two-byte header, DEFLATE data, a checksum) at the start of `input`, which may be
-  // followed by other data; Compression's zlib decoder reads the raw DEFLATE data after the header.
-  fileprivate static func inflate(_ input: UnsafeRawBufferPointer, name: String) throws -> [UInt8] {
-    func failure() -> Error { MitsubaImporter.error("\(name): the compressed mesh data is damaged") }
+  // followed by other data; Compression's zlib decoder reads the raw DEFLATE data after the header. `expectedSize`
+  // sees the bytes decoded so far and returns the exact size the stream must have once it can tell (nil: not
+  // yet); decoding stops there, and a stream that ends before or runs past it is an error.
+  fileprivate static func inflate(_ input: UnsafeRawBufferPointer, name: String,
+                                  expectedSize: (UnsafeRawBufferPointer) throws -> Int?) throws -> [UInt8] {
+    func failure(_ what: String = "is damaged") -> Error { ReadError("\(name): the compressed mesh data \(what)") }
     guard input.count > 2, input[0] & 0x0F == 8, (Int(input[0]) << 8 | Int(input[1])) % 31 == 0, input[1] & 0x20 == 0 else { throw failure() }
     let chunk = 1 << 20
     let scratch = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
@@ -963,21 +1036,36 @@ extension MitsubaImporter {
     stream.src_ptr = body
     stream.src_size = input.count - 2
     var output: [UInt8] = []
+    var expected: Int?
     while true {
+      // Until the header is known, small steps; then no more than one byte past the declared size.
+      let room = expected.map { min(chunk, $0 - output.count + 1) } ?? 4096
       stream.dst_ptr = scratch
-      stream.dst_size = chunk
+      stream.dst_size = room
       let status = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
-      let produced = chunk - stream.dst_size
+      let produced = room - stream.dst_size
       output.append(contentsOf: UnsafeBufferPointer(start: scratch, count: produced))
-      if status == COMPRESSION_STATUS_END { return output }
+      if expected == nil { expected = try output.withUnsafeBytes { try expectedSize($0) } }
+      if let expected {
+        if output.count > expected { throw failure("has more data than its header declares") }
+        if status == COMPRESSION_STATUS_END {
+          guard output.count == expected else { throw failure("ends before the data its header declares") }
+          return output
+        }
+      } else if status == COMPRESSION_STATUS_END {
+        throw failure("ends inside its header")
+      }
       guard status == COMPRESSION_STATUS_OK, produced > 0 else { throw failure() }
     }
   }
 
   fileprivate static func readSerialized(_ raw: UnsafeRawBufferPointer, name: String, normals wantNormals: Bool, index: Int) throws -> Mesh {
-    func failure(_ what: String) -> Error { MitsubaImporter.error("\(name): \(what)") }
+    func failure(_ what: String) -> Error { ReadError("\(name): \(what)") }
+    // A little-endian integer at `offset`, compared without overflow.
     func integer<T: FixedWidthInteger>(_ type: T.Type, in bytes: UnsafeRawBufferPointer, at offset: Int) throws -> Int {
-      guard offset >= 0, offset + MemoryLayout<T>.size <= bytes.count else { throw failure("the serialized data is truncated") }
+      guard offset >= 0, bytes.count >= MemoryLayout<T>.size, offset <= bytes.count - MemoryLayout<T>.size else {
+        throw failure("the serialized data is truncated")
+      }
       return Int(truncatingIfNeeded: bytes.loadUnaligned(fromByteOffset: offset, as: T.self))
     }
     guard try integer(UInt16.self, in: raw, at: 0) == 0x041C else { throw failure("is not a Mitsuba serialized file") }
@@ -991,46 +1079,44 @@ extension MitsubaImporter {
       start = version == 4
         ? try integer(UInt64.self, in: raw, at: raw.count - 8 * (count - index) - 4)
         : try integer(UInt32.self, in: raw, at: raw.count - 4 * (count - index + 1))
-      guard start >= 0, start + 4 < raw.count else { throw failure("the serialized offset table is damaged") }
+      guard start >= 0, start < raw.count - 4 else { throw failure("the serialized offset table is damaged") }
     }
-    let body = try inflate(UnsafeRawBufferPointer(rebasing: raw[(start + 4)...]), name: name)
+    let input = UnsafeRawBufferPointer(rebasing: raw[(start + 4)...])
+    var header: SerializedHeader?
+    let body = try inflate(input, name: name) { prefix in
+      header = try serializedHeader(prefix, version: version, compressed: input.count - 2, name: name)
+      return header?.size
+    }
+    guard let header else { throw failure("the serialized sub-mesh has no header") }
     return try body.withUnsafeBytes { (data: UnsafeRawBufferPointer) in
-      var cursor = 0
-      let flags = try integer(UInt32.self, in: data, at: cursor)
-      cursor += 4
-      if version == 4 {
-        // The sub-mesh's name, null-terminated.
-        guard let terminator = data[cursor...].firstIndex(of: 0) else { throw failure("the serialized data is truncated") }
-        cursor = terminator + 1
-      }
-      let vertexCount = try integer(UInt64.self, in: data, at: cursor), faceCount = try integer(UInt64.self, in: data, at: cursor + 8)
-      cursor += 16
-      let double = flags & 0x2000 != 0, hasNormals = flags & 0x1 != 0, hasUVs = flags & 0x2 != 0, hasColors = flags & 0x8 != 0
+      // The stream has exactly the declared size, so every read below is inside it.
+      let vertexCount = header.vertexCount, faceCount = header.faceCount
+      let double = header.flags & 0x2000 != 0, hasNormals = header.flags & 0x1 != 0, hasUVs = header.flags & 0x2 != 0
+      let hasColors = header.flags & 0x8 != 0
       let width = double ? 8 : 4
-      guard vertexCount >= 0, vertexCount < 1 << 32, faceCount > 0, faceCount < 1 << 32,
-            cursor + width * vertexCount * (3 + (hasNormals ? 3 : 0) + (hasUVs ? 2 : 0) + (hasColors ? 3 : 0)) + 12 * faceCount <= data.count
-      else { throw failure("the serialized data is truncated") }
-      func floats(_ components: Int) -> [Float] {
+      var cursor = header.dataStart
+      func floats(_ components: Int) throws -> [Float] {
         let values = (0..<vertexCount * components).map { k -> Float in
           let offset = cursor + k * width
           return double ? Float(data.loadUnaligned(fromByteOffset: offset, as: Double.self)) : data.loadUnaligned(fromByteOffset: offset, as: Float.self)
         }
         cursor += vertexCount * components * width
+        guard values.allSatisfy({ $0.isFinite }) else { throw failure("mesh contains invalid vertex data") }
         return values
       }
-      let p = floats(3), n = hasNormals ? floats(3) : [], uv = hasUVs ? floats(2) : []
+      let p = try floats(3), n = hasNormals ? try floats(3) : [], uv = hasUVs ? try floats(2) : []
       if hasColors { cursor += vertexCount * 3 * width }
-      let positions = (0..<vertexCount).map { SIMD3(p[3 * $0], p[3 * $0 + 1], p[3 * $0 + 2]) }
-      guard positions.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { throw failure("mesh contains invalid vertex position data") }
       var triangles: [SIMD3<UInt32>] = []
       triangles.reserveCapacity(faceCount)
       for f in 0..<faceCount {
-        let t = SIMD3(UInt32(try integer(UInt32.self, in: data, at: cursor + 12 * f)), UInt32(try integer(UInt32.self, in: data, at: cursor + 12 * f + 4)),
-                      UInt32(try integer(UInt32.self, in: data, at: cursor + 12 * f + 8)))
-        guard t.max() < vertexCount else { throw failure("a serialized face refers to a vertex that does not exist") }
+        let at = cursor + 12 * f
+        let t = SIMD3(data.loadUnaligned(fromByteOffset: at, as: UInt32.self), data.loadUnaligned(fromByteOffset: at + 4, as: UInt32.self),
+                      data.loadUnaligned(fromByteOffset: at + 8, as: UInt32.self))
+        guard Int(t.max()) < vertexCount else { throw failure("a serialized face refers to a vertex that does not exist") }
         triangles.append(t)
       }
-      return Mesh(positions: positions, normals: hasNormals && wantNormals ? (0..<vertexCount).map { SIMD3(n[3 * $0], n[3 * $0 + 1], n[3 * $0 + 2]) } : nil,
+      return Mesh(positions: (0..<vertexCount).map { SIMD3(p[3 * $0], p[3 * $0 + 1], p[3 * $0 + 2]) },
+                  normals: hasNormals && wantNormals ? (0..<vertexCount).map { SIMD3(n[3 * $0], n[3 * $0 + 1], n[3 * $0 + 2]) } : nil,
                   uvs: hasUVs ? (0..<vertexCount).map { SIMD2(uv[2 * $0], uv[2 * $0 + 1]) } : nil, triangles: triangles)
     }
   }

@@ -232,11 +232,11 @@
     shapeCount += 1
     return try MitsubaImporter.Scene(url: try write("shape\(shapeCount).xml", #"<scene version="3.0.0">\#(xml)</scene>"#)).root.children[0]
   }
-  func meshNode(_ file: String, faceNormals: Bool = false, extra: String = "") throws -> MitsubaImporter.Node {
+  func meshNode(_ file: String, faceNormals: Bool = false, extra: String = "", id: String? = nil) throws -> MitsubaImporter.Node {
     let inFixtures = FileManager.default.fileExists(atPath: fixtures.appendingPathComponent(file).path)
     let path = inFixtures ? fixtures.appendingPathComponent(file).path : file
     let type = file.hasSuffix(".obj") ? "obj" : file.hasSuffix(".ply") ? "ply" : "serialized"
-    return try shapeNode(#"<shape type="\#(type)"><string name="filename" value="\#(path)"/>"#
+    return try shapeNode(#"<shape type="\#(type)"\#(id.map { " id=\"\($0)\"" } ?? "")><string name="filename" value="\#(path)"/>"#
       + (faceNormals ? #"<boolean name="face_normals" value="true"/>"# : "") + extra + "</shape>")
   }
   func faceNormal(_ m: MitsubaImporter.Mesh, _ i: Int) -> SIMD3<Float> {
@@ -350,9 +350,92 @@
   try truncated.write(to: folder.appendingPathComponent("truncated.ply"))
   requireThrows("truncated") { _ = try MitsubaImporter.mesh(try meshNode("truncated.ply"), scene: &shapeScene) }
   requireThrows("missing.obj") { _ = try MitsubaImporter.mesh(try meshNode("missing.obj"), scene: &shapeScene) }
+  requireThrows("shape 'wall'") { _ = try MitsubaImporter.mesh(try meshNode("missing.obj", id: "wall"), scene: &shapeScene) }
+  requireThrows("shape 'floor'") { _ = try MitsubaImporter.mesh(try meshNode("bad.obj", id: "floor"), scene: &shapeScene) }
+  requireThrows("shape 'ply'") { _ = try MitsubaImporter.mesh(try meshNode("truncated.ply"), scene: &shapeScene) }
   let hair = try shapeNode(#"<shape type="hair"/>"#)
   let skipped = try MitsubaImporter.mesh(hair, scene: &shapeScene)
   require(skipped == nil && shapeScene.report.contains { $0.contains("shape hair") }, "unsupported shapes are reported")
+  // Malformed and hostile files.
+  func fails(_ fragment: String, _ file: String, extra: String = "") {
+    requireThrows(fragment) { _ = try MitsubaImporter.mesh(try meshNode(file, extra: extra), scene: &shapeScene) }
+  }
+  let binaryPLY = try Data(contentsOf: fixtures.appendingPathComponent("tri-binary.ply"))
+  let headerEnd = binaryPLY.range(of: Data("end_header\n".utf8))!.upperBound
+  // The Mitsuba-written binary PLY with its header text edited and its body edited by `body`.
+  func ply(_ name: String, header edit: (String) -> String = { $0 }, body: (inout [UInt8]) -> Void = { _ in }) throws {
+    var bytes = Array(binaryPLY[headerEnd...])
+    body(&bytes)
+    try (Data(edit(String(decoding: binaryPLY[..<headerEnd], as: UTF8.self)).utf8) + Data(bytes)).write(to: folder.appendingPathComponent(name))
+  }
+  try ply("many-vertices.ply", header: { $0.replacingOccurrences(of: "element vertex 3", with: "element vertex 1000") })
+  fails("truncated", "many-vertices.ply")
+  try ply("many-faces.ply", header: { $0.replacingOccurrences(of: "element face 1", with: "element face 5") })
+  fails("truncated", "many-faces.ply")
+  try ply("unknown-type.ply", header: { $0.replacingOccurrences(of: "property float x", with: "property floot x") })
+  fails("unsupported PLY property", "unknown-type.ply")
+  try ply("no-end.ply", header: { $0.replacingOccurrences(of: "end_header\n", with: "") })
+  fails("header is truncated", "no-end.ply")
+  try ply("negative-count.ply", header: { $0.replacingOccurrences(of: "list uchar int", with: "list char int") }, body: { $0[$0.count - 13] = 0xFF })
+  fails("malformed", "negative-count.ply")
+  try ply("float-count.ply", header: { $0.replacingOccurrences(of: "list uchar int", with: "list float int") })
+  fails("integer types", "float-count.ply")
+  try ply("float-index.ply", header: { $0.replacingOccurrences(of: "list uchar int", with: "list uchar float") }, body: { $0.replaceSubrange(($0.count - 12)..., with: [UInt8](repeating: 0xFF, count: 12)) })
+  fails("integer types", "float-index.ply")
+  try ply("inf-normal.ply", body: { $0.replaceSubrange(12..<16, with: [0, 0, 0x80, 0x7F]) })
+  fails("invalid vertex data", "inf-normal.ply")
+  try ply("nan-uv.ply", body: { $0.replaceSubrange(28..<32, with: [0, 0, 0xC0, 0x7F]) })
+  fails("invalid vertex data", "nan-uv.ply")
+
+  for value in ["nan", "inf", "1e30", "-1", "1.5"] {
+    fails("shape_index must be a non-negative integer", "tri.serialized", extra: #"<float name="shape_index" value="\#(value)"/>"#)
+  }
+
+  _ = try write("index-zero.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n")
+  fails("invalid vertex index 0", "index-zero.obj")
+  _ = try write("garbage.obj", "v 0 0 0\nv 1 0 0\nv 0 1 3xyz\nf 1 2 3\n")
+  fails("cannot read a number", "garbage.obj")
+  _ = try write("lf.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n")
+  _ = try write("crlf.obj", "# header\r\nv\t0 0 0 # origin\r\nv 1\t0 0\r\nv 0 1 0\r\n\r\nvt 0 0\r\nvt 1 0\r\nvt 0 1\r\nf\t1/1 2/2 3/3 # face\r\n")
+  let lf = try MitsubaImporter.mesh(try meshNode("lf.obj"), scene: &shapeScene)!, crlf = try MitsubaImporter.mesh(try meshNode("crlf.obj"), scene: &shapeScene)!
+  require(lf.positions == crlf.positions && lf.uvs == crlf.uvs && lf.triangles == crlf.triangles && lf.normals == crlf.normals,
+    "CRLF line endings, tabs and trailing comments read as the same mesh")
+  _ = try write("zero-normal.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 0\nf 1//1 2//1 3//1\n")
+  let zeroNormal = try MitsubaImporter.mesh(try meshNode("zero-normal.obj"), scene: &shapeScene)!
+  require(zeroNormal.normals?.allSatisfy { simd_length($0 - SIMD3(0, 0, 1)) < 1e-6 } == true, "a zero vn gives computed smooth normals")
+
+  // Serialized files built here: a stored (uncompressed) DEFLATE block in a zlib stream.
+  func bytes<T: FixedWidthInteger>(_ value: T) -> [UInt8] { withUnsafeBytes(of: value.littleEndian) { Array($0) } }
+  func zlib(_ body: [UInt8]) -> [UInt8] {
+    [0x78, 0x01, 0x01] + bytes(UInt16(body.count)) + bytes(~UInt16(body.count)) + body + [0, 0, 0, 0]
+  }
+  func serialized(vertices: UInt64, faces: UInt64, payload: [UInt8], version: UInt16 = 4) -> [UInt8] {
+    bytes(UInt16(0x041C)) + bytes(version) + zlib(bytes(UInt32(0x1000)) + Array("m\0".utf8) + bytes(vertices) + bytes(faces) + payload)
+  }
+  let positions = [Float](arrayLiteral: 0, 0, 0, 1, 0, 0, 0, 1, 0).flatMap { bytes($0.bitPattern) }
+  let triangle = positions + bytes(UInt32(0)) + bytes(UInt32(1)) + bytes(UInt32(2))
+  func serializedFails(_ fragment: String, _ name: String, _ content: [UInt8], extra: String = "") throws {
+    try Data(content).write(to: folder.appendingPathComponent(name))
+    fails(fragment, name, extra: extra)
+  }
+  let good = serialized(vertices: 3, faces: 1, payload: triangle)
+  try Data(good).write(to: folder.appendingPathComponent("built.serialized"))
+  let built = try MitsubaImporter.mesh(try meshNode("built.serialized"), scene: &shapeScene)!
+  require(built.triangles == [SIMD3(0, 1, 2)], "the test's own serialized builder reads back")
+  try serializedFails("outside the importer's limits", "huge-counts.serialized", serialized(vertices: 1 << 40, faces: 1 << 40, payload: triangle))
+  try serializedFails("compressed size can hold", "bomb.serialized", serialized(vertices: 5_000_000, faces: 10_000_000, payload: triangle))
+  try serializedFails("ends before", "short.serialized", serialized(vertices: 3, faces: 1, payload: Array(triangle.dropLast(4))))
+  try serializedFails("more data", "long.serialized", serialized(vertices: 3, faces: 1, payload: triangle + [1, 2, 3, 4, 5, 6, 7, 8]))
+  try serializedFails("version 5", "version5.serialized", serialized(vertices: 3, faces: 1, payload: triangle, version: 5))
+  try serializedFails("compressed mesh data", "cut.serialized", Array(good.prefix(30)))
+  try serializedFails("compressed mesh data", "not-zlib.serialized", Array(good.prefix(4)) + [0xFF, 0xFF, 1, 2, 3])
+  // An offset table pointing outside the file or near the end of the integer range.
+  let fixture = Array(try Data(contentsOf: fixtures.appendingPathComponent("tri.serialized")))
+  for (name, offset) in [("outside", UInt64(0xFFFF)), ("max", UInt64.max), ("int-max", UInt64(Int.max) - 3), ("end", UInt64(fixture.count - 4))] {
+    var patched = fixture
+    patched.replaceSubrange((patched.count - 12)..<(patched.count - 4), with: bytes(offset))
+    try serializedFails("offset table", "offset-\(name).serialized", patched, extra: #"<integer name="shape_index" value="1"/>"#)
+  }
   print("PASS: Mitsuba shapes: obj, ply and serialized readers, analytic shapes, normals, winding, texture coordinates")
 }
 try fixMitsubaChecks()
