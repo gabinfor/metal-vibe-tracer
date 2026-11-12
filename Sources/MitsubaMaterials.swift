@@ -31,7 +31,7 @@ import simd
 //                        256 px 8-bit sRGB PNG of color0 (0.4) and color1 (0.2) in the import folder
 //   no BSDF              grey diffuse 0.5, or black when the shape emits (Mitsuba's Shape default)
 //   area emitter         emission_color x emission_luminance = the radiance (MitsubaImporter.load divides it by eta^2
-//                        for an emitter inside glass, emitterEnclosures)
+//                        for an emitter inside glass, emitterEnclosures and enclosedRadianceScale)
 //   interior medium      homogeneous with albedo 0 (Mitsuba 0.6: sigma_s 0) behind a refracting BSDF:
 //                        transmission_color exp(-sigma_t x scale) at transmission_depth 1
 // Unsupported BSDFs, textures and properties, and every approximation, add a report line, as do values that are not

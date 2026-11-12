@@ -500,8 +500,8 @@ enum MitsubaImporter {
 //   shape        one mesh asset and one node per shape (MitsubaImporter.mesh, world space, identity node transform),
 //                named by its id, else <type><index>; one material per BSDF, area-emitter radiance and interior
 //                medium (MitsubaImporter.material), shared by the shapes that reference the same BSDF id with the same
-//                emission; an area emitter inside dielectrics has its radiance divided by their eta^2, with a report
-//                line (emitterEnclosures). Zero-area triangles are dropped. A shape whose dielectric (wrapped or not)
+//                emission; an area emitter inside dielectrics has its radiance divided by eta^(2 n) of each, n the
+//                net crossings out of it, with a report line (emitterEnclosures). Zero-area triangles are dropped. A shape whose dielectric (wrapped or not)
 //                has an IOR ratio below 1 is reversed (reversesFacing), unless it emits. Every surface is two-sided,
 //                so a BSDF that Mitsuba renders black from the back (isOneSided), or no BSDF on a shape that does not
 //                emit (Mitsuba's default diffuse), adds one report line for the scene. Loading stops as soon as the
@@ -557,11 +557,11 @@ extension MitsubaImporter {
     }
 
     var meshes = try loadMeshes(shapes, scene: &scene, progress: progress)
-    // Before the loop below reverses inverted dielectrics: containment takes Mitsuba's facing.
+    // Before the loop below reverses inverted dielectrics: the crossings take Mitsuba's facing.
     progress?.begin("Finding emitters inside glass")
-    let enclosures = emitterEnclosures(shapes, meshes)
+    let enclosures = emitterEnclosures(shapes, meshes, progress: progress)
     if enclosures.untested > 0 {
-      scene.note("\(enclosures.untested) area emitters not tested for enclosing dielectrics (more than \(enclosureTestLimit.formatted()) ray-triangle tests); their radiance is not converted")
+      scene.note("\(enclosures.untested) area emitters not tested for enclosing dielectrics (the limit of \(enclosureTestLimit.formatted()) ray-triangle tests was reached); their radiance is not converted")
     }
 
     // Materials, in shape order: the first shape with a material passes its mesh (a bump map's UV stretch).
@@ -930,136 +930,230 @@ extension MitsubaImporter {
 }
 
 // Area emitters inside dielectrics, a convention conversion (REFERENCES.md MITSUBA3, ADOBEOPENPBR). Mitsuba's emitted
-// radiance is radiance in the medium the emitter lies in, and its dielectrics scale radiance by (eta_i / eta_t)^2 on
-// refraction in radiance mode (dielectric.cpp, roughdielectric.cpp), so an emitter inside glass of int_ior / ext_ior eta
-// is seen from outside at radiance / eta^2. The app's camera paths carry basic radiance (L / n^2) through OpenPBR
-// transmission, which applies no such factor, and its light paths match them (caustic_trace_kernel), so an emission
-// value is the radiance seen outside: load divides the radiance by eta^2 of each dielectric that encloses the emitter.
+// radiance is radiance in the medium the emitter lies in, and its dielectrics multiply radiance by (eta_i / eta_t)^2 at
+// each refraction in radiance mode (dielectric.cpp, roughdielectric.cpp), so light that leaves a dielectric of int_ior /
+// ext_ior eta on its way out is seen at radiance / eta^2, and light that enters one at radiance x eta^2. The app's
+// camera paths carry basic radiance (L / n^2) through OpenPBR transmission, which applies no such factor, and its light
+// paths match them (caustic_trace_kernel), so an emission value is the radiance seen where its light ends up: load
+// divides the radiance by eta^(2 n) for each dielectric that the emitter's light leaves n times more than it enters it.
 //
-// Containment: enclosureRays rays from the emitter's surface, uniform by area and cosine-distributed on its emitting
-// side (as its light leaves), against each dielectric or roughdielectric shape whose bounds contain the emitter's, in
-// Mitsuba's facing (before reversesFacing). A ray whose nearest hit on the shape leaves it through its interior side
-// (along the winding normal) counts; a shape that enclosureShare of the rays leave encloses the emitter, so a mesh
-// with a gap (Little Lamp's bulb is open at its socket) still does, and one that partialShare to enclosureShare leave
-// is reported and not converted. Emitters past enclosureTestLimit ray-triangle tests in all are left untested and
-// counted.
+// Crossings: enclosureRays rays from the emitter's surface, at area-weighted points (a stratified triangle choice and
+// Halton barycentrics) in cosine directions on its emitting side, as its light leaves, are traced through each dielectric
+// or roughdielectric shape whose bounding box holds one of those points (one that holds none cannot surround the
+// emitter), in Mitsuba's facing (before reversesFacing). Every hit beyond 10^-4 of the shape's bounding-box diagonal
+// counts, +1 leaving the shape along its winding normal and -1 entering it. A net count that enclosureShare of the rays
+// agree on is the shape's: a mesh with a gap (Little Lamp's bulb is open at its socket) still counts, and a shell
+// around a cavity, in one mesh or two, nets 0. Without such agreement on a shape the emitter is reported and not
+// converted. Each shape's triangles go into one EnclosureBVH, built when a sample point first lies in its bounds and
+// shared by the emitters after it. Once testLimit ray-triangle tests have been made in all, the emitters left are not
+// tested and are counted.
 extension MitsubaImporter {
   static let enclosureRays = 256
   static let enclosureShare: Float = 0.9
-  static let partialShare: Float = 0.1
   static let enclosureTestLimit = 1 << 28
 
-  // A dielectric shape around an emitter: its int_ior / ext_ior and the share of test rays that leave it from inside.
+  // A dielectric shape that an emitter's test rays cross: its int_ior / ext_ior and the share of the rays with each net
+  // count of crossings out of it (exits minus entries), largest share first.
   struct Enclosure {
     var dielectric: Int
     var eta: Float
-    var share: Float
+    var crossings: [(net: Int, share: Float)]
+    // The net count that enclosureShare of the rays agree on; nil without agreement.
+    var agreed: Int? { crossings.first.flatMap { $0.share >= MitsubaImporter.enclosureShare ? $0.net : nil } }
   }
 
-  // For each emitting shape (by index) the dielectric shapes that test rays from it leave from inside, in shape order,
-  // and the number of emitters left untested by the limit.
-  static func emitterEnclosures(_ shapes: [Node], _ meshes: [Mesh?]) -> (enclosures: [Int: [Enclosure]], untested: Int) {
-    func bounds(_ mesh: Mesh) -> (lo: SIMD3<Float>, hi: SIMD3<Float>) {
-      mesh.positions.reduce((lo: SIMD3<Float>(repeating: .infinity), hi: SIMD3<Float>(repeating: -.infinity))) {
-        (simd_min($0.lo, $1), simd_max($0.hi, $1))
+  // A bounding volume hierarchy over a mesh's triangles: each node splits its triangles at the midpoint of their
+  // centroids' extent on its longest axis, down to leaves of at most 4 triangles (or of triangles with one centroid).
+  struct EnclosureBVH {
+    // An inner node's children are nodes first and first + 1 (count 0); a leaf's triangles are order[first ..< first + count].
+    struct Box { var lo: SIMD3<Float>; var hi: SIMD3<Float>; var first: Int; var count: Int }
+    private(set) var nodes: [Box] = []
+    private(set) var order: [Int] = []
+
+    init(_ mesh: Mesh) {
+      let corners = mesh.triangles.map { t in (mesh.positions[Int(t.x)], mesh.positions[Int(t.y)], mesh.positions[Int(t.z)]) }
+      let lows = corners.map { simd_min(simd_min($0.0, $0.1), $0.2) }, highs = corners.map { simd_max(simd_max($0.0, $0.1), $0.2) }
+      let centres = corners.map { ($0.0 + $0.1 + $0.2) / 3 }
+      order = Array(corners.indices)
+      nodes = [Box(lo: .zero, hi: .zero, first: 0, count: 0)]
+      var pending = [(node: 0, start: 0, end: corners.count)]
+      while let item = pending.popLast() {
+        let (node, start, end) = item
+        var lo = SIMD3<Float>(repeating: .infinity), hi = -lo, centreLo = lo, centreHi = hi
+        for k in order[start..<end] {
+          lo = simd_min(lo, lows[k]); hi = simd_max(hi, highs[k])
+          centreLo = simd_min(centreLo, centres[k]); centreHi = simd_max(centreHi, centres[k])
+        }
+        nodes[node].lo = lo
+        nodes[node].hi = hi
+        let extent = centreHi - centreLo
+        let axis = extent.x >= extent.y && extent.x >= extent.z ? 0 : extent.y >= extent.z ? 1 : 2
+        // Not finite (a NaN vertex) or a single centroid: a leaf of them all.
+        guard end - start > 4, extent[axis] > 0, extent[axis].isFinite else {
+          nodes[node].first = start
+          nodes[node].count = end - start
+          continue
+        }
+        // Both sides are non-empty: the extreme centroids lie on either side of the midpoint.
+        let middle = 0.5 * (centreLo[axis] + centreHi[axis])
+        var split = start
+        for k in start..<end where centres[order[k]][axis] < middle {
+          order.swapAt(k, split)
+          split += 1
+        }
+        let left = nodes.count
+        nodes.append(Box(lo: .zero, hi: .zero, first: 0, count: 0))
+        nodes.append(Box(lo: .zero, hi: .zero, first: 0, count: 0))
+        nodes[node].first = left
+        pending.append((left, start, split))
+        pending.append((left + 1, split, end))
       }
     }
+
+    // The net count of crossings out of the mesh (+1 along a triangle's winding normal, -1 against it) along the ray
+    // beyond tMin, and the ray-triangle tests made (Moller-Trumbore, both sides).
+    func crossings(_ mesh: Mesh, origin: SIMD3<Float>, direction: SIMD3<Float>, tMin: Float) -> (net: Int, tests: Int) {
+      guard !nodes.isEmpty, !order.isEmpty else { return (0, 0) }
+      let inverse = 1 / direction
+      var stack = [0], net = 0, tests = 0
+      while let index = stack.popLast() {
+        let box = nodes[index]
+        let t0 = (box.lo - origin) * inverse, t1 = (box.hi - origin) * inverse
+        // NaN (an origin on a slab with a zero direction component) keeps the node.
+        if simd_reduce_min(simd_max(t0, t1)) < max(simd_reduce_max(simd_min(t0, t1)), tMin) { continue }
+        guard box.count > 0 else { stack.append(box.first); stack.append(box.first + 1); continue }
+        for k in order[box.first..<box.first + box.count] {
+          tests += 1
+          let t = mesh.triangles[k]
+          let p0 = mesh.positions[Int(t.x)], e1 = mesh.positions[Int(t.y)] - p0, e2 = mesh.positions[Int(t.z)] - p0
+          let p = simd_cross(direction, e2), det = simd_dot(e1, p)
+          guard abs(det) > 1e-20 else { continue }
+          let s = origin - p0, u = simd_dot(s, p) / det
+          guard u >= 0, u <= 1 else { continue }
+          let q = simd_cross(s, e1), w = simd_dot(direction, q) / det
+          guard w >= 0, u + w <= 1, simd_dot(e2, q) / det > tMin else { continue }
+          net += simd_dot(direction, simd_cross(e1, e2)) > 0 ? 1 : -1
+        }
+      }
+      return (net, tests)
+    }
+  }
+
+  // For each emitting shape (by index) the dielectric shapes its test rays cross without agreeing on a net count of
+  // 0, in shape order, and the number of emitters left untested by testLimit.
+  static func emitterEnclosures(_ shapes: [Node], _ meshes: [Mesh?], testLimit: Int = enclosureTestLimit,
+                                progress: OperationProgress? = nil) -> (enclosures: [Int: [Enclosure]], untested: Int) {
     var dielectrics: [(index: Int, eta: Float, lo: SIMD3<Float>, hi: SIMD3<Float>)] = []
     for (i, shape) in shapes.enumerated() {
       guard let mesh = meshes[i], !mesh.triangles.isEmpty, let bsdf = shape.child("bsdf").map(leafBSDF),
         bsdf.type == "dielectric" || bsdf.type == "roughdielectric",
         let eta = try? ior(bsdf, "int_ior", default: 1.5046) / ior(bsdf, "ext_ior", default: 1.000277), eta.isFinite, eta > 0
       else { continue }
-      let box = bounds(mesh)
+      let box = mesh.positions.reduce((lo: SIMD3<Float>(repeating: .infinity), hi: SIMD3<Float>(repeating: -.infinity))) {
+        (simd_min($0.lo, $1), simd_max($0.hi, $1))
+      }
       dielectrics.append((i, eta, box.lo, box.hi))
     }
     guard !dielectrics.isEmpty else { return ([:], 0) }
-    var enclosures: [Int: [Enclosure]] = [:], untested = 0, tests = 0
-    for (i, shape) in shapes.enumerated() where shape.children.contains(where: { $0.tag == "emitter" && $0.type == "area" }) {
-      guard let emitter = meshes[i], !emitter.triangles.isEmpty else { continue }
-      let box = bounds(emitter)
-      let candidates = dielectrics.filter { d in
-        let margin = 1e-4 * simd_length(d.hi - d.lo)
-        return d.index != i && all(box.lo .>= d.lo - margin) && all(box.hi .<= d.hi + margin)
-      }
-      guard !candidates.isEmpty else { continue }
-      let work = enclosureRays * candidates.reduce(0) { $0 + meshes[$1.index]!.triangles.count }
-      guard tests + work <= enclosureTestLimit else { untested += 1; continue }
-      tests += work
+    let emitting = shapes.indices.filter { i in
+      shapes[i].children.contains { $0.tag == "emitter" && $0.type == "area" } && !(meshes[i]?.triangles.isEmpty ?? true)
+    }
+    var hierarchies: [Int: EnclosureBVH] = [:], enclosures: [Int: [Enclosure]] = [:], untested = 0, tests = 0
+    for (n, i) in emitting.enumerated() {
+      progress?.update("Finding emitters inside glass", completed: n, of: emitting.count)
+      let emitter = meshes[i]!
       // Area CDF of the emitter's triangles.
       let cdf = emitter.triangles.reduce(into: [Float]()) { cdf, t in
         let a = emitter.positions[Int(t.x)], b = emitter.positions[Int(t.y)], c = emitter.positions[Int(t.z)]
         cdf.append((cdf.last ?? 0) + simd_length(simd_cross(b - a, c - a)))
       }
-      let total = cdf.last ?? 0
-      guard total > 0, total.isFinite else { continue }
-      let surfaces = candidates.map { meshes[$0.index]! }
-      var exits = [UInt8](repeating: 0, count: enclosureRays * candidates.count)
-      exits.withUnsafeMutableBufferPointer { buffer in
-        let output = DisjointWrites(base: buffer.baseAddress!)  // Each ray writes only its own entries.
-        DispatchQueue.concurrentPerform(iterations: enclosureRays) { r in
-          // A point by area (stratified triangle choice, Halton barycentrics) and a cosine direction (Halton).
-          func halton(_ index: Int, _ base: Int) -> Float {
-            var f: Float = 1, value: Float = 0, n = index + 1
-            while n > 0 { f /= Float(base); value += f * Float(n % base); n /= base }
-            return value
-          }
-          let pick = (Float(r) + 0.5) / Float(enclosureRays) * total
-          var low = 0, high = cdf.count - 1
-          while low < high { let middle = (low + high) / 2; if cdf[middle] >= pick { high = middle } else { low = middle + 1 } }
-          let t = emitter.triangles[low]
-          let a = emitter.positions[Int(t.x)], b = emitter.positions[Int(t.y)], c = emitter.positions[Int(t.z)]
-          let root = halton(r, 2).squareRoot(), v = halton(r, 3)
-          let origin = (1 - root) * a + root * (1 - v) * b + root * v * c
-          let normal = simd_normalize(simd_cross(b - a, c - a))
-          let helper: SIMD3<Float> = abs(normal.x) < 0.9 ? SIMD3(1, 0, 0) : SIMD3(0, 1, 0)
-          let x = simd_normalize(simd_cross(normal, helper)), y = simd_cross(normal, x)
-          let u1 = halton(r, 5), phi = 2 * Float.pi * halton(r, 7), radius = u1.squareRoot()
-          let direction = simd_normalize(radius * cos(phi) * x + radius * sin(phi) * y + (1 - u1).squareRoot() * normal)
-          for (k, surface) in surfaces.enumerated() {
-            let tMin = 1e-4 * simd_length(candidates[k].hi - candidates[k].lo)
-            var nearest = Float.infinity, leaves = false
-            for t in surface.triangles {
-              // Moller-Trumbore, both sides.
-              let p0 = surface.positions[Int(t.x)], e1 = surface.positions[Int(t.y)] - p0, e2 = surface.positions[Int(t.z)] - p0
-              let p = simd_cross(direction, e2), det = simd_dot(e1, p)
-              guard abs(det) > 1e-20 else { continue }
-              let s = origin - p0, u = simd_dot(s, p) / det
-              guard u >= 0, u <= 1 else { continue }
-              let q = simd_cross(s, e1), w = simd_dot(direction, q) / det
-              guard w >= 0, u + w <= 1 else { continue }
-              let distance = simd_dot(e2, q) / det
-              guard distance > tMin, distance < nearest else { continue }
-              nearest = distance
-              leaves = simd_dot(direction, simd_cross(e1, e2)) > 0
+      guard let total = cdf.last, total > 0, total.isFinite else { continue }
+      func halton(_ index: Int, _ base: Int) -> Float {
+        var f: Float = 1, value: Float = 0, n = index + 1
+        while n > 0 { f /= Float(base); value += f * Float(n % base); n /= base }
+        return value
+      }
+      let rays = (0..<enclosureRays).map { r -> (origin: SIMD3<Float>, direction: SIMD3<Float>) in
+        let pick = (Float(r) + 0.5) / Float(enclosureRays) * total
+        var low = 0, high = cdf.count - 1
+        while low < high { let middle = (low + high) / 2; if cdf[middle] >= pick { high = middle } else { low = middle + 1 } }
+        let t = emitter.triangles[low]
+        let a = emitter.positions[Int(t.x)], b = emitter.positions[Int(t.y)], c = emitter.positions[Int(t.z)]
+        let root = halton(r, 2).squareRoot(), v = halton(r, 3)
+        let normal = simd_normalize(simd_cross(b - a, c - a))
+        let helper: SIMD3<Float> = abs(normal.x) < 0.9 ? SIMD3(1, 0, 0) : SIMD3(0, 1, 0)
+        let x = simd_normalize(simd_cross(normal, helper)), y = simd_cross(normal, x)
+        let u1 = halton(r, 5), phi = 2 * Float.pi * halton(r, 7), radius = u1.squareRoot()
+        return ((1 - root) * a + root * (1 - v) * b + root * v * c,
+                simd_normalize(radius * cos(phi) * x + radius * sin(phi) * y + (1 - u1).squareRoot() * normal))
+      }
+      let candidates = dielectrics.indices.filter { d in
+        let margin = 1e-4 * simd_length(dielectrics[d].hi - dielectrics[d].lo)
+        return dielectrics[d].index != i
+          && rays.contains { all($0.origin .>= dielectrics[d].lo - margin) && all($0.origin .<= dielectrics[d].hi + margin) }
+      }
+      guard !candidates.isEmpty else { continue }
+      guard tests < testLimit else { untested += 1; continue }
+      for d in candidates where hierarchies[d] == nil { hierarchies[d] = EnclosureBVH(meshes[dielectrics[d].index]!) }
+      let surfaces = candidates.map { (mesh: meshes[dielectrics[$0].index]!, bvh: hierarchies[$0]!,
+                                      tMin: 1e-4 * simd_length(dielectrics[$0].hi - dielectrics[$0].lo)) }
+      var nets = [Int](repeating: 0, count: enclosureRays * candidates.count), made = [Int](repeating: 0, count: enclosureRays)
+      nets.withUnsafeMutableBufferPointer { netBuffer in
+        made.withUnsafeMutableBufferPointer { madeBuffer in
+          // Each ray writes only its own entries.
+          let netOutput = DisjointWrites(base: netBuffer.baseAddress!), madeOutput = DisjointWrites(base: madeBuffer.baseAddress!)
+          DispatchQueue.concurrentPerform(iterations: enclosureRays) { r in
+            for (k, surface) in surfaces.enumerated() {
+              let result = surface.bvh.crossings(surface.mesh, origin: rays[r].origin, direction: rays[r].direction, tMin: surface.tMin)
+              netOutput.base[r * surfaces.count + k] = result.net
+              madeOutput.base[r] += result.tests
             }
-            output.base[r * candidates.count + k] = leaves ? 1 : 0
           }
         }
       }
+      tests += made.reduce(0, +)
       let found = candidates.indices.compactMap { k -> Enclosure? in
-        let count = (0..<enclosureRays).reduce(0) { $0 + Int(exits[$1 * candidates.count + k]) }
-        let share = Float(count) / Float(enclosureRays)
-        return share >= partialShare ? Enclosure(dielectric: candidates[k].index, eta: candidates[k].eta, share: share) : nil
+        let counts = (0..<enclosureRays).reduce(into: [Int: Int]()) { $0[nets[$1 * candidates.count + k], default: 0] += 1 }
+        let crossings = counts.map { (net: $0.key, share: Float($0.value) / Float(enclosureRays)) }
+          .sorted { $0.share != $1.share ? $0.share > $1.share : abs($0.net) < abs($1.net) }
+        let enclosure = Enclosure(dielectric: dielectrics[candidates[k]].index, eta: dielectrics[candidates[k]].eta, crossings: crossings)
+        return enclosure.agreed == 0 ? nil : enclosure
       }
       if !found.isEmpty { enclosures[i] = found }
     }
+    progress?.update("Finding emitters inside glass", completed: emitting.count, of: emitting.count)
     return (enclosures, untested)
   }
 
-  // The divisor of an emitting shape's radiance, eta^2 for each dielectric that encloses it (1 when none does), with
-  // a report line for the conversion and one for each dielectric that test rays leave only in part.
+  // The divisor of an emitting shape's radiance, eta^(2 n) for each dielectric its test rays leave n times on balance
+  // (1 when they disagree on one), with a report line.
   static func enclosedRadianceScale(_ found: [Enclosure], label: String, shapes: [Node], scene: inout Scene) -> Float {
     func number(_ x: Float) -> String { String(format: "%g", Double(x)) }
     func percent(_ share: Float) -> String { "\(Int((share * 100 + 1e-3).rounded(.down)))%" }  // 0.9 as 90%
-    let enclosing = found.filter { $0.share >= enclosureShare }
-    for partial in found where partial.share < enclosureShare {
-      scene.note("shape '\(label)': \(percent(partial.share)) of test rays from its area emitter leave dielectric '\(self.label(shapes[partial.dielectric], partial.dielectric))' from inside; radiance not converted (\(percent(enclosureShare)) needed)")
+    func times(_ n: Int) -> String { n == 1 ? "once" : n == 2 ? "twice" : "\(n) times" }
+    func crossing(_ net: Int) -> String {
+      net > 0 ? "leave it \(times(net)) on balance" : net < 0 ? "enter it \(times(-net)) on balance" : "leave it as often as they enter it"
     }
-    guard !enclosing.isEmpty else { return 1 }
-    let scale = enclosing.reduce(Float(1)) { $0 * $1.eta * $1.eta }
-    let list = enclosing.map { "dielectric '\(self.label(shapes[$0.dielectric], $0.dielectric))' (int_ior / ext_ior \(number($0.eta)), \(percent($0.share)) of test rays)" }
-    scene.note("shape '\(label)': area emitter inside \(list.joined(separator: ", ")); radiance divided by \(number(scale)), from Mitsuba's radiance in the glass to the app's")
+    func dielectric(_ e: Enclosure) -> String {
+      "dielectric '\(self.label(shapes[e.dielectric], e.dielectric))' (int_ior / ext_ior \(number(e.eta))"
+    }
+    let disputed = found.filter { $0.agreed == nil }
+    guard disputed.isEmpty else {
+      for e in disputed {
+        let shares = e.crossings.map { "\(percent($0.share)) \(crossing($0.net))" }.joined(separator: ", ")
+        scene.note("shape '\(label)': test rays from its area emitter disagree on \(dielectric(e))): \(shares); radiance not converted (\(percent(enclosureShare)) needed)")
+      }
+      return 1
+    }
+    let scale = found.reduce(Float(1)) { $0 * powf($1.eta, Float(2 * $1.agreed!)) }
+    let list = found.map { e in
+      "\(e.agreed! > 0 ? "inside" : "outside") \(dielectric(e)); \(percent(e.crossings[0].share)) of test rays \(crossing(e.agreed!)))"
+    }
+    if abs(scale - 1) < 1e-5 {
+      scene.note("shape '\(label)': area emitter \(list.joined(separator: ", ")); radiance unchanged, as these cancel")
+      return 1
+    }
+    scene.note("shape '\(label)': area emitter \(list.joined(separator: ", ")); radiance divided by \(number(scale)), from Mitsuba's radiance in the glass to the app's")
     return scale
   }
 }
