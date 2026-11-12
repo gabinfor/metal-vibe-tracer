@@ -528,7 +528,7 @@
   let explicit = try MitsubaImporter.conductor(etaKNode(eta: [eta.x, eta.y, eta.z], k: [k.x, k.y, k.z]))
   let expectedF0 = ((eta - 1) * (eta - 1) + k * k) / ((eta + 1) * (eta + 1) + k * k)
   require(simd_length(explicit.f0 - expectedF0) < 1e-4, "explicit eta, k through the Fresnel formula")
-  // Mitsuba 3.9.1's conductor at these eta and k, sampled at mu = 1/7 as conductor_colors does.
+  // Mitsuba 3.9.1's smooth conductor at these eta and k: its reflectance at mu = 1/7 over the Schlick curve from F0.
   require(simd_length(explicit.tint - SIMD3(0.978395, 0.974457, 0.977413)) < 1e-4, "explicit eta, k: the 82-degree tint")
   requireThrows("not both") {
     _ = try MitsubaImporter.conductor(shapeNode(#"<bsdf type="conductor"><string name="material" value="Au"/><float name="eta" value="1"/></bsdf>"#))
