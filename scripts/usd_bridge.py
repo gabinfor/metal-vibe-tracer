@@ -5,7 +5,7 @@ No input file is executed. This process only loads USD's installed core plugins.
 import sys, pathlib, json, math, uuid, hashlib, argparse, struct, xml.etree.ElementTree as ET
 from array import array
 HERE=pathlib.Path(__file__).resolve().parent
-# Mirror SceneLimits.triangles (stored, distinct meshes) and SceneLimits.renderedTriangles.
+# The helper's own caps on stored (distinct meshes) and rendered triangles, below SceneLimits' (Python time and memory).
 STORED_TRIANGLES=16000000;RENDERED_TRIANGLES=64000000
 # SceneLimits.materials (1024) minus the 8 procedural slots, and SceneLimits.nodes.
 MATERIALS=1016;NODES=65535

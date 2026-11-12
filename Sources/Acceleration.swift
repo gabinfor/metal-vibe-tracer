@@ -166,9 +166,9 @@ enum WideBVH {
       let extent = r.chi - r.clo, bins = WideBVH.bins
       if !median, simd_reduce_max(extent) > 0 {
         let big = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-        let scale = SIMD3<Float>(
-          extent.x > 0 ? Float(bins) / extent.x : 0, extent.y > 0 ? Float(bins) / extent.y : 0,
-          extent.z > 0 ? Float(bins) / extent.z : 0)
+        // An axis whose extent is zero, or too small for a finite scale, is not binned.
+        func binScale(_ e: Float) -> Float { let s = Float(bins) / e; return e > 0 && s.isFinite ? s : 0 }
+        let scale = SIMD3<Float>(binScale(extent.x), binScale(extent.y), binScale(extent.z))
         let top = SIMD3<Int>(repeating: bins - 1)
         let bl = binLo, bh = binHi, cl = binCLo, ch = binCHi, bc = binCount, sa = suffix
         for k in 0..<(3 * bins) { bl[k] = big; bh[k] = -big; cl[k] = big; ch[k] = -big; bc[k] = 0 }
@@ -242,8 +242,8 @@ enum WideBVH {
       }
       return (measure(r.start, middle), measure(middle, r.end))
     }
-    // Builds the subtree of `root` into `nodes` (indices local to `nodes`). Items with fewer than
-    // `deferThreshold` triangles are left for later when `deferred` is given.
+    // Builds the subtree of `root` into `nodes` (indices local to `nodes`). Child ranges with fewer
+    // than `deferThreshold` items are not built but appended to `deferred` (threshold 0: none).
     func run(_ root: Range, depth: Int, nodes: inout [MeshWideNode], deferThreshold: Int = 0,
                       deferred: inout [(Range, Int, Int, Int)]) -> Int {
       var depthReached = depth
@@ -613,13 +613,6 @@ extension MaterialLibrary {
   // Rendered (instanced) triangles: HitRecord.triangle and emitter IDs range over these.
   var renderedTriangleCount: Int { meshLayout?.renderedTriangles ?? triangleCount }
 
-  // The world-space triangle of a rendered-triangle ID, as SceneGraph flattening builds it.
-  func renderedTriangle(_ id: Int) -> MeshTriangle? {
-    guard let layout = meshLayout else { return orderedTriangles.indices.contains(id) ? orderedTriangles[id] : nil }
-    guard let (instance, local) = layout.locate(id) else { return nil }
-    return layout.worldTriangle(
-      orderedTriangles[layout.assets[layout.instances[instance].asset].triangleBase + local], instance: instance)
-  }
   // Every rendered triangle in ID order: a flattened copy, for checks and tools only.
   func renderedTriangles() -> [MeshTriangle] {
     var result: [MeshTriangle] = []
@@ -1081,11 +1074,13 @@ extension MaterialLibrary {
   }
   // Triangle k uses vertices 3k, 3k + 1 and 3k + 2 of a packed unwelded input.
   static func identityIndices(_ device: MTLDevice, count: Int) -> MTLBuffer? {
-    let indices = [UInt32](unsafeUninitializedCapacity: 3 * count) { b, initialized in
-      for k in 0..<3 * count { b[k] = UInt32(k) }
-      initialized = 3 * count
+    // At least four indices, so the 16-byte minimum buffer is copied from initialized storage.
+    let total = max(4, 3 * count)
+    let indices = [UInt32](unsafeUninitializedCapacity: total) { b, initialized in
+      for k in 0..<total { b[k] = UInt32(k) }
+      initialized = total
     }
-    return indices.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: max(16, $0.count), options: .storageModeShared) }
+    return indices.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
   }
   static func primitiveDescriptor(vertices: MTLBuffer, offset: Int, count: Int, indices: MTLBuffer)
     -> MTLPrimitiveAccelerationStructureDescriptor

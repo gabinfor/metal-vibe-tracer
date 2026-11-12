@@ -30,7 +30,7 @@ for path in [executable, contents / "Info.plist", resources / "OpenPBR.metal", r
     if not path.is_file():
         problems.append(f"missing {path.relative_to(app)}")
 
-# Bundled spectral examples (SpectralExamples): every showcase stage under Examples/ is in the bundle at the
+# Bundled spectral examples (the spectral entries of SceneCatalog): every showcase stage under Examples/ is in the bundle at the
 # same path, unchanged.
 try:
     for shot in json.loads((resources / "showcase.json").read_text()):
@@ -43,6 +43,25 @@ try:
                 problems.append(f"bundled example {stage} differs from the repository")
 except (OSError, ValueError) as error:
     problems.append(f"showcase.json unreadable: {error}")
+
+# Scene browser thumbnails: one JPEG per id of scene-ids.txt, which the thumbnail run writes from SceneCatalog.entries
+# without the scenes in SceneCatalog.thumbnailExempt, identical to the repository's.
+try:
+    thumbnails = resources / "Examples/Thumbnails"
+    listed = (thumbnails / "scene-ids.txt").read_text().split()
+    for stray in sorted(thumbnails.glob("*.jpg")):
+        if stray.stem not in listed:
+            problems.append(f"Examples/Thumbnails/{stray.name} is not listed in scene-ids.txt")
+    for scene_id in listed:
+        image = thumbnails / f"{scene_id}.jpg"
+        if not image.is_file():
+            problems.append(f"missing thumbnail Examples/Thumbnails/{scene_id}.jpg")
+        elif image.read_bytes()[:3] != b"\xff\xd8\xff":
+            problems.append(f"Examples/Thumbnails/{scene_id}.jpg is not a JPEG")
+        elif sha256_file(image) != sha256_file(app.parents[1] / "Examples/Thumbnails" / image.name):
+            problems.append(f"bundled thumbnail {scene_id}.jpg differs from the repository")
+except OSError as error:
+    problems.append(f"thumbnail list unreadable: {error}")
 
 # Spectral transport's tables: exactly the generator's outputs (their manifest's SHA-256), the
 # licences that cover them, and not the opt-in 96 MiB test table.

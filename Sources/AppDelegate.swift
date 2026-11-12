@@ -10,18 +10,29 @@ func launchTrace(_ event: String) {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   var window: NSWindow!
   var studio: StudioController!
-  // Until the launch shader compilation finishes: the start screen, the compilation's progress and
-  // the start action the user chose meanwhile, performed once the renderer exists.
-  private(set) var startScreen: StartScreenView?
+  // The Scenes window with the scene browser, and the recent projects; both are handed to the studio once it exists.
+  private(set) var scenes: ScenesWindowController!
+  private var recent: RecentProjects!
+  // Until the launch shader compilation finishes: the main menu, the compilation's progress shown on it,
+  // and the start action the user chose meanwhile, performed once the renderer exists.
+  private var launchMenu: MainMenuView?
+  private var openRecentMenu: NSMenu?
   private var launchProgress: OperationProgress?
   private var launchTimer: Timer?
   private var launchStarted = Date()
   private(set) var pendingStart: StartAction?
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+  // Closing the window asks to quit, so the window is still there when the quit is cancelled
+  // (a failed final save): without it the document could no longer be saved.
+  func windowShouldClose(_ sender: NSWindow) -> Bool {
+    NSApp.terminate(nil)
+    return false
+  }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard let studio else { return .terminateNow }
@@ -63,9 +74,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     studio?.exampleDownload?.cancel()
   }
 
-  // The window opens at once on the empty start screen; the GPU shaders compile in the background
-  // (minutes on the first launch of a new build, while the Metal compiler service fills its cache)
-  // and the studio replaces the launch screen when they are ready.
+  // The main window opens at once on the main menu; the Scenes window is created but shown only on request.
+  // The GPU shaders compile in the background (minutes on the first launch of a new build, while the Metal
+  // compiler service fills its cache) and the studio takes over both windows when they are ready.
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.regular)
     guard let device = MTLCreateSystemDefaultDevice() else {
@@ -78,14 +89,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered,
       defer: false)
     window.title = "Metal Vibe Tracer"
+    window.isReleasedWhenClosed = false
+    window.delegate = self
     window.contentMinSize = NSSize(width: 700, height: 440)
     window.center()
-    let start = StartScreenView()
-    start.setRestore(StudioController.autosaveDate(at: StudioController.defaultAutosaveURL))
-    start.onAction = { [weak self] action in self?.queueStartAction(action) }
-    start.onCancelPending = { [weak self] in self?.cancelPendingStart() }
-    startScreen = start
-    window.contentView = start
+    let scenes = ScenesWindowController(over: window)
+    scenes.browser.onAction = { [weak self] action in self?.queueStartAction(action) }
+    self.scenes = scenes
+    let recent = RecentProjects()
+    recent.onChange = { [weak self] in self?.recentProjectsChanged() }
+    self.recent = recent
+    let menu = MainMenuView()
+    menu.onAction = { [weak self] action in self?.queueStartAction(action) }
+    menu.onBrowse = { [weak self] in self?.scenes.show() }
+    menu.onOpenRecent = { [weak self] url in self?.openRecent(url) }
+    menu.onClearRecent = { [weak self] in self?.recent.clear() }
+    menu.onCancelPending = { [weak self] in self?.cancelPendingStart() }
+    menu.setRestore(StudioController.autosaveDate(at: StudioController.defaultAutosaveURL))
+    menu.setRecent(recent.shown)
+    launchMenu = menu
+    window.contentView = menu
     installLaunchMenus()
     window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
@@ -98,8 +121,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     launchProgress = progress
     launchStarted = Date()
     let source = metalSource, mathMode = shaderCompileOptions().mathMode
-    let timer = Timer(timeInterval: 0.1, repeats: true) { _ in
-      MainActor.assumeIsolated { [weak self] in self?.refreshLaunchProgress() }
+    let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.refreshLaunchProgress() }
     }
     RunLoop.main.add(timer, forMode: .common)
     launchTimer = timer
@@ -117,7 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     guard let progress = launchProgress else { return }
     // A cached build compiles in well under a second; explain only a compile that takes a while.
     let slow = Date().timeIntervalSince(launchStarted) > 2
-    startScreen?.setProgress(progress.snapshot, hint: slow
+    launchMenu?.setProgress(progress.snapshot, hint: slow
       ? "The first launch of a new build compiles the renderer's GPU shaders, which can take a few minutes. Later launches reuse them." : nil)
   }
 
@@ -127,13 +150,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     launchProgress = nil
     do {
       let renderer = try PathTracerRenderer(device: device, shaders: result.get())
-      let studio = StudioController(renderer: renderer, window: window)
+      let studio = StudioController(renderer: renderer, window: window, scenes: scenes, recent: recent)
       self.studio = studio
+      launchMenu = nil
+      openRecentMenu = nil
       window.contentView = studio.view
-      let start = startScreen ?? StartScreenView()
-      startScreen = nil
-      start.setProgress(nil)
-      studio.showStartScreen(start)
+      studio.showStartScreen()
       launchTrace("shaders-ready")
       // Warm the groups a first scene most likely needs: ReSTIR PT (imported scenes' default) and,
       // when it is the active transport, spectral transport; both compile in the background.
@@ -149,30 +171,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  // Before the studio exists, open and import actions ask for their file at once and wait with it.
+  // Before the studio exists, open and import actions ask for their file at once (a sheet on the Scenes
+  // window while it is key, else on the main window) and wait with it, shown on the main menu.
   func queueStartAction(_ action: StartAction) {
     if let studio {
       studio.performStartAction(action)
       return
     }
-    guard pendingStart == nil, let window else { return }
-    StartScreenView.chooseFile(for: action, window: window) { [weak self] chosen in
+    guard pendingStart == nil, let window, let scenesWindow = scenes.window else { return }
+    SceneBrowserView.chooseFile(for: action, window: scenesWindow.isKeyWindow ? scenesWindow : window) { [weak self] chosen in
       guard let self, self.studio == nil else {
         self?.studio?.performStartAction(chosen)
         return
       }
       self.pendingStart = chosen
-      self.startScreen?.setPending(StartScreenView.describe(chosen) + " once the shaders are ready.")
-      self.startScreen?.setActionsEnabled(false)
+      self.launchMenu?.setPending(SceneBrowserView.describe(chosen) + " once the shaders are ready.")
+      self.launchMenu?.setActionsEnabled(false)
+      self.scenes.browser.setActionsEnabled(false)
     }
   }
   private func cancelPendingStart() {
     pendingStart = nil
-    startScreen?.setPending(nil)
-    startScreen?.setActionsEnabled(true)
+    launchMenu?.setPending(nil)
+    launchMenu?.setActionsEnabled(true)
+    scenes.browser.setActionsEnabled(true)
+  }
+  // A recent project before the studio exists: queued like Open Project, or, when the file is gone, removed with
+  // a message on the main menu.
+  private func openRecent(_ url: URL) {
+    guard pendingStart == nil else { return }
+    recent.open(url, with: { [weak self] in self?.queueStartAction(.openProject($0)) },
+      report: { [weak self] in self?.launchMenu?.setMessage($0) })
+  }
+  private func recentProjectsChanged() {
+    launchMenu?.setRecent(recent.shown)
+    if let menu = openRecentMenu {
+      recent.fill(menu, target: self, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
+    }
   }
 
-  // Quit, window commands and the start actions until StudioController installs the full menus.
+  // Quit, window commands, the start actions, Open Recent and Browse Scenes until StudioController installs the
+  // full menus.
   private func installLaunchMenus() {
     let main = NSMenu()
     func menu(_ title: String, _ entries: [(String, String, Selector, AnyObject?)]) {
@@ -191,14 +230,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       ("Quit Metal Vibe Tracer", "q", #selector(NSApplication.terminate(_:)), nil),
     ])
     menu("File", [
-      ("Open Project…", "o", #selector(openProjectAction), self), ("Import OBJ…", "", #selector(importOBJAction), self),
-      ("Open USD Scene…", "", #selector(importUSDAction), self),
+      ("Open Project…", "o", #selector(openProjectAction), self),
+      ("Open Scene File…", "", #selector(openSceneFileAction), self),
+      ("Browse Scenes…", "O", #selector(browseScenesAction), self),
       ("Close Window", "w", #selector(NSWindow.performClose(_:)), nil),
     ])
+    if let file = main.items.last?.submenu {
+      let item = recent.menuItem(target: self, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
+      openRecentMenu = item.submenu
+      file.insertItem(item, at: 1)
+    }
     menu("Window", [("Minimize", "m", #selector(NSWindow.performMiniaturize(_:)), nil)])
     NSApp.mainMenu = main
   }
   @objc func openProjectAction() { queueStartAction(.openProject(nil)) }
-  @objc func importOBJAction() { queueStartAction(.importOBJ(nil)) }
-  @objc func importUSDAction() { queueStartAction(.importUSD(nil)) }
+  @objc func openSceneFileAction() { queueStartAction(.openScene(nil)) }
+  @objc func browseScenesAction() { scenes.show() }
+  @objc func openRecentAction(_ sender: NSMenuItem) {
+    if let url = sender.representedObject as? URL { openRecent(url) }
+  }
+  @objc func clearRecentAction() { recent.clear() }
+}
+
+// File › Open Recent and its Clear Menu wait, like the main menu, while an action is queued.
+extension AppDelegate: NSMenuItemValidation {
+  func validateMenuItem(_ item: NSMenuItem) -> Bool {
+    if item.action == #selector(openRecentAction(_:)) || item.action == #selector(clearRecentAction) {
+      return pendingStart == nil
+    }
+    return true
+  }
 }

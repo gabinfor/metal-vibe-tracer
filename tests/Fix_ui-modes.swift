@@ -193,6 +193,13 @@
     && titles(temporal)[0] == "Automatic (currently: Reprojection)"
     && titles(shading)[0] == "Automatic (currently: \(automaticShading()))",
     "an imported scene graph resolves Automatic to unified ReSTIR PT and compatibility-guided neighbours")
+  // The inspector's scene control shows the document's name for imported content and a catalog title otherwise.
+  func sceneLabels() -> [String] { views(NSTextField.self, in: controller.stack).map(\.stringValue) }
+  require(sceneLabels().contains("Untitled") && views(NSButton.self, in: controller.stack).contains { $0.identifier?.rawValue == "scene-browse" },
+    "an imported scene is named by its document in the inspector's scene control")
+  controller.projectURL = URL(fileURLWithPath: "/tmp/Renamed.vtrace")
+  require(sceneLabels().contains("Renamed.vtrace"), "the scene control follows the document's name without a rebuild")
+  controller.projectURL = nil
   if testRenderer.indirectReuse == .automatic && testRenderer.spatialNeighbors == .automatic {
     require(titles(shading)[0] == "Automatic (currently: Control variates)",
       "unified ReSTIR PT resolves path shading to control variates")

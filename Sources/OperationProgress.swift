@@ -4,7 +4,7 @@ import Synchronization
 // Progress of one long operation (shader compilation, an open, import, save, export or OIDN
 // pass). Workers on any thread set the current phase and, where they can count their work, a
 // fraction; the main thread polls `snapshot` for the progress bar (StudioController's activity
-// strip, the start screen), so frequent updates never flood the main queue.
+// strip, the main menu), so frequent updates never flood the main queue.
 final class OperationProgress: Sendable {
   struct Snapshot: Equatable, Sendable {
     // Short status text ("Decoding textures").

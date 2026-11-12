@@ -1,4 +1,4 @@
-// Example scenes (File > Open Example Scene, Sources/ExampleScenes.swift), without the network or the archive's
+// Example scenes (the scene browser, Sources/ExampleScenes.swift and SceneCatalog.swift), without the network or the archive's
 // OBJ files: the catalog against scripts/showcase.json, which archives a scene still needs, archive verification
 // and extraction from a locally made zip, and the showcase shot's camera, lighting and emission scaling applied to
 // a synthetic emissive OBJ imported through ProjectDocument.appendOBJ, then opened through the studio controller.
@@ -8,25 +8,45 @@
   try? manager.removeItem(at: folder)
   try manager.createDirectory(at: folder, withIntermediateDirectories: true)
 
-  // Catalog: every scene names a showcase shot of its own OBJ, and pinned McGuire archive downloads.
+  // Catalog: every scene names a showcase shot of its own scene file, and pinned archive downloads.
   let shots = try ShowcaseShot.bundled()
   func shot(_ name: String) throws -> ShowcaseShot {
     guard let found = shots.first(where: { $0.name == name }) else { throw MaterialLibrary.error("no \(name) shot") }
     return found
   }
-  let catalog = ExampleScenes.catalog
-  require(catalog.map(\.shot) == ["sponza-noon", "san-miguel-golden", "bistro-exterior-golden", "bistro-interior",
-    "bedroom", "breakfast-room", "buddha", "chinese-dragon", "fireplace-room", "living-room"],
-    "example catalog lists Sponza, San Miguel, both Bistro shots and the six research models: \(catalog.map(\.shot))")
+  let entries = SceneCatalog.entries
+  require(Set(entries.map(\.id)).count == entries.count && entries.count == 31, "catalog ids are unique")
+  require(entries.filter { $0.isDownload && $0.collection == .mcguire }.compactMap(\.shot) == ["sponza-noon", "san-miguel-golden",
+    "bistro-exterior-golden", "bistro-interior", "bedroom", "breakfast-room", "buddha", "chinese-dragon",
+    "fireplace-room", "living-room"], "download entries keep their shots")
+  for entry in entries {
+    if case .builtIn(let index) = entry.source {
+      require(entry.shot == nil && StudioController.sceneNames.indices.contains(index) && index < 6
+        && entry.title == StudioController.sceneNames[index], "\(entry.id) is a built-in scene")
+    } else {
+      require(shots.contains { $0.name == entry.shot }, "\(entry.id) has its showcase shot")
+    }
+    require(entry.id.allSatisfy { $0.isLowercase || $0.isNumber || $0 == "-" }, "\(entry.id) is a file-safe id")
+  }
+  require(SceneCatalog.entry("sponza")?.triangles == 262_266 && SceneCatalog.entry("nope") == nil, "lookup by id")
+  let catalog = SceneCatalog.entries.filter { $0.collection == .mcguire }
+  require(catalog.map(\.id) == ["sponza", "san-miguel", "bistro-exterior", "bistro-interior", "bedroom",
+    "breakfast-room", "buddha", "chinese-dragon", "fireplace-room", "living-room"]
+    && catalog.map(\.triangles) == [262_266, 9_963_375, 2_833_329, 1_020_903, 383_504, 269_764, 1_087_304, 871_198,
+      142_983, 580_592]
+    && catalog.map(\.materials) == [25, 287, 132, 66, 7, 14, nil, nil, 22, 42],
+    "the download entries list Sponza, San Miguel, both Bistro shots and the six research models with their specs")
   for scene in catalog {
-    guard let shot = shots.first(where: { $0.name == scene.shot }) else {
-      require(false, "showcase.json has the \(scene.shot) shot")
+    guard let shot = shots.first(where: { $0.name == scene.shot }), case .download(let storage, let file, _) = scene.source,
+      let credit = scene.credit, let licenseURL = scene.licenseURL, let terms = scene.terms, let attribution = scene.attribution
+    else {
+      require(false, "\(scene.id) is a download with a showcase shot, credit, license and terms")
       continue
     }
-    require(shot.obj?.hasSuffix("/\(scene.storage)/\(scene.obj)") == true,
-      "\(scene.shot) frames the catalog's OBJ (\(shot.obj ?? "none") vs \(scene.storage)/\(scene.obj))")
+    require(scene.format == .obj && shot.obj?.hasSuffix("/\(storage)/\(file)") == true,
+      "\(scene.id) frames the catalog's OBJ (\(shot.obj ?? "none") vs \(storage)/\(file))")
     require(shot.yaw != nil && shot.distance != nil && shot.target?.count == 3 && shot.exposure != nil
-      && shot.sky != nil, "\(scene.shot) sets the camera, sky and exposure")
+      && shot.sky != nil, "\(scene.id) sets the camera, sky and exposure")
     require(!scene.archives.isEmpty && Set(scene.archives.map(\.name)).count == scene.archives.count,
       "\(scene.title) has distinct archives")
     for archive in scene.archives {
@@ -37,49 +57,139 @@
       require(archive.bytes > 0 && archive.unpackedBytes >= archive.bytes, "\(archive.name) sizes")
       require(!archive.folder.contains("..") && !archive.folder.hasPrefix("/"), "\(archive.name) extracts inside its scene")
     }
-    require(scene.attribution.contains(scene.credit) && scene.attribution.contains(scene.licenseURL.absoluteString)
-      && scene.attribution.hasSuffix(scene.terms), "\(scene.title) attribution names the author, links the license and gives its terms")
+    require(attribution.contains(credit) && attribution.contains(licenseURL.absoluteString)
+      && attribution.hasSuffix(terms), "\(scene.title) attribution names the author, links the license and gives its terms")
   }
-  let credits = ExampleScenes.credits
-  require(credits.count == 9 && credits.contains { $0.hasPrefix("Amazon Lumberyard Bistro © 2017") }
-    && credits.filter { $0.contains("creativecommons.org/licenses/by/") }.count == 6
+  require(entries.filter { !$0.isDownload }.allSatisfy { $0.attribution == nil && $0.archives.isEmpty && $0.credit == nil },
+    "built-in and bundled scenes carry no credit and need no archive")
+  let credits = SceneCatalog.credits
+  require(credits.count == 19 && credits.contains { $0.hasPrefix("Amazon Lumberyard Bistro © 2017") }
+    && credits.filter { $0.contains("creativecommons.org/licenses/by/") }.count == 10
     && credits.contains { $0.hasPrefix("Bedroom") && $0.contains("creativecommons.org/licenses/by-sa/4.0/") }
-    && credits.filter { $0.contains("graphics.stanford.edu/data/3Dscanrep/") }.count == 2,
+    && credits.filter { $0.contains("graphics.stanford.edu/data/3Dscanrep/") }.count == 2
+    && credits.filter { $0.contains("creativecommons.org/publicdomain/zero/1.0/") }.count == 6
+    && credits.contains { $0.hasPrefix("The White Room © Jay-Artist. CC BY 3.0") }
+    && credits.contains { $0.hasPrefix("Glass of Water aXel. CC0 1.0") },
     "credits list each work once with its license: \(credits)")
   // The Stanford scans carry the repository's non-commercial and good-taste terms; the Bedroom's ShareAlike.
-  require(catalog.filter { $0.terms == ExampleScenes.stanfordTerms }.map(\.shot) == ["buddha", "chinese-dragon"]
-    && catalog[4].terms.contains("CC BY-SA 4.0"), "per-scene terms: the Stanford scans' and the Bedroom's ShareAlike")
+  require(catalog.filter { $0.terms == SceneCatalog.stanfordTerms }.map(\.shot) == ["buddha", "chinese-dragon"]
+    && catalog[4].terms?.contains("CC BY-SA 4.0") == true, "per-scene terms: the Stanford scans' and the Bedroom's ShareAlike")
+  require(catalog.allSatisfy { $0.attribution?.contains("Morgan McGuire's Computer Graphics Archive (casual-effects.com/data). ") == true
+    && $0.attribution?.contains("Bitterli") == false }, "McGuire attributions name McGuire's archive")
+
+  // Bitterli's ten validated scenes: Mitsuba scene files in archives of benedikt-bitterli.me, each extracting into
+  // a folder of its archive's name, under a storage folder of its own.
+  let bitterliIDs = ["veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp", "kitchen",
+    "white-room", "grey-white-room", "modern-hall"]
+  let bitterliArchives = ["veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp", "kitchen",
+    "living-room-2", "living-room", "staircase2"]
+  let publicDomain = ["veach-bidir", "veach-ajar", "glass-of-water", "bathroom", "water-caustic", "lamp"]
+  let bitterli = entries.filter { $0.collection == .bitterli }
+  require(bitterli.map(\.id) == bitterliIDs && entries.suffix(10).map(\.id) == bitterliIDs
+    && bitterli.allSatisfy { $0.format == .mitsuba && $0.isDownload },
+    "the ten Bitterli scenes follow the McGuire ones as Mitsuba downloads")
+  // What MitsubaImporter.load reports for each scene (measured 2026-11-12).
+  require(bitterli.map(\.triangles) == [11_544, 382_690, 405_709, 591_907, 103_487, 623_326, 1_443_298, 589_803, 142_998, 29_056]
+    && bitterli.map(\.materials) == [6, 13, 7, 33, 9, 11, 90, 66, 19, 21], "Bitterli triangle and material counts")
+  require(bitterli.map(\.title) == ["Veach, Bidir Room", "Veach, Ajar", "Glass of Water", "Contemporary Bathroom",
+    "Water Caustic", "Little Lamp", "Country Kitchen", "The White Room", "The Grey & White Room", "Modern Hall"]
+    && bitterli.map(\.credit) == ["Benedikt Bitterli", "Benedikt Bitterli", "aXel", "Mareck", "Benedikt Bitterli", "UP3D",
+      "© Jay-Artist", "© Jay-Artist", "© Wig42", "© NewSee2l035"], "titles and credits")
+  require(bitterli.map(\.tags) == [["caustics", "glass"], ["glass", "textures"], ["caustics", "glass"],
+    ["glass", "textures"], ["caustics", "glass"], ["caustics", "glass"], ["glass", "textures"], ["glass", "textures"],
+    ["glass", "textures"], ["glass", "textures"]], "Bitterli tags")
+  let publicDomainTerms = "Public domain (CC0). Credit is appreciated but not required."
+  var bitterliStorages = Set<String>()
+  let mcguireStorages = Set(catalog.compactMap { scene -> String? in
+    if case .download(let storage, _, _) = scene.source { return storage }
+    return nil
+  })
+  for (scene, archiveName) in zip(bitterli, bitterliArchives) {
+    guard let shot = shots.first(where: { $0.name == scene.shot }), case .download(let storage, let file, let archives) = scene.source,
+      let archive = archives.first, let licenseURL = scene.licenseURL, let terms = scene.terms, let attribution = scene.attribution,
+      let credit = scene.credit
+    else {
+      require(false, "\(scene.id) is a download with a showcase shot, credit, license and terms")
+      continue
+    }
+    let sceneFile = scene.id == "water-caustic" ? "water-caustic/scene_v0.6.xml" : "\(archiveName)/scene_v3.xml"
+    // The comparison scripts and the thumbnails read the same files from build/scenes/<archive>/<archive>/….
+    require(shot.mitsuba == "build/scenes/\(archiveName)/\(file)", "\(scene.id) shot unpacks to build/scenes/\(archiveName)/\(file): \(shot.mitsuba ?? "none")")
+    require(scene.shot == "bitterli-\(scene.id)" && shot.mitsuba?.hasSuffix("/\(file)") == true && file == sceneFile
+      && shot.view == "Mitsuba: camera" && shot.obj == nil && shot.usd == nil && shot.scene == nil
+      && shot.width == nil && shot.height == nil && shot.samples == nil && shot.depth == nil
+      && shot.caustics == (scene.id == "water-caustic" ? 3 : nil), "\(scene.id) shot (\(shot.mitsuba ?? "none") vs \(file))")
+    require(archives.count == 1 && archive.name == "\(archiveName).zip" && archive.folder.isEmpty
+      && archive.url.scheme == "https" && archive.url.host == "benedikt-bitterli.me"
+      && archive.url.path == "/resources/mitsuba/\(archive.name)", "\(scene.id) downloads \(archive.url)")
+    require(archive.sha256.count == 64 && archive.sha256.allSatisfy { "0123456789abcdef".contains($0) }
+      && archive.bytes > 0 && archive.unpackedBytes > archive.bytes, "\(scene.id) pins its archive")
+    require(storage == "bitterli-\(archiveName)" && bitterliStorages.insert(storage).inserted
+      && !mcguireStorages.contains(storage), "\(scene.id) has a storage folder of its own: \(storage)")
+    if publicDomain.contains(scene.id) {
+      require(scene.license == "CC0 1.0" && licenseURL.absoluteString == "https://creativecommons.org/publicdomain/zero/1.0/"
+        && terms == publicDomainTerms, "\(scene.id) is CC0")
+    } else {
+      require(scene.license == "CC BY 3.0" && licenseURL.absoluteString == "https://creativecommons.org/licenses/by/3.0/"
+        && terms == SceneCatalog.entry("sponza")?.terms, "\(scene.id) is CC BY 3.0 with the default terms")
+    }
+    require(attribution == "\(scene.title): \(credit), from Benedikt Bitterli's Rendering Resources "
+      + "(benedikt-bitterli.me/resources). \(scene.license ?? "") (\(licenseURL.absoluteString)). \(terms)"
+      && !attribution.contains("McGuire"), "\(scene.id) attribution names Bitterli's resources")
+  }
+  require(bitterli.filter { $0.credit?.hasPrefix("© ") == true }.count == 4 && publicDomain.count == 6,
+    "four CC BY works and six CC0 works")
   let exterior = catalog[2], interior = catalog[3]
-  require(exterior.storage == interior.storage
+  let root = ExampleLibrary(root: folder)
+  require(root.storage(exterior) == root.storage(interior)
     && Array(exterior.archives.dropFirst()) == Array(interior.archives.dropFirst())
     && exterior.archives.dropFirst().map(\.name) == ["BuildingTextures.zip", "OtherTextures.zip", "PropTextures.zip"],
     "the Bistro exterior and interior share one folder and its three texture archives")
+  require(SceneEntry.Collection.allCases.map(\.title) == ["Built-in", "Spectral examples", "McGuire Computer Graphics Archive",
+      "Bitterli's Rendering Resources"]
+    && SceneEntry.Collection.mcguire.website?.absoluteString == "https://casual-effects.com/data/"
+    && SceneEntry.Collection.bitterli.website?.absoluteString == "https://benedikt-bitterli.me/resources/"
+    && SceneEntry.Collection.spectral.website == nil && interior.work == "Amazon Lumberyard Bistro",
+    "collections name themselves and the archive's website")
+  // Tags: the spectral scenes name their effect, textured downloads say so.
+  require(SceneCatalog.entries.filter { $0.collection == .spectral }.map(\.tags) == [["spectral", "thin film"], ["spectral", "dispersion"],
+    ["spectral", "fog"], ["spectral", "light spectra"], ["spectral", "many lights"]]
+    && SceneCatalog.entry("cornell-fog")?.tags == ["fog"] && SceneCatalog.entry("cornell-glass-mirror")?.tags == ["glass"]
+    && SceneCatalog.entry("sponza")?.tags == ["textures"] && SceneCatalog.entry("buddha")?.tags.isEmpty == true,
+    "entries carry their feature tags")
   // Bundled spectral examples: a showcase shot each, whose stage is under Examples/Spectral and resolves.
-  require(SpectralExamples.catalog.map(\.shot) == ["spectral-newton-series", "spectral-abbe-row", "spectral-tyndall-tank",
+  let spectral = SceneCatalog.entries.filter { $0.collection == .spectral }
+  require(spectral.map(\.shot) == ["spectral-newton-series", "spectral-abbe-row", "spectral-tyndall-tank",
     "spectral-lamp-spectra", "spectral-lantern-arcade"],
     "spectral examples list Newton's colour series, the Abbe row, the Tyndall tank, the lamp spectra and the lantern arcade")
-  for example in SpectralExamples.catalog {
-    let stage = try shot(example.shot).usd
-    require(stage?.hasPrefix("Examples/Spectral/") == true && stage.flatMap(SpectralExamples.url) != nil,
-      "\(example.shot) opens a bundled stage (\(stage ?? "none"))")
+  for example in spectral {
+    let stage = try shot(example.shot ?? "").usd
+    guard case .bundled(let path) = example.source else {
+      require(false, "\(example.id) is bundled")
+      continue
+    }
+    require(example.format == .usd && stage == path && stage?.hasPrefix("Examples/Spectral/") == true
+      && SceneCatalog.bundledURL(path) != nil, "\(example.id) opens a bundled stage (\(stage ?? "none"))")
   }
-  require(ExampleScenes.megabytes(80_113_441) == "80 MB" && ExampleScenes.megabytes(1_438_403_029) == "1.4 GB",
+  require(SceneCatalog.megabytes(80_113_441) == "80 MB" && SceneCatalog.megabytes(1_438_403_029) == "1.4 GB",
     "download sizes read in MB and GB")
 
   // Installed archives: a marker holding the archive's digest; a stale marker does not count.
   let library = ExampleLibrary(root: folder.appendingPathComponent("library", isDirectory: true))
-  let textures = ExampleScenes.bistroTextures.reduce(Int64(0)) { $0 + $1.bytes }
+  let textures = interior.archives.dropFirst().reduce(Int64(0)) { $0 + $1.bytes }
   require(library.downloadBytes(catalog[0]) == 80_113_441 && library.missing(interior).count == 4
     && library.downloadBytes(interior) == 21_293_389 + textures, "a fresh library needs every archive")
   try manager.createDirectory(at: library.storage(interior), withIntermediateDirectories: true)
   for archive in interior.archives {
-    try Data((archive.sha256 + "\n").utf8).write(to: library.marker(archive, storage: interior.storage))
+    try Data((archive.sha256 + "\n").utf8).write(to: library.marker(archive, storage: "bistro"))
   }
   require(library.missing(interior).isEmpty && library.downloadBytes(exterior) == 64_186_766
     && library.diskBytes(exterior) == 311_371_057, "after the interior, the exterior needs only Exterior.zip")
-  try Data("0\n".utf8).write(to: library.marker(interior.archives[1], storage: interior.storage))
+  try Data("0\n".utf8).write(to: library.marker(interior.archives[1], storage: "bistro"))
   require(library.missing(interior).map(\.name) == ["BuildingTextures.zip"], "a marker with another digest is stale")
-  require(library.objURL(interior).path.hasSuffix("library/bistro/Interior/interior.obj"), "OBJ location")
+  require(library.sceneFileURL(interior)?.path.hasSuffix("library/bistro/Interior/interior.obj") == true
+    && library.sceneFileURL(spectral[0]) == nil && library.downloadBytes(spectral[0]) == 0
+    && library.missing(SceneCatalog.entries[0]).isEmpty, "OBJ location; scenes that are not downloads need nothing")
 
   // A local archive in the same layout as Interior.zip: an emissive lamp and a plain floor.
   let source = folder.appendingPathComponent("source", isDirectory: true)
@@ -195,32 +305,36 @@
   var empty = ProjectDocument()
   require(empty.scaleImportedEmission(by: 0) == 0 && empty.scenes[6] == nil, "no imported scene, nothing to scale")
 
-  // Controller: File > Open Example Scene lists the catalog with download sizes, and an installed scene opens
-  // as a new untitled project with its shot and credit, undoably. The lamp stands in for the Bistro interior.
-  let examples = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu?.items
-    .first { $0.title == "Open Example Scene" }?.submenu
-  let entries = examples?.items.filter { $0.action == #selector(StudioController.exampleSceneAction(_:)) } ?? []
+  // Controller: File > Credits and Licenses… stays, and an installed scene opens as a new untitled project with its
+  // shot and credit, undoably. The lamp stands in for the Bistro interior.
+  let fileMenu = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu
   let previousLibrary = controller.exampleLibrary
   controller.exampleLibrary = ExampleLibrary(root: folder.appendingPathComponent("controller", isDirectory: true))
   defer { controller.exampleLibrary = previousLibrary }
-  for item in entries { _ = controller.validateMenuItem(item) }
-  require(entries.map(\.tag) == Array(catalog.indices) && entries.first?.title == "Crytek Sponza — 80 MB download…"
-    && entries[3].title == "Amazon Lumberyard Bistro (interior) — 1.4 GB download…"
-    && entries.last?.title == "Living Room — 15 MB download…"
-    && examples?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true,
-    "File > Open Example Scene lists the scenes with their download sizes: \(entries.map(\.title))")
+  require(fileMenu?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true
+    && fileMenu?.items.contains { $0.action == #selector(StudioController.revealExampleScenesAction) } == true,
+    "File lists Credits and Licenses… and Show Downloaded Scenes in Finder")
   let installed = controller.exampleLibrary
+  // A download scene that is not installed opens nothing: the consent and download flow is the caller's.
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = .sortedKeys
+  let untouched = try encoder.encode(controller.project)
+  require(!controller.isInstalled(interior) && controller.isInstalled(SceneCatalog.entries[0])
+    && controller.isInstalled(spectral[0]), "built-in and bundled scenes are installed; a missing download is not")
+  controller.openScene(interior)
+  let afterwards = try encoder.encode(controller.project)
+  require(!controller.isBusy && controller.exampleDownload == nil && afterwards == untouched,
+    "opening a download scene that is not installed does nothing")
   try manager.createDirectory(at: installed.storage(interior), withIntermediateDirectories: true)
-  try manager.createDirectory(at: installed.objURL(interior).deletingLastPathComponent(), withIntermediateDirectories: true)
+  let interiorFile = installed.sceneFileURL(interior)!
+  try manager.createDirectory(at: interiorFile.deletingLastPathComponent(), withIntermediateDirectories: true)
   for name in ["lamp.mtl", "lamp.obj"] {
     try manager.copyItem(at: storage.appendingPathComponent("Lamp/" + name),
-      to: installed.objURL(interior).deletingLastPathComponent().appendingPathComponent(name == "lamp.obj" ? "interior.obj" : name))
+      to: interiorFile.deletingLastPathComponent().appendingPathComponent(name == "lamp.obj" ? "interior.obj" : name))
   }
   for archive in interior.archives {
-    try Data((archive.sha256 + "\n").utf8).write(to: installed.marker(archive, storage: interior.storage))
+    try Data((archive.sha256 + "\n").utf8).write(to: installed.marker(archive, storage: "bistro"))
   }
-  _ = controller.validateMenuItem(entries[3])
-  require(entries[3].title == interior.title, "an installed scene's menu entry shows no download")
   waitUntil({ !controller.isBusy }, seconds: 60)
   // Without an event loop, undo registrations need an explicit group (as in Fix_persistence.swift).
   let history = controller.history, groupsByEvent = history.groupsByEvent
@@ -229,7 +343,10 @@
   func grouped(_ body: () -> Void) { history.beginUndoGrouping(); body(); history.endUndoGrouping() }
   let previousScene = testRenderer.sceneIndex, previousYaw = testRenderer.yaw
   grouped {
-    controller.confirmExampleDownload(interior)
+    require(controller.isInstalled(interior), "the scene is installed once its archives are present")
+    // Opening asks before discarding edits; this document has none to lose.
+    controller.associate(nil, edited: false, replaced: false)
+    controller.openScene(interior)
     waitUntil({ !controller.isBusy }, seconds: 60)
   }
   require(testRenderer.sceneIndex == 6 && testRenderer.yaw == -1.967 && testRenderer.distance == 1064.002
@@ -243,6 +360,335 @@
   waitUntil({ !controller.isBusy }, seconds: 60)
   require(testRenderer.sceneIndex == previousScene && testRenderer.yaw == previousYaw,
     "undo returns to the previous document")
-  print("PASS: example scenes (catalog against showcase.json, archive markers, verification and extraction, shot settings and emission scaling, File > Open Example Scene)")
+
+  // Downloading from the scene browser, from local archives: a digest mismatch ends with the error in the details pane
+  // and the Download button back, a cancel is reported, and a correct archive installs and opens the scene.
+  let downloadLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download", isDirectory: true))
+  controller.exampleLibrary = downloadLibrary
+  let payload = folder.appendingPathComponent("payload", isDirectory: true)
+  try manager.createDirectory(at: payload, withIntermediateDirectories: true)
+  try manager.copyItem(at: source.appendingPathComponent("lamp.obj"), to: payload.appendingPathComponent("interior.obj"))
+  try manager.copyItem(at: source.appendingPathComponent("lamp.mtl"), to: payload.appendingPathComponent("lamp.mtl"))
+  let payloadZip = folder.appendingPathComponent("Interior.zip")
+  let payloadDitto = Process()
+  payloadDitto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+  payloadDitto.arguments = ["-c", "-k", payload.path, payloadZip.path]
+  try payloadDitto.run()
+  payloadDitto.waitUntilExit()
+  let payloadBytes = Int64((try payloadZip.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0)
+  let payloadDigest = SHA256.hash(data: try Data(contentsOf: payloadZip)).map { String(format: "%02x", $0) }.joined()
+  guard case .download(let interiorStorage, let interiorPath, _) = interior.source else { return require(false, "a download scene") }
+  func localInterior(sha256: String) -> SceneEntry {
+    var local = interior
+    local.source = .download(storage: interiorStorage, file: interiorPath, archives: [ExampleArchive(
+      name: "Interior.zip", url: payloadZip, folder: "Interior", bytes: payloadBytes, unpackedBytes: payloadBytes, sha256: sha256)])
+    return local
+  }
+  let mismatched = localInterior(sha256: String(repeating: "0", count: 64)), correct = localInterior(sha256: payloadDigest)
+  let scenes = controller.scenes, browser = scenes.browser
+  controller.showStartScreen()
+  controller.browseScenes()
+  browser.filter = .all; browser.search = ""
+  browser.selection = SceneCatalog.entry(interior.id)
+  controller.beginSceneDownload(mismatched)
+  require(controller.downloadingScene?.id == interior.id && browser.control("scene-download-cancel")?.isHidden == false
+    && browser.control("scene-download")?.isHidden == true, "a download shows its progress in the details pane")
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  let failure = (browser.control("scene-download-error") as? NSTextField)?.stringValue ?? ""
+  require(controller.exampleDownload == nil && !controller.isInstalled(mismatched) && failure.contains("SHA-256")
+    && browser.control("scene-download-error")?.isHidden == false && browser.control("scene-download")?.isHidden == false
+    && browser.control("scene-download-cancel")?.isHidden == true && controller.startScreen != nil && scenes.isVisible,
+    "a digest mismatch shows its error in the pane, restores Download and leaves the scene missing: \(failure)")
+  // A download goes on while the Scenes window is hidden, and shows its progress for its card when it is shown again.
+  controller.beginSceneDownload(mismatched)
+  scenes.hide()
+  browser.selection = SceneCatalog.entry("sponza")
+  controller.browseScenes()
+  let again = browser
+  again.selection = SceneCatalog.entry(interior.id)
+  require(controller.downloadingScene?.id == interior.id && controller.exampleDownload?.isCancelled == false && scenes.isVisible
+    && again.control("scene-download-cancel")?.isHidden == false && again.control("scene-download")?.isHidden == true,
+    "a download keeps running while the Scenes window is hidden and shows its progress when it is shown again")
+  controller.cancelSceneDownload()
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  require(controller.status.stringValue.contains("cancelled") && !controller.isInstalled(mismatched)
+    && again.control("scene-download")?.isHidden == false, "Cancel ends the download and restores Download")
+  // A failure on the second archive keeps the first installed; the scene is missing only the second.
+  let partialLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-partial", isDirectory: true))
+  controller.exampleLibrary = partialLibrary
+  var partial = mismatched
+  let first = ExampleArchive(name: "Interior.zip", url: payloadZip, folder: "Interior", bytes: payloadBytes,
+    unpackedBytes: payloadBytes, sha256: payloadDigest)
+  var second = first
+  (second.name, second.folder, second.sha256) = ("Textures.zip", "Textures", String(repeating: "0", count: 64))
+  partial.source = .download(storage: interiorStorage, file: interiorPath, archives: [first, second])
+  again.reload()
+  controller.beginSceneDownload(partial)
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  let partialError = (again.control("scene-download-error") as? NSTextField)?.stringValue ?? ""
+  require(partialLibrary.isInstalled(first, storage: interiorStorage) && !partialLibrary.isInstalled(second, storage: interiorStorage)
+    && partialLibrary.missing(partial).map(\.name) == ["Textures.zip"] && partialLibrary.downloadBytes(partial) == second.bytes
+    && partialError.contains("SHA-256") && again.control("scene-download")?.isHidden == false
+    && (again.control("scene-download") as? NSButton)?.title == "Download \(SceneCatalog.megabytes(partialLibrary.downloadBytes(interior)))",
+    "a failed second archive leaves the first installed, shows its error and restores Download: \(partialError)")
+  controller.exampleLibrary = downloadLibrary
+  controller.associate(nil, edited: false, replaced: false)
+  grouped {
+    controller.beginSceneDownload(correct)
+    waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(controller.isInstalled(correct) && controller.startScreen == nil && testRenderer.sceneIndex == 6
+    && controller.project.importReport?.first == interior.attribution && !scenes.isVisible,
+    "a verified download with the Scenes window shown and no document loaded installs the scene, opens it with its credit and hides the window")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  // A download that finishes over a document with unsaved changes asks nothing and replaces nothing: the Scenes window
+  // stays with the scene selected and Open showing. A download that finishes while the window is hidden only reports
+  // it, even over an unedited document. One that finishes over an unedited document with the window shown opens.
+  let overLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-over", isDirectory: true))
+  controller.exampleLibrary = overLibrary
+  controller.associate(nil, edited: true, replaced: false)
+  var discardPrompts = 0
+  controller.unsavedChangesAnswer = { respond in discardPrompts += 1; respond(.alertThirdButtonReturn) }
+  let editedScene = testRenderer.sceneIndex
+  controller.browseScenes()
+  let over = browser
+  over.selection = SceneCatalog.entry("sponza")
+  require(over.control("scene-show-in-finder")?.isHidden == true, "Show in Finder is hidden for a download that is missing")
+  over.selection = correct
+  controller.beginSceneDownload(correct)
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  require(controller.isInstalled(correct) && discardPrompts == 0 && controller.documentEdited && scenes.isVisible
+    && testRenderer.sceneIndex == editedScene && controller.project.importReport?.first != interior.attribution
+    && over.selection?.id == interior.id && over.control("scene-open")?.isHidden == false
+    && over.control("scene-download")?.isHidden == true
+    && controller.status.stringValue == "\(interior.title) is downloaded; open it from the scene browser.",
+    "a download finishing over an edited document does not prompt or replace it, selects the scene and shows Open: \(controller.status.stringValue)")
+  require(over.control("scene-show-in-finder")?.isHidden == false, "Show in Finder is visible for an installed download")
+  scenes.hide()
+  let closedLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-closed", isDirectory: true))
+  controller.exampleLibrary = closedLibrary
+  controller.associate(nil, edited: false, replaced: false)
+  controller.browseScenes()
+  browser.selection = SceneCatalog.entry("sponza")
+  controller.beginSceneDownload(correct)
+  scenes.hide()
+  waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  require(controller.isInstalled(correct) && discardPrompts == 0 && !controller.documentEdited && !scenes.isVisible
+    && testRenderer.sceneIndex == editedScene && controller.project.importReport?.first != interior.attribution
+    && browser.selection?.id == interior.id && browser.control("scene-open")?.isHidden == false
+    && controller.status.stringValue == "\(interior.title) is downloaded; open it from the scene browser.",
+    "a download finishing while the Scenes window is hidden does not open the scene, selects it and reports it in the status line")
+  let shownLibrary = ExampleLibrary(root: folder.appendingPathComponent("browser-download-shown", isDirectory: true))
+  controller.exampleLibrary = shownLibrary
+  controller.browseScenes()
+  grouped {
+    controller.beginSceneDownload(correct)
+    waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(controller.isInstalled(correct) && discardPrompts == 0 && testRenderer.sceneIndex == 6
+    && controller.project.importReport?.first == interior.attribution && !scenes.isVisible,
+    "a download finishing over an unedited document with the Scenes window shown opens the scene and hides the window")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  controller.unsavedChangesAnswer = nil
+  controller.associate(nil, edited: false, replaced: false)
+  controller.exampleLibrary = downloadLibrary
+  // A Mitsuba download: a locally made archive holding a floor, an emissive rectangle and a perspective sensor installs
+  // and opens through the Mitsuba importer with the Water Caustic shot (view "Mitsuba: camera", caustics 3) and the
+  // entry's credit first in the import report, without the report sheet. Its thinlens focus distance (3) differs
+  // from the camera's distance, so the shot's saved view, which sets the focus to its distance, is observable.
+  let mitsubaSource = folder.appendingPathComponent("mitsuba-source", isDirectory: true)
+  try manager.createDirectory(at: mitsubaSource.appendingPathComponent("synthetic", isDirectory: true), withIntermediateDirectories: true)
+  try Data("""
+    <scene version="3.0.0">
+      <integrator type="path"><integer name="max_depth" value="6"/></integrator>
+      <sensor type="thinlens">
+        <float name="fov" value="40"/>
+        <float name="aperture_radius" value="0.1"/>
+        <float name="focus_distance" value="3"/>
+        <transform name="to_world"><lookat origin="0, 2, 6" target="0, 0, 0" up="0, 1, 0"/></transform>
+        <film type="hdrfilm"><integer name="width" value="64"/><integer name="height" value="48"/></film>
+      </sensor>
+      <bsdf type="diffuse" id="grey"><rgb name="reflectance" value="0.5"/></bsdf>
+      <shape type="rectangle"><transform name="to_world"><rotate x="1" angle="-90"/><scale value="3"/></transform><ref id="grey"/></shape>
+      <shape type="rectangle">
+        <emitter type="area"><rgb name="radiance" value="10"/></emitter>
+        <transform name="to_world"><rotate x="1" angle="90"/><translate y="2"/></transform>
+      </shape>
+    </scene>
+    """.utf8).write(to: mitsubaSource.appendingPathComponent("synthetic/scene.xml"))
+  let mitsubaZip = folder.appendingPathComponent("Synthetic.zip")
+  let mitsubaDitto = Process()
+  mitsubaDitto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+  mitsubaDitto.arguments = ["-c", "-k", mitsubaSource.path, mitsubaZip.path]
+  try mitsubaDitto.run()
+  mitsubaDitto.waitUntilExit()
+  require(mitsubaDitto.terminationStatus == 0, "ditto made the Mitsuba test archive")
+  let mitsubaBytes = Int64((try mitsubaZip.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0)
+  let mitsubaDigest = SHA256.hash(data: try Data(contentsOf: mitsubaZip)).map { String(format: "%02x", $0) }.joined()
+  var mitsubaEntry = SceneCatalog.entry("water-caustic")!
+  mitsubaEntry.source = .download(storage: "synthetic", file: "synthetic/scene.xml", archives: [ExampleArchive(
+    name: "Synthetic.zip", url: mitsubaZip, folder: "", bytes: mitsubaBytes, unpackedBytes: mitsubaBytes, sha256: mitsubaDigest)])
+  require(mitsubaEntry.format == .mitsuba && mitsubaEntry.shot == "bitterli-water-caustic", "the test entry is a Mitsuba download")
+  let mitsubaLibrary = ExampleLibrary(root: folder.appendingPathComponent("mitsuba-controller", isDirectory: true))
+  controller.exampleLibrary = mitsubaLibrary
+  try manager.createDirectory(at: mitsubaLibrary.storage(mitsubaEntry), withIntermediateDirectories: true)
+  try ExampleSceneDownload.installDownloaded(mitsubaZip, archive: mitsubaEntry.archives[0], storage: mitsubaLibrary.storage(mitsubaEntry), library: mitsubaLibrary)
+  require(controller.isInstalled(mitsubaEntry) && mitsubaLibrary.sceneFileURL(mitsubaEntry).map { manager.fileExists(atPath: $0.path) } == true,
+    "the Mitsuba archive extracts to its scene file")
+  var reportSheets = 0
+  controller.importReportShown = { reportSheets += 1 }
+  defer { controller.importReportShown = nil }
+  // An edited document with the prompt answered Cancel stays as it is, with the Scenes window shown.
+  controller.associate(nil, edited: true, replaced: false)
+  controller.browseScenes()
+  var mitsubaPrompts = 0
+  controller.unsavedChangesAnswer = { respond in mitsubaPrompts += 1; respond(.alertThirdButtonReturn) }
+  let beforeMitsuba = try encoder.encode(controller.project)
+  controller.openScene(mitsubaEntry)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  let cancelled = try encoder.encode(controller.project)
+  require(mitsubaPrompts == 1 && controller.documentEdited && scenes.isVisible && !controller.isBusy
+    && cancelled == beforeMitsuba && reportSheets == 0,
+    "Cancel at the unsaved-changes prompt leaves the document and the Scenes window as they are")
+  // Don't Save at the prompt proceeds: one prompt, then the scene opens.
+  let caustics = controller.project.caustics
+  mitsubaPrompts = 0
+  controller.unsavedChangesAnswer = { respond in mitsubaPrompts += 1; respond(.alertSecondButtonReturn) }
+  grouped {
+    controller.openScene(mitsubaEntry)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(mitsubaPrompts == 1, "Don't Save at the unsaved-changes prompt asks once (\(mitsubaPrompts))")
+  controller.unsavedChangesAnswer = nil
+  let opened = controller.project
+  require(opened.graph?.assets.map(\.geometry.count).reduce(0, +) == 4 && opened.views["Mitsuba: camera"] != nil
+    && opened.camera.yaw == opened.views["Mitsuba: camera"]?.yaw && opened.camera.distance == opened.views["Mitsuba: camera"]?.distance
+    && opened.camera.fov == opened.views["Mitsuba: camera"]?.fov && opened.options.outputWidth == 64 && opened.options.outputHeight == 48
+    && opened.options.depth == 5, "the Mitsuba scene opens with its triangles, its camera and its film size and depth")
+  require(caustics != 3 && opened.caustics == 3, "the shot's caustics mode applies (\(String(describing: caustics)) before)")
+  require(opened.options.focusDistance == opened.views["Mitsuba: camera"]?.distance && opened.options.focusDistance != 3,
+    "the shot's view sets the focus distance to the camera's (\(String(describing: opened.options.focusDistance)))")
+  require(opened.importReport?.first == mitsubaEntry.attribution && controller.projectURL == nil && controller.documentEdited
+    && !scenes.isVisible && reportSheets == 0 && controller.history.canUndo
+    && controller.status.stringValue == "Opened \(mitsubaEntry.title) \(mitsubaEntry.credit!), \(mitsubaEntry.license!). Credits: File > Credits and Licenses….",
+    "the Mitsuba scene opens untitled with its credit first in the report, no report sheet and the Scenes window hidden: \(controller.status.stringValue)")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  controller.associate(nil, edited: false, replaced: false)
+
+  // Open Scene File on a Mitsuba .xml over unsaved changes: one prompt, and the Scenes window hides once the scene is
+  // open. An .xml that is not a Mitsuba scene asks once too, then leaves the document and the Scenes window as they are.
+  let xmlScene = mitsubaSource.appendingPathComponent("synthetic/scene.xml")
+  let drawing = folder.appendingPathComponent("drawing.xml")
+  try Data("<svg/>".utf8).write(to: drawing)
+  controller.exampleLibrary = downloadLibrary
+  controller.associate(nil, edited: true, replaced: false)
+  controller.browseScenes()
+  var xmlPrompts = 0
+  controller.unsavedChangesAnswer = { respond in xmlPrompts += 1; respond(.alertSecondButtonReturn) }
+  let beforeDrawing = try encoder.encode(controller.project)
+  controller.beginOpenSceneFile(drawing)
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  let afterDrawing = try encoder.encode(controller.project)
+  require(xmlPrompts == 1 && controller.errorMessage?.contains("drawing.xml is not a Mitsuba scene") == true
+    && afterDrawing == beforeDrawing && scenes.isVisible && controller.documentEdited,
+    "an .xml that is not a Mitsuba scene asks once and leaves the document and the Scenes window as they are: \(controller.errorMessage ?? "no error")")
+  controller.dismissError()
+  xmlPrompts = 0
+  let sheetsBefore = reportSheets
+  grouped {
+    controller.beginOpenSceneFile(xmlScene)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(xmlPrompts == 1 && controller.projectURL == nil && controller.documentEdited
+    && controller.project.views["Mitsuba: camera"] != nil && controller.project.graph?.assets.map(\.geometry.count).reduce(0, +) == 4
+    && reportSheets == sheetsBefore + 1 && !scenes.isVisible && controller.errorMessage == nil,
+    "Open Scene File opens a Mitsuba .xml after one prompt and hides the Scenes window (\(xmlPrompts) prompts, \(controller.errorMessage ?? "no error"))")
+  controller.unsavedChangesAnswer = nil
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  controller.associate(nil, edited: false, replaced: false)
+
+  // A Mitsuba download that finishes with the Scenes window shown and nothing to lose installs and opens the scene
+  // through the Mitsuba importer, like the OBJ download above.
+  let mitsubaDownloadLibrary = ExampleLibrary(root: folder.appendingPathComponent("mitsuba-download", isDirectory: true))
+  controller.exampleLibrary = mitsubaDownloadLibrary
+  controller.browseScenes()
+  browser.filter = .all; browser.search = ""
+  browser.selection = mitsubaEntry
+  require(!controller.isInstalled(mitsubaEntry), "the Mitsuba entry is not installed in a fresh library")
+  grouped {
+    controller.beginSceneDownload(mitsubaEntry)
+    waitUntil({ controller.downloadingScene == nil }, seconds: 60)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+  }
+  require(controller.isInstalled(mitsubaEntry) && controller.projectURL == nil && controller.documentEdited
+    && controller.project.importReport?.first == mitsubaEntry.attribution && controller.project.views["Mitsuba: camera"] != nil
+    && controller.project.caustics == 3 && controller.project.graph?.assets.map(\.geometry.count).reduce(0, +) == 4
+    && !scenes.isVisible && controller.errorMessage == nil
+    && controller.status.stringValue == "Opened \(mitsubaEntry.title) \(mitsubaEntry.credit!), \(mitsubaEntry.license!). Credits: File > Credits and Licenses….",
+    "a finished Mitsuba download opens the scene through the importer and hides the Scenes window: \(controller.status.stringValue)")
+  history.undo()
+  waitUntil({ !controller.isBusy }, seconds: 60)
+  controller.associate(nil, edited: false, replaced: false)
+  controller.exampleLibrary = mitsubaLibrary
+
+  // An installed catalog scene whose file was deleted does not open: the document is unchanged, the Scenes window stays
+  // shown and its details pane shows the error, as the status line does.
+  func failedOpen(_ entry: SceneEntry, _ library: ExampleLibrary, _ name: String, damaged: Bool = false) throws {
+    controller.exampleLibrary = library
+    guard let file = library.sceneFileURL(entry) else { return require(false, "\(name) is a download") }
+    if damaged { try Data("<scene version=\"3.0.0\"><shape".utf8).write(to: file) } else { try manager.removeItem(at: file) }
+    require(controller.isInstalled(entry), "\(name) is still installed by its marker")
+    controller.browseScenes()
+    browser.filter = .all; browser.search = ""
+    browser.selection = entry
+    let before = try encoder.encode(controller.project)
+    controller.openScene(entry)
+    waitUntil({ !controller.isBusy }, seconds: 60)
+    let message = controller.errorMessage ?? ""
+    let label = browser.control("scene-download-error") as? NSTextField
+    let after = try encoder.encode(controller.project)
+    require(!message.isEmpty && controller.status.stringValue == message && scenes.isVisible
+      && after == before && label?.isHidden == false && label?.stringValue == message,
+      "a \(damaged ? "damaged" : "deleted") \(name) file leaves the document and the Scenes window as they are and shows the error in the details pane: \(message)")
+  }
+  try failedOpen(mitsubaEntry, mitsubaLibrary, "Mitsuba scene", damaged: true)
+  require(controller.errorMessage?.hasPrefix("Mitsuba: cannot read scene.xml") == true,
+    "a damaged Mitsuba scene file shows the importer's own error: \(controller.errorMessage ?? "none")")
+  controller.dismissError()
+  try failedOpen(mitsubaEntry, mitsubaLibrary, "Mitsuba scene")
+  let objLibrary = ExampleLibrary(root: folder.appendingPathComponent("obj-controller", isDirectory: true))
+  try manager.createDirectory(at: objLibrary.storage(correct), withIntermediateDirectories: true)
+  try ExampleSceneDownload.installDownloaded(payloadZip, archive: correct.archives[0], storage: objLibrary.storage(correct), library: objLibrary)
+  try failedOpen(correct, objLibrary, "OBJ scene")
+  controller.dismissError()
+  scenes.hide()
+  controller.exampleLibrary = downloadLibrary
+
+  // Bundled thumbnails: one 480 x 270 image per scene but the exempt Stanford scans, listed in scene-ids.txt.
+  require(SceneCatalog.thumbnailExempt == Set(["buddha", "chinese-dragon"]), "the Stanford scans are exempt from thumbnails")
+  let thumbnailIDs = SceneCatalog.entries.map(\.id).filter { !SceneCatalog.thumbnailExempt.contains($0) }
+  let listed = SceneCatalog.bundledURL("Examples/Thumbnails/scene-ids.txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+  require(listed?.split(separator: "\n").map(String.init) == thumbnailIDs && thumbnailIDs.count == 29,
+    "scene-ids.txt lists the scenes with a thumbnail")
+  for entry in SceneCatalog.entries {
+    let url = SceneCatalog.bundledURL("Examples/Thumbnails/\(entry.id).jpg")
+    let size = url.flatMap { CGImageSourceCreateWithURL($0 as CFURL, nil) }.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+      .map { ($0.width, $0.height) }
+    if SceneCatalog.thumbnailExempt.contains(entry.id) {
+      require(size == nil && SceneBrowserView.thumbnail(entry) == nil, "\(entry.id) ships no thumbnail")
+    } else {
+      require(size?.0 == 480 && size?.1 == 270, "\(entry.id) has a 480 x 270 thumbnail (\(String(describing: size)))")
+      require(SceneBrowserView.thumbnail(entry) != nil, "\(entry.id) shows its thumbnail")
+    }
+  }
+  print("PASS: example scenes (catalog against showcase.json, archive markers, verification and extraction, shot settings and emission scaling, the File menu's credits, downloading from the scene browser)")
 }
 try fixExampleSceneChecks()

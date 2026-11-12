@@ -1,26 +1,30 @@
 """Bisection and probe scenes for Mitsuba comparisons (scripts/compare_scene.py).
 
 Usage:
-  build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py variant SCENE.xml MODE
-      Writes scene_<MODE>.xml (":" as "_") beside SCENE.xml (relative paths keep resolving) and prints its path.
+  build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py variant SCENE.xml MODE OUTDIR
+      Writes OUTDIR/<scene folder>_<MODE>/scene.xml (":" and "=" as "_"), beside links to everything else in
+      SCENE.xml's folder, including the .xml files it <include>s, which are linked unchanged (so relative paths
+      keep resolving for the app and for Mitsuba), and prints its path.
       MODE flat: every BSDF becomes a two-sided diffuse 0.5; drop:KIND: only BSDFs containing KIND
       (e.g. roughconductor) are flattened. Nested BSDF ids keep a flattened copy, since Mitsuba ids
       are global. A scene that matches when flattened has no transport or emitter error.
+      constant:PROPERTY=VALUE: every BSDF property PROPERTY given by a texture becomes <rgb value="VALUE">
+      (constant:specular_reflectance=0.5 gives Veach Ajar's constant-floor variant, for compare_scene.py --metal-ms).
   build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py plate OUTDIR NAME front|back|backlit 'BSDF XML'
       A 1.2 x 1.2 plate with the given BSDF over a grey floor under a large area light; backlit puts the
       light behind the plate, so the camera sees only light the plate transmits (and the lit floor).
   build/mitsuba-venv/bin/python -I scripts/mitsuba_probes.py glint OUTDIR NAME 'BSDF XML'
       The plate reflecting a small, bright disk light in its mirror direction.
-Compare a written scene with: scripts/compare_scene.py SCENE --scale 1 --out build/mitsuba-probes/results.
-Results of 2026-10-21 are in REFERENCES.md, BITTERLI2016. Development tool, not bundled.
+Compare a written scene with: scripts/compare_scene.py SCENE --scale 1 --out build/mitsuba-probes/results
+(the app imports it natively). Results are in REFERENCES.md, BITTERLI2016. Development tool, not bundled.
 """
 import pathlib
 import sys
 import xml.etree.ElementTree as ET
 
 
-def variant(src, mode):
-    src = pathlib.Path(src)
+def variant(src, mode, outdir):
+    src = pathlib.Path(src).resolve()
     tree = ET.parse(src); root = tree.getroot()
     nested = []
 
@@ -47,10 +51,26 @@ def variant(src, mode):
                     flat(c)
             else:
                 visit(c, kind)
-    visit(root, mode[5:] if mode.startswith('drop:') else None)
+    if mode.startswith('constant:'):
+        prop, value = mode[9:].split('=', 1)
+        for b in list(root.iter('bsdf')):
+            for i, c in enumerate(list(b)):
+                if c.tag == 'texture' and c.get('name') == prop:
+                    b.remove(c)
+                    b.insert(i, ET.Element('rgb', name=prop, value=value))
+    else:
+        visit(root, mode[5:] if mode.startswith('drop:') else None)
     for i in nested:
         e = ET.Element('bsdf', id=i); flat(e); root.insert(0, e)
-    out = src.with_name(f'scene_{mode.replace(":", "_")}.xml')
+    folder = pathlib.Path(outdir) / f'{src.parent.name}_{mode.replace(":", "_").replace("=", "_")}'
+    folder.mkdir(parents=True, exist_ok=True)
+    # The scene file itself is replaced; files it includes (the first component of each include's path) are linked.
+    included = {pathlib.Path(i.get('filename', '')).parts[0] for i in root.iter('include') if i.get('filename')}
+    for entry in src.parent.iterdir():
+        link = folder / entry.name
+        if (entry.suffix != '.xml' or entry.name in included) and not link.exists():
+            link.symlink_to(entry)
+    out = folder / 'scene.xml'
     tree.write(out)
     return out
 
@@ -96,7 +116,7 @@ def probe(outdir, name, bsdf, side='front', glint=False):
 if __name__ == '__main__':
     command = sys.argv[1]
     if command == 'variant':
-        print(variant(sys.argv[2], sys.argv[3]))
+        print(variant(sys.argv[2], sys.argv[3], sys.argv[4]))
     elif command == 'plate':
         print(probe(sys.argv[2], sys.argv[3], sys.argv[5], side=sys.argv[4]))
     elif command == 'glint':

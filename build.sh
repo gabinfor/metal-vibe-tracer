@@ -34,11 +34,13 @@ cp Vendor/OpenUSD/UPSTREAM.md "$stage/Contents/Resources/OpenUSD-UPSTREAM.md"
 cp -RH build/OIDN "$stage/Contents/Frameworks/OIDN"
 cp Vendor/OIDN/UPSTREAM.md "$stage/Contents/Resources/OIDN-UPSTREAM.md"
 cp REFERENCES.md "$stage/Contents/Resources/REFERENCES.md"
-# Camera and lighting of File > Open Example Scene (ShowcaseShot). The spectral examples are bundled at their
-# repository paths (SpectralExamples); the McGuire archive scenes are downloaded on request.
+# Camera and lighting of the scene browser's example scenes (ShowcaseShot). The spectral examples are bundled at their
+# repository paths (SceneCatalog's spectral entries); the McGuire archive scenes are downloaded on request.
 cp scripts/showcase.json "$stage/Contents/Resources/showcase.json"
 mkdir -p "$stage/Contents/Resources/Examples"
 cp -R Examples/Spectral "$stage/Contents/Resources/Examples/Spectral"
+# The scene browser's thumbnails (scripts/render_showcase.py --thumbnails).
+cp -R Examples/Thumbnails "$stage/Contents/Resources/Examples/Thumbnails"
 cat > "$stage/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

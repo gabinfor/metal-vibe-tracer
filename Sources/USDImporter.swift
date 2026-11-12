@@ -225,8 +225,6 @@ enum USDImporter {
     snapshot.report += diagnostics.components(separatedBy: .newlines).filter {
       $0.hasPrefix("Warning:")
     }.map { String($0.prefix(1200)) }
-    var p = source
-    // USD opens as a complete scene; it does not merge lighting or IDs into an existing import.
     var stored = 0
     let assetCount = snapshot.assets.count
     let assets = try snapshot.assets.enumerated().map { index, asset -> MeshAsset in
@@ -239,11 +237,27 @@ enum USDImporter {
       stored += geometry.count
       return MeshAsset(id: asset.id, name: asset.name, geometry: geometry, subsets: asset.subsets)
     }
+    return try document(snapshot, assets: assets, folder: folder, url: url, into: source)
+  }
+  // Builds the imported document from a scene snapshot (the OpenUSD helper's, GLTFImporter's or
+  // MitsubaImporter's) and its mesh assets. MaterialX image paths resolve against `folder`. `format` names
+  // the source in saved views ("USD: Camera") and report lines; `lights` names its light schema. Without
+  // `inspectionSky`, a scene with no supported lighting stays unlit instead of getting the neutral sky.
+  static func document(
+    _ snapshot: USDImportSnapshot, assets: [MeshAsset], folder: URL, url: URL, into source: ProjectDocument,
+    format: String = "USD", lights: String = "UsdLux", inspectionSky: Bool = true
+  ) throws -> USDImportResult {
+    var snapshot = snapshot
+    var p = source
+    // A scene opens as a complete scene; it does not merge lighting or IDs into an existing import.
     var graph = SceneGraph(assets: assets, nodes: snapshot.nodes, materials: [])
     var state = SceneState()
     var uncompiled = Set<UUID>()
     for material in snapshot.materials {
       let slot = 8 + graph.materials.count
+      guard slot < SceneLimits.materials else {
+        throw MaterialLibrary.error("\(format) scene exceeds the \(SceneLimits.materials - 8) imported-material limit.")
+      }
       graph.materials.append(SceneMaterial(id: material.id, name: material.name, slot: slot))
       guard material.color.count == 3, material.color.allSatisfy({ $0.isFinite }) else {
         throw MaterialLibrary.error("Invalid USD material color.")
@@ -341,7 +355,7 @@ enum USDImporter {
     p.triangles = []
     p.scene = 6
     p.meshName = url.lastPathComponent
-    // A USD scene opens as a new untitled document: earlier saved views do not carry over.
+    // The scene opens as a new untitled document: earlier saved views do not carry over.
     p.views = [:]
     p.scenes[6] = state
     p.options.aperture = 0
@@ -389,8 +403,12 @@ enum USDImporter {
     let graphEmissive = state.materialX?.values.contains { $0.emissionWeight > 0 } == true
     if snapshot.environment == nil && snapshot.sun == nil && state.emissions?.isEmpty != false {
       if graphEmissive {
-        snapshot.report.append(
-          "No UsdLux lights: emissive materials light the scene; no environment or sun added.")
+        if inspectionSky {
+          snapshot.report.append(
+            "No \(lights) lights: emissive materials light the scene; no environment or sun added.")
+        }
+      } else if !inspectionSky {
+        snapshot.report.append("No supported authored lighting: the scene is unlit.")
       } else {
         p.options.environmentIntensity = 1
         p.options.sunIntensity = 0
@@ -415,7 +433,7 @@ enum USDImporter {
       c.pitch = asin(min(0.997, max(-0.997, delta.y / distance)))
       c.yaw = atan2(delta.x, -delta.z)
       c.fov = camera.fov
-      p.views["USD: " + camera.name] = c
+      p.views[format + ": " + camera.name] = c
       if importedCamera == nil {
         importedCamera = c
         importedFocus = camera.focus.flatMap { $0.isFinite && $0 > 0 ? min(1_000_000, max(0.0001, $0)) : nil }
@@ -445,6 +463,7 @@ enum USDImporter {
 }
 extension StudioController {
   func showUSDReport() {
+    if let shown = importReportShown { return shown() }
     let alert = NSAlert()
     alert.messageText = "Import report"
     let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 320))
@@ -457,19 +476,27 @@ extension StudioController {
     alert.accessoryView = scroll
     alert.runModal()
   }
-  func importUSD() {
+  func openSceneFile() {
+    chooseOpen("Open scene file", extensions: SceneFile.extensions) { [weak self] url in self?.beginOpenSceneFile(url) }
+  }
+  // USD, glTF and Mitsuba files open as a new scene; an OBJ becomes a new untitled scene holding that model.
+  // Asks first when the current document has unsaved changes.
+  func beginOpenSceneFile(_ url: URL) {
     confirmDiscardingChanges { [weak self] in
-      self?.chooseOpen("Open OpenUSD scene", extensions: ["usd", "usda", "usdc", "usdz"]) {
-        [weak self] url in self?.beginImportUSD(from: url)
+      guard let self else { return }
+      if url.pathExtension.lowercased() == "obj" {
+        self.beginOpenOBJScene(url)
+      } else {
+        self.beginImportUSD(from: url)
       }
     }
   }
   // `adjust` edits the imported document before its resources are prepared; with `opened`, that status
-  // message replaces the import report sheet (the bundled spectral examples).
-  func beginImportUSD(from url: URL, opened: String? = nil,
+  // message replaces the import report sheet (the bundled spectral examples). `failed` also receives a failure's message.
+  func beginImportUSD(from url: URL, opened: String? = nil, failed: (@MainActor @Sendable (String) -> Void)? = nil,
                       adjust: (@Sendable (inout ProjectDocument) -> Void)? = nil) {
     guard !isBusy else { return }
-    let record = undoRecord("Open USD scene", replacesDocument: true)
+    let record = undoRecord("Open scene", replacesDocument: true)
     let source = snapshot()
     let reuse = renderer.materials.reusableResources(graph: project.graph)
     let job = USDImportJob()
@@ -480,12 +507,23 @@ extension StudioController {
     // The activity strip shows the phase (OpenUSD composition can take minutes) and a Cancel button.
     let progress = beginProjectActivity("Importing \(url.lastPathComponent)…") { [weak self] in
       job.cancel()
-      self?.show("Cancelling the USD import…")
+      self?.show("Cancelling the import…")
     }
     DispatchQueue.global(qos: .userInitiated).async {
       // Resources are prepared off the main thread, reusing unchanged live resources.
       let result = Result { () -> (USDImportResult, MaterialLibrary) in
-        var imported = try USDImporter.load(url, into: source, job: job, progress: progress)
+        // glTF and Mitsuba (any .xml) are read in process (GLTFImporter, MitsubaImporter); OpenUSD composes in the
+        // helper that `job` controls.
+        var imported: USDImportResult
+        if GLTFImporter.isGLTF(url) {
+          defer { job.finish() }
+          imported = try GLTFImporter.load(url, into: source, progress: progress)
+        } else if MitsubaImporter.fileExtensions.contains(url.pathExtension.lowercased()) {
+          defer { job.finish() }
+          imported = try MitsubaImporter.load(url, into: source, progress: progress)
+        } else {
+          imported = try USDImporter.load(url, into: source, job: job, progress: progress)
+        }
         adjust?(&imported.document)
         return (imported, try self.prepareResources(imported.document, reuse: reuse, progress: progress))
       }
@@ -495,7 +533,7 @@ extension StudioController {
         self.usdImportJob = nil
         self.renderer.paused = wasPaused
         if cancelled {
-          self.show("USD import cancelled.")
+          self.show("Import cancelled.")
           self.rebuild()
           return
         }
@@ -505,6 +543,7 @@ extension StudioController {
           if let opened { self.show(opened) } else { self.showUSDReport() }
         case .failure(let error):
           self.showError(error.localizedDescription)
+          failed?(error.localizedDescription)
           self.rebuild()
         }
       }

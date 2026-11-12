@@ -13,7 +13,10 @@ def fetch(item):
         if hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()!=item['sha']:raise ValueError('Git object checksum mismatch: '+path)
         target.write_bytes(data)
     return {'path':relative,'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)}
-with urllib.request.urlopen('https://api.github.com/repos/usd-wg/assets/git/trees/'+COMMIT+'?recursive=1',timeout=30) as response:tree=json.load(response)['tree']
+with urllib.request.urlopen('https://api.github.com/repos/usd-wg/assets/git/trees/'+COMMIT+'?recursive=1',timeout=30) as response:listing=json.load(response)
+# A truncated listing would silently drop files.
+assert not listing.get('truncated'),'GitHub tree listing truncated'
+tree=listing['tree']
 files=[x for x in tree if x['type']=='blob' and x['path'].startswith('full_assets/StandardShaderBall/') and not any('/'+d+'/' in x['path'] for d in ('media','src','cards','thumbnails'))]
 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:manifest=list(pool.map(fetch,files))
 (DEST/'DOWNLOAD.json').write_text(json.dumps({'repository':'https://github.com/usd-wg/assets','commit':COMMIT,'license':'CC-BY-4.0','files':manifest},indent=2))

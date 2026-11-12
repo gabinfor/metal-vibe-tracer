@@ -1,6 +1,7 @@
 import Cocoa
 import CoreImage
 import MetalKit
+import Synchronization
 import simd
 
 struct ObjectSettings: Codable {
@@ -113,8 +114,8 @@ extension StudioOptions {
       && (indirectClamp ?? 0) == (o.indirectClamp ?? 0)
   }
 }
-// The ReSTIR strategy's reuse modes, the sampler and the light transport (Render inspector; the
-// sampler and the light transport apply to every strategy). Each one changes the image, so a
+// The ReSTIR strategy's reuse modes, the sampler, the light transport, the light sampling and the caustic mode
+// (Render inspector; the last four apply to every strategy). Each one changes the image, so a
 // difference restarts accumulation like a radiance-affecting option (StudioController.applyProject).
 struct ReSTIRModes: Equatable, Sendable {
   var indirectReuse: IndirectReuse
@@ -124,9 +125,10 @@ struct ReSTIRModes: Equatable, Sendable {
   var sampler: SamplerMode
   var lightTransport: LightTransport
   var lightSampling: LightSampling
+  var caustics: CausticMode
   // Projects without a stored choice use these: .automatic, or in -D VIBE_TESTING builds the
   // VIBE_INDIRECT_REUSE / VIBE_SPATIAL_NEIGHBORS / VIBE_TEMPORAL_REUSE / VIBE_CONTROL_VARIATES /
-  // VIBE_SAMPLER / VIBE_LIGHT_TRANSPORT / VIBE_LIGHT_SAMPLING override. A stored choice wins.
+  // VIBE_SAMPLER / VIBE_LIGHT_TRANSPORT / VIBE_LIGHT_SAMPLING / VIBE_CAUSTICS override. A stored choice wins.
   static var defaults: ReSTIRModes {
     ReSTIRModes(
       indirectReuse: PathTracerRenderer.defaultIndirectReuse,
@@ -135,13 +137,15 @@ struct ReSTIRModes: Equatable, Sendable {
       controlVariates: PathTracerRenderer.defaultControlVariates,
       sampler: PathTracerRenderer.defaultSampler,
       lightTransport: PathTracerRenderer.defaultLightTransport,
-      lightSampling: PathTracerRenderer.defaultLightSampling)
+      lightSampling: PathTracerRenderer.defaultLightSampling,
+      caustics: PathTracerRenderer.defaultCaustics)
   }
   init(indirectReuse: IndirectReuse, spatialNeighbors: SpatialNeighborSelection, temporalReuse: TemporalReuse,
        controlVariates: ControlVariates = PathTracerRenderer.defaultControlVariates,
        sampler: SamplerMode = PathTracerRenderer.defaultSampler,
        lightTransport: LightTransport = PathTracerRenderer.defaultLightTransport,
-       lightSampling: LightSampling = PathTracerRenderer.defaultLightSampling) {
+       lightSampling: LightSampling = PathTracerRenderer.defaultLightSampling,
+       caustics: CausticMode = PathTracerRenderer.defaultCaustics) {
     self.indirectReuse = indirectReuse
     self.spatialNeighbors = spatialNeighbors
     self.temporalReuse = temporalReuse
@@ -149,11 +153,12 @@ struct ReSTIRModes: Equatable, Sendable {
     self.sampler = sampler
     self.lightTransport = lightTransport
     self.lightSampling = lightSampling
+    self.caustics = caustics
   }
   @MainActor init(_ r: PathTracerRenderer) {
     self.init(indirectReuse: r.indirectReuse, spatialNeighbors: r.spatialNeighbors, temporalReuse: r.temporalReuse,
               controlVariates: r.controlVariates, sampler: r.sampler, lightTransport: r.lightTransport,
-              lightSampling: r.lightSampling)
+              lightSampling: r.lightSampling, caustics: r.caustics)
   }
   @MainActor func apply(_ r: PathTracerRenderer) {
     r.indirectReuse = indirectReuse
@@ -163,6 +168,7 @@ struct ReSTIRModes: Equatable, Sendable {
     r.sampler = sampler
     r.lightTransport = lightTransport
     r.lightSampling = lightSampling
+    r.caustics = caustics
   }
 }
 struct OIDNOptions: Codable, Equatable {
@@ -217,6 +223,8 @@ struct ProjectDocument: Codable {
   var sampler: UInt32?
   var lightTransport: UInt32?
   var lightSampling: UInt32?
+  // CausticMode raw value; nil (projects before caustic light tracing) is the default.
+  var caustics: UInt32?
   // The scene medium (SceneMedium); nil is clear air, as in projects written before media.
   var medium: SceneMedium?
   // Written only into autosaves: the document's file association and unsaved state.
@@ -233,7 +241,8 @@ struct ProjectDocument: Codable {
         controlVariates: controlVariates.flatMap(ControlVariates.init(rawValue:)) ?? fallback.controlVariates,
         sampler: sampler.flatMap(SamplerMode.init(rawValue:)) ?? fallback.sampler,
         lightTransport: lightTransport.flatMap(LightTransport.init(rawValue:)) ?? fallback.lightTransport,
-        lightSampling: lightSampling.flatMap(LightSampling.init(rawValue:)) ?? fallback.lightSampling)
+        lightSampling: lightSampling.flatMap(LightSampling.init(rawValue:)) ?? fallback.lightSampling,
+        caustics: caustics.flatMap(CausticMode.init(rawValue:)) ?? fallback.caustics)
     }
     set {
       indirectReuse = newValue.indirectReuse.rawValue
@@ -243,6 +252,7 @@ struct ProjectDocument: Codable {
       sampler = newValue.sampler.rawValue
       lightTransport = newValue.lightTransport.rawValue
       lightSampling = newValue.lightSampling.rawValue
+      caustics = newValue.caustics.rawValue
     }
   }
 
@@ -328,6 +338,7 @@ struct ProjectDocument: Codable {
       sampler.map({ SamplerMode(rawValue: $0) != nil }) ?? true,
       lightTransport.map({ LightTransport(rawValue: $0) != nil }) ?? true,
       lightSampling.map({ LightSampling(rawValue: $0) != nil }) ?? true,
+      caustics.map({ CausticMode(rawValue: $0) != nil }) ?? true,
       options.lightSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true,
       options.sunSpectrum.map({ Illuminant(rawValue: $0) != nil }) ?? true
     else { try bad(); return }
@@ -852,6 +863,7 @@ extension MaterialXProgram {
       thinWalled == other.thinWalled, subsurfaceWeight == other.subsurfaceWeight,
       subsurfaceColor == other.subsurfaceColor, subsurfaceAnisotropy == other.subsurfaceAnisotropy, medium == other.medium, mediumAnisotropy == other.mediumAnisotropy,
       mediumBoundary == other.mediumBoundary, mediumRayleigh == other.mediumRayleigh,
+      anisotropyRotation == other.anisotropyRotation,
       sameBytes(instructions, other.instructions),
       images.count == other.images.count, parameters.count == other.parameters.count,
       zip(images, other.images).allSatisfy({ $0.name == $1.name && $0.srgb == $1.srgb && $0.data == $1.data })
@@ -973,7 +985,8 @@ extension MaterialLibrary {
   // Material images always sample as RGBA. MTKTextureLoader keeps gray and gray+alpha
   // files as R/RG, so those become swizzled views (RRR1, RRRG). sRGB cases the formats
   // cannot express (16-bit data; RG8 sRGB, which would also decode alpha) are expanded
-  // to RGBA on the CPU.
+  // to RGBA on the CPU. Mip levels are box-filtered in linear space (encodeMipmaps), except those a
+  // KTX file supplies, which are kept.
   func decodeTexture(_ data: Data, srgb: Bool, maximumSide: Int? = nil) throws -> MTLTexture {
     // Budget downscaling (materialXCandidate): an ImageIO thumbnail at most `maximumSide` texels
     // long, passed on as uncompressed TIFF so every format path below still applies.
@@ -992,8 +1005,10 @@ extension MaterialLibrary {
       guard CGImageDestinationFinalize(destination) else { throw Self.error("Could not downscale a texture.") }
       return try decodeTexture(output as Data, srgb: srgb)
     }
+    let authoredLevels = Self.ktxMipmapLevels(data) > 1
     let options: [MTKTextureLoader.Option: Any] = [
-      .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
+      .SRGB: srgb, .allocateMipmaps: !authoredLevels, .generateMipmaps: false,
+      .origin: MTKTextureLoader.Origin.topLeft,
       .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
       .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
     ]
@@ -1011,12 +1026,15 @@ extension MaterialLibrary {
       else { throw error }
       context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
       guard let rgba = context.makeImage() else { throw error }
-      return try loader.newTexture(cgImage: rgba, options: options)
+      let texture = try loader.newTexture(cgImage: rgba, options: options.merging([.allocateMipmaps: true]) { $1 })
+      try generateMipmaps(texture)
+      return texture
     }
     let format = texture.pixelFormat
     if srgb, [.r8Unorm, .r16Unorm, .rg16Unorm, .rgba16Unorm, .rg8Unorm, .rg8Unorm_srgb].contains(format) {
       return try expandedSRGB(data)
     }
+    if !authoredLevels { try generateMipmaps(texture) }
     let swizzle: MTLTextureSwizzleChannels
     switch format {
     case .r8Unorm, .r8Unorm_srgb, .r16Unorm, .r16Float, .r32Float:
@@ -1103,14 +1121,177 @@ extension MaterialLibrary {
       sourceBytesPerImage: width * height * pixelBytes,
       sourceSize: MTLSize(width: width, height: height, depth: 1), to: texture, destinationSlice: 0,
       destinationLevel: 0, destinationOrigin: MTLOrigin())
-    blit.generateMipmaps(for: texture)
     blit.endEncoding()
+    try encodeMipmaps(texture, into: command)
     command.commit()
     command.waitUntilCompleted()
     guard command.status == .completed else {
       throw Self.error("Could not upload the expanded sRGB texture.")
     }
     return texture
+  }
+
+  // Mip levels come from MSL area_mipmap: each texel is the area-weighted mean, in linear space, of the
+  // footprint it covers in the level above (a box filter over the exact footprint: 2×2 texels, up to 3×3
+  // below an odd side). An sRGB texel is read through the hardware decode, which near black is only close to
+  // IEC 61966-2-1 (20% low at code 1), so the kernel recovers its 8-bit code (exact for all 256 codes) and
+  // decodes that with the IEC formula; it writes 8-bit levels as the code nearest the mean in linear space
+  // (sRGB ones through a linear view), so no decode or rounding error compounds from level to level. Metal's own mip generation (the blit's generateMipmaps, and
+  // MTKTextureLoader's .generateMipmaps, measured the same) takes one bilinear tap per texel when the level
+  // above has an odd side, which skips some source texels and under-weights others; the error compounds level
+  // by level (Bitterli's 894² Modern Hall floor: up to +11% at 6×6 and +86% at 1×1). At power-of-two sides its
+  // levels drift upward by about 0.1% a level on bright sRGB images. Formats the kernel cannot write, and a
+  // device where it does not compile, get the blit's levels (REFERENCES.md METALTEXTURES).
+  private static let areaMipmapSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    float3 srgb_encode(float3 v) { return select(1.055f * powr(v, 1.0f / 2.4f) - 0.055f, 12.92f * v, v <= 0.0031308f); }
+    float3 srgb_decode(float3 c) { return select(powr((c + 0.055f) / 1.055f, 2.4f), c / 12.92f, c <= 0.04045f); }
+    // mode.x: sRGB colour (read and written as codes, as above); mode.y: an 8-bit format, rounded here.
+    kernel void area_mipmap(texture2d<float, access::read> source [[texture(0)]],
+        texture2d<float, access::write> destination [[texture(1)]], constant uint2 &mode [[buffer(0)]],
+        uint2 id [[thread_position_in_grid]]) {
+      uint2 size = uint2(destination.get_width(), destination.get_height());
+      uint2 sourceSize = uint2(source.get_width(), source.get_height());
+      if (any(id >= size)) return;
+      float2 lo = float2(id * sourceSize) / float2(size);
+      float2 hi = min(float2((id + 1) * sourceSize) / float2(size), float2(sourceSize));
+      float4 sum = 0;
+      float total = 0;
+      for (uint y = uint(lo.y); float(y) < hi.y; ++y) {
+        float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));
+        for (uint x = uint(lo.x); float(x) < hi.x; ++x) {
+          float w = wy * (min(hi.x, float(x + 1)) - max(lo.x, float(x)));
+          float4 texel = source.read(uint2(x, y));
+          if (mode.x != 0) texel.rgb = srgb_decode(rint(255.0f * srgb_encode(texel.rgb)) / 255.0f);
+          sum += w * texel;
+          total += w;
+        }
+      }
+      float4 c = sum / total;
+      if (mode.y != 0) {
+        // The nearest 8-bit code in linear space. An even mix of two neighbouring codes, common in smooth
+        // images, is a tie that rounding would always break the same way (upward, for sRGB codes), so each
+        // level would drift; ties go up or down by texel parity instead.
+        float4 v = saturate(c);
+        float4 code = min(floor(255.0f * v), 254.0f);
+        if (mode.x != 0) code.rgb = min(floor(255.0f * srgb_encode(v.rgb)), 254.0f);
+        float4 a = code / 255.0f, b = (code + 1.0f) / 255.0f;
+        if (mode.x != 0) { a.rgb = srgb_decode(a.rgb); b.rgb = srgb_decode(b.rgb); }
+        float4 offset = (2.0f * v - a - b) / (b - a);
+        float4 up = select(float4(offset > 0.0f), float4(((id.x ^ id.y) & 1) != 0), abs(offset) < 1e-3f);
+        c = (code + up) / 255.0f;
+      }
+      destination.write(c, id);
+    }
+    """
+  // The pixel format area_mipmap writes for each format it filters (sRGB formats through their linear twin).
+  private static let areaMipmapWriteFormats: [MTLPixelFormat: MTLPixelFormat] = [
+    .rgba8Unorm_srgb: .rgba8Unorm, .bgra8Unorm_srgb: .bgra8Unorm, .r8Unorm_srgb: .r8Unorm, .rg8Unorm_srgb: .rg8Unorm,
+    .rgba8Unorm: .rgba8Unorm, .bgra8Unorm: .bgra8Unorm, .r8Unorm: .r8Unorm, .rg8Unorm: .rg8Unorm,
+    .r16Unorm: .r16Unorm, .rg16Unorm: .rg16Unorm, .rgba16Unorm: .rgba16Unorm,
+    .r16Float: .r16Float, .rg16Float: .rg16Float, .rgba16Float: .rgba16Float,
+    .r32Float: .r32Float, .rg32Float: .rg32Float, .rgba32Float: .rgba32Float,
+  ]
+  // One command queue and area_mipmap pipeline per device, shared by every library on it; the pipeline is nil
+  // where the kernel did not compile (the blit then makes the levels).
+  private struct AreaMipmapFilter: @unchecked Sendable {
+    let queue: MTLCommandQueue
+    let pipeline: MTLComputePipelineState?
+  }
+  private static let areaMipmapFilters = Mutex<[UInt64: AreaMipmapFilter]>([:])
+  private func areaMipmapFilter() throws -> AreaMipmapFilter {
+    let device = device
+    return try Self.areaMipmapFilters.withLock { filters in
+      if let filter = filters[device.registryID] { return filter }
+      guard let queue = device.makeCommandQueue() else { throw Self.error("Could not generate mip levels.") }
+      let pipeline = (try? device.makeLibrary(source: Self.areaMipmapSource, options: nil))
+        .flatMap { $0.makeFunction(name: "area_mipmap") }
+        .flatMap { try? device.makeComputePipelineState(function: $0) }
+      let filter = AreaMipmapFilter(queue: queue, pipeline: pipeline)
+      filters[device.registryID] = filter
+      return filter
+    }
+  }
+  // The number of mip levels a KTX (version 1) file stores, or 0 for any other file. MTKTextureLoader loads
+  // them, and decodeTexture keeps them.
+  static func ktxMipmapLevels(_ data: Data) -> Int {
+    let identifier: [UInt8] = [0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A]
+    guard data.count >= 64, data.prefix(12).elementsEqual(identifier) else { return 0 }
+    func word(_ offset: Int) -> UInt32 {
+      data.dropFirst(offset).prefix(4).reversed().reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+    }
+    let levels = word(12) == 0x0403_0201 ? word(56) : word(56).byteSwapped
+    return Int(levels)
+  }
+  // Fills levels 1... of a texture whose level 0 is loaded.
+  private func generateMipmaps(_ texture: MTLTexture) throws {
+    guard texture.mipmapLevelCount > 1 else { return }
+    guard let command = try areaMipmapFilter().queue.makeCommandBuffer() else {
+      throw Self.error("Could not generate mip levels.")
+    }
+    try encodeMipmaps(texture, into: command)
+    command.commit()
+    command.waitUntilCompleted()
+    guard command.status == .completed else { throw Self.error("Could not generate mip levels.") }
+  }
+  // Encodes levels 1... of a texture from its level 0 with area_mipmap, or with the blit where the kernel does
+  // not apply (see areaMipmapSource).
+  private func encodeMipmaps(_ texture: MTLTexture, into command: MTLCommandBuffer) throws {
+    guard texture.mipmapLevelCount > 1 else { return }
+    if try encodeAreaMipmaps(texture, into: command) { return }
+    guard let blit = command.makeBlitCommandEncoder() else { throw Self.error("Could not generate mip levels.") }
+    blit.generateMipmaps(for: texture)
+    blit.endEncoding()
+  }
+  // area_mipmap's levels, written to a scratch chain (a third of level 0's size, released when the command
+  // buffer completes, so outside textureBudget) and copied in, so the texture needs no shader-write usage.
+  // False, with nothing encoded, when the kernel does not apply.
+  private func encodeAreaMipmaps(_ texture: MTLTexture, into command: MTLCommandBuffer) throws -> Bool {
+    let levels = texture.mipmapLevelCount
+    guard texture.textureType == .type2D, let writeFormat = Self.areaMipmapWriteFormats[texture.pixelFormat],
+      let pipeline = try areaMipmapFilter().pipeline
+    else { return false }
+    // Scratch level k holds the texture's level k + 1.
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: texture.pixelFormat, width: max(1, texture.width / 2), height: max(1, texture.height / 2),
+      mipmapped: true)
+    descriptor.mipmapLevelCount = levels - 1
+    descriptor.usage = writeFormat == texture.pixelFormat ? [.shaderRead, .shaderWrite]
+      : [.shaderRead, .shaderWrite, .pixelFormatView]
+    descriptor.storageMode = .private
+    guard let scratch = device.makeTexture(descriptor: descriptor) else { return false }
+    var views: [(source: MTLTexture, destination: MTLTexture)] = []
+    for level in 0..<(levels - 1) {
+      guard
+        let source = level == 0 ? texture.makeTextureView(
+          pixelFormat: texture.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1)
+          : scratch.makeTextureView(
+            pixelFormat: texture.pixelFormat, textureType: .type2D, levels: (level - 1)..<level, slices: 0..<1),
+        let destination = scratch.makeTextureView(
+          pixelFormat: writeFormat, textureType: .type2D, levels: level..<(level + 1), slices: 0..<1)
+      else { return false }
+      views.append((source, destination))
+    }
+    guard let encoder = command.makeComputeCommandEncoder() else { return false }
+    var mode = SIMD2<UInt32>(writeFormat == texture.pixelFormat ? 0 : 1,
+      [.rgba8Unorm, .bgra8Unorm, .r8Unorm, .rg8Unorm].contains(writeFormat) ? 1 : 0)
+    encoder.setComputePipelineState(pipeline)
+    encoder.setBytes(&mode, length: 8, index: 0)
+    for (source, destination) in views {
+      encoder.setTexture(source, index: 0)
+      encoder.setTexture(destination, index: 1)
+      encoder.dispatchThreads(
+        MTLSize(width: destination.width, height: destination.height, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+    }
+    encoder.endEncoding()
+    guard let blit = command.makeBlitCommandEncoder() else { throw Self.error("Could not generate mip levels.") }
+    blit.copy(
+      from: scratch, sourceSlice: 0, sourceLevel: 0, to: texture, destinationSlice: 0, destinationLevel: 1,
+      sliceCount: 1, levelCount: levels - 1)
+    blit.endEncoding()
+    return true
   }
 
   func environmentImportance(_ pixels: UnsafeBufferPointer<Float>, width: Int, height: Int) throws -> (MTLTexture, MTLTexture) {

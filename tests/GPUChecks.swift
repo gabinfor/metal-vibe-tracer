@@ -313,7 +313,7 @@ func savePreview(_ panels: [[SIMD4<Float>]], width: Int, height: Int, name: Stri
     let spectral = spectral ?? rendererTracesSpectrally()
     guard spectral else { return try gpu.makeLibrary(source: metalSource + kernels, options: shaderCompileOptions()) }
     let options = shaderCompileOptions()
-    options.preprocessorMacros = ["VIBE_SPECTRAL": NSNumber(value: 1)]
+    options.preprocessorMacros = ["VIBE_SPECTRAL": NSNumber(value: 1), "VIBE_MEDIA_PHOTONS": NSNumber(value: 0)]
     return try gpu.makeLibrary(source: try loadSpectralTablesSource() + metalSource + kernels, options: options)
 }
 @MainActor func bindRendererSpectral(_ encoder: MTLComputeCommandEncoder) {

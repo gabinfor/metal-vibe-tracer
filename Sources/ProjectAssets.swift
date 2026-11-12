@@ -385,7 +385,7 @@ struct AutosaveWriteReport {
 }
 
 extension ProjectDocument {
-  // Format-3 bytes without the save limits (material presets). `inline` embeds every
+  // Current-format (ProjectAssets.formatVersion) bytes without the save limits (material presets). `inline` embeds every
   // payload; otherwise the table lists sizes and the payloads are returned for sidecars.
   func encodedProject(inline: Bool = true) throws -> (json: Data, payloads: [String: Data]) {
     let collector = ProjectAssets.Collector()

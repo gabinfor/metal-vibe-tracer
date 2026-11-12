@@ -52,6 +52,13 @@ let metalSource = loadOpenPBRSource() + """
 using namespace metal;
 
 #define PI 3.14159265358979323846f
+// Whether volume_path records caustic photon requests (CausticMode.photons in scenes with media). The spectral libraries
+// compile without them: with relaxed math they crash the Metal backend compiler (AGX, macOS 27, 2026-11-09), and safe
+// math costs spectral rendering 12-14% (tests/PERFORMANCE.md), so a safe-math spectral shading_kernel with them is
+// compiled on demand (PathTracerRenderer.requestMediaPhotonKernel).
+#ifndef VIBE_MEDIA_PHOTONS
+#define VIBE_MEDIA_PHOTONS 1
+#endif
 #define TWO_PI 6.28318530717958647692f
 
 // Scene kernels (PathTracerRenderer.proceduralKernels) compile with VIBE_MESHES=0: scenes 0-5
@@ -196,8 +203,8 @@ uint z_morton(uint2 p) {
     return v.x | (v.y << 1);
 }
 
-// A pixel's random numbers. In PCG mode every draw continues `state`, exactly as the earlier
-// `thread uint &seed` streams did. In Z mode sampling draws come from the Z sampler: each
+// A pixel's random numbers. In PCG mode every draw continues `state`, one sequential
+// stream. In Z mode sampling draws come from the Z sampler: each
 // sampling event (sampler_event: a path vertex and a stream such as BSDF or NEE) owns 32
 // consecutive dimensions, and each rand_f / rand_f2 / rand_f3 call takes the event's next
 // one, a 1D, 2D or 3D constituent. sampler_candidate adds `bits` low index bits for one of
@@ -390,7 +397,7 @@ struct Uniforms {
     uint viewportMode;     // 0 = beauty, 1 = albedo, 2 = normals, 3 = depth, 4 = material
     uint width;
     uint height;
-    uint indirectReuse;    // IndirectReuse, ReSTIR PT and sampler options (former padding); see indirect_reuse_mode, sampler_z
+    uint indirectReuse;    // IndirectReuse (bits 0-1), ReSTIR PT options (2-5), sampler (6-8), caustics (9-10); see indirect_reuse_mode, sampler_z, caustics_on, photons_on
     float2 jitter;         // Shared subpixel offset, in pixels, excluding the 0.5 pixel center.
     uint sampleIndex;      // Continues across orbit changes, independently of accumulation.
     uint reservoirHistoryReset; // 1 = DI/GI history reservoirs were just allocated; skip temporal reuse
@@ -446,6 +453,28 @@ bool restir_pt_control_variates(constant Uniforms &u) { return restir_pt_active(
 // 3 a fresh random block per accumulation (ReShuffle-like).
 bool sampler_z(constant Uniforms &u) { return (u.indirectReuse & 64u) != 0u; }
 uint sampler_z_temporal(constant Uniforms &u) { return (u.indirectReuse >> 7) & 3u; }
+// Bit 9: caustic light tracing (CausticMode.lightTracing; docs/CAUSTICS_DESIGN.md): light paths carry the caustics
+// the camera sees directly (caustic_trace_kernel), and camera paths leave those light paths out. Imported scenes only.
+bool caustics_on(constant Uniforms &u) { return MESHES && u.sceneIndex == 6u && (u.indirectReuse & 512u) != 0u; }
+// Bit 10: caustic photons (CausticMode.photons; docs/CAUSTICS_DESIGN.md §6): camera paths also gather photons at up to
+// two vertices after the primary hit (surfaces, and scattering points in media), and leave out the light they carry.
+bool photons_on(constant Uniforms &u) { return caustics_on(u) && (u.indirectReuse & 1024u) != 0u; }
+// Spectral photons: a sample's light paths and pixels share CAUSTIC_GROUPS sets of four wavelengths, the wavelength
+// numbers u_g = frac(u_0 + g / groups) with u_0 the sample's, so a camera path gathers photons at exactly its own
+// wavelengths (the grid keys photons by group, caustic_cell). Light path i takes group i mod groups; a pixel's group is
+// a hash of the pixel that advances with each sample. RGB transport needs one group.
+#if VIBE_SPECTRAL
+constant uint CAUSTIC_GROUPS = 4u;
+#else
+constant uint CAUSTIC_GROUPS = 1u;
+#endif
+float caustic_group_u(constant Uniforms &u, uint group) {
+    float u0 = float(pcg_hash(u.sampleIndex * 0x9e3779b9u ^ 0x85ebca6bu) >> 8u) * (1.0f / 16777216.0f);
+    return fract(u0 + float(group) / float(CAUSTIC_GROUPS));
+}
+uint caustic_pixel_group(uint2 gid, constant Uniforms &u) {
+    return (pcg_hash(gid.x ^ (gid.y << 16)) + u.sampleIndex) % CAUSTIC_GROUPS;
+}
 
 // Z++ key of a pixel for this frame (layout: Sampler): the recursively shuffled Morton index (Ahmed
 // and Wonka's pixel ordering) XOR a temporal index t (ZPP2026 Eq. 3) as the pixel code, and the frame
@@ -466,7 +495,7 @@ uint z_pixel_key(uint2 gid, constant Uniforms &u) {
     if ((j >> Z_FRAME_BITS) != 0u) t ^= z_mix(j >> Z_FRAME_BITS);
     return ((k ^ t) << Z_FRAME_BITS) | (j & ((1u << Z_FRAME_BITS) - 1u));
 }
-// Pass 1 and pass 2 of a pixel start from this sampler (the PCG state both passes used before).
+// Pass 1 and pass 2 of a pixel start from this sampler (its PCG state is seeded per pixel and sample).
 Sampler pixel_sampler(uint2 gid, constant Uniforms &u) {
     Sampler s;
     s.state = (gid.y * u.width + gid.x) ^ (u.sampleIndex * 1999999973u);
@@ -606,7 +635,7 @@ struct MaterialResources {
     // Per slot, SLOT_PARAMETERS float4 (MaterialLibrary.slotParameters; docs/VOLUME_DESIGN.md §5): the
     // spectral OpenPBR parameters (SpectralMaterial), the constant specular_color (slot_specular_color) and
     // subsurface_scatter_anisotropy (slot_subsurface_anisotropy), the constant transmission_color and
-    // geometry_thin_walled (slot_transmission), the emitter record, colour and shaping (slot_emitter, slot_emitter_rgb, emitter_shaping) and the interior medium (slot_medium).
+    // geometry_thin_walled (slot_transmission), the emitter record, colour and shaping (slot_emitter, slot_emitter_rgb, emitter_shaping), the interior medium (slot_medium) and the anisotropy rotation (slot_anisotropy_rotation).
     device float4 *spectralMaterials [[id(14)]];
     // Alpha cutouts: per slot the register of MaterialX geometry_opacity (-1: opaque), then at
     // MATERIAL_SLOTS the number of cutout slots (MaterialLibrary.rebuildArguments).
@@ -623,12 +652,22 @@ float3 slot_specular_color(uint slot, constant MaterialResources &images) {
 float slot_subsurface_anisotropy(uint slot, constant MaterialResources &images) {
     return slot < MATERIAL_SLOTS ? images.spectralMaterials[SLOT_PARAMETERS * slot + 1].w : 0.0f;
 }
-// OpenPBR transmission_color (rgb) and geometry_thin_walled (w: 1 or 0) of a slot; white and solid
-// unless a MaterialX program sets them.
+// OpenPBR transmission_color as a tint at the surface (rgb) and geometry_thin_walled (w: 1 or 0) of a slot;
+// white and solid unless a MaterialX program sets them. A solid surface with an interior medium
+// (transmission_depth > 0) is not tinted: its transmission_color is the medium's extinction (slot_medium),
+// as upstream openpbr_bsdf.h leaves transmission_tint white in that case to avoid double colour (ADOBEOPENPBR).
 float4 slot_transmission(uint slot, constant MaterialResources &images) {
-    return slot < MATERIAL_SLOTS ? images.spectralMaterials[SLOT_PARAMETERS * slot + 2] : float4(1.0f, 1.0f, 1.0f, 0.0f);
+    if (slot >= MATERIAL_SLOTS) return float4(1.0f, 1.0f, 1.0f, 0.0f);
+    float4 t = images.spectralMaterials[SLOT_PARAMETERS * slot + 2];
+    if (t.w == 0.0f && images.spectralMaterials[SLOT_PARAMETERS * slot + 6].w > 0.0f) t.xyz = float3(1.0f);
+    return t;
 }
 
+// Rotation of a slot's specular anisotropy direction from the tangent toward the bitangent, in radians
+// (MaterialXProgram.anisotropyRotation; 0 unless a MaterialX program rotates geometry_tangent).
+float slot_anisotropy_rotation(uint slot, constant MaterialResources &images) {
+    return slot < MATERIAL_SLOTS ? images.spectralMaterials[SLOT_PARAMETERS * slot + 7].w : 0.0f;
+}
 // Whether any slot has an emitter record (MaterialLibrary.slotParameters stores their count after the slots);
 // without one, light samples skip looking up their slot (light_sample_slot).
 bool emitter_records(constant MaterialResources &images) {
@@ -685,7 +724,7 @@ struct SpectralMaterial {
     float thinFilmThickness; // thin_film_thickness, micrometres
     float thinFilmIOR;       // thin_film_ior
 };
-// Scene spectral state (PathTracerRenderer.spectralScene, buffer 27).
+// Scene spectral state (PathTracerRenderer.spectralSceneWords, buffer 27).
 struct SpectralScene {
     uint lightIlluminant;    // VibeIlluminant of area and sphere lights and imported emitters (D65 = their RGB colour)
     uint sunIlluminant;      // VibeIlluminant of the sun (procedural disc, imported DistantLight)
@@ -799,7 +838,6 @@ Wavelengths sample_wavelengths(float u, thread const Wavelengths &wl) {
 // exact moments of the cell's 4 x 4 x 4 codes (spectral_refine_solve_kernel), interpolated in the same
 // way at one-code spacing. tests/Fix_spectral.swift measures the round trip over every code.
 constant uint SPECTRAL_REFINED = 86u * 86u * 86u;     // float4 offset of the refined blocks
-constant uint SPECTRAL_REFINED_CAPACITY = 8192u;      // blocks (PathTracerRenderer.spectralGridBytes)
 float3 spectral_eotf(float3 v) { return select(pow((v + 0.055f) / 1.055f, float3(2.4f)), v / 12.92f, v <= 0.04045f); }
 // Position in coarse-node units (code / 3) of a linear colour in [0, 1].
 float3 spectral_code85(float3 c) {
@@ -940,8 +978,9 @@ Spectrum spectral_emission_shape(float3 e, EmitterShape s, thread const Waveleng
     const device float4 *basis = (const device float4 *)wl.icdf + SPECTRAL_BASIS;
     Spectrum result;
     for (uint k = 0u; k < 4u; ++k) {
-        float lambda = spectral_lambda(wl, k);
-        result[k] = spectral_emission_basis(w, basis, spectral_bin(lambda)) * emitter_shape_value(s, lambda);
+        // The shape at the 1 nm node, as its normalisation and camera-ray colour sum it (spectral_bin).
+        uint bin = spectral_bin(spectral_lambda(wl, k));
+        result[k] = spectral_emission_basis(w, basis, bin) * emitter_shape_value(s, VIBE_LAMBDA_MIN + float(bin));
     }
     return result;
 }
@@ -1390,7 +1429,7 @@ bool trace_scene(Ray r, uint sceneIndex, thread HitRecord &rec, device ObjectSet
         if (intersect_box(r, float3( 0.33f, -0.7f, -0.25f), float3(0.3f, 0.3f, 0.3f), -0.30f, shortBox, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
     } else if (sceneIndex == 2) {
-        Material floor_mat = { DIFFUSE, float3(0.2f), float3(0.0f), 0, 1 }; floor_mat.slot=1; floor_mat.slot=1;
+        Material floor_mat = { DIFFUSE, float3(0.2f), float3(0.0f), 0, 1 }; floor_mat.slot=1;
         if (intersect_quad(r, float3(-10, -1, -10), float3(20, 0, 0), float3(0, 0, 20), float3(0, 1, 0), false, floor_mat, 0.001f, closest, t_rec, objects)) { hit = true; closest = t_rec.t; rec = t_rec; }
 
         float roughnesses[4] = { 0.005f, 0.04f, 0.15f, 0.45f };
@@ -1885,11 +1924,9 @@ bool mesh_occluded(Ray r, float tMin, float tMax, bool slack, constant MaterialR
             raytracing::ray(r.origin,r.direction,max(tMin,tMax-S),tMax),scene,params);
         while(query.next()) {
             MeshInstance instance=instances[query.get_candidate_instance_id()];
-            if(slack) {
-                MeshTriangle tri=face_triangle(images.faces[instance.range.x+query.get_candidate_primitive_id()],images.vertices);
-                float local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
-                if(query.get_candidate_triangle_distance()>=tMax-max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local))) continue;
-            }
+            MeshTriangle tri=face_triangle(images.faces[instance.range.x+query.get_candidate_primitive_id()],images.vertices);
+            float local=max(max_abs(tri.a.xyz),max(max_abs(tri.b.xyz),max_abs(tri.c.xyz)));
+            if(query.get_candidate_triangle_distance()>=tMax-max(1e-7f,1.907349e-6f*(instance.bound.x+instance.bound.y*local))) continue;
             float2 bc=query.get_candidate_triangle_barycentric_coord();
             if(face_cut(instance,query.get_candidate_primitive_id(),bc.x,bc.y,instance_ray(instance,r),graphSlots,images)) continue;
             query.abort();
@@ -2171,6 +2208,12 @@ float2 wavelength_numbers(Sampler s) {
     uint h = pcg_hash(s.state ^ 0x5bd1e995u);
     return float2(float(h >> 8u), float(pcg_hash(h) >> 8u)) * (1.0f / 16777216.0f);
 }
+// A pixel's wavelength numbers; with caustic photons, u is the pixel's group value of this sample (caustic_group_u).
+float2 pixel_wavelength_numbers(Sampler s, uint2 gid, constant Uniforms &u) {
+    float2 numbers = wavelength_numbers(s);
+    if (photons_on(u)) numbers.x = caustic_group_u(u, caustic_pixel_group(gid, u));
+    return numbers;
+}
 // Kernels of spectral libraries bind the scene's spectral state at buffers 27-29.
 #define SPECTRAL_BUFFERS , constant SpectralScene &spectralScene [[buffer(27)]], \
     const device float4 *spectralGrid [[buffer(28)]], const device float *spectralSampling [[buffer(29)]]
@@ -2316,6 +2359,11 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
     hit.mat.geometricNormal = hit.geometricNormal;
     if (hit.mat.type == EMISSIVE || hit.mat.slot >= MATERIAL_SLOTS) return;
     uint slot = hit.mat.slot;
+    // A rotated anisotropy direction turns the tangent toward dP/dv (the bitangent on the front face).
+    float anisotropyRotation = slot_anisotropy_rotation(slot, images);
+    if (anisotropyRotation != 0.0f && dot(hit.bitangent, hit.bitangent) > 0.25f)
+        hit.mat.tangent = normalize(cos(anisotropyRotation) * hit.tangent
+            + sin(anisotropyRotation) * (hit.front_face ? 1.0f : -1.0f) * hit.bitangent);
     SurfaceSettings config = settings[slot];
     if (config.enabled != 0) {
         hit.mat.type = OPENPBR;
@@ -2328,11 +2376,11 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
         hit.mat.ior = config.detail.y;
         hit.mat.transmission = config.detail.z;
     }
-    TextureFootprint fp = surface_footprint(hit, ray, footprint);
     if(images.graphHeaders[slot].info.y>0) {
-        resolve_materialx(hit,ray,images,fp);return;
+        resolve_materialx(hit,ray,images,surface_footprint(hit, ray, footprint));return;
     }
     if (config.mapMask == 0) return;
+    TextureFootprint fp = surface_footprint(hit, ray, footprint);
     float repeat = max(0.01f, config.detail.w);
     float2 uv = hit.uv * repeat;
     ObjectSettings object=images.objects[slot];
@@ -2982,7 +3030,7 @@ float eval_light_pdf(float3 p,float3 hit_pos,Material mat,constant Uniforms &u,c
 // REFERENCES.md: SMS2020 is related work, not this approximation's derivation.
 template <typename R>
 float3 sample_specular_manifold_caustic(float3 x, float3 n_x, constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages) {
-    if (u.sceneIndex != 0 && u.sceneIndex != 5 && u.sceneIndex != 3) return float3(0.0f);
+    if (u.sceneIndex != 0 && u.sceneIndex != 5) return float3(0.0f);
 
     float3 total_caustic = float3(0.0f);
     LightSample ls = sample_direct_light(x, n_x, u, seed, materialImages);
@@ -3188,6 +3236,18 @@ Spectrum spectral_thin_film_mirror(Material mat, Spectrum standard, Spectrum f0,
 bool is_delta(Material mat) {
     return mat.type == DIELECTRIC || (mat.type == GLOSSY && mat.roughness < 0.02f);
 }
+// Caustic light tracing's split (docs/CAUSTICS_DESIGN.md §3). Specular-class vertices are delta materials and glass or
+// metal no rougher than CAUSTIC_ROUGHNESS: imported glass and metals are never delta (OpenPBR roughness >= 0.03), so
+// light paths and camera paths share this rule instead of is_delta. Light paths continue through specular-class
+// vertices and end at the first receiver (any other non-emitting surface); camera paths leave out the light reached
+// from a receiving primary hit through one or more specular-class vertices.
+constant float CAUSTIC_ROUGHNESS = 0.1f;
+bool caustic_specular(Material m) {
+    if (is_delta(m)) return true;
+    if (m.roughness > CAUSTIC_ROUGHNESS) return false;
+    return m.type == GLOSSY || (m.type == OPENPBR && (m.transmission >= 0.5f || m.metalness >= 0.5f));
+}
+bool caustic_receiver(Material m) { return m.type != EMISSIVE && !caustic_specular(m); }
 
 // Returns f * abs(cos(theta)) / PDF, using the same glossy model as NEE. The lobe choice and
 // the direction form one 3D constituent (rand_f3) in Z mode. Spectral: per-wavelength values; a
@@ -3444,7 +3504,7 @@ Medium slot_medium(uint slot, constant MaterialResources &images, thread const W
     if (!(r.w > 0.0f)) return m;
     Spectrum colour = clamp(spectral_reflectance(images.spectralMaterials[SLOT_PARAMETERS * slot + 2].rgb, wl), 1e-6f, 1.0f);
     float4 extra = images.spectralMaterials[SLOT_PARAMETERS * slot + 7];
-    m.g = extra.x;
+    m.g = clamp(extra.x, -0.99f, 0.99f);   // the scene medium's range (SceneMedium.isValid): hg_phase is 0/0 at +-1
     if (extra.z > 0.0f) {
         // Rayleigh scattering (MaterialXProgram.mediumRayleigh; not OpenPBR): transmission_scatter's luminance
         // per depth at 550 nm, times (550 / lambda)^4; transmission_color adds absorption on top, so white
@@ -3587,9 +3647,261 @@ Spectrum medium_shadow(float3 p, float3 n, float error, LightSample ls, uint slo
     }
     return Spectrum(0.0f);
 }
+// ============================================================================
+// Caustic photons (docs/CAUSTICS_DESIGN.md §6; REFERENCES.md KNAUS2011, PBRT2023 SPPM grid)
+// ============================================================================
+// PathTracerRenderer.CausticParams: light paths per sample; one pixel's area on the image plane at distance one (the
+// perspective camera's importance normalization, pbrt-v3 PerspectiveCamera::We; PBRT2023); this sample's surface
+// photon radius squared (KNAUS2011 Eq. 15) and grid cell size (two radii), the hash table's mask, and the volume
+// photons' radius squared (KNAUS2011 Eq. 20) and cell size; emission guiding's state (0: off; 1: training only, the
+// first sample; 2: training and sampling) and its region grid over the emitters' bounds (corner and
+// CAUSTIC_GUIDE_SPLIT / extent).
+struct CausticParams {
+    uint paths;
+    float pixelArea;
+    float radius2;
+    float cellSize;
+    uint tableMask;
+    float volumeRadius2;
+    float volumeCellSize;
+    uint guideEnabled;
+    packed_float3 guideLo;
+    uint padding0;
+    packed_float3 guideScale;
+    uint padding1;
+};
+// A light path's end after one or more specular-class vertices (caustic_trace_kernel), at a receiver or a scattering
+// point in a medium: the point, the octahedral-encoded travel direction, the power at the path's wavelengths (four
+// lanes in spectral transport, at its group's wavelengths; three in RGB), the number of non-delta specular-class
+// vertices it crossed (bits 0-7; the camera paths' scattering budget, caustic_gather) and whether its path started from
+// the environment (bit 8; caustic_source_share), and the emission guide's cell its path left
+// the emitter through (region x cells + cell; 0xffffffff: an environment path). 40 B.
+struct CausticPhoton {
+    packed_float3 position;
+    uint direction;
+    float power[4];
+    uint scattering;
+    uint guide;
+};
+Spectrum caustic_photon_power(CausticPhoton photon) {
+#if VIBE_SPECTRAL
+    return Spectrum(photon.power[0], photon.power[1], photon.power[2], photon.power[3]);
+#else
+    return Spectrum(photon.power[0], photon.power[1], photon.power[2]);
+#endif
+}
+// The hash table entry of grid cell `c` for photons of wavelength group `group`, surface (kind 0) or volume (kind 1).
+uint caustic_cell(int3 c, uint group, uint kind, constant CausticParams &params) {
+    uint key = group + kind * CAUSTIC_GROUPS;
+    return (uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u ^ key * 2654435761u) & params.tableMask;
+}
+uint caustic_octahedral(float3 d) {
+    float2 p = d.xy / (abs(d.x) + abs(d.y) + abs(d.z));
+    if (d.z < 0.0f) p = (1.0f - abs(p.yx)) * select(float2(-1.0f), float2(1.0f), p >= 0.0f);
+    uint2 q = uint2(clamp(p * 0.5f + 0.5f, 0.0f, 1.0f) * 65535.0f + 0.5f);
+    return q.x | (q.y << 16);
+}
+float3 caustic_direction(uint code) {
+    float2 p = float2(code & 0xffffu, code >> 16) / 65535.0f * 2.0f - 1.0f;
+    float3 d = float3(p, 1.0f - abs(p.x) - abs(p.y));
+    if (d.z < 0.0f) d.xy = (1.0f - abs(d.yx)) * select(float2(-1.0f), float2(1.0f), d.xy >= 0.0f);
+    return normalize(d);
+}
+// Emission guiding (docs/CAUSTICS_DESIGN.md §5): per region of a CAUSTIC_GUIDE_SPLIT^3 grid over the emitters' bounds,
+// a histogram over CAUSTIC_GUIDE_SIDE^2 equal-area cells of the sphere of directions (PBRT2023 §3.8.3's equal-area
+// mapping) of the directions light paths left the emitter in, each weighted by the luminance the path added to the
+// image: its light-tracing splat (caustic_trace_kernel) and its photon's share of each camera path's gather
+// (caustic_gather, caustic_gather_volume). Those carry 1 / p of the direction, so the histogram estimates where the
+// caustics the camera sees leave the emitter rather than where paths were sent. caustic_guide_build_kernel turns the
+// histograms into CDFs before each sample, and caustic_trace_kernel samples a direction from its region's CDF or from
+// cosine emission with equal probability (one-sample MIS with the mixture density), so every sample stays unbiased.
+constant uint CAUSTIC_GUIDE_SIDE = 64u, CAUSTIC_GUIDE_CELLS = 4096u, CAUSTIC_GUIDE_SPLIT = 4u, CAUSTIC_GUIDE_REGIONS = 64u;
+float3 equal_area_square_to_sphere(float2 p) {
+    float u = 2.0f * p.x - 1.0f, v = 2.0f * p.y - 1.0f, up = abs(u), vp = abs(v);
+    float signedDistance = 1.0f - (up + vp), d = abs(signedDistance), r = 1.0f - d;
+    float phi = (r == 0.0f ? 1.0f : (vp - up) / r + 1.0f) * PI / 4.0f;
+    float z = copysign(1.0f - r * r, signedDistance);
+    float cosPhi = copysign(cos(phi), u), sinPhi = copysign(sin(phi), v);
+    float s = r * sqrt(max(0.0f, 2.0f - r * r));
+    return float3(cosPhi * s, sinPhi * s, z);
+}
+float2 equal_area_sphere_to_square(float3 d) {
+    float x = abs(d.x), y = abs(d.y), z = abs(d.z);
+    float r = sqrt(max(0.0f, 1.0f - z));
+    float a = max(x, y), b = a == 0.0f ? 0.0f : min(x, y) / a;
+    float phi = atan(b) * 2.0f / PI;
+    if (x < y) phi = 1.0f - phi;
+    float v = phi * r, u = r - v;
+    if (d.z < 0.0f) { float w = u; u = 1.0f - v; v = 1.0f - w; }
+    u = copysign(u, d.x); v = copysign(v, d.y);
+    return float2(0.5f * (u + 1.0f), 0.5f * (v + 1.0f));
+}
+uint caustic_guide_cell(float3 d) {
+    uint2 c = min(uint2(equal_area_sphere_to_square(d) * float(CAUSTIC_GUIDE_SIDE)), uint2(CAUSTIC_GUIDE_SIDE - 1u));
+    return c.x + CAUSTIC_GUIDE_SIDE * c.y;
+}
+float caustic_luminance(float3 rgb) { return dot(rgb, float3(0.2126f, 0.7152f, 0.0722f)); }
+// The guide trains on one light path (and one photon) in CAUSTIC_GUIDE_TRAINING, weighted by that factor, which keeps
+// its estimate unbiased; every path's atomic add into the few cells its caustics leave through serialized the light
+// tracing (Glass of Water, 2026-11-10: 82 s instead of 39 s per 128 samples).
+constant uint CAUSTIC_GUIDE_TRAINING = 16u;
+// The light the environment's and the emitter triangles' paths add to the image since accumulation restarted
+// (sources[0] and [1], trained as the guide is), which splits the next samples' paths between them
+// (caustic_source_share).
+void caustic_train_source(device atomic_float *sources, bool environment, float luminance) {
+    atomic_fetch_add_explicit(sources + (environment ? 0 : 1), float(CAUSTIC_GUIDE_TRAINING) * luminance, memory_order_relaxed);
+}
+uint caustic_guide_region(float3 p, constant CausticParams &params) {
+    uint3 c = uint3(clamp(int3(floor((p - float3(params.guideLo)) * float3(params.guideScale))), 0, int(CAUSTIC_GUIDE_SPLIT) - 1));
+    return c.x + CAUSTIC_GUIDE_SPLIT * (c.y + CAUSTIC_GUIDE_SPLIT * c.z);
+}
+// One threadgroup of 256 threads per region: the histogram's normalized CDF (cdf[region * cells + cell]) and its total
+// (cdf[regions * cells + region]; zero turns guiding off there).
+kernel void caustic_guide_build_kernel(const device float *weights [[buffer(0)]], device float *cdf [[buffer(1)]],
+                                       uint region [[threadgroup_position_in_grid]], uint lane [[thread_position_in_threadgroup]]) {
+    threadgroup float partial[256];
+    threadgroup float groupTotal;
+    const uint per = CAUSTIC_GUIDE_CELLS / 256u, base = region * CAUSTIC_GUIDE_CELLS + lane * per;
+    float sum = 0.0f;
+    for (uint k = 0u; k < per; ++k) { float w = weights[base + k]; sum += isfinite(w) ? max(w, 0.0f) : 0.0f; }
+    partial[lane] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        float running = 0.0f;
+        for (uint k = 0u; k < 256u; ++k) { float s = partial[k]; partial[k] = running; running += s; }
+        cdf[CAUSTIC_GUIDE_REGIONS * CAUSTIC_GUIDE_CELLS + region] = running;
+        groupTotal = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = groupTotal, running = partial[lane];
+    for (uint k = 0u; k < per; ++k) {
+        float w = weights[base + k];
+        running += isfinite(w) ? max(w, 0.0f) : 0.0f;
+        cdf[base + k] = total > 0.0f ? (k + 1u == per && lane == 255u ? 1.0f : running / total) : 0.0f;
+    }
+}
+// A vertex where a camera path gathers photons (CausticMode.photons), recorded by shading_kernel's surface loop or
+// volume_path in one of two slots per pixel and gathered by caustic_gather_kernel in a pass of its own: inside the
+// shading kernel the gather crashed the Metal backend compiler of the RGB or the spectral library in turn (macOS 27,
+// 2026-11-09). 40 B: the point; a surface's rendered triangle, or 0x80000000 | the medium's slot (MATERIAL_SLOTS: the
+// scene medium) for a scattering point (0xffffffff: an empty slot); the octahedral direction toward the previous
+// vertex; the non-delta vertices before it (bits 0-7) and hero-only wavelengths (bit 8); and the path's throughput
+// there (four floats; converting the spectral throughput to halves crashed the Metal backend compiler).
+struct CausticRequest {
+    packed_float3 position;
+    uint triangle;
+    uint wo;
+    uint prefix;
+    float throughput[4];
+};
+constant uint CAUSTIC_MEDIUM_REQUEST = 0x80000000u;
+// Records a vertex in the next of the pixel's two slots (kept in thread memory and written once by shading_kernel:
+// device writes in the bounce loop crashed the spectral library's backend compiler); false when both are taken or the
+// vertex is a surface but not a mesh triangle (the camera path then keeps that vertex's light).
+bool caustic_request(thread CausticRequest *slots, thread uint &count, float3 position, uint triangle, float3 wo,
+                     Spectrum throughput, int prefix, thread const Wavelengths &wl) {
+    if (count >= 2u || triangle == 0xffffffffu) return false;
+    CausticRequest q;
+    q.position = packed_float3(position);
+    q.triangle = triangle;
+    q.wo = caustic_octahedral(wo);
+#if VIBE_SPECTRAL
+    q.prefix = uint(clamp(prefix, 0, 255)) | (wl.heroOnly ? 256u : 0u);
+    float4 t = float4(throughput);
+#else
+    q.prefix = uint(clamp(prefix, 0, 255));
+    float4 t = float4(throughput, 0.0f);
+#endif
+    q.throughput[0] = t.x; q.throughput[1] = t.y; q.throughput[2] = t.z; q.throughput[3] = t.w;
+    slots[count] = q;
+    ++count;
+    return true;
+}
+// Photon density estimate at a receiver reached through `prefix` non-delta vertices (KNAUS2011's per-sample estimate
+// with a box kernel): sum f(wo, wi) |cos_s(wi)| / |cos_g(wi)| power / (pi r^2 paths) over the photons of the pixel's
+// wavelength group within a disc of the radius on the receiver's tangent plane (a sphere would also count another
+// surface's photons, such as the floor's at a wall's foot) that arrived on the camera's side and fit the camera paths'
+// scattering budget with it (prefix + max(photon's vertices, 1) <= limit, as shading_kernel reaches such light), with
+// `paths` the group's light paths. The photon grid: per hashed cell the last photon stored in it (`heads`), and per
+// photon the one stored before it in its cell (`next`; 0xffffffff ends a list), built with atomic exchanges as
+// pbrt-v3's SPPM grid is.
+float3 caustic_gather(HitRecord rec, float3 wo, Spectrum throughput, int prefix, uint group, constant CausticParams &params,
+                      const device CausticPhoton *photons, const device uint *next, const device uint *heads,
+                      device atomic_float *guideWeights, device atomic_float *sources, constant Uniforms &u,
+                      thread const Wavelengths &wl) {
+    if (dot(rec.normal, wo) <= 0.0f) return float3(0.0f);
+    float r = sqrt(params.radius2);
+    int3 lo = int3(floor((rec.position - r) / params.cellSize)), hi = int3(floor((rec.position + r) / params.cellSize));
+    int limit = scattering_limit(u.cameraTarget.w);
+    // The receiver's BSDF is prepared once; prepared_eval gives f |cos_s(wi)| per photon (eval_bsdf's adapter).
+    bool diffuse = rec.mat.type == DIFFUSE;
+    Spectrum albedo = diffuse ? spectral_albedo(rec.mat, clamp(rec.mat.albedo, 0.0f, 1.0f), wl) / PI : Spectrum(0.0f);
+    PreparedBsdf prepared = prepare_bsdf(rec.mat, rec.normal, wo, wl);
+    Spectrum sum = Spectrum(0.0f);
+    for (int z = lo.z; z <= hi.z; ++z) for (int y = lo.y; y <= hi.y; ++y) for (int x = lo.x; x <= hi.x; ++x) {
+        uint i = heads[caustic_cell(int3(x, y, z), group, 0u, params)];
+        for (int n = 0; n < 4096 && i != 0xffffffffu; ++n, i = next[i]) {
+            CausticPhoton photon = photons[i];
+            float3 d = float3(photon.position) - rec.position;
+            float height = dot(d, rec.geometricNormal);
+            if (dot(d, d) > params.radius2 || height * height > 0.01f * params.radius2
+                || prefix + max(int(photon.scattering & 255u), 1) > limit) continue;
+            float3 wi = -caustic_direction(photon.direction);
+            float cosGeometric = dot(wi, rec.geometricNormal);
+            if (cosGeometric <= 1e-6f) continue;
+            Spectrum fCos = diffuse ? albedo * max(dot(wi, rec.normal), 0.0f) : prepared_eval(prepared, wi);
+            Spectrum value = fCos * caustic_photon_power(photon) / cosGeometric;
+            sum += value;
+            // The emission guide learns the photon's contribution to the image (caustic_guide_build_kernel).
+            if (i % CAUSTIC_GUIDE_TRAINING == 0u) {
+                float luminance = caustic_luminance(spectrum_rgb(throughput * value, wl));
+                caustic_train_source(sources, (photon.scattering & 256u) != 0u, luminance);
+                if (photon.guide != 0xffffffffu)
+                    atomic_fetch_add_explicit(guideWeights + photon.guide, float(CAUSTIC_GUIDE_TRAINING) * luminance,
+                                              memory_order_relaxed);
+            }
+        }
+    }
+    return spectrum_rgb(throughput * sum, wl) / (PI * params.radius2 * float(params.paths / CAUSTIC_GROUPS));
+}
+// Volume photon density estimate at a scattering point in `medium` (JENSEN1998's volume photon map with KNAUS2011
+// Eq. 20's three-dimensional kernel; the normalization is derived here from medium_sample_distance's weights): the
+// camera path's throughput already carries the vertex's T sigma_s / p, so the point needs the phase-weighted
+// in-scattered radiance. The light paths deposit where they scatter, their power carrying the same T sigma_s / p, so it
+// is sum p(w_photon, wo) power / (sigma_s V paths) over the group's volume photons within the radius, V = 4/3 pi r^3.
+float3 caustic_gather_volume(float3 x, float3 wo, Medium medium, Spectrum throughput, int prefix, uint group,
+                             constant CausticParams &params, const device CausticPhoton *photons, const device uint *next,
+                             const device uint *heads, device atomic_float *guideWeights, device atomic_float *sources,
+                             constant Uniforms &u, thread const Wavelengths &wl) {
+    float r2 = params.volumeRadius2, r = sqrt(r2);
+    int3 lo = int3(floor((x - r) / params.volumeCellSize)), hi = int3(floor((x + r) / params.volumeCellSize));
+    int limit = scattering_limit(u.cameraTarget.w);
+    Spectrum sum = Spectrum(0.0f);
+    for (int z = lo.z; z <= hi.z; ++z) for (int y = lo.y; y <= hi.y; ++y) for (int c = lo.x; c <= hi.x; ++c) {
+        uint i = heads[caustic_cell(int3(c, y, z), group, 1u, params)];
+        for (int n = 0; n < 4096 && i != 0xffffffffu; ++n, i = next[i]) {
+            CausticPhoton photon = photons[i];
+            float3 d = float3(photon.position) - x;
+            if (dot(d, d) > r2 || prefix + max(int(photon.scattering & 255u), 1) > limit) continue;
+            Spectrum value = hg_phase(dot(caustic_direction(photon.direction), wo), medium.g) * caustic_photon_power(photon);
+            sum += value;
+            if (i % CAUSTIC_GUIDE_TRAINING == 0u) {
+                float luminance = caustic_luminance(spectrum_rgb(throughput * value, wl));
+                caustic_train_source(sources, (photon.scattering & 256u) != 0u, luminance);
+                if (photon.guide != 0xffffffffu)
+                    atomic_fetch_add_explicit(guideWeights + photon.guide, float(CAUSTIC_GUIDE_TRAINING) * luminance,
+                                              memory_order_relaxed);
+            }
+        }
+    }
+    Spectrum density = select(Spectrum(0.0f), sum / medium.sigmaS, medium.sigmaS > 0.0f);
+    return spectrum_rgb(throughput * density, wl) / (4.0f / 3.0f * PI * r2 * r * float(params.paths / CAUSTIC_GROUPS));
+}
+
 template <typename R>
 __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, constant SurfaceSettings *settings, constant MaterialResources &images,
-                   thread R &seed, thread Wavelengths &wl, thread float3 &indirect) {
+                   thread R &seed, thread Wavelengths &wl, thread float3 &indirect,
+                   thread CausticRequest *causticSlots, thread uint &causticCount) {
     // Indirect (path_add): NEE after one scattering event, emission after two (`scatter` counts them).
     float3 radiance = float3(0.0f);
     Spectrum throughput = Spectrum(1.0f), laneRatio = Spectrum(1.0f);
@@ -3606,6 +3918,12 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
     float previousPdf = 0.0f;
     float3 previousPosition = ray.origin, previousNormal = ray.direction;
     float pathDistance = 0.0f, coneSpread = 2.0f * tan(u.cameraPos.w * PI / 360.0f) / float(u.height);
+    // Caustic light paths (as shading_kernel's `caustic`): -1 while every surface since the camera was specular-class
+    // (`causticPrefix` of them), then the number of specular-class vertices since the last vertex whose light through
+    // glass the light paths carry: light tracing at a receiving first surface, photons at the other receivers and at
+    // scattering points in media (CausticMode.photons); -2 when they do not. Light reached with a count of one or more
+    // is left out.
+    int caustic = caustics_on(u) ? -1 : -2, causticPrefix = 0;
     for (int bounce = 0; bounce < 1024; ++bounce) {
         HitRecord rec;
         bool hit = trace_scene(ray, u.sceneIndex, rec, images, u);
@@ -3621,6 +3939,11 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
             // A medium vertex: NEE with the phase function, then phase sampling.
             ++vertices;
             float3 p = ray.origin + ray.direction * t, n = -ray.direction;
+            caustic = -2;
+#if VIBE_MEDIA_PHOTONS
+            if (photons_on(u) && caustic_request(causticSlots, causticCount, p, CAUSTIC_MEDIUM_REQUEST | mediumSlot,
+                                                 -ray.direction, throughput, scatter, wl)) caustic = 0;
+#endif
             if (u.samplingMode != 3u) {
                 sampler_event(seed, uint(vertices), Z_NEE);
                 LightSample ls = sample_direct_light(p, n, u, seed, images);
@@ -3656,7 +3979,9 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
             if (u.sceneIndex == 0 || u.sceneIndex == 6) {
                 float lightPDF = eval_environment_pdf(ray.direction, previousNormal, u, images);
                 float weight = emission_weight(previousDelta, previousNEE, previousMIS, previousPdf * lane_mean(segment), lightPDF);
-                path_add(radiance, indirect, spectrum_rgb(throughput * weight * environment_spectrum(ray.direction, u, images, wl), wl), scatter >= 2, u);
+                // Environment light through glass since the last receiver is the light paths' (caustic).
+                if (caustic < 1)
+                    path_add(radiance, indirect, spectrum_rgb(throughput * weight * environment_spectrum(ray.direction, u, images, wl), wl), scatter >= 2, u);
             }
             break;
         }
@@ -3671,15 +3996,27 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
         if (rec.mat.type == EMISSIVE) {
             float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, u, images, rec.triangle);
             float weight = emission_weight(previousDelta, previousNEE, previousMIS, previousPdf * lane_mean(segment), lightPDF);
-            path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, rec.mat.slot, images, wl), wl), scatter >= 2, u);
+            if (caustic < 1)
+                path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, rec.mat.slot, images, wl), wl), scatter >= 2, u);
             break;
         }
         float3 surfaceEmission = openpbr_emission(rec.mat, rec.normal, -ray.direction);
-        if (any(surfaceEmission > 0.0f)) {
+        if (any(surfaceEmission > 0.0f) && caustic < 1) {
             float lightPDF = u.sceneIndex == 6 ? eval_light_pdf(previousPosition, rec.position, rec.mat, u, images, rec.triangle) : 0.0f;
             float weight = emission_weight(previousDelta, previousNEE, previousMIS, previousPdf * lane_mean(segment), lightPDF);
             path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, rec.mat.slot, images, wl), wl), scatter >= 2, u);
         }
+        if (caustic_receiver(rec.mat)) {
+            bool first = caustic == -1 && causticPrefix == 0;
+            caustic = first ? 0 : -2;
+#if VIBE_MEDIA_PHOTONS
+            if (!first && photons_on(u) && caustic_request(causticSlots, causticCount, rec.position, rec.triangle,
+                                                           -ray.direction, throughput, scatter, wl)) caustic = 0;
+#endif
+        } else if (caustic_specular(rec.mat)) {
+            if (caustic == -1) ++causticPrefix;
+            else if (caustic >= 0) ++caustic;
+        } else caustic = -2;
         if (emissionOnly) break;
         ++vertices;
         spectral_arrive_lanes(rec.mat, throughput, wl, laneRatio);
@@ -3687,7 +4024,7 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
         // The medium a direction from this surface travels in: this side's, or across a solid transmissive surface.
         bool solid = (rec.mat.type == DIELECTRIC || rec.mat.transmission > 0.0f)
             && !(rec.mat.usesMaterialX && rec.mat.transmissionTint.w > 0.0f);
-        if (!delta && u.samplingMode != 3u) {
+        if (!delta && u.samplingMode != 3u && caustic < 1) {
             sampler_event(seed, uint(vertices), Z_NEE);
             LightSample ls = sample_direct_light(rec.position, rec.normal, u, seed, images);
             if (ls.pdf > 0.0f) {
@@ -3735,6 +4072,401 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
     }
     return radiance;
 }
+
+// ============================================================================
+// Caustic light tracing (docs/CAUSTICS_DESIGN.md §3-4; REFERENCES.md VEACH1997, PBRT2023 light tracing)
+// ============================================================================
+#if VIBE_MESHES
+// The share of light paths that start from the environment: none without sky, image or sun; all without emitter
+// triangles; else in proportion to the light each source's paths added to the image so far (caustic_train_source),
+// between 10% and 90% so that both keep learning (half until either has added any). Any share in (0, 1) keeps the
+// estimate unbiased: each path divides by the probability of its source.
+float caustic_source_share(constant Uniforms &u, uint triangles, device atomic_float *sources) {
+    bool environment = u.environment.x > 0.0f || (u.lens.w > 0.0f && u.sunParams.w > 0.0f);
+    if (!environment) return 0.0f;
+    if (triangles == 0u) return 1.0f;
+    float e = atomic_load_explicit(sources, memory_order_relaxed), t = atomic_load_explicit(sources + 1, memory_order_relaxed);
+    return e > 0.0f && t > 0.0f && isfinite(e + t) ? clamp(e / (e + t), 0.1f, 0.9f) : 0.5f;
+}
+// A direction toward the environment for light paths, with its density: the sun's cone (with sample_direct_light's
+// sun probability), else the image's luminance distribution, or the uniform sphere for the procedural sky.
+template <typename R>
+float3 caustic_environment_direction(constant Uniforms &u, constant MaterialResources &images, thread R &seed, thread float &pdf) {
+    float sunProbability = environment_sun_probability(u), w = sun_one_minus_cos(u);
+    float3 sun = normalize(u.sunParams.xyz), d;
+    if (rand_f(seed) < sunProbability) {
+        float2 r = rand_f2(seed);
+        float oneMinusCos = r.x * w, sinTheta = sqrt(max(0.0f, oneMinusCos * (2.0f - oneMinusCos))), phi = TWO_PI * r.y;
+        float3 su, sv;
+        make_basis(sun, su, sv);
+        d = normalize(su * (cos(phi) * sinTheta) + sv * (sin(phi) * sinTheta) + sun * (1.0f - oneMinusCos));
+    } else if (u.environment.z > 0.5f) {
+        uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
+        float2 c = rand_f2(seed);
+        uint y = environment_cdf_index(images.environmentRows, height, 0, c.x, true);
+        uint x = environment_cdf_index(images.environmentColumns, width, y, c.y, false);
+        float2 size = float2(width, height), cell = float2(x, y);
+        float2 uv = min(cell / size + rand_f2(seed) / size, nextafter((cell + 1.0f) / size, float2(0.0f)));
+        float theta = uv.y * PI, phi = (uv.x - 0.5f - u.environment.y / TWO_PI) * TWO_PI;
+        d = normalize(float3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi)));
+    } else {
+        float2 r = rand_f2(seed);
+        float z = 1.0f - 2.0f * r.x, s = sqrt(max(0.0f, 1.0f - z * z));
+        d = float3(s * cos(TWO_PI * r.y), z, s * sin(TWO_PI * r.y));
+    }
+    float sunPdf = sunProbability > 0.0f && in_sun_cone(d, sun, w) ? 1.0f / (TWO_PI * w) : 0.0f;
+    float rest = u.environment.z > 0.5f ? environment_image_pdf(d, u, images) : 1.0f / (4.0f * PI);
+    pdf = sunProbability * sunPdf + (1.0f - sunProbability) * rest;
+    return d;
+}
+// Stores a photon and links it into its cell's list (surface kind 0 or volume kind 1; caustic_cell).
+void caustic_store(float3 position, float3 direction, Spectrum power, int scattering, uint group, uint kind, uint guide, float cellSize,
+                   constant CausticParams &params, device CausticPhoton *photons, device uint *next,
+                   device atomic_uint *heads, device atomic_uint *count) {
+    uint index = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+    if (index >= params.paths) return;
+    CausticPhoton photon;
+    photon.position = packed_float3(position);
+    photon.direction = caustic_octahedral(direction);
+    photon.power[0] = power[0]; photon.power[1] = power[1]; photon.power[2] = power[2];
+#if VIBE_SPECTRAL
+    photon.power[3] = power[3];
+#else
+    photon.power[3] = 0.0f;
+#endif
+    photon.scattering = uint(scattering);
+    photon.guide = guide;
+    photons[index] = photon;
+    uint cell = caustic_cell(int3(floor(position / cellSize)), group, kind, params);
+    next[index] = atomic_exchange_explicit(&heads[cell], index, memory_order_relaxed);
+}
+// One light path per thread: an emitter triangle chosen by power (MaterialLibrary.causticEmitterBuffer: count, total
+// power, IDs, normalized CDF), a uniform point on it and a cosine direction about its winding normal (emitters are
+// one-sided). The path continues through specular-class vertices (caustic_specular) and ends at the first receiver,
+// which it connects to the camera when one or more specular-class vertices came before: through the thin lens (a
+// pinhole without aperture) to the pixel whose camera ray reaches the same point, splatting
+// beta f |cos_s(wi)| / |cos_g(wi)| |cos_g(wc)| / (pixelArea d^2 cos^3 theta) / paths. That is light tracing's estimate
+// of what shading_kernel's camera paths leave out (causticChain, volume_path's caustic count), so their sum is
+// unbiased. Light paths carry power: at each vertex the radiance-mode BSDF weight takes Veach's adjoint shading-normal
+// correction, and refraction the IOR factor that matches the camera paths' convention, so photons inside an object
+// (the floor of a pool) carry what camera paths reaching it expect (docs/CAUSTICS_DESIGN.md §3). Absorbing and
+// scattering media multiply the path by its transmittance (the camera paths' unscattered share). Spectral: the path's
+// own wavelengths, converted to RGB before the splat (as reused ReSTIR samples are).
+kernel void caustic_trace_kernel(constant Uniforms &u [[buffer(0)]],
+                                 constant SurfaceSettings *settings [[buffer(1)]],
+                                 constant MaterialResources &images [[buffer(2)]],
+                                 constant CausticParams &params [[buffer(3)]],
+                                 const device uint *emitters [[buffer(4)]],
+                                 device atomic_float *splat [[buffer(5)]],
+                                 device CausticPhoton *photons [[buffer(6)]],
+                                 device uint *photonNext [[buffer(7)]],
+                                 device atomic_uint *photonHeads [[buffer(8)]],
+                                 device atomic_uint *photonCount [[buffer(9)]],
+                                 device atomic_float *guideWeights [[buffer(10)]],
+                                 const device float *guideCDF [[buffer(11)]],
+                                 device atomic_float *sources [[buffer(12)]]
+                                 SPECTRAL_BUFFERS,
+                                 uint id [[thread_position_in_grid]])
+{
+    uint count = emitters[0];
+    if (id >= params.paths) return;
+    float environmentShare = caustic_source_share(u, count, sources);
+    if (count == 0u && environmentShare <= 0.0f) return;
+    Sampler seed;
+    seed.state = pcg_hash(id * 0x9e3779b9u ^ pcg_hash(u.sampleIndex ^ 0x6a09e667u));
+    seed.key = 0u; seed.dimension = 0u; seed.sub = 0u; seed.subBits = 0u; seed.z = false;
+    float2 numbers = float2(rand_f(seed), rand_f(seed));
+    // With photons, the path's wavelengths are its group's (caustic_group_u), shared with the pixels that gather it.
+    uint group = id % CAUSTIC_GROUPS;
+    if (photons_on(u)) numbers.x = caustic_group_u(u, group);
+    Wavelengths wl = SPECTRAL_WAVELENGTHS(numbers, u, images);
+    bool media = u.pathOptions.z > 0.0f;
+    uint mediumSlot = MATERIAL_SLOTS;
+    Medium medium = scene_medium(u, wl);
+    float3 lo, hi;
+    medium_box(u, images, lo, hi);
+
+    Spectrum beta;
+    Ray ray;
+    // The emission guide's cell this path left its emitter through (0xffffffff: from the environment, unguided).
+    uint guide = 0xffffffffu;
+    bool fromEnvironment = rand_f(seed) < environmentShare;
+    if (fromEnvironment) {
+        // The environment (sky, image and sun): a direction toward it, then a point on the disc of the scene's
+        // bounding sphere facing it, and radiance times the disc's area over the direction's density (the flux
+        // through the disc).
+        float pdf;
+        float3 d = caustic_environment_direction(u, images, seed, pdf);
+        float3 centre = 0.5f * (lo + hi);
+        float radius = 0.5f * length(hi - lo);
+        if (!(pdf > 0.0f) || !(radius > 0.0f)) return;
+        float3 su, sv;
+        make_basis(d, su, sv);
+        float2 q = rand_f2(seed);
+        float rho = radius * sqrt(q.x), phi = TWO_PI * q.y;
+        ray.origin = centre + d * radius + su * (rho * cos(phi)) + sv * (rho * sin(phi));
+        ray.direction = -d;
+        beta = environment_spectrum(d, u, images, wl) * (PI * radius * radius / (pdf * environmentShare));
+    } else {
+        // Emitter triangle by power, point, and a direction from emission guiding or cosine emission.
+        float pick = rand_f(seed);
+        uint low = 0u, high = count - 1u;
+        while (low < high) {
+            uint middle = (low + high) / 2u;
+            if (as_type<float>(emitters[2u + count + middle]) >= pick) high = middle; else low = middle + 1u;
+        }
+        uint index = emitters[2u + low];
+        MeshTriangle t = scene_triangle(index, images);
+        uint slot = uint(t.uvc.z);
+        float total = as_type<float>(emitters[1]);
+        float selection = slot < MATERIAL_SLOTS ? images.emissions[slot].w : 0.0f;
+        float3 ng = cross(t.b.xyz - t.a.xyz, t.c.xyz - t.a.xyz);
+        if (!(total > 0.0f) || !(selection > 0.0f) || dot(ng, ng) <= 1e-20f) return;
+        ng = normalize(ng);
+        float2 r = rand_f2(seed);
+        float root = sqrt(r.x), b1 = root * (1.0f - r.y), b2 = root * r.y;
+        float3 position = (1.0f - root) * t.a.xyz + b1 * t.b.xyz + b2 * t.c.xyz;
+        // From the region's guide (emission guiding, above) or cosine emission, with equal probability once the
+        // region's guide holds caustics.
+        uint region = caustic_guide_region(position, params);
+        const device float *regionCDF = guideCDF + region * CAUSTIC_GUIDE_CELLS;
+        float guided = params.guideEnabled == 2u && guideCDF[CAUSTIC_GUIDE_REGIONS * CAUSTIC_GUIDE_CELLS + region] > 0.0f ? 0.5f : 0.0f;
+        float3 direction;
+        if (rand_f(seed) < guided) {
+            float x = rand_f(seed);
+            uint first = 0u, last = CAUSTIC_GUIDE_CELLS - 1u;
+            while (first < last) {
+                uint middle = (first + last) / 2u;
+                if (regionCDF[middle] > x) last = middle; else first = middle + 1u;
+            }
+            float2 cell = float2(first % CAUSTIC_GUIDE_SIDE, first / CAUSTIC_GUIDE_SIDE);
+            direction = equal_area_square_to_sphere((cell + rand_f2(seed)) / float(CAUSTIC_GUIDE_SIDE));
+        } else {
+            direction = sample_cosine_hemisphere(ng, rand_f2(seed));
+        }
+        float cosine = dot(direction, ng);
+        if (cosine <= 1e-6f) return;
+        float directionPdf = (1.0f - guided) * cosine / PI;
+        uint emitted = caustic_guide_cell(direction);
+        if (guided > 0.0f)
+            directionPdf += guided * (regionCDF[emitted] - (emitted > 0u ? regionCDF[emitted - 1u] : 0.0f))
+                * float(CAUSTIC_GUIDE_CELLS) / (4.0f * PI);
+        float3 emission = images.emissions[slot].rgb;
+        if (!any(emission > 0.0f)) emission = imported_graph_emission(index, b1, b2, position + direction, position, -direction, images);
+        emission *= emitter_triangle_shaping(t, direction, images);
+        // Le cos / (p_area p_direction): the point's density is the slot's selection weight over the total power.
+        beta = emitter_spectrum(emission, slot, images, wl) * (cosine / directionPdf * total / selection / (1.0f - environmentShare));
+        ray.origin = ray_origin(position, ng, direction, u, 0.0f);
+        ray.direction = direction;
+        if (params.guideEnabled != 0u) guide = region * CAUSTIC_GUIDE_CELLS + emitted;
+    }
+    if (spectrum_max(beta) <= 0.0f || !all(isfinite(beta))) return;
+    // The camera paths' scattering budget (scattering_limit) bounds the chains they leave out: the receiver and each
+    // non-delta specular-class vertex sample a direction, except the last, whose light comes from NEE; so the receiver
+    // and the vertices after it number at most the limit plus one.
+    const int limit = scattering_limit(u.cameraTarget.w) + 1;
+    int specular = 0, scattering = 1;
+    for (int bounce = 0; bounce < 64; ++bounce) {
+        HitRecord rec;
+        bool hit = trace_scene(ray, u.sceneIndex, rec, images, u);
+        if (media && photons_on(u) && specular > 0 && spectrum_max(medium.sigmaS) > 0.0f) {
+            // After glass, media scatter the path (free-flight sampling, as volume_path's camera paths): where it
+            // scatters it ends as a volume photon, which camera paths gather at their own scattering points.
+            float tSurface = hit ? rec.t : INFINITY, a = 0.0f, b = tSurface, t = 0.0f;
+            if (mediumSlot == MATERIAL_SLOTS) medium_clip(ray, tSurface, lo, hi, a, b);
+            if (medium_sample_distance(medium, a, b, beta, seed, t)) {
+                if (scattering > limit || spectrum_max(beta) <= 0.0f || !all(isfinite(beta))) return;
+                caustic_store(ray.origin + ray.direction * t, ray.direction, beta, (scattering - 1) | (fromEnvironment ? 256 : 0),
+                              group, 1u, guide,
+                              params.volumeCellSize, params, photons, photonNext, photonHeads, photonCount);
+                return;
+            }
+            if (!all(isfinite(beta)) || spectrum_max(beta) <= 0.0f) return;
+        } else if (media && hit) {
+            // Before glass (the camera paths' NEE and scattering carry that light) and in absorbing media: the
+            // unscattered share.
+            beta *= medium_transmittance(medium, mediumSlot == MATERIAL_SLOTS, ray, rec.t, lo, hi);
+        }
+        if (!hit) return;
+        resolve_material(rec, ray, u, settings, images, 0.0f);
+        if (media && slot_boundary(rec.mat.slot, images)) {
+            medium_cross(rec, mediumSlot, medium, u, images, wl);
+            ray.origin = ray_origin(rec.position, rec.geometricNormal, ray.direction, u, rec.error);
+            continue;
+        }
+        if (rec.mat.type == EMISSIVE) return;
+        spectral_arrive(rec.mat, beta, wl);
+        float3 toLight = -ray.direction;
+        if (caustic_receiver(rec.mat)) {
+            if (specular == 0 || scattering > limit) return;
+            // Photons (CausticMode.photons): the same path's end, for camera paths that reach it through glass.
+            if (photons_on(u))
+                caustic_store(rec.position, ray.direction, beta, (scattering - 1) | (fromEnvironment ? 256 : 0), group, 0u, guide,
+                              params.cellSize, params,
+                              photons, photonNext, photonHeads, photonCount);
+            // Connect the receiver to a point on the lens and find the pixel whose camera ray reaches it.
+            float3 camPos = u.cameraPos.xyz;
+            float3 forward = normalize(u.cameraTarget.xyz - camPos);
+            float3 right = normalize(cross(forward, u.cameraUp.xyz));
+            float3 up = cross(right, forward);
+            float3 lensPoint = camPos;
+            if (u.lens.x > 0.0f) {
+                float2 l = rand_f2(seed);
+                float radius = sqrt(l.x) * u.lens.x, angle = TWO_PI * l.y;
+                lensPoint += radius * (cos(angle) * right + sin(angle) * up);
+            }
+            float3 toCamera = lensPoint - rec.position;
+            float d2 = dot(toCamera, toCamera);
+            if (d2 <= 1e-12f) return;
+            float distance = sqrt(d2);
+            float3 wc = toCamera / distance;
+            float cosTheta = dot(-wc, forward);
+            if (cosTheta <= 1e-4f) return;
+            // The lens ray from lensPoint toward the receiver crosses the focus plane where the pixel's ray does.
+            float3 focus = u.lens.x > 0.0f ? lensPoint - wc * (u.lens.y / cosTheta) : camPos - wc;
+            float3 view = focus - camPos;
+            float z = dot(view, forward);
+            if (z <= 0.0f) return;
+            float fovScale = tan(u.cameraPos.w * 0.5f * PI / 180.0f);
+            float aspect = float(u.width) / float(u.height);
+            float px = (dot(view, right) / (z * aspect * fovScale) + 1.0f) * 0.5f * float(u.width);
+            float py = (1.0f - dot(view, up) / (z * fovScale)) * 0.5f * float(u.height);
+            if (!(px >= 0.0f && py >= 0.0f && px < float(u.width) && py < float(u.height))) return;
+            uint2 pixel = uint2(px, py);
+            float pdf;
+            Spectrum f = eval_bsdf_with_pdf(rec.mat, rec.normal, wc, toLight, pdf, wl);
+            float cosLightGeometric = abs(dot(toLight, rec.geometricNormal));
+            if (spectrum_max(f) <= 0.0f || cosLightGeometric < 1e-6f) return;
+            LightSample camera = {};
+            camera.position = lensPoint; camera.wi = wc; camera.dist = distance; camera.pdf = 1.0f;
+            Spectrum visible = media
+                ? medium_shadow(rec.position, rec.geometricNormal, rec.error, camera, mediumSlot, medium, lo, hi, u, images, wl)
+                : (light_visible(rec.position, rec.geometricNormal, camera, u.sceneIndex, images, u, rec.error) ? Spectrum(1.0f) : Spectrum(0.0f));
+            if (spectrum_max(visible) <= 0.0f) return;
+            float geometry = abs(dot(toLight, rec.normal)) / cosLightGeometric * abs(dot(wc, rec.geometricNormal))
+                / (params.pixelArea * d2 * cosTheta * cosTheta * cosTheta * float(params.paths));
+            float3 rgb = spectrum_rgb(beta * visible * f, wl) * geometry;
+            if (!all(isfinite(rgb))) return;
+            uint base = 3u * (pixel.y * u.width + pixel.x);
+            atomic_fetch_add_explicit(&splat[base], rgb.x, memory_order_relaxed);
+            atomic_fetch_add_explicit(&splat[base + 1u], rgb.y, memory_order_relaxed);
+            atomic_fetch_add_explicit(&splat[base + 2u], rgb.z, memory_order_relaxed);
+            // The emission guide and the source share learn the splat's contribution to the image.
+            if (id % CAUSTIC_GUIDE_TRAINING == 0u) {
+                caustic_train_source(sources, fromEnvironment, caustic_luminance(rgb));
+                if (guide != 0xffffffffu)
+                    atomic_fetch_add_explicit(guideWeights + guide, float(CAUSTIC_GUIDE_TRAINING) * caustic_luminance(rgb),
+                                              memory_order_relaxed);
+            }
+            return;
+        }
+        // A specular-class vertex: continue with the radiance-mode BSDF sample and the adjoint correction
+        // |wo.ns| |wi.ng| / (|wo.ng| |wi.ns|) (VEACH1997 ch. 5; pbrt-v3 CorrectShadingNormal, PBRT2023).
+        ++specular;
+        if (!is_delta(rec.mat)) ++scattering;
+        float3 next;
+        Spectrum weight;
+        float pdf;
+        if (!sample_bsdf(rec.mat, rec.normal, ray.direction, rec.front_face, seed, next, weight, pdf, wl)) return;
+        float denominator = abs(dot(toLight, rec.geometricNormal)) * abs(dot(next, rec.normal));
+        if (denominator < 1e-8f) return;
+        beta *= weight * (abs(dot(toLight, rec.normal)) * abs(dot(next, rec.geometricNormal)) / denominator);
+        if (!all(isfinite(beta)) || spectrum_max(beta) <= 0.0f) return;
+        bool solid = (rec.mat.type == DIELECTRIC || rec.mat.transmission > 0.0f)
+            && !(rec.mat.usesMaterialX && rec.mat.transmissionTint.w > 0.0f);
+        bool crossed = solid && dot(next, rec.geometricNormal) * dot(toLight, rec.geometricNormal) < 0.0f;
+        if (crossed) {
+            // The power the camera paths' convention gives a refracted path, for photons stored inside an object:
+            // DIELECTRIC's weight carries the radiance scaling (n_from / n_to)^2, which power does not; Adobe OpenPBR's
+            // transmission weight carries none, so its camera paths see basic radiance L / n^2 inside, and the
+            // photons there must carry power / n^2 to match. Both cancel on leaving the object. The material's IOR
+            // (its dispersion's wavelength shift is left out).
+            float ratio2 = rec.front_face ? rec.mat.ior * rec.mat.ior : 1.0f / (rec.mat.ior * rec.mat.ior);
+            beta *= rec.mat.type == DIELECTRIC ? ratio2 : 1.0f / ratio2;
+        }
+        if (media && crossed) medium_cross(rec, mediumSlot, medium, u, images, wl);
+        ray.origin = ray_origin(rec.position, rec.geometricNormal, next, u, rec.error);
+        ray.direction = next;
+        if (bounce > 16) {
+            if (rand_f(seed) >= 0.9f) return;
+            beta /= 0.9f;
+        }
+    }
+}
+#endif
+
+#if VIBE_MESHES
+// The receiver of a CausticRequest, rebuilt as trace_scene and resolve_material build a mesh hit.
+HitRecord caustic_receiver(CausticRequest q, float3 wo, constant Uniforms &u, constant SurfaceSettings *settings,
+                           constant MaterialResources &images) {
+    MeshTriangle t = scene_triangle(q.triangle, images);
+    float3 p = float3(q.position), e1 = t.b.xyz - t.a.xyz, e2 = t.c.xyz - t.a.xyz, d = p - t.a.xyz;
+    float d11 = dot(e1, e1), d12 = dot(e1, e2), d22 = dot(e2, e2), d1 = dot(d, e1), d2 = dot(d, e2);
+    float denominator = d11 * d22 - d12 * d12;
+    float b1 = denominator != 0.0f ? (d22 * d1 - d12 * d2) / denominator : 0.0f;
+    float b2 = denominator != 0.0f ? (d11 * d2 - d12 * d1) / denominator : 0.0f;
+    HitRecord rec = {};
+    rec.t = 1.0f; rec.position = p; rec.triangle = q.triangle;
+    mesh_hit_attributes(rec, t, b1, b2, -wo);
+    rec.mat = {DIFFUSE, float3(0.7f), float3(0), 0, 1};
+    rec.mat.slot = uses_scene_graph(u) ? uint(t.uvc.z) : 7u;
+    Ray ray;
+    ray.origin = p + wo; ray.direction = -wo;
+    resolve_material(rec, ray, u, settings, images, 0.0f);
+    return rec;
+}
+// Gathers the photons at the pixel's recorded vertices (CausticMode.photons; docs/CAUSTICS_DESIGN.md §6) after the
+// shading pass and adds them to its running average, as part of this sample (accumulated + g / frameIndex). The
+// indirect clamp does not apply to them, and the MetalFX input frame does not include them.
+kernel void caustic_gather_kernel(texture2d<float, access::read_write> accumTexture [[texture(0)]],
+                                  constant Uniforms &u [[buffer(0)]],
+                                  constant SurfaceSettings *settings [[buffer(1)]],
+                                  constant MaterialResources &images [[buffer(2)]],
+                                  constant CausticParams &params [[buffer(3)]],
+                                  const device CausticPhoton *photons [[buffer(4)]],
+                                  const device uint *photonNext [[buffer(5)]],
+                                  const device uint *photonHeads [[buffer(6)]],
+                                  const device CausticRequest *requests [[buffer(7)]],
+                                  device atomic_float *guideWeights [[buffer(8)]],
+                                  device atomic_float *sources [[buffer(9)]]
+                                  SPECTRAL_BUFFERS,
+                                  uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height) return;
+    uint base = 2u * (gid.y * u.width + gid.x);
+    Sampler seed = pixel_sampler(gid, u);
+    float3 sum = float3(0.0f);
+    uint group = caustic_pixel_group(gid, u);
+    for (uint k = 0u; k < 2u; ++k) {
+        CausticRequest q = requests[base + k];
+        if (q.triangle == 0xffffffffu) break;
+        // The pixel's wavelengths, as the shading pass derived them.
+        Wavelengths wl = SPECTRAL_WAVELENGTHS(pixel_wavelength_numbers(seed, gid, u), u, images);
+        float4 packed = float4(q.throughput[0], q.throughput[1], q.throughput[2], q.throughput[3]);
+#if VIBE_SPECTRAL
+        wl.heroOnly = (q.prefix & 256u) != 0u;
+        Spectrum throughput = Spectrum(packed);
+#else
+        Spectrum throughput = packed.xyz;
+#endif
+        float3 wo = caustic_direction(q.wo);
+        int prefix = int(q.prefix & 255u);
+        if ((q.triangle & CAUSTIC_MEDIUM_REQUEST) != 0u) {
+            uint slot = q.triangle & ~CAUSTIC_MEDIUM_REQUEST;
+            Medium medium = slot == MATERIAL_SLOTS ? scene_medium(u, wl) : slot_medium(slot, images, wl);
+            sum += caustic_gather_volume(float3(q.position), wo, medium, throughput, prefix, group, params, photons,
+                                         photonNext, photonHeads, guideWeights, sources, u, wl);
+        } else {
+            HitRecord rec = caustic_receiver(q, wo, u, settings, images);
+            sum += caustic_gather(rec, wo, throughput, prefix, group, params, photons, photonNext, photonHeads, guideWeights,
+                                  sources, u, wl);
+        }
+    }
+    if (!all(isfinite(sum)) || !any(sum != 0.0f)) return;
+    float4 average = accumTexture.read(gid);
+    accumTexture.write(float4(average.rgb + sum / float(max(u.frameIndex, 1u)), average.a), gid);
+}
+#endif
 
 // Bounded, single-scatter camera fog. This preview does not model multiple scattering.
 // Spectral: the medium is grey, so the scattered light is converted at the pixel's wavelengths.
@@ -4083,7 +4815,7 @@ kernel void restir_temporal_kernel(
 
     Sampler seed = pixel_sampler(gid, uniforms);
     // The pixel's wavelengths: pass 2 derives the same ones from the same sampler.
-    Wavelengths wl = SPECTRAL_WAVELENGTHS(wavelength_numbers(seed), uniforms, materialImages);
+    Wavelengths wl = SPECTRAL_WAVELENGTHS(pixel_wavelength_numbers(seed, gid, uniforms), uniforms, materialImages);
     float aspect = float(uniforms.width) / float(uniforms.height);
     float fov_scale = tan((uniforms.cameraPos.w * 0.5f) * PI / 180.0f);
 
@@ -4460,7 +5192,7 @@ float3 pt_reflectance(Material m, float3 n, float3 wo) {
     if (m.type == DIFFUSE) return saturate(m.albedo);
     if (m.type == GLOSSY) return conductor_fresnel(saturate(m.albedo), cosine);
     if (m.type == OPENPBR) {
-        float f0 = pow((m.ior - 1.0f) / (m.ior + 1.0f), 2.0f);
+        float f0 = (m.ior - 1.0f) / (m.ior + 1.0f); f0 *= f0;
         return saturate(m.albedo) * (1.0f - m.metalness) * (1.0f - m.transmission) +
             conductor_fresnel(mix(float3(f0), saturate(m.albedo), m.metalness), cosine);
     }
@@ -4487,8 +5219,8 @@ float3 pt_decode_direction(uint v) {
 }
 
 // Random replay (RESTIRPT2022 Sec. 7.2): each sampling event at path vertex j draws from its
-// own stream (0 BSDF, 1 NEE, 2 roulette, 3-5 resampling), so replaying a prefix at another
-// pixel consumes the same numbers whatever the other events consumed.
+// own stream (0 BSDF, 1 NEE, 2 roulette; stream 3 of vertex 0 is the path tree's RIS), so replaying a prefix at
+// another pixel consumes the same numbers whatever the other events consumed.
 uint pt_seed(uint seed, uint pathVertex, uint stream) { return pcg_hash(seed ^ pcg_hash(pathVertex * 8u + stream + 1u)); }
 // The sampler of one such stream. In Z mode the reservoir's seed is the pixel's Z++ key at
 // generation (pt_initial_seed), so a replay anywhere reproduces the base path's numbers; the
@@ -5247,7 +5979,7 @@ kernel void restir_pt_temporal_kernel(
         pt_cv_temporal(controls[index], c.M, min(t.M, cap), ptIndirect.read(uint2(prevCoord)).xyz, difference);
 }
 
-// ReSTIR PT pass B: each pixel shifts its path to its PT_NEIGHBORS paired partners once.
+// ReSTIR PT shift pass (before pass C): each pixel shifts its path to its PT_NEIGHBORS paired partners once.
 // The partner's primary hit is its PrimarySurface and G-buffer position, seen along its own
 // camera ray. Output: F(T x) |dT/du| and the shifted path's Jacobian denominator.
 kernel void restir_pt_shift_kernel(
@@ -5293,7 +6025,7 @@ kernel void restir_pt_shift_kernel(
 // defensive pairwise MIS and confidence weights (RESTIRPT2022 Eq. 38, as its real-time
 // prototype weighs it), shading with the vector-valued resampling weights (RESTIRPTE2026
 // Sec. 6.3). The selected path becomes the next frame's temporal history. The current
-// PrimarySurface is copied to the history buffer here, after pass A read the old one.
+// PrimarySurface is copied to the history buffer here, after temporal reuse read the old one.
 // With ReSTCV (RESTCV2026 Sec. 5.3) the pixel is shaded with its spatial control-variate estimate
 // instead, which also becomes the next frame's history estimate; the reservoirs are unchanged.
 kernel void restir_pt_spatial_kernel(
@@ -5831,7 +6563,7 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
     float M = float(spmis_count(cell));
     float scale = float(SPMIS_CANDIDATES) / M;
     float cS = cell.confidence[0] * scale, cc = canonicalWeights.y;
-    float weightSum = 0.0f;
+    float weightSum = 0.0f, target = pc;
     if (pc > 0.0f && canonicalWeights.z > 0.0f) {
         uint z = spmis_uniform_pixel(slots, cell, rand_f(seed));
         uint2 zc = uint2(z % u.width, z / u.width);
@@ -5860,9 +6592,8 @@ LightSample spmis_di_reuse(uint2 gid, HitRecord rec, float3 view, float4 canonic
         float wi = m * here * w.z;
         if (!(wi > 0.0f) || !isfinite(wi)) continue;
         weightSum += wi;
-        if (rand_f(seed) * weightSum < wi) selected = y;
+        if (rand_f(seed) * weightSum < wi) { selected = y; target = here; }
     }
-    float target = eval_restir_target_pdf(rec.position, rec.normal, view, rec.mat, selected, u.sceneIndex, u.light.w, images, wl);
     W = target > 0.0f && weightSum > 0.0f && isfinite(weightSum) ? weightSum / target : 0.0f;
     return selected;
 }
@@ -5898,7 +6629,7 @@ void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf
     float M = float(spmis_count(cell));
     float scale = float(SPMIS_CANDIDATES) / M;
     float cS = cell.confidence[1] * scale, cc = canonicalWeights.y;
-    float weightSum = 0.0f;
+    float weightSum = 0.0f, target = pc;
     if (pc > 0.0f && canonicalWeights.z > 0.0f) {
         uint z = spmis_uniform_pixel(slots, cell, rand_f(seed));
         uint2 zc = uint2(z % u.width, z / u.width);
@@ -5937,11 +6668,9 @@ void spmis_gi_reuse(uint2 gid, HitRecord rec, float3 view, thread float4 &posPdf
         if (!(wi > 0.0f) || !isfinite(wi)) continue;
         weightSum += wi;
         if (rand_f(seed) * weightSum < wi) {
-            posPdf = zPosPdf; normal = zNormal; radiance = zRadiance; sampleU = w.w;
+            posPdf = zPosPdf; normal = zNormal; radiance = zRadiance; sampleU = w.w; target = here;
         }
     }
-    float target = normal.w > 0.0f ? eval_restir_gi_target(rec.position, rec.normal, view, rec.mat, posPdf.xyz, normal.xyz, radiance,
-                                                           sample_wavelengths(sampleU, wl)) : 0.0f;
     W = target > 0.0f && weightSum > 0.0f && isfinite(weightSum) ? weightSum / target : 0.0f;
 }
 
@@ -6603,14 +7332,18 @@ kernel void shading_kernel(
     const device PrimarySurface *primarySurfaces [[buffer(3)]],
     const device SPMISPixel *spmisCells [[buffer(4)]],
     const device SPMISSlot *spmisSlots [[buffer(5)]],
-    const device SPMISChoice *spmisChoices [[buffer(6)]]
+    const device SPMISChoice *spmisChoices [[buffer(6)]],
+    // Caustic light tracing's RGB splats of this sample, three floats per pixel (caustic_trace_kernel), and the
+    // pixel's two photon-gathering receivers (caustic_gather_kernel).
+    const device float *causticSplat [[buffer(7)]],
+    device CausticRequest *causticRequests [[buffer(8)]]
     SPECTRAL_BUFFERS,
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
     Sampler seed = pixel_sampler(gid, uniforms);
     // The pixel's wavelengths (pass 1 derived the same ones). Reused DI and GI samples bring theirs.
-    Wavelengths wl = SPECTRAL_WAVELENGTHS(wavelength_numbers(seed), uniforms, materialImages);
+    Wavelengths wl = SPECTRAL_WAVELENGTHS(pixel_wavelength_numbers(seed, gid, uniforms), uniforms, materialImages);
 
     float4 posDepth = gbufferPosDepth.read(gid);
     float3 radiance = float3(0.0f);
@@ -6653,9 +7386,12 @@ kernel void shading_kernel(
     decorrelate_shading_seed(seed.state);
 
     bool media = uniforms.pathOptions.z > 0.0f;
+    // The pixel's photon-gathering receivers (CausticMode.photons), written to causticRequests at the end.
+    CausticRequest causticSlots[2];
+    uint causticCount = 0u;
     if (media) {
         // Participating media (docs/VOLUME_DESIGN.md §4): the whole path from the camera, with Standard MIS.
-        radiance = volume_path(primaryRay, uniforms, surfaceSettings, materialImages, seed, wl, indirect);
+        radiance = volume_path(primaryRay, uniforms, surfaceSettings, materialImages, seed, wl, indirect, causticSlots, causticCount);
     } else if (posDepth.w <= 0.0f) {
         if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
             radiance = environment_rgb(primaryRay.direction, uniforms, materialImages, wl);
@@ -6910,6 +7646,11 @@ kernel void shading_kernel(
             bool pathSplit = splitPass;
             for (uint lane = 0u; ; ) {
             sampler_split(seed, splitPass ? lane : 0u);
+            // Caustic light paths (docs/CAUSTICS_DESIGN.md §3, §6): -1 while every vertex since the camera is
+            // specular-class, then the number of specular-class vertices since the last receiver whose light through
+            // glass the light paths carry (light tracing at the primary hit, photons at every later receiver); -2 when
+            // they do not. Light reached with a count of one or more is left out.
+            int caustic = !caustics_on(uniforms) ? -2 : caustic_specular(mat) ? -1 : caustic_receiver(mat) ? 0 : -2;
             for (int bounce = 1; !unifiedPT; ++bounce) {
                 float3 nextDirection;
                 Spectrum bsdfWeight;
@@ -6953,7 +7694,8 @@ kernel void shading_kernel(
                     if ((uniforms.sceneIndex == 0 || uniforms.sceneIndex == 6)) {
                         float lightPDF = eval_environment_pdf(nextDirection, previousNormal, uniforms,materialImages);
                         float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                        if (lane == 0u || splitPass)
+                        // Environment light through glass since the last receiver is the light paths' (caustic).
+                        if ((lane == 0u || splitPass) && caustic < 1)
                             path_add(radiance, indirect, spectrum_rgb(throughput * weight * environment_spectrum(nextDirection, uniforms, materialImages, wl), wl), scatteringDepth >= 2, uniforms);
                     }
                     break;
@@ -6961,7 +7703,7 @@ kernel void shading_kernel(
                 if (rec.mat.type == EMISSIVE) {
                     float lightPDF = eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms,materialImages,rec.triangle);
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                    if (lane == 0u || splitPass)
+                    if ((lane == 0u || splitPass) && caustic < 1)
                         path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(rec.mat.emission, rec.mat.slot, materialImages, wl), wl), scatteringDepth >= 2, uniforms);
                     break;
                 }
@@ -6973,8 +7715,19 @@ kernel void shading_kernel(
                     float lightPDF = uniforms.sceneIndex == 6
                         ? eval_light_pdf(previousPosition, rec.position, rec.mat, uniforms, materialImages, rec.triangle) : 0.0f;
                     float weight = emission_weight(previousDelta, previousNEE, previousMIS, bsdfPDF, lightPDF);
-                    if (lane == 0u || splitPass)
+                    if ((lane == 0u || splitPass) && caustic < 1)
                         path_add(radiance, indirect, spectrum_rgb(throughput * weight * emitter_spectrum(surfaceEmission, rec.mat.slot, materialImages, wl), wl), scatteringDepth >= 2, uniforms);
+                }
+                if (caustic_receiver(rec.mat)) {
+                    // Photons (CausticMode.photons) carry this receiver's light through glass, as the light paths' splat
+                    // does the primary hit's: recorded here, gathered by caustic_gather_kernel. A path split into its
+                    // wavelengths (spectral_split) keeps path tracing, as does a third receiver.
+                    caustic = photons_on(uniforms) && !splitPass && caustic_request(causticSlots, causticCount,
+                        rec.position, rec.triangle, -currentRay.direction, throughput, scatteringDepth, wl) ? 0 : -2;
+                } else if (caustic_specular(rec.mat)) {
+                    if (caustic >= 0) ++caustic;
+                } else {
+                    caustic = -2;
                 }
                 if (emissionOnly) break;
                 // The x2 emission above is a two-vertex path; ReSTIR PT holds the longer ones.
@@ -6989,7 +7742,7 @@ kernel void shading_kernel(
 
                 bool restirGISecondary = uniforms.samplingMode == 0 && mat.type == DIFFUSE &&
                     bounce == 1 && rec.mat.type == DIFFUSE;
-                if (!is_delta(rec.mat) && uniforms.samplingMode != 3 && !restirGISecondary) {
+                if (!is_delta(rec.mat) && uniforms.samplingMode != 3 && !restirGISecondary && caustic < 1) {
                     sampler_event(seed, uint(bounce) + 1u, Z_NEE);
                     LightSample ls = sample_direct_light(rec.position, rec.normal, uniforms, seed, materialImages);
                     if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, rec.error)) {
@@ -7030,6 +7783,17 @@ kernel void shading_kernel(
         }
     }
 
+    if (photons_on(uniforms)) {
+        uint base = 2u * (gid.y * uniforms.width + gid.x);
+        for (uint k = 0u; k < 2u; ++k) {
+            if (k >= causticCount) causticSlots[k].triangle = 0xffffffffu;
+            causticRequests[base + k] = causticSlots[k];
+        }
+    }
+    if (caustics_on(uniforms)) {
+        uint base = 3u * (gid.y * uniforms.width + gid.x);
+        path_add(radiance, indirect, float3(causticSplat[base], causticSplat[base + 1u], causticSplat[base + 2u]), true, uniforms);
+    }
     if (indirect_clamp_on(uniforms)) radiance += indirect_clamped(indirect, uniforms);
 
     if (uniforms.enableFog == 1 && !media) {
@@ -7217,7 +7981,7 @@ kernel void metalfx_guides_kernel(
             Material resolved = load_primary_surface(primarySurfaces[gid.y * u.width + gid.x], p, materialImages).mat;
             rough = resolved.roughness;
             diffuseAlbedo = resolved.albedo * (1.0f - resolved.metalness) * (1.0f - resolved.transmission);
-            float f0 = pow((resolved.ior - 1.0f) / (resolved.ior + 1.0f), 2.0f);
+            float f0 = (resolved.ior - 1.0f) / (resolved.ior + 1.0f); f0 *= f0;
             specularAlbedo = conductor_fresnel(mix(float3(f0), resolved.albedo, resolved.metalness), max(0.0f, dot(normal, wo)));
         }
         if (int(n.w) == DIELECTRIC) {
@@ -7521,15 +8285,15 @@ struct Uniforms {
     var viewportMode: UInt32
     var width: UInt32
     var height: UInt32
-    // IndirectReuse raw value (bits 0-1), ReSTIR PT options (bits 2-5) and the sampler (bits 6-8; MSL
-    // sampler_z); occupies former padding (offset 228).
+    // IndirectReuse raw value (bits 0-1), ReSTIR PT options (bits 2-5), the sampler (bits 6-8; MSL sampler_z) and
+    // caustic light tracing / photons (bits 9-10; MSL caustics_on, photons_on); offset 228.
     var indirectReuse: UInt32 = IndirectReuse.restirGI.rawValue
     var jitter: SIMD2<Float> = .zero
     var sampleIndex: UInt32 = 1
     var reservoirHistoryReset: UInt32 = 0
     // Consecutive frames with written ReSTIR reservoirs; gates temporal reuse.
     var reservoirHistory: UInt32 = 0
-    // SpatialNeighborSelection raw value; occupies former padding (offset 252).
+    // SpatialNeighborSelection raw value (offset 252).
     var spatialNeighbors: UInt32 = SpatialNeighborSelection.compatibility.rawValue
     var environment = SIMD4<Float>(1, 0, 0, 0)
     // Aperture radius, focus distance, scene-graph mode (sceneGraphMode), independent sun 1 - cos(half angle).
@@ -7661,6 +8425,23 @@ enum LightSampling: UInt32, Sendable {
     // through the scene and cost about 5% where they are not (tests/PERFORMANCE.md, "Light tree").
     case automatic = 2
     func resolved() -> LightSampling { self == .automatic ? .tree : self }
+}
+
+// Caustics of imported scenes (docs/CAUSTICS_DESIGN.md): path tracing alone; light tracing of the caustics the camera
+// sees directly (MSL caustic_trace_kernel); or light tracing plus photons gathered at the camera paths' later vertices
+// (MSL caustic_gather_kernel); each of the last two with emission guiding (§5), which aims light paths at where the
+// caustics the camera sees came from. All render with Standard MIS (activeSamplingMode).
+enum CausticMode: UInt32, Sendable {
+    case off = 0
+    case lightTracing = 1
+    // Host-side default: off until equal-time measurements choose otherwise (docs/CAUSTICS_DESIGN.md §8).
+    case automatic = 2
+    case photons = 3
+    case lightTracingGuided = 4
+    case photonsGuided = 5
+    func resolved() -> CausticMode { self == .automatic ? .off : self }
+    var photons: Bool { self == .photons || self == .photonsGuided }
+    var guided: Bool { self == .lightTracingGuided || self == .photonsGuided }
 }
 
 // How spectral transport samples dispersive interfaces (MSL SpectralScene.dispersionSampling bits;
@@ -7863,11 +8644,15 @@ func makePairingTexture(side: Int, sigma: Double, seed: UInt64) -> [SIMD2<Int8>]
     var refinedCells = 0
     // Pipelines compiled so far while compiling (shown by the UI's activity strip).
     var progress: OperationProgress?
+    // The spectral mesh shading_kernel with caustic photons in media (requestMediaPhotonKernel), and whether it was
+    // requested.
+    var mediaPhotonShading: MTLComputePipelineState?
+    var mediaPhotonRequested = false
 }
 
 // Scene kernels of one device, shared by its renderers like SpectralShaderCache: the core pipelines
 // compiled at launch (PathTracerRenderer.compileShaders) and the optional ReSTIR PT, reservoir
-// splatting and stochastic pairwise MIS groups, compiled in the background when a mode first needs
+// splatting, stochastic pairwise MIS and caustics groups, compiled in the background when a mode first needs
 // them (PathTracerRenderer.requestKernels); until then their modes resolve to the fallbacks.
 @MainActor final class SceneShaderCache {
     var procedural: PathTracerRenderer.SceneKernels
@@ -7884,7 +8669,6 @@ func makePairingTexture(side: Int, sigma: Double, seed: UInt64) -> [SIMD2<Int8>]
         proceduralLibrary = shaders.proceduralLibrary
         attempted = Set(PathTracerRenderer.KernelGroup.allCases.filter { procedural.has($0) && mesh.has($0) })
     }
-    func has(_ group: PathTracerRenderer.KernelGroup) -> Bool { procedural.has(group) && mesh.has(group) }
 }
 
 // The three pairing textures ReSTIR PT's spatial reuse reads (MSL PT_PAIRING_SIDES: 254, 230 and
@@ -8135,10 +8919,12 @@ final class MaterialLibrary {
     // Imported emitters are chosen with a light BVH (LightSampling.tree) instead of by power alone.
     var lightTree = false { didSet { if oldValue != lightTree { bindingsDirty = true; emittersDirty = true } } }
     var emissionBuffer:MTLBuffer!,emitterBuffer:MTLBuffer!
-    // Whether imported emitters exist (constant or MaterialX emission).
-    var hasEmitters: Bool {
-        emissions.values.contains { $0.max() > 0 } || materialX.values.contains { $0.emission != nil }
-    }
+    // Caustic light tracing's emitter choice (MSL caustic_trace_kernel): count, total power (float bits), the
+    // emitters' IDs and their normalized power CDF, whatever the light sampling; [0, 0] without emitters.
+    private(set) var causticEmitterBuffer: MTLBuffer?
+    // The emitter triangles' world bounds (emission guiding's region grid; MSL caustic_guide_region).
+    private(set) var causticEmitterBounds: (lo: SIMD3<Float>, hi: SIMD3<Float>)?
+    var hasCausticEmitters: Bool { (causticEmitterBuffer?.contents().load(as: UInt32.self) ?? 0) > 0 }
     // Spectral transport's per-slot OpenPBR parameters (MSL SpectralMaterial: dispersion 20 / V_d, thin
     // film weight, thickness in micrometres and IOR), from the slots' MaterialX constants;
     // spectralOverrides replaces a slot's (test scenes).
@@ -8148,7 +8934,8 @@ final class MaterialLibrary {
     // subsurface_scatter_anisotropy (w; MSL slot_subsurface_anisotropy), the
     // constant transmission_color (rgb) and geometry_thin_walled (w; MSL slot_transmission), the emitter
     // record, colour and shaping (EmitterLight.slotParameters; MSL slot_emitter, emitter_shaping), and a
-    // interior medium (MaterialXProgram.medium: transmission_scatter, depth; then anisotropy and the boundary flag).
+    // interior medium (MaterialXProgram.medium: transmission_scatter, depth; then anisotropy, the boundary flag, the
+    // Rayleigh flag and the specular anisotropy rotation, MaterialXProgram.anisotropyRotation; MSL slot_anisotropy_rotation).
     static let slotStride = 8
     var slotParameters: [SIMD4<Float>] {
         let observer = CIEObserver.shared
@@ -8162,7 +8949,7 @@ final class MaterialLibrary {
                     SIMD4(tint, program?.subsurfaceAnisotropy ?? 0), transmission]
                 + emitter + [program?.medium ?? .zero,
                              SIMD4(program?.mediumAnisotropy ?? 0, program?.mediumBoundary == true ? 1 : 0,
-                                   program?.mediumRayleigh == true ? 1 : 0, 0)]
+                                   program?.mediumRayleigh == true ? 1 : 0, program?.anisotropyRotation ?? 0)]
         } + [SIMD4(Float(emitterLights.count), 0, 0, 0)]   // MSL emitter_records
     }
     var orderedTriangles: StoredTriangles {
@@ -8453,6 +9240,17 @@ final class MaterialLibrary {
             if lightTree { entries.sort { $0.id < $1.id } }
             var total=0.0
             let cumulative=entries.map { total+=$0.power; return total }
+            let causticValues: [UInt32] = total>0 && total.isFinite
+                ? [UInt32(entries.count),Float(total).bitPattern]+entries.map(\.id)
+                    + cumulative.indices.map { $0==cumulative.count-1 ? Float(1).bitPattern : Float(cumulative[$0]/total).bitPattern }
+                : [0,0]
+            causticEmitterBuffer=causticValues.withUnsafeBytes { device.makeBuffer(bytes:$0.baseAddress!,length:$0.count,options:.storageModeShared) }
+            causticEmitterBounds = entries.isEmpty ? nil : entries.reduce((lo: SIMD3<Float>(repeating: .infinity), hi: SIMD3<Float>(repeating: -.infinity))) {
+                let t = $1.triangle
+                let lo = simd_min(simd_min(SIMD3(t.a.x, t.a.y, t.a.z), SIMD3(t.b.x, t.b.y, t.b.z)), SIMD3(t.c.x, t.c.y, t.c.z))
+                let hi = simd_max(simd_max(SIMD3(t.a.x, t.a.y, t.a.z), SIMD3(t.b.x, t.b.y, t.b.z)), SIMD3(t.c.x, t.c.y, t.c.z))
+                return (simd_min($0.lo, lo), simd_max($0.hi, hi))
+            }
             if total>0 && total.isFinite {
                 if let tree=lightTreeList(entries,total:total) { emitterValues=tree } else {
                     let cdf=cumulative.indices.map { $0==cumulative.count-1 ? Float(1).bitPattern : Float(cumulative[$0]/total).bitPattern }
@@ -8640,7 +9438,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var bytesPerPixel: UInt64 {
             // Beauty/sample/position/OIDN accumulations: 6 RGBA32F; three
             // normal/material guides: 3 RGBA16F; resolved primary surfaces:
-            // 128 B. ReSTIR adds the reservoirs of its indirect-reuse mode and,
+            // 136 B. ReSTIR adds the reservoirs of its indirect-reuse mode and,
             // when temporal reuse splats, the reservoir-splatting resources.
             // MetalFX formats total 55 B/pixel plus the scaler's own history and
             // feature allocations.
@@ -8664,10 +9462,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // The pipelines this renderer was created with, for renderers that share them (`sharing:`).
     let compiledShaders: CompiledShaders
     let materialFunction: MTLFunction
-    let pickPipeline: MTLComputePipelineState
     let restirTemporalPipeline: MTLComputePipelineState
-    let shadingPipeline: MTLComputePipelineState
-    let metalFXGuidePipeline: MTLComputePipelineState
     let presentPipeline: MTLComputePipelineState
     // The scene kernels. Scenes 0-5 use a library compiled with VIBE_MESHES=0: the imported-mesh
     // traversal is dead code there, but its registers slowed them by 13-17% (tests/PERFORMANCE.md).
@@ -8681,11 +9476,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Nil for a library without them or until compiled; the scene then selects spatial neighbours as
         // .automatic does.
         var spmis: SPMISKernels?
+        // Caustic light tracing and photon gathering (mesh libraries only); nil until compiled, and caustics then
+        // resolve to off.
+        var caustics: CausticKernels?
         func has(_ group: KernelGroup) -> Bool {
             switch group {
             case .pt: return pt != nil
             case .splat: return splat != nil
             case .spmis: return spmis != nil
+            case .caustics: return caustics != nil
             }
         }
         func adding(_ k: OptionalKernels) -> SceneKernels {
@@ -8693,6 +9492,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             result.pt = pt ?? k.pt
             result.splat = splat ?? k.splat
             result.spmis = spmis ?? k.spmis
+            result.caustics = caustics ?? k.caustics
             return result
         }
     }
@@ -8703,10 +9503,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     struct SplatKernels { let activate, layers, deepReSTIR, deepPT, reservoirs, temporal, ptTemporal: MTLComputePipelineState }
     // Stochastic pairwise MIS (SPMIS2026): reuse-cell construction and ReSTIR PT spatial reuse.
     struct SPMISKernels { let cells, select, ptShift, pt: MTLComputePipelineState }
+    // Caustics (docs/CAUSTICS_DESIGN.md): light paths with their splats and photons, and the photon gather.
+    struct CausticKernels { let trace, gather, guide: MTLComputePipelineState }
     // Scene kernel groups that compile after the core set (SceneShaderCache): the core pipelines
     // render GI, reprojection and the automatic neighbour selection until their group is ready.
     enum KernelGroup: CaseIterable, Sendable {
-        case pt, splat, spmis
+        case pt, splat, spmis, caustics
         var names: [String] {
             switch self {
             case .pt: return ["restir_pt_initial_kernel", "restir_pt_temporal_kernel", "restir_pt_shift_kernel",
@@ -8715,6 +9517,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                                  "restir_pt_deep_initial_kernel", "splat_reservoirs_kernel", "splat_temporal_kernel",
                                  "restir_pt_splat_temporal_kernel"]
             case .spmis: return ["spmis_cells_kernel", "spmis_select_kernel", "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
+            case .caustics: return ["caustic_trace_kernel", "caustic_gather_kernel", "caustic_guide_build_kernel"]
             }
         }
         var title: String {
@@ -8722,6 +9525,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             case .pt: return "ReSTIR PT"
             case .splat: return "reservoir splatting"
             case .spmis: return "stochastic pairwise MIS"
+            case .caustics: return "caustic light tracing"
             }
         }
     }
@@ -8730,6 +9534,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var pt: ReSTIRPTKernels?
         var splat: SplatKernels?
         var spmis: SPMISKernels?
+        var caustics: CausticKernels?
     }
     nonisolated static func pipeline(_ device: MTLDevice, _ library: MTLLibrary, _ name: String) throws -> MTLComputePipelineState {
         guard let function = library.makeFunction(name: name) else {
@@ -8781,6 +9586,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                 case .splat: kernels.splat = SplatKernels(activate: p[0], layers: p[1], deepReSTIR: p[2], deepPT: p[3],
                                                           reservoirs: p[4], temporal: p[5], ptTemporal: p[6])
                 case .spmis: kernels.spmis = SPMISKernels(cells: p[0], select: p[1], ptShift: p[2], pt: p[3])
+                case .caustics: kernels.caustics = CausticKernels(trace: p[0], gather: p[1], guide: p[2])
                 }
             }
             return kernels
@@ -8828,9 +9634,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return CompiledShaders(
             library: lib, proceduralLibrary: procedural, present: states[4],
             mesh: SceneKernels(temporal: states[1], shading: states[2], guides: states[3], pick: states[0],
-                               pt: optional[0].pt, splat: optional[0].splat, spmis: optional[0].spmis),
+                               pt: optional[0].pt, splat: optional[0].splat, spmis: optional[0].spmis, caustics: optional[0].caustics),
             procedural: SceneKernels(temporal: states[5], shading: states[6], guides: states[7], pick: states[8],
-                                     pt: optional[1].pt, splat: optional[1].splat, spmis: optional[1].spmis))
+                                     pt: optional[1].pt, splat: optional[1].splat, spmis: optional[1].spmis, caustics: optional[1].caustics))
     }
     // Spectral transport's scene kernels (VIBE_SPECTRAL=1 libraries, after the generated tables), and
     // the inverse-CDF kernel. The MetalFX guide and picking kernels have no colour transport and are
@@ -8843,8 +9649,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         func library(meshes: Bool) throws -> MTLLibrary {
             let options = MTLCompileOptions()
             options.mathMode = relaxedMath ? .relaxed : .safe
-            options.preprocessorMacros = meshes ? ["VIBE_SPECTRAL": NSNumber(value: 1)]
-                : ["VIBE_SPECTRAL": NSNumber(value: 1), "VIBE_MESHES": NSNumber(value: 0)]
+            options.preprocessorMacros = meshes ? ["VIBE_SPECTRAL": NSNumber(value: 1), "VIBE_MEDIA_PHOTONS": NSNumber(value: 0)]
+                : ["VIBE_SPECTRAL": NSNumber(value: 1), "VIBE_MESHES": NSNumber(value: 0), "VIBE_MEDIA_PHOTONS": NSNumber(value: 0)]
             return try device.makeLibrary(source: source, options: options)
         }
         progress?.begin("Compiling the spectral shader library")
@@ -8855,7 +9661,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                      "splat_temporal_kernel", "restir_pt_splat_temporal_kernel", "spmis_cells_kernel", "spmis_select_kernel",
                      "restir_pt_spmis_shift_kernel", "restir_pt_spmis_kernel"]
         let jobs = libraries.flatMap { library in names.map { (library, $0) } }
-            + ["spectral_icdf_kernel", "spectral_refine_flags_kernel", "spectral_refine_solve_kernel"].map { (libraries[0], $0) }
+            + ["spectral_icdf_kernel", "spectral_refine_flags_kernel", "spectral_refine_solve_kernel",
+               "caustic_trace_kernel", "caustic_gather_kernel", "caustic_guide_build_kernel"].map { (libraries[0], $0) }
         let states = try pipelines(device, jobs, progress: progress, phase: "Compiling spectral shaders")
         func kernels(_ k: Int, rgb: SceneKernels) -> SceneKernels {
             let p = Array(states[(k * names.count)..<((k + 1) * names.count)])
@@ -8865,8 +9672,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                                                     temporal: p[12], ptTemporal: p[13]),
                                 spmis: SPMISKernels(cells: p[14], select: p[15], ptShift: p[16], pt: p[17]))
         }
-        let extra = states.suffix(3).map { $0 }
-        return SpectralKernels(procedural: kernels(1, rgb: rgbProcedural), mesh: kernels(0, rgb: rgbMesh), icdf: extra[0],
+        let extra = states.suffix(6).map { $0 }
+        var mesh = kernels(0, rgb: rgbMesh)
+        mesh.caustics = CausticKernels(trace: extra[3], gather: extra[4], guide: extra[5])
+        return SpectralKernels(procedural: kernels(1, rgb: rgbProcedural), mesh: mesh, icdf: extra[0],
                                refineFlags: extra[1], refineSolve: extra[2])
     }
     // Shared with renderers created with `sharing:`; optional groups are added as they compile.
@@ -9027,6 +9836,44 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         didSet { if oldValue != lightSampling { materials.lightTree = activeLightSampling == .tree; resetAccumulation() } }
     }
     var activeLightSampling: LightSampling { lightSampling.resolved() }
+    // Caustic light tracing of imported scenes (CausticMode; docs/CAUSTICS_DESIGN.md).
+    var caustics = PathTracerRenderer.defaultCaustics {
+        didSet { if oldValue != caustics { resetAccumulation() } }
+    }
+    // Light paths traced per sample while caustic light tracing is active.
+    var causticPaths = 1 << 20 {
+        didSet { if oldValue != causticPaths { resetAccumulation() } }
+    }
+    // Whether this frame traces caustic light paths: requested, an imported scene with emitters, its kernel compiled.
+    var activeCaustics: Bool {
+        caustics.resolved() != .off && sceneIndex == 6 && viewportMode == 0 && (materials.hasCausticEmitters || hasCausticEnvironment)
+            && sceneKernels.caustics != nil
+    }
+    // Whether the environment emits (sky, image or sun; MSL caustic_source_share), so light paths start from it too.
+    var hasCausticEnvironment: Bool { options.environmentIntensity > 0 || (options.sunAngle != nil && options.sunIntensity > 0) }
+    // Whether its light paths also leave photons that camera paths gather at their later receivers.
+    var activePhotons: Bool { activeCaustics && caustics.resolved().photons }
+    // Whether camera paths in media (MSL volume_path) gather photons: in spectral frames once the shading kernel that
+    // records them is ready (requestMediaPhotonKernel).
+    var activeMediaPhotons: Bool { activePhotons && hasMedia && (!spectralFrame || spectralShaders.mediaPhotonShading != nil) }
+    // The first sample's photon radius in pixel footprints at the orbit distance (docs/CAUSTICS_DESIGN.md §6); later
+    // samples shrink it (causticRadius2).
+    var causticRadiusPixels: Float = 4 {
+        didSet { if oldValue != causticRadiusPixels { resetAccumulation() } }
+    }
+    // Caustic light tracing's RGB splats of the current sample (MSL caustic_trace_kernel), 12 B per pixel, and its
+    // photon grid: photons (40 B), per photon the next in its cell (4 B), the cells' heads and the photon count, and
+    // per pixel two photon-gathering vertices (MSL CausticRequest, 80 B per pixel).
+    private(set) var causticSplat: MTLBuffer?
+    // Emission guiding (MSL caustic_guide_build_kernel): per region the direction histogram (atomic floats, cleared when
+    // accumulation restarts) and its CDF plus the regions' totals.
+    private(set) var causticGuide: (weights: MTLBuffer, cdf: MTLBuffer)?
+    // The light the environment's and the emitter triangles' light paths added since accumulation restarted (two atomic
+    // floats; MSL caustic_source_share).
+    private(set) var causticSources: MTLBuffer?
+    nonisolated static let causticGuideRegions = 64, causticGuideCells = 4096, causticGuideSplit: Float = 4
+    private(set) var causticPhotons: (photons: MTLBuffer, next: MTLBuffer, heads: MTLBuffer, count: MTLBuffer, requests: MTLBuffer)?
+    nonisolated static let causticTableSize = 1 << 20
     var dispersionSampling = PathTracerRenderer.defaultDispersionSampling {
         didSet { if oldValue != dispersionSampling { resetAccumulation() } }
     }
@@ -9044,7 +9891,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         var shapes: [SIMD4<Float>] = []
         var inheriting = (1...5).contains(sceneIndex)
         if sceneIndex == 6 {
-            for (slot, e) in materials.emissions where e.max() > 0 {
+            // In slot order: the shapes' order (and which fit the capacity) is the same in every launch.
+            for (slot, e) in materials.emissions.sorted(by: { $0.key < $1.key }) where e.max() > 0 {
                 switch materials.emitterLights[slot]?.spectrum ?? .inherit {
                 case .inherit: inheriting = true
                 case .preset(let k): weights[Int(Illuminant.resolved(k).rawValue)] = 1
@@ -9134,6 +9982,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         switch ProcessInfo.processInfo.environment["VIBE_LIGHT_TRANSPORT"] {
         case "rgb": return .rgb
         case "spectral": return .spectral
+        default: break
+        }
+#endif
+        return .automatic
+    }
+    nonisolated static var defaultCaustics: CausticMode {
+#if VIBE_TESTING
+        // Test builds can run the whole suite with caustic light tracing on or off.
+        switch ProcessInfo.processInfo.environment["VIBE_CAUSTICS"] {
+        case "off": return .off
+        case "light": return .lightTracing
+        case "photons": return .photons
         default: break
         }
 #endif
@@ -9296,8 +10156,43 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return resolved == .stochasticPairwise && sceneKernels.spmis == nil
             ? SpatialNeighborSelection.automatic.resolved(importedSceneGraph: imported) : resolved
     }
-    // The reuse modes the last frame resolved to (renderFrame).
-    struct ResolvedModes: Equatable { let indirect: IndirectReuse, temporal: TemporalReuse, spatial: SpatialNeighborSelection }
+    // MSL CausticParams (64 B): light paths per sample, one pixel's area on the image plane at distance one, the surface
+    // photons' radius squared, cell size and table mask, the volume photons' radius squared and cell size, and emission
+    // guiding's state and region grid.
+    struct CausticParams {
+        var paths: UInt32
+        var pixelArea: Float
+        var radius2: Float = 0
+        var cellSize: Float = 1
+        var tableMask = UInt32(PathTracerRenderer.causticTableSize - 1)
+        var volumeRadius2: Float = 0
+        var volumeCellSize: Float = 1
+        var guideEnabled: UInt32 = 0
+        var guideLoX: Float = 0, guideLoY: Float = 0, guideLoZ: Float = 0
+        var padding0: UInt32 = 0
+        var guideScaleX: Float = 0, guideScaleY: Float = 0, guideScaleZ: Float = 0
+        var padding1: UInt32 = 0
+    }
+    // (2 tan(fov / 2))^2 x aspect / pixels: the perspective camera's per-pixel importance normalization.
+    func causticPixelArea(width: Int, height: Int) -> Float {
+        let tangent = tan(fov * .pi / 360)
+        return 4 * tangent * tangent * (Float(width) / Float(height)) / Float(width * height)
+    }
+    // The photon radius squared of accumulated sample `i` (1-based): KNAUS2011 Eq. 16 for surface photons (d = 2),
+    // r_i^2 = r_1^2 (prod_{k=1}^{i-1} (k + alpha) / k) / i = r_1^2 Gamma(i + alpha) / (Gamma(1 + alpha) Gamma(i) i), and
+    // Eq. 20's r_i^3 / r_1^3 = the same ratio for volume photons (d = 3), with alpha = 2/3 and r_1 causticRadiusPixels
+    // pixel footprints at the orbit distance.
+    func causticRadius2(sample i: UInt32, height: Int, dimensions d: Double = 2) -> Float {
+        let alpha = 2.0 / 3.0, n = Double(max(1, i))
+        let footprint = 2 * Double(tan(fov * .pi / 360)) * Double(distance) / Double(height)
+        let r1 = Double(causticRadiusPixels) * footprint
+        let ratio = exp(lgamma(n + alpha) - lgamma(1 + alpha) - lgamma(n)) / n
+        return Float(r1 * r1 * pow(ratio, 2 / d))
+    }
+    // The reuse modes the last beauty frame resolved to (renderFrame).
+    struct ResolvedModes: Equatable {
+        let indirect: IndirectReuse, temporal: TemporalReuse, spatial: SpatialNeighborSelection, caustics: Bool, mediaPhotons: Bool
+    }
     private var lastResolvedModes: ResolvedModes?
     // Set when only the reservoirs were reallocated; the next frame skips temporal reuse.
     private(set) var reservoirHistoryNeedsReset = false
@@ -9331,7 +10226,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             let id = ObjectIdentifier(texture as AnyObject)
             return seen.insert(id).inserted ? total + UInt64(texture.allocatedSize) : total
         } + ([primarySurfaces, historyPrimarySurfaces, ptReservoirs, ptHistory, ptShifts, ptPairing, ptControls,
-              splatMask, splatLayers, splatSources, spmisCells, spmisSlots, spmisChoices] + (splatCurrent?.buffers ?? []) + (splatPrevious?.buffers ?? []))
+              splatMask, splatLayers, splatSources, spmisCells, spmisSlots, spmisChoices, causticSplat,
+              causticPhotons?.photons, causticPhotons?.next, causticPhotons?.heads, causticPhotons?.count, causticPhotons?.requests,
+              causticGuide?.weights, causticGuide?.cdf, causticSources]
+             + (splatCurrent?.buffers ?? []) + (splatPrevious?.buffers ?? []))
             .reduce(UInt64(0)) { $0 + UInt64($1?.allocatedSize ?? 0) }
     }
 
@@ -9425,13 +10323,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             throw NSError(domain: "PathTracer", code: 2, userInfo: [NSLocalizedDescriptionKey: "A required Metal shader is missing."])
         }
         self.materialFunction = fnTemporal
-        self.pickPipeline = shaders.mesh.pick
         let materials = try MaterialLibrary(device: device, function: fnTemporal)
         materials.lightTree = PathTracerRenderer.defaultLightSampling.resolved() == .tree
         self.materials = materials
         self.restirTemporalPipeline = shaders.mesh.temporal
-        self.shadingPipeline = shaders.mesh.shading
-        self.metalFXGuidePipeline = shaders.mesh.guides
         self.presentPipeline = shaders.present
         super.init()
         measuredMetalFXScalerBytesPerPixel = other.flatMap {
@@ -9445,7 +10340,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // failure has been reported once, decided synchronously.
     func prepareSpectralShaders() -> Bool {
         let cache = spectralShaders
-        if cache.kernels != nil && cache.grid != nil { return true }
+        if cache.kernels != nil && cache.grid != nil { refineSpectralGrid(); return true }
         if cache.failure != nil || cache.compiling { return false }
         if cache.grid == nil {
             do {
@@ -9497,6 +10392,41 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
         return false
     }
+    // The spectral mesh shading_kernel that records caustic photon requests in volume_path (MSL VIBE_MEDIA_PHOTONS), with
+    // safe math: requested the first time a spectral frame renders photons in a scene with media, compiled off the main
+    // thread (synchronously where spectral shaders are, in tests). Until it is ready such frames gather no photons in
+    // media (activeMediaPhotons) and keep light tracing.
+    nonisolated static func buildMediaPhotonShading(device: MTLDevice, source: String) throws -> MTLComputePipelineState {
+        let options = MTLCompileOptions()
+        options.mathMode = .safe
+        options.preprocessorMacros = ["VIBE_SPECTRAL": NSNumber(value: 1)]
+        let library = try device.makeLibrary(source: try loadSpectralTablesSource() + source, options: options)
+        return try pipeline(device, library, "shading_kernel")
+    }
+    func requestMediaPhotonKernel() {
+        let cache = spectralShaders
+        guard spectralFrame, activePhotons, hasMedia, !cache.mediaPhotonRequested else { return }
+        cache.mediaPhotonRequested = true
+        let device = self.device, source = metalSource
+        if !Self.compilesSpectralShadersInBackground {
+            do { cache.mediaPhotonShading = try Self.buildMediaPhotonShading(device: device, source: source) }
+            catch { onError?("Spectral photon shaders failed to compile: \(error.localizedDescription)") }
+            return
+        }
+        let progress = OperationProgress("Compiling spectral photon shaders")
+        cache.progress = cache.progress ?? progress
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try PathTracerRenderer.buildMediaPhotonShading(device: device, source: source) }
+            }.value
+            if cache.progress === progress { cache.progress = nil }
+            switch result {
+            case .success(let state): cache.mediaPhotonShading = state
+            case .failure(let error): self?.onError?("Spectral photon shaders failed to compile: \(error.localizedDescription)")
+            }
+            self?.onKernelsReady?()
+        }
+    }
     // Starts compiling, off the main thread, the optional kernel groups (KernelGroup) that the current
     // modes or `extra` need. Until a group is ready its modes resolve to the core fallbacks; renderFrame
     // restarts accumulation once the resolved modes change. Each group is attempted once per device.
@@ -9510,6 +10440,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         if spatialNeighbors.resolved(importedSceneGraph: imported && materials.hasSceneGraph) == .stochasticPairwise {
             wanted.insert(.spmis)
         }
+        if imported && caustics.resolved() != .off { wanted.insert(.caustics) }
         let missing = wanted.subtracting(cache.attempted)
         guard !missing.isEmpty else { return }
         cache.attempted.formUnion(missing)
@@ -9863,9 +10794,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // Background-compiled kernel groups (requestKernels) change the resolved modes; accumulation
         // restarts then, so every accumulated sample uses the same reuse.
         requestKernels()
-        let modes = ResolvedModes(indirect: activeIndirectReuse, temporal: activeTemporalReuse, spatial: activeSpatialNeighbors)
-        if let previous = lastResolvedModes, previous != modes, frameIndex > 0 { resetAccumulation() }
-        lastResolvedModes = modes
+        requestMediaPhotonKernel()
+        let modes = ResolvedModes(indirect: activeIndirectReuse, temporal: activeTemporalReuse, spatial: activeSpatialNeighbors,
+                                  caustics: activeCaustics, mediaPhotons: activeMediaPhotons)
+        // Inspection views add no beauty samples and trace no caustics, so they keep the accumulation; the modes
+        // are compared with the last beauty frame's once beauty resumes.
+        if viewportMode == 0 {
+            if let previous = lastResolvedModes, previous != modes, frameIndex > 0 { resetAccumulation() }
+            lastResolvedModes = modes
+        }
 
         let samplingMode = activeSamplingMode
         let needsReSTIR = samplingMode == 0 && viewportMode == 0
@@ -10088,6 +11025,61 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let splatState = splatCurrent.flatMap { current in splatPrevious.map { (current, $0) } }
         let splatFrame = splatState != nil && needsReSTIR && nextFrame <= 1 && nextHistory > 1
             && !reservoirHistoryNeedsReset && options.aperture <= 0 && sceneKernels.splat != nil
+        // Caustic light tracing: this sample's splats, cleared and traced before the shading pass reads them.
+        let causticKernels = activeCaustics ? sceneKernels.caustics : nil
+        let causticKernel = causticKernels?.trace
+        if causticKernel != nil && causticSplat?.length != w * h * 12 {
+            causticSplat = device.makeBuffer(length: w * h * 12, options: .storageModePrivate)
+        } else if causticKernel == nil {
+            causticSplat = nil
+        }
+        let causticFrame = causticKernel != nil && causticSplat != nil
+        // Photons: one per light path at most, so the photon buffers hold `causticPaths`.
+        if causticFrame && activePhotons {
+            if causticPhotons?.next.length != causticPaths * 4 || causticPhotons?.requests.length != w * h * 80 {
+                // Buffers of another size are released first: a failed allocation leaves no photon frame.
+                causticPhotons = nil
+                if let photons = device.makeBuffer(length: causticPaths * 40, options: .storageModePrivate),
+                   let next = device.makeBuffer(length: causticPaths * 4, options: .storageModePrivate),
+                   let heads = device.makeBuffer(length: Self.causticTableSize * 4, options: .storageModePrivate),
+                   let count = device.makeBuffer(length: 16, options: .storageModePrivate),
+                   let requests = device.makeBuffer(length: w * h * 80, options: .storageModePrivate) {
+                    causticPhotons = (photons, next, heads, count, requests)
+                }
+            }
+        } else {
+            causticPhotons = nil
+        }
+        let photonFrame = causticFrame && causticPhotons != nil
+        var causticParams = CausticParams(paths: UInt32(causticPaths), pixelArea: causticPixelArea(width: w, height: h))
+        if !causticFrame {
+            causticSources = nil
+        } else if causticSources == nil {
+            causticSources = device.makeBuffer(length: 16, options: .storageModePrivate)
+        }
+        if !(causticFrame && caustics.resolved().guided) {
+            causticGuide = nil
+        } else if causticGuide == nil,
+           let weights = device.makeBuffer(length: Self.causticGuideRegions * Self.causticGuideCells * 4, options: .storageModePrivate),
+           let cdf = device.makeBuffer(length: Self.causticGuideRegions * (Self.causticGuideCells + 1) * 4, options: .storageModePrivate) {
+            causticGuide = (weights, cdf)
+        }
+        // The guide learns from the samples since accumulation restarted; the first traces cosine emission only.
+        let guiding = causticFrame && causticGuide != nil && caustics.resolved().guided
+        let guideFrame = guiding && nextFrame > 1
+        if causticFrame, let bounds = materials.causticEmitterBounds {
+            let extent = simd_max(bounds.hi - bounds.lo, SIMD3(repeating: 1e-4))
+            let scale = SIMD3(repeating: Self.causticGuideSplit) / extent
+            causticParams.guideEnabled = guideFrame ? 2 : guiding ? 1 : 0
+            causticParams.guideLoX = bounds.lo.x; causticParams.guideLoY = bounds.lo.y; causticParams.guideLoZ = bounds.lo.z
+            causticParams.guideScaleX = scale.x; causticParams.guideScaleY = scale.y; causticParams.guideScaleZ = scale.z
+        }
+        if photonFrame {
+            causticParams.radius2 = causticRadius2(sample: nextFrame, height: h)
+            causticParams.cellSize = 2 * causticParams.radius2.squareRoot()
+            causticParams.volumeRadius2 = causticRadius2(sample: nextFrame, height: h, dimensions: 3)
+            causticParams.volumeCellSize = 2 * causticParams.volumeRadius2.squareRoot()
+        }
 
         let camX = target.x + distance * cos(pitch) * sin(yaw)
         let camY = target.y + distance * sin(pitch)
@@ -10114,7 +11106,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             prevViewProj: prevViewProj,
             frameIndex: nextFrame,
             sceneIndex: sceneIndex,
-            samplingMode: samplingMode,
+            samplingMode: activeSamplingMode,
             enableSMS: enableSMS,
             skyMode: skyMode,
             enableFog: enableFog,
@@ -10123,7 +11115,8 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             height: UInt32(h),
             indirectReuse: indirectReuse.rawValue | (ptDecorrelation ? 4 : 0) | (ptTemporalWhileAccumulating ? 8 : 0)
                 | (splatFrame ? 16 : 0) | (usesPT && activeControlVariates == .restcv ? 32 : 0)
-                | (activeSampler == .zSampling ? 64 | (zTemporal.rawValue << 7) : 0),
+                | (activeSampler == .zSampling ? 64 | (zTemporal.rawValue << 7) : 0)
+                | (causticFrame ? 512 : 0) | (photonFrame ? 1024 : 0),
             jitter: frameJitter(nextSample), sampleIndex: nextSample,
             reservoirHistoryReset: reservoirHistoryNeedsReset ? 1 : 0, reservoirHistory: nextHistory,
             spatialNeighbors: activeSpatialNeighbors.rawValue,
@@ -10132,7 +11125,6 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             light: SIMD4(options.lightColor*options.lightIntensity,options.lightSize),
             mediumScatter: mediumUniforms.scatter, pathOptions: mediumUniforms.options
         )
-        uniforms.sceneGraphMode = materials.hasSceneGraph
         lastUniforms=uniforms
 
         // Spectral transport: the scene's wavelength sampling (rebuilt when its illuminants change) and
@@ -10166,7 +11158,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
             blit.endEncoding()
         }
-        // Buffers 9-23 of the splat kernels (MSL "Multi-layer reservoir splatting").
+        // Buffers 9-23, 25 and 26 of the splat kernels (MSL "Multi-layer reservoir splatting").
         func bindSplatBuffers(_ encoder: MTLComputeCommandEncoder) {
             guard let (current, previous) = splatState else { return }
             let buffers: [(Int, MTLBuffer?)] = [
@@ -10356,11 +11348,61 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         // ReSTIR GI: the reuse cells of the DI and GI reservoirs.
         if !usesPT && needsReSTIR { guard encodeSPMISCells(ptReservoirs: nil) else { return nil } }
 
+        // Caustic light tracing (docs/CAUSTICS_DESIGN.md §4): clear the splats, then trace this sample's light paths.
+        if causticFrame, let kernel = causticKernel, let splat = causticSplat, let emitters = materials.causticEmitterBuffer {
+            guard let blit = cmdBuffer.makeBlitCommandEncoder() else { return nil }
+            blit.label = "Caustics: clear"
+            blit.fill(buffer: splat, range: 0..<splat.length, value: 0)
+            if photonFrame, let photons = causticPhotons {
+                blit.fill(buffer: photons.heads, range: 0..<photons.heads.length, value: 0xff)
+                blit.fill(buffer: photons.count, range: 0..<photons.count.length, value: 0)
+            }
+            if nextFrame <= 1, let sources = causticSources { blit.fill(buffer: sources, range: 0..<sources.length, value: 0) }
+            if guiding && !guideFrame, let guide = causticGuide {
+                blit.fill(buffer: guide.weights, range: 0..<guide.weights.length, value: 0)
+            }
+            blit.endEncoding()
+            if guideFrame, let guide = causticGuide, let build = causticKernels?.guide {
+                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+                encoder.label = "Caustics: emission guide"
+                encoder.setComputePipelineState(build)
+                encoder.setBuffer(guide.weights, offset: 0, index: 0)
+                encoder.setBuffer(guide.cdf, offset: 0, index: 1)
+                encoder.dispatchThreadgroups(MTLSize(width: Self.causticGuideRegions, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                encoder.endEncoding()
+            }
+            guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+            encoder.label = "Caustics: light tracing"
+            encoder.setComputePipelineState(kernel)
+            guard materials.bind(encoder) else {
+                encoder.endEncoding()
+                onError?("Could not update material bindings.")
+                return nil
+            }
+            encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+            encoder.setBytes(&causticParams, length: MemoryLayout<CausticParams>.stride, index: 3)
+            encoder.setBuffer(emitters, offset: 0, index: 4)
+            encoder.setBuffer(splat, offset: 0, index: 5)
+            encoder.setBuffer(causticPhotons?.photons ?? placeholder, offset: 0, index: 6)
+            encoder.setBuffer(causticPhotons?.next ?? placeholder, offset: 0, index: 7)
+            encoder.setBuffer(causticPhotons?.heads ?? placeholder, offset: 0, index: 8)
+            encoder.setBuffer(causticPhotons?.count ?? placeholder, offset: 0, index: 9)
+            encoder.setBuffer(causticGuide?.weights ?? placeholder, offset: 0, index: 10)
+            encoder.setBuffer(causticGuide?.cdf ?? placeholder, offset: 0, index: 11)
+            encoder.setBuffer(causticSources ?? placeholder, offset: 0, index: 12)
+            bindSpectral(encoder)
+            encoder.dispatchThreads(MTLSize(width: causticPaths, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
         // PASS 2: Spatial Resampling & Full Path Tracing
         guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return nil }
         do {
             enc2.label = "Pass 2: Spatial Resampling & Shading"
-            enc2.setComputePipelineState(sceneKernels.shading)
+            enc2.setComputePipelineState(spectralFrame && activeMediaPhotons
+                ? spectralShaders.mediaPhotonShading ?? sceneKernels.shading : sceneKernels.shading)
             enc2.setTexture(gPos, index: 0)
             enc2.setTexture(gNorm, index: 1)
             enc2.setTexture(gAlb, index: 2)
@@ -10386,9 +11428,35 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             enc2.setBuffer(spmis?.0 ?? placeholder, offset: 0, index: 4)
             enc2.setBuffer(spmis?.1 ?? placeholder, offset: 0, index: 5)
             enc2.setBuffer(spmis?.2 ?? placeholder, offset: 0, index: 6)
+            enc2.setBuffer(causticFrame ? causticSplat : placeholder, offset: 0, index: 7)
+            enc2.setBuffer(photonFrame ? causticPhotons?.requests : placeholder, offset: 0, index: 8)
             bindSpectral(enc2)
             enc2.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
             enc2.endEncoding()
+        }
+
+        // Caustic photons (docs/CAUSTICS_DESIGN.md §6): gather at the receivers the shading pass recorded.
+        if photonFrame, let gather = causticKernels?.gather, let photons = causticPhotons {
+            guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+            encoder.label = "Caustics: photon gather"
+            encoder.setComputePipelineState(gather)
+            guard materials.bind(encoder) else {
+                encoder.endEncoding()
+                onError?("Could not update material bindings.")
+                return nil
+            }
+            encoder.setTexture(accum, index: 0)
+            encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
+            encoder.setBytes(&causticParams, length: MemoryLayout<CausticParams>.stride, index: 3)
+            encoder.setBuffer(photons.photons, offset: 0, index: 4)
+            encoder.setBuffer(photons.next, offset: 0, index: 5)
+            encoder.setBuffer(photons.heads, offset: 0, index: 6)
+            encoder.setBuffer(photons.requests, offset: 0, index: 7)
+            encoder.setBuffer(causticGuide?.weights ?? placeholder, offset: 0, index: 8)
+            encoder.setBuffer(causticSources ?? placeholder, offset: 0, index: 9)
+            bindSpectral(encoder)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerGroup)
+            encoder.endEncoding()
         }
 
         if present {
