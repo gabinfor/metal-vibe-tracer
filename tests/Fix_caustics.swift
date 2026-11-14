@@ -165,7 +165,7 @@
         let error = (pow(standardError(traced, pixels), 2) + pow(standardError(reference, pixels), 2)).squareRoot()
         return (a / b, abs(a - b) / max(error, 1e-12))
       }
-      savePreview([reference, traced], width: w, height: hgt, name: "caustics-\(name.replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: ",", with: ""))-\(transport == .rgb ? "rgb" : "spectral")")
+      savePreview([reference, traced], width: w, height: hgt, name: "caustics-\(name.replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: ",", with: ""))-\(transport == .rgb ? "rgb" : "spectral").png")
       // The immersed floor is seen only through the glass; in haze, volume photons light every pixel.
       if !name.hasPrefix("immersed") && medium == nil {
         let whole = agreement(floorPixels), caustic = agreement(middle)
