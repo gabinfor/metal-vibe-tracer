@@ -171,30 +171,31 @@ extension StudioController {
     }
     switch light.spectrum {
     case .blackbody(let t):
-      number("Temperature, K", t, 1000...12000, 2700, entry: EmitterLight.temperatureRange, step: 50) { v in
+      number("Temperature, K", t, 1000...12000, 2700, entry: EmitterLight.temperatureRange, step: 50, live: false) { v in
         update { $0.spectrum = .blackbody(kelvin: v) }
       }
     case .narrowband(let c, let w):
-      number("Centre, nm", c, 380...780, 532, entry: EmitterLight.wavelengthRange, step: 1) { v in
-        update { $0.spectrum = .narrowband(center: v, fwhm: w) }
+      // Each row changes its own value of the light's current band, which the other row may have edited since.
+      number("Centre, nm", c, 380...780, 532, entry: EmitterLight.wavelengthRange, step: 1, live: false) { v in
+        update { if case .narrowband(_, let width) = $0.spectrum { $0.spectrum = .narrowband(center: v, fwhm: width) } }
       }
       number(
-        "Band width, nm", w, 1...50, 2, entry: EmitterLight.fwhmRange, step: 0.5,
+        "Band width, nm", w, 1...50, 2, entry: EmitterLight.fwhmRange, step: 0.5, live: false,
         help: "Full width at half maximum of the band."
       ) { v in
-        update { $0.spectrum = .narrowband(center: c, fwhm: v) }
+        update { if case .narrowband(let centre, _) = $0.spectrum { $0.spectrum = .narrowband(center: centre, fwhm: v) } }
       }
     default: break
     }
     section("Spot cone")
     let cone = "Measured from the light's facing direction (UsdLux ShapingAPI); a few degrees make a beam. 90° turns the cone off."
-    number("Cone angle, °", light.coneAngle ?? 90, 0.5...90, 90, step: 1, help: cone) { v in
+    number("Cone angle, °", light.coneAngle ?? 90, 0.5...90, 90, step: 1, live: false, help: cone) { v in
       update { $0.coneAngle = v >= 90 ? nil : v }
     }
-    number("Cone softness", light.coneSoftness, 0...1, 0, step: 0.01, help: "Softens the cone's edge.") { v in
+    number("Cone softness", light.coneSoftness, 0...1, 0, step: 0.01, live: false, help: "Softens the cone's edge.") { v in
       update { $0.coneSoftness = v }
     }
-    number("Focus", light.focus, 0...50, 0, help: "Concentrates the emission towards the light's axis.") { v in
+    number("Focus", light.focus, 0...50, 0, live: false, help: "Concentrates the emission towards the light's axis.") { v in
       update { $0.focus = v }
     }
   }

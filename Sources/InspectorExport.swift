@@ -30,7 +30,7 @@ extension StudioController {
     set { preferences.set(newValue, forKey: Self.exportRevealKey) }
   }
   func setOutputSize(width: Int, height: Int) {
-    guard acceptsEdits else { return }
+    guard acceptsEdits, renderer.options.outputWidth != width || renderer.options.outputHeight != height else { return }
     checkpoint("Output size")
     renderer.options.outputWidth = width
     renderer.options.outputHeight = height
@@ -40,7 +40,7 @@ extension StudioController {
   func filePanel() {
     let o = renderer.options
     section("Size")
-    popupRow(
+    let preset = popupRow(
       "Preset", Self.exportSizeTitles, Self.exportSizeIndex(width: o.outputWidth, height: o.outputHeight),
       help: "Match Viewport takes the viewport's size in pixels."
     ) { [weak self] i in
@@ -55,11 +55,18 @@ extension StudioController {
       self.rebuild()
     }
     // The output size commits once on release (live: false): one undo step and autosave per drag.
-    number("Width", Float(o.outputWidth), 16...8192, 1920, reset: false, integral: true, live: false) {
-      [weak self] in self?.renderer.options.outputWidth = Int($0)
+    // The preset popup follows a typed or dragged size.
+    let follow = { [weak self, weak preset] in
+      guard let self else { return }
+      preset?.selectItem(at: Self.exportSizeIndex(width: self.renderer.options.outputWidth, height: self.renderer.options.outputHeight))
     }
-    number("Height", Float(o.outputHeight), 16...8192, 1080, reset: false, integral: true, live: false) {
-      [weak self] in self?.renderer.options.outputHeight = Int($0)
+    number("Width", Float(o.outputWidth), 16...8192, 1920, reset: false, integral: true, live: false) { [weak self] in
+      self?.renderer.options.outputWidth = Int($0)
+      follow()
+    }
+    number("Height", Float(o.outputHeight), 16...8192, 1080, reset: false, integral: true, live: false) { [weak self] in
+      self?.renderer.options.outputHeight = Int($0)
+      follow()
     }
     section("Quality")
     number(

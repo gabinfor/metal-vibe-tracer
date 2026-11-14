@@ -76,6 +76,8 @@ final class StudioController: NSViewController {
     exportRenderer != nil || previewDenoiseJob != nil || importInProgress || projectOperationInProgress
   }
   var pauseButton: NSButton?
+  // The Render tab's Reset Render Settings button, enabled while a setting differs from its default (changed()).
+  weak var renderResetButton: ActionButton?
   private var busyButtons: [NSButton] = []
   private var projectActivity = ""
   let autosaveQueue = DispatchQueue(label: "VibeTracer.autosave", qos: .utility)
@@ -607,6 +609,7 @@ final class StudioController: NSViewController {
     documentRevision &+= 1
     documentEdited = true
     if reset { renderer.resetAccumulation() }
+    renderResetButton?.isEnabled = !renderSettingsAreDefault
     scheduleAutosave(after: autosaveDelay)
   }
   private func scheduleAutosave(after delay: TimeInterval = 1) {

@@ -142,6 +142,15 @@
   }
   require(abs(testRenderer.eyePosition.x - 1) < 1e-4 && abs(testRenderer.eyePosition.z + 3) < 1e-4
     && history.undoActionName == "Position", "a position field sets that coordinate with one undo step")
+  // The value first shown is as good as any other: typing it back moves the camera back.
+  grouped {
+    let x = vector("Position")!.components[0]
+    x.field.stringValue = "0"
+    x.typed()
+  }
+  require(abs(testRenderer.eyePosition.x) < 1e-4, "typing the first-shown coordinate back applies it")
+  require(vector("Position")!.resetButton.isHidden, "the position row has no reset button: Reset View restores it")
+  history.undo()
   history.undo()
   require(near(testRenderer.eyePosition, SIMD3(0, 0, -3)), "undo restores the position")
   history.removeAllActions()

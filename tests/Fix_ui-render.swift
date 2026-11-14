@@ -260,6 +260,13 @@
     == (testRenderer.activeSamplingMode != testRenderer.samplingMode), "a forced Standard MIS is explained only when it applies")
   print("PASS: fix-ui-render imported scene")
 
+  // The button follows an edit that does not rebuild the tab.
+  try reset(cornell)
+  grouped { number("Path depth")!.set(8) }
+  require(button("Reset Render Settings")?.isEnabled == true, "a number edit enables Reset Render Settings at once")
+  grouped { number("Path depth")!.set(16) }
+  require(button("Reset Render Settings")?.isEnabled == false, "back at the default it is disabled again")
+
   // Reset Render Settings: every setting back to its default in one undo step.
   try reset(cornell)
   testRenderer.options.previewScale = 0.25

@@ -157,6 +157,13 @@
   let width = views(NumberControl.self, in: controller.stack).first { $0.field.accessibilityLabel() == "Width" }
   require(width?.live == false && width?.integral == true && width?.minimum == 16 && width?.maximum == 8192,
     "Width: whole numbers 16–8192, committed on release")
+  let height = views(NumberControl.self, in: controller.stack).first { $0.field.accessibilityLabel() == "Height" }
+  grouped { width!.set(1280) }
+  grouped { height!.set(720) }
+  require(popup("Preset")?.indexOfSelectedItem == 1, "the preset popup follows a typed size")
+  controller.history.removeAllActions()
+  grouped { pick("Preset", 1) }
+  require(controller.history.undoActionName != "Output size", "choosing the current preset records no undo step")
   pick("Export source", 1)
   require(!controller.exportDenoise && controller.exportRaw, "Source Raw")
   pick("Export source", 2)

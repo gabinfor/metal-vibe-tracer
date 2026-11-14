@@ -388,7 +388,8 @@ final class NumberControl: NSStackView, NSTextFieldDelegate {
     let factor: Float = modifiers.contains(.shift) ? 10 : modifiers.contains(.option) ? 0.1 : 1
     var delta = stepAt(value) * factor
     if integral { delta = max(1, delta.rounded()) }
-    set(Self.snap(value + direction * delta, to: min(delta, stepAt(value))))
+    // One step from the value itself, so a value between two steps moves equally far up and down.
+    set(Self.snap(value + direction * delta, to: min(delta, stepAt(value)) / 100))
   }
   func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
     guard let event = NSApp.currentEvent, event.type == .keyDown, event.keyCode == 125 || event.keyCode == 126,
@@ -402,6 +403,8 @@ final class NumberControl: NSStackView, NSTextFieldDelegate {
   // The slider's action. Outside a drag (keyboard) it is one discrete change; during a drag a live control publishes
   // each new snapped value and a non-live one only shows it.
   @objc func slid() {
+    // A click on the knob that does not move it leaves a value between two steps as it is.
+    guard abs(slider.doubleValue - position(of: value)) > (slider.maxValue - slider.minValue) * 1e-6 else { return }
     let v = value(atPosition: slider.doubleValue, snapping: !NSEvent.modifierFlags.contains(.option))
     guard isDragging else {
       set(v)

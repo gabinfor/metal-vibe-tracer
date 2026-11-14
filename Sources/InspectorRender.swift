@@ -192,10 +192,12 @@ extension StudioController {
     }
 
     if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(18, after: last) }
-    button(
+    let reset = button(
       "Reset Render Settings", style: .destructive,
       help: "Restores every setting on this tab to its default, as one undo step."
-    ) { [weak self] in self?.resetRenderSettings() }.isEnabled = !renderSettingsAreDefault
+    ) { [weak self] in self?.resetRenderSettings() }
+    reset.isEnabled = !renderSettingsAreDefault
+    renderResetButton = reset
   }
 
   // The four ReSTIR reuse popups (ReSTIR Direct + Indirect only), after a note while their shaders compile.

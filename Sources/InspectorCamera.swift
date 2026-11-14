@@ -30,7 +30,10 @@ extension StudioController {
   func cameraPanel() {
     hint("Drag to orbit, Shift-drag to pan, scroll to zoom, click to select.")
     section("Lens")
-    number("Field of view, °", renderer.fov, 5...150, renderer.defaultFieldOfView, step: 1, help: "Vertical field of view.") {
+    // The reset goes to the default view's field of view: the imported camera's, else the scene's.
+    let defaultFOV = (renderer.sceneIndex == 6 ? importedViewName.flatMap { project.views[$0]?.fov } : nil)
+      ?? renderer.defaultFieldOfView
+    number("Field of view, °", renderer.fov, 5...150, defaultFOV, step: 1, help: "Vertical field of view.") {
       [weak self] in self?.renderer.fov = $0
     }
     option(
@@ -50,7 +53,8 @@ extension StudioController {
 
     section("Position")
     // Fields show the coordinates on a grid fine enough for the view's scale (0.01 at a few units away); a field
-    // edit replaces only the coordinates that changed, so the others keep their full precision.
+    // edit replaces only the coordinates that differ from the ones last shown, so the others keep their full
+    // precision.
     let step = Float(pow(10, floor(log10(Double(max(renderer.distance, 1e-4)) / 50))))
     let reach: ClosedRange<Float> = -1_000_000...1_000_000
     func grid(_ v: SIMD3<Float>) -> SIMD3<Float> {
@@ -61,20 +65,26 @@ extension StudioController {
       for i in 0..<3 where typed[i] != shown[i] { p[i] = typed[i] }
       return p
     }
-    let eye = grid(renderer.eyePosition), target = grid(renderer.target)
+    final class Shown {
+      var value: SIMD3<Float>
+      init(_ value: SIMD3<Float>) { self.value = value }
+    }
+    let eye = Shown(grid(renderer.eyePosition)), target = Shown(grid(renderer.target))
     vector(
-      "Position", eye, -100...100, eye, entry: reach, step: step,
+      "Position", eye.value, -100...100, eye.value, entry: reach, step: step,
       help: "Camera position. Moving it keeps the target, so the camera turns to keep looking at it."
     ) { [weak self] v in
       guard let self else { return }
-      self.renderer.setEye(merge(v, shown: eye, into: self.renderer.eyePosition))
+      self.renderer.setEye(merge(v, shown: eye.value, into: self.renderer.eyePosition))
+      eye.value = v
     }.hidesReset = true
     vector(
-      "Target", target, -100...100, target, entry: reach, step: step,
+      "Target", target.value, -100...100, target.value, entry: reach, step: step,
       help: "The point the camera looks at and orbits around. Moving it keeps the camera's direction and distance."
     ) { [weak self] v in
       guard let self else { return }
-      self.renderer.target = merge(v, shown: target, into: self.renderer.target)
+      self.renderer.target = merge(v, shown: target.value, into: self.renderer.target)
+      target.value = v
     }.hidesReset = true
     button(
       "Reset View",
