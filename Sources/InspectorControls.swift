@@ -8,7 +8,7 @@ import Cocoa
 //
 //   section("Quality")                                          section heading (14 pt semibold) with space above
 //   collapsible("Advanced", key: "render.advanced") { … }       disclosure + heading; the body is built only while open
-//   popupRow("Tone map", ["Filmic fit", "Linear"], i) { i in … } label + popup
+//   popupRow("Tone map", ["Filmic fit", "Linear"], i) { i in … } label + popup (under the label when an item is too long)
 //   toggle("MetalFX preview", isOn) { on in … }                 label + small NSSwitch
 //   number("Exposure, EV", v, -16...16, 0, step: 0.1) { v in … } label, field, reset; slider beneath
 //   option("Sun intensity", \.sunIntensity, 0...10000, 850)    number row bound to a StudioOptions key path
@@ -39,6 +39,7 @@ enum InspectorButtonStyle { case normal, primary, destructive }
 
 final class ActionButton: NSButton {
   var actionBlock: (() -> Void)?
+  private var destructive = false
   convenience init(_ title: String, style: InspectorButtonStyle = .normal, _ action: @escaping () -> Void) {
     self.init(frame: .zero)
     self.title = title
@@ -49,8 +50,21 @@ final class ActionButton: NSButton {
     switch style {
     case .normal: break
     case .primary: bezelColor = .controlAccentColor
-    case .destructive: contentTintColor = .systemRed
+    case .destructive:
+      destructive = true
+      tintTitle()
     }
+  }
+  // A destructive button's title is red while it is enabled; a push button's bezel ignores contentTintColor.
+  override var isEnabled: Bool { didSet { tintTitle() } }
+  private func tintTitle() {
+    guard destructive else { return }
+    let style = NSMutableParagraphStyle()
+    style.alignment = .center
+    attributedTitle = NSAttributedString(string: title, attributes: [
+      .foregroundColor: isEnabled ? NSColor.systemRed : NSColor.disabledControlTextColor,
+      .font: font ?? .systemFont(ofSize: NSFont.systemFontSize), .paragraphStyle: style,
+    ])
   }
   @objc func invoke() { actionBlock?() }
 }
@@ -624,11 +638,25 @@ extension StudioController {
     popup.isEnabled = enabled
     let label = inspectorLabel(title, help: help)
     if !enabled { label.textColor = .disabledControlTextColor }
+    // A popup whose longest item would be cut off in the control column goes under its label, across the row.
+    let font = popup.font ?? .systemFont(ofSize: NSFont.systemFontSize)
+    let widest = titles.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+    if widest + Self.popupChrome > (inspectorWidth - 24) * Self.popupColumn {
+      let row = NSStackView(views: [label, popup])
+      row.orientation = .vertical
+      row.alignment = .leading
+      row.spacing = 4
+      add(row)
+      popup.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -(inspectorGutter + 6)).isActive = true
+      return popup
+    }
     let row = inspectorRow(label, popup)
     add(row)
-    popup.widthAnchor.constraint(equalTo: row.widthAnchor, multiplier: 0.58).isActive = true
+    popup.widthAnchor.constraint(equalTo: row.widthAnchor, multiplier: Self.popupColumn).isActive = true
     return popup
   }
+  // The share of a row an inline popup takes, and the width of a popup's bezel and arrows around its title.
+  static let popupColumn: CGFloat = 0.58, popupChrome: CGFloat = 44
   // An on/off setting. The row records an undo step named `title` and calls `changed(reset:)` after `action`.
   @discardableResult func toggle(
     _ title: String, _ isOn: Bool, reset: Bool = true, help: String? = nil, enabled: Bool = true,
