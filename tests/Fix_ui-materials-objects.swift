@@ -126,7 +126,7 @@
     "each map has Load… and Clear (disabled while empty)")
   let resetMaterial = button("Reset Material")!
   let file = views(ActionButton.self, in: controller.stack).filter { ["Save Preset…", "Load Preset…", "Import MaterialX…", "Reset Material"].contains($0.title) }
-  require(file.last === resetMaterial && resetMaterial.contentTintColor == .systemRed, "Reset Material is the destructive last item")
+  require(file.last === resetMaterial && resetMaterial.style == .destructive, "Reset Material is the destructive last item")
   let image = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4, bitsPerSample: 8, samplesPerPixel: 4,
     hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
   let png = folder.appendingPathComponent("rough.png")
@@ -172,7 +172,7 @@
     "imported Objects sections and Parent popup: \(sections())")
   let actions = views(ActionButton.self, in: controller.stack).map(\.title)
   require(actions.suffix(5) == ["Frame Selection", "Frame All", "Create Instance", "Add Model…", "Delete"]
-    && button("Delete")!.contentTintColor == .systemRed && !(button("Delete")!.toolTip ?? "").isEmpty,
+    && button("Delete")!.style == .destructive && !(button("Delete")!.toolTip ?? "").isEmpty,
     "Actions: framing, instancing, Add Model… and Delete last: \(actions)")
   func node() -> SceneNode { controller.project.graph!.nodes.first { $0.id == a }! }
   visible()!.state = .off
@@ -237,7 +237,7 @@
   let parameter = edited.parameters.first { $0.name.hasSuffix("base_color") }!
   require(abs(edited.instructions[parameter.instruction].value.y - 0.5) < 1e-6
     && history.undoActionName == "MaterialX parameter", "editing the vector row recompiles the program")
-  require(button("Remove MaterialX Graph")?.contentTintColor == .systemRed, "MaterialX materials end with Remove MaterialX Graph")
+  require(button("Remove MaterialX Graph")?.style == .destructive, "MaterialX materials end with Remove MaterialX Graph")
   print("PASS: fix-ui-materials-objects MaterialX parameter names and vector rows")
 
   // Imported light: Radiance vector row, Spectrum, blackbody fields, Spot cone.

@@ -39,7 +39,7 @@ enum InspectorButtonStyle { case normal, primary, destructive }
 
 final class ActionButton: NSButton {
   var actionBlock: (() -> Void)?
-  private var destructive = false
+  private(set) var style = InspectorButtonStyle.normal
   convenience init(_ title: String, style: InspectorButtonStyle = .normal, _ action: @escaping () -> Void) {
     self.init(frame: .zero)
     self.title = title
@@ -47,18 +47,17 @@ final class ActionButton: NSButton {
     target = self
     self.action = #selector(invoke)
     actionBlock = action
+    self.style = style
     switch style {
     case .normal: break
     case .primary: bezelColor = .controlAccentColor
-    case .destructive:
-      destructive = true
-      tintTitle()
+    case .destructive: tintTitle()
     }
   }
   // A destructive button's title is red while it is enabled; a push button's bezel ignores contentTintColor.
   override var isEnabled: Bool { didSet { tintTitle() } }
   private func tintTitle() {
-    guard destructive else { return }
+    guard style == .destructive else { return }
     let style = NSMutableParagraphStyle()
     style.alignment = .center
     attributedTitle = NSAttributedString(string: title, attributes: [
