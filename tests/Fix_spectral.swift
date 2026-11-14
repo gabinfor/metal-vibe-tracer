@@ -629,8 +629,8 @@
   }
   controller.page = 2
   controller.rebuild()
-  require(popup("Light spectrum").itemTitles == StudioController.illuminantTitles && popup("Sun spectrum").itemTitles.count == 7,
-    "the Lighting panel offers the light and sun spectra")
+  require(popup("Light spectrum").itemTitles == StudioController.illuminantTitles,
+    "the Lighting panel offers the light spectrum on the Cornell Box")
   history.removeAllActions()
   testRenderer.lightTransport = .automatic
   pick("Light spectrum", 5)
@@ -638,8 +638,13 @@
     && history.undoActionName == "Light spectrum", "a sodium light spectrum keeps Automatic spectral, with one undo step")
   history.undo()
   require(testRenderer.options.lightSpectrum == nil, "undo restores the RGB colour")
+  // The sun spectrum is on sky scenes (the Pavilion).
+  testRenderer.sceneIndex = 0
+  controller.rebuild()
+  require(popup("Sun spectrum").itemTitles.count == 7, "the Lighting panel offers the sun spectrum on the Pavilion")
   pick("Sun spectrum", 3)
   require(testRenderer.options.sunSpectrum == Illuminant.a.rawValue, "the sun spectrum popup sets the sun's preset")
+  testRenderer.sceneIndex = 1
   // Exports copy the light transport.
   controller.page = 0
   controller.rebuild()

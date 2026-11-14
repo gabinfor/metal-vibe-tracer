@@ -142,8 +142,12 @@
     && abs(testRenderer.distance / distance - expected) < 1e-3, "line scroll deltas are scaled for notched wheels")
   print("PASS: fix-frontend drag threshold, click picking and scroll zoom (R-42, R-85, R-88)")
 
-  // R-86: a colour-panel burst records one undo step.
+  // R-86: a colour-panel burst records one undo step (the Cornell Box has the Light color row).
   try reset()
+  var cornell = ProjectDocument()
+  cornell.scene = 1
+  try controller.restore(cornell)
+  history.removeAllActions()
   show(page: 2)
   let well = views(ActionColor.self, in: controller.stack).first { $0.accessibilityLabel() == "Light color" }!
   for (i, red) in [0.2, 0.4, 0.6].enumerated() {
@@ -311,7 +315,7 @@
   // A live slider drag is one undo step, and a rebuild during the drag waits for its end.
   try reset()
   show(page: 1)
-  let fov = control("Field of view, degrees")!
+  let fov = control("Field of view, °")!
   let fovBefore = testRenderer.fov
   // Each change arrives in its own run-loop pass, as mouse events do: any undo step it registered would be its own group.
   history.groupsByEvent = true
@@ -322,7 +326,7 @@
     RunLoop.main.run(until: Date().addingTimeInterval(0.02))
     if v == 60 {
       controller.rebuild()
-      require(fov.superview != nil && control("Field of view, degrees") === fov,
+      require(fov.superview != nil && control("Field of view, °") === fov,
         "a rebuild during a drag keeps the dragged slider")
     }
   }
@@ -330,7 +334,7 @@
   fov.endDrag()
   RunLoop.main.run(until: Date().addingTimeInterval(0.02))
   history.groupsByEvent = false
-  require(fov.superview == nil && control("Field of view, degrees") != nil, "the deferred rebuild runs when the drag ends")
+  require(fov.superview == nil && control("Field of view, °") != nil, "the deferred rebuild runs when the drag ends")
   history.undo()
   require(testRenderer.fov == fovBefore && !history.canUndo, "one undo step undoes the whole drag")
   print("PASS: fix-frontend live slider drag: one undo step, rebuild deferred to the drag's end")
