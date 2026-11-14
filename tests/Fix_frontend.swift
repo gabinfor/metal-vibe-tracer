@@ -227,7 +227,7 @@
   try controller.restore(framed)
   controller.selectedNode = nil
   show(page: 4)
-  require(views(ActionButton.self, in: controller.stack).filter { $0.title == "Frame all imported objects" }.count == 1,
+  require(views(ActionButton.self, in: controller.stack).filter { $0.title == "Frame All" }.count == 1,
     "Objects panel has one framing button")
   let items = NSApp.mainMenu!.items.flatMap { $0.submenu?.items ?? [] }
   for (key, action) in [("w", #selector(NSWindow.performClose(_:))), ("m", #selector(NSWindow.performMiniaturize(_:))),

@@ -249,7 +249,7 @@
   controller.page = 3
   controller.rebuild()
   testRenderer.materials.bindingAllocationFailureCountdown = 0
-  grouped { button("Reset material and maps", in: controller.stack)?.invoke() }
+  grouped { button("Reset Material", in: controller.stack)!.invoke() }
   testRenderer.materials.bindingAllocationFailureCountdown = nil
   require(abs(testRenderer.materials.settings[1].surface.x - 0.77) < 1e-6 && history.undoActionName != "Reset material",
     "failed material reset leaves the material unchanged")
