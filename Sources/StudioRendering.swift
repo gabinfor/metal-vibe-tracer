@@ -66,8 +66,13 @@ extension PathTracerRenderer {
 }
 
 extension StudioController {
+  // Render and Export…: asks where to save (tests answer through exportDestination), then renders.
   func beginExport(hdr: Bool) {
     guard !isBusy else { return }
+    if let destination = exportDestination {
+      if let url = destination(hdr ? "exr" : "png") { startExport(url: url, hdr: hdr) }
+      return
+    }
     chooseSave(
       hdr ? "Render HDR OpenEXR" : "Render PNG", name: hdr ? "Render.exr" : "Render.png",
       ext: hdr ? "exr" : "png"
@@ -212,12 +217,18 @@ extension StudioController {
     guard let texture = exportHDR ? r.lastDisplay : exportOutput else { return }
     do {
       try RenderImage.write(texture: texture, url: url, hdr: exportHDR)
-      cancelExport()
-      show("Saved \(url.lastPathComponent)")
+      exportWritten(url, "Saved \(url.lastPathComponent)")
     } catch {
       cancelExport()
       showError("Export failed: \(error.localizedDescription)")
     }
+  }
+  // A written export: the preview resumes, the status says so and, with "Show in Finder when done" on, the Finder
+  // shows the file (revealInFinder).
+  private func exportWritten(_ url: URL, _ message: String) {
+    cancelExport()
+    show(message)
+    if revealsExportInFinder { revealInFinder([url]) }
   }
 
   private func beginOfflineDenoise(renderer r: PathTracerRenderer, url: URL) {
@@ -269,8 +280,7 @@ extension StudioController {
     if exportHDR {
       do {
         try RenderImage.write(texture: texture, url: url, hdr: true)
-        cancelExport()
-        show("Saved OIDN-denoised \(url.lastPathComponent)")
+        exportWritten(url, "Saved OIDN-denoised \(url.lastPathComponent)")
       } catch {
         cancelExport()
         showError("Export failed: \(error.localizedDescription)")
@@ -292,8 +302,7 @@ extension StudioController {
           throw MaterialLibrary.error(failure ?? "OIDN tone mapping failed.")
         }
         try RenderImage.write(texture: output, url: url, hdr: false)
-        self.cancelExport()
-        self.show("Saved OIDN-denoised \(url.lastPathComponent)")
+        self.exportWritten(url, "Saved OIDN-denoised \(url.lastPathComponent)")
       } catch {
         self.cancelExport()
         self.showError("Export failed: \(error.localizedDescription)")

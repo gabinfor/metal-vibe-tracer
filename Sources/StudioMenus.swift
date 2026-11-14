@@ -1,101 +1,123 @@
 import Cocoa
 
-// The main menu bar, its actions and their validation.
+// The menu bar, its actions and their validation. AppDelegate installs the same menu bar at launch, with itself as the
+// target: commands it does not implement stay disabled until the studio takes over, so the bar keeps its shape.
 extension StudioController {
-  func installMenus() {
-    let main = NSMenu()
-    func menu(_ title: String, _ entries: [(String, String, Selector)]) {
-      let item = NSMenuItem()
-      item.title = title
+  // The menu bar: App, File, Edit, Render, View, Window and Help. Commands go to `target`; the standard application,
+  // window and text commands go to NSApp and the responder chain. Returns the bar, its Window and Help menus and the
+  // File › Open Recent submenu (which the owner refills when the recent projects change).
+  static func makeMenuBar(target: AnyObject, recent: RecentProjects)
+    -> (bar: NSMenu, window: NSMenu, help: NSMenu, openRecent: NSMenu)
+  {
+    let bar = NSMenu()
+    func menu(_ title: String) -> NSMenu {
+      let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
       let sub = NSMenu(title: title)
       item.submenu = sub
-      main.addItem(item)
-      for (title, key, selector) in entries {
-        let e = NSMenuItem(title: title, action: selector, keyEquivalent: key)
-        e.target = self
-        sub.addItem(e)
-      }
+      bar.addItem(item)
+      return sub
     }
-    menu("Metal Vibe Tracer", [("Quit Metal Vibe Tracer", "q", #selector(quit))])
-    menu(
-      "File",
-      [
-        ("Open Project…", "o", #selector(openAction)), ("Save Project", "s", #selector(saveAction)),
-        ("Save Project As…", "S", #selector(saveAsAction)),
-        ("Open Scene File…", "", #selector(openSceneFileAction)),
-        ("Browse Scenes…", "O", #selector(browseScenesAction)),
-        ("Credits and Licenses…", "", #selector(exampleCreditsAction)),
-        ("Show Downloaded Scenes in Finder", "", #selector(revealExampleScenesAction)),
-        ("Export…", "e", #selector(exportAction)),
-      ])
-    if let file = main.items.last?.submenu {
-      let item = recent.menuItem(target: self, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
-      openRecentMenu = item.submenu
-      file.insertItem(item, at: 1)
+    // An item sent to `target` (or, with `standard`, to NSApp / the responder chain).
+    @discardableResult func add(
+      _ menu: NSMenu, _ title: String, _ action: Selector, _ key: String = "",
+      modifiers: NSEvent.ModifierFlags = .command, tag: Int = 0, standard: Bool = false
+    ) -> NSMenuItem {
+      let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+      item.keyEquivalentModifierMask = modifiers
+      item.tag = tag
+      if !standard { item.target = target }
+      menu.addItem(item)
+      return item
     }
-    // Standard application and window commands go to NSApp and the key window.
-    if let app = main.items.first?.submenu {
-      let hide = NSMenuItem(title: "Hide Metal Vibe Tracer", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-      let others = NSMenuItem(
-        title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
-      others.keyEquivalentModifierMask = [.command, .option]
-      let all = NSMenuItem(
-        title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
-      // Inserted in order above Quit.
-      for item in [hide, others, all, .separator()] {
-        app.insertItem(item, at: app.numberOfItems - 1)
-      }
+    let app = menu("Metal Vibe Tracer")
+    add(app, "About Metal Vibe Tracer", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), standard: true)
+    app.addItem(.separator())
+    add(app, "Hide Metal Vibe Tracer", #selector(NSApplication.hide(_:)), "h", standard: true)
+    add(app, "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", modifiers: [.command, .option],
+      standard: true)
+    add(app, "Show All", #selector(NSApplication.unhideAllApplications(_:)), standard: true)
+    app.addItem(.separator())
+    add(app, "Quit Metal Vibe Tracer", #selector(NSApplication.terminate(_:)), "q", standard: true)
+
+    let file = menu("File")
+    add(file, "New Project", #selector(newProjectAction), "n")
+    add(file, "Open Project…", #selector(openAction), "o")
+    let recentItem = recent.menuItem(target: target, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
+    file.addItem(recentItem)
+    add(file, "Open Scene File…", #selector(openSceneFileAction))
+    add(file, "Browse Scenes…", #selector(browseScenesAction), "O")
+    file.addItem(.separator())
+    add(file, "Save", #selector(saveAction), "s")
+    add(file, "Save As…", #selector(saveAsAction), "S")
+    file.addItem(.separator())
+    add(file, "Add Model…", #selector(addModelAction))
+    add(file, "Import MaterialX…", #selector(importMaterialXAction))
+    add(file, "Load Environment Image…", #selector(loadEnvironmentAction))
+    file.addItem(.separator())
+    add(file, "Export…", #selector(exportAction), "e")
+    file.addItem(.separator())
+    add(file, "Show Downloaded Scenes in Finder", #selector(revealExampleScenesAction))
+    file.addItem(.separator())
+    add(file, "Close Window", #selector(NSWindow.performClose(_:)), "w", standard: true)
+
+    let edit = menu("Edit")
+    add(edit, "Undo", #selector(undoAction), "z")
+    add(edit, "Redo", #selector(redoAction), "Z")
+    edit.addItem(.separator())
+    // Standard responder-chain editing shortcuts for the numeric fields.
+    add(edit, "Cut", #selector(NSText.cut(_:)), "x", standard: true)
+    add(edit, "Copy", #selector(NSText.copy(_:)), "c", standard: true)
+    add(edit, "Paste", #selector(NSText.paste(_:)), "v", standard: true)
+    add(edit, "Select All", #selector(NSText.selectAll(_:)), "a", standard: true)
+
+    let render = menu("Render")
+    add(render, "Pause", #selector(pauseAction), "p")
+    add(render, "Restart", #selector(restartAction), "r")
+    render.addItem(.separator())
+    add(render, "Denoise Current Frame", #selector(oidnAction))
+    add(render, "Clear Denoised Preview", #selector(clearOIDNAction))
+
+    let view = menu("View")
+    add(view, "Hide Inspector", #selector(inspectorAction), "i")
+    view.addItem(.separator())
+    for (index, title) in pageTitles.enumerated() {
+      add(view, title, #selector(showTabAction(_:)), "\(index + 1)", tag: index)
     }
-    main.items.last?.submenu?.addItem(.separator())
-    main.items.last?.submenu?.addItem(
-      NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
-    menu("Edit", [("Undo", "z", #selector(undoAction)), ("Redo", "Z", #selector(redoAction))])
-    // Standard responder-chain editing shortcuts remain available in numeric fields.
-    if let edit = main.items.last?.submenu {
-      for (title, key, selector) in [
-        ("Cut", "x", #selector(NSText.cut(_:))), ("Copy", "c", #selector(NSText.copy(_:))),
-        ("Paste", "v", #selector(NSText.paste(_:))),
-        ("Select All", "a", #selector(NSText.selectAll(_:))),
-      ] { edit.addItem(NSMenuItem(title: title, action: selector, keyEquivalent: key)) }
+    view.addItem(.separator())
+    add(view, "Frame Selection", #selector(frameSelectionAction), "f")
+    add(view, "Frame All", #selector(frameAllAction), "F")
+    view.addItem(.separator())
+    for (index, title) in viewportNames.enumerated() {
+      add(view, title, #selector(viewportAction(_:)), tag: index)
     }
-    menu(
-      "Render",
-      [("Pause / Resume", "p", #selector(pauseAction)), ("Restart", "r", #selector(restartAction)),
-       ("Denoise Current Frame with OIDN", "", #selector(oidnAction)),
-       ("Clear OIDN Preview", "", #selector(clearOIDNAction))])
-    menu("View", [("Show / Hide Inspector", "i", #selector(inspectorAction)), ("Frame Selection", "f", #selector(frameSelectionAction)), ("Frame All Imported Objects", "F", #selector(frameAllAction))])
-    if let viewMenu = main.items.last?.submenu {
-      viewMenu.addItem(.separator())
-      for (index, title) in Self.viewportNames.enumerated() {
-        let item = NSMenuItem(title: title, action: #selector(viewportAction(_:)), keyEquivalent: "")
-        item.tag = index
-        item.target = self
-        viewMenu.addItem(item)
-      }
-    }
-    let windowItem = NSMenuItem()
-    let windowMenu = NSMenu(title: "Window")
-    windowItem.submenu = windowMenu
-    windowMenu.addItem(
-      NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
-    windowMenu.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
-    windowMenu.addItem(.separator())
-    windowMenu.addItem(
-      NSMenuItem(title: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
-    main.addItem(windowItem)
-    NSApp.mainMenu = main
-    NSApp.windowsMenu = windowMenu
+
+    let window = menu("Window")
+    add(window, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m", standard: true)
+    add(window, "Zoom", #selector(NSWindow.performZoom(_:)), standard: true)
+    window.addItem(.separator())
+    add(window, "Bring All to Front", #selector(NSApplication.arrangeInFront(_:)), standard: true)
+
+    let help = menu("Help")
+    add(help, "User Guide", #selector(userGuideAction))
+    add(help, "Credits and Licenses…", #selector(exampleCreditsAction))
+    return (bar, window, help, recentItem.submenu!)
   }
+  func installMenus() {
+    let menus = Self.makeMenuBar(target: self, recent: recent)
+    openRecentMenu = menus.openRecent
+    NSApp.mainMenu = menus.bar
+    NSApp.windowsMenu = menus.window
+    NSApp.helpMenu = menus.help
+  }
+  @objc func newProjectAction() { confirmDiscardingChanges { [weak self] in self?.performStartAction(.newProject) } }
   @objc func inspectorAction() { setInspectorVisible(!sidebarVisible) }
+  @objc func showTabAction(_ sender: NSMenuItem) {
+    guard !isBusy, startScreen == nil else { return }
+    showPage(sender.tag)
+  }
   @objc func oidnAction() { guard !isBusy else { return }; startOIDNPreview() }
   @objc func clearOIDNAction() { guard !isBusy else { return }; clearOIDNPreview(); rebuild() }
-  @objc func viewportAction(_ sender: NSMenuItem) {
-    guard !isBusy else { return }
-    checkpoint("Viewport")
-    renderer.viewportMode = UInt32(sender.tag)
-    changed(reset: false)
-    rebuild()
-  }
+  @objc func viewportAction(_ sender: NSMenuItem) { setViewportMode(sender.tag) }
   @objc func saveAsAction() { saveProject(asNew: true) }
   @objc func openSceneFileAction() { openSceneFile() }
   @objc func browseScenesAction() { browseScenes() }
@@ -103,12 +125,15 @@ extension StudioController {
     if let url = sender.representedObject as? URL { openRecent(url) }
   }
   @objc func clearRecentAction() { recent.clear() }
+  @objc func addModelAction() { guard !isBusy else { return }; addModel() }
+  @objc func importMaterialXAction() { guard !isBusy else { return }; importMaterialX() }
+  @objc func loadEnvironmentAction() { guard !isBusy else { return }; loadEnvironment() }
   @objc func frameSelectionAction() { guard !isBusy else { return }; frameMesh() }
   @objc func frameAllAction() { guard !isBusy else { return }; selectedNode = nil; frameMesh() }
-  @objc func quit() { NSApp.terminate(nil) }
   @objc func openAction() { openProject() }
   @objc func saveAction() { saveProject() }
   @objc func exportAction() { showPage(5) }
+  @objc func userGuideAction() { NSWorkspace.shared.open(MainMenuView.userGuideURL) }
   @objc func undoAction() {
     guard !isBusy else { return }
     history.undo()
@@ -122,36 +147,40 @@ extension StudioController {
 }
 
 extension StudioController: NSMenuItemValidation {
+  // Titles and checkmarks follow the state; commands that need a document are disabled on the main menu, and every
+  // command but the inspector toggle, Help and Show Downloaded Scenes in Finder is disabled while busy.
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
-    if item.action == #selector(quit) { return true }
-    if item.action == #selector(inspectorAction) { return true }
-    if item.action == #selector(exampleCreditsAction) || item.action == #selector(revealExampleScenesAction) {
+    switch item.action {
+    case #selector(viewportAction(_:)): item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
+    case #selector(showTabAction(_:)): item.state = startScreen == nil && page == item.tag ? .on : .off
+    case #selector(pauseAction): item.title = renderer.paused ? "Resume" : "Pause"
+    case #selector(inspectorAction):
+      item.title = sidebarVisible ? "Hide Inspector" : "Show Inspector"
+      return startScreen == nil
+    case #selector(exampleCreditsAction), #selector(revealExampleScenesAction), #selector(userGuideAction):
       return true
-    }
-    if item.action == #selector(viewportAction(_:)) {
-      item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
+    default: break
     }
     if isBusy { return false }
     // With no document loaded only the commands that open one apply.
     if startScreen != nil {
       return [
-        #selector(openAction), #selector(openRecentAction(_:)), #selector(clearRecentAction), #selector(openSceneFileAction),
-        #selector(browseScenesAction),
+        #selector(newProjectAction), #selector(openAction), #selector(openRecentAction(_:)), #selector(clearRecentAction),
+        #selector(openSceneFileAction), #selector(browseScenesAction),
       ].contains(item.action)
     }
-    if item.action == #selector(undoAction) {
+    switch item.action {
+    case #selector(undoAction):
       item.title = history.undoMenuItemTitle
       return history.canUndo
-    }
-    if item.action == #selector(redoAction) {
+    case #selector(redoAction):
       item.title = history.redoMenuItemTitle
       return history.canRedo
-    }
-    if item.action == #selector(clearOIDNAction) { return renderer.offlineDenoisedPreview != nil }
-    if item.action == #selector(oidnAction) { return renderer.offlineDenoisedPreview == nil }
-    if item.action == #selector(frameSelectionAction) || item.action == #selector(frameAllAction) {
+    case #selector(clearOIDNAction): return renderer.offlineDenoisedPreview != nil
+    case #selector(oidnAction): return renderer.offlineDenoisedPreview == nil
+    case #selector(frameSelectionAction), #selector(frameAllAction):
       return project.graph?.nodes.contains { $0.mesh != nil } == true || !project.triangles.isEmpty
+    default: return true
     }
-    return true
   }
 }

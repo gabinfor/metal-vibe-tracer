@@ -391,7 +391,7 @@
   require(controller.page == 2 && controller.tabBar?.selectedSegment == 2, "the tab bar switches pages")
   try controller.restore(framed)
   controller.catalogSceneTitle = "Probe Scene"
-  func stackLabels() -> [String] { views(NSTextField.self, in: controller.stack).map(\.stringValue) }
+  func stackLabels() -> [String] { views(NSTextField.self, in: controller.inspectorHeader).map(\.stringValue) }
   require(stackLabels().contains("Probe Scene"), "a scene opened from the browser shows its catalog title")
   controller.associate(folder.appendingPathComponent("Saved.vtrace"), edited: false, replaced: false)
   require(controller.catalogSceneTitle == nil && stackLabels().contains("Saved.vtrace"), "saving names the scene by its file")

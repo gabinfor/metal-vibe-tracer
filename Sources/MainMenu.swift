@@ -97,12 +97,32 @@ final class SystemRecentProjects: RecentProjectsStore {
   }
 }
 
+// A view that opens files dropped on it: it takes file drags while `onDropFiles` is set, which opens them or refuses
+// them with a message and returns whether it opened them. The studio's root view (StudioController) and the main menu
+// (MainMenuView) are drop targets.
+class FileDropView: NSView {
+  var onDropFiles: (([URL]) -> Bool)? {
+    didSet { if onDropFiles == nil { unregisterDraggedTypes() } else { registerForDraggedTypes([.fileURL]) } }
+  }
+  static func fileURLs(_ info: NSDraggingInfo) -> [URL] {
+    info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+      as? [URL] ?? []
+  }
+  // Any file is taken, so that a refused one is answered with a message rather than silently bounced.
+  override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+    onDropFiles != nil && !Self.fileURLs(sender).isEmpty ? .copy : []
+  }
+  override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    onDropFiles?(Self.fileURLs(sender)) ?? false
+  }
+}
+
 // The main window's content while no document is loaded (StudioController.startScreen, and AppDelegate's launch
 // state before the studio exists): the app's name and version, a Start column (New Project, Open Project…, Open Scene
 // File…, Browse Scenes…, Restore Last Session while an autosave exists), the recent projects, the launch progress and
 // the action queued until the shaders are ready, and User Guide and Credits and licenses…. It scrolls when the window
-// is too small for it.
-final class MainMenuView: NSView {
+// is too small for it, and opens projects and scene files dropped on it (onDropFiles).
+final class MainMenuView: FileDropView {
   static let userGuideURL = URL(string: "https://github.com/gabinfor/metal-vibe-tracer/blob/main/docs/USER_GUIDE.md")!
   // New Project, Open Project…, Open Scene File… and Restore Last Session.
   var onAction: ((StartAction) -> Void)?
