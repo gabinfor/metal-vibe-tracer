@@ -107,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     menu.onOpenRecent = { [weak self] url in self?.openRecent(url) }
     menu.onClearRecent = { [weak self] in self?.recent.clear() }
     menu.onCancelPending = { [weak self] in self?.cancelPendingStart() }
+    menu.onDropFiles = { [weak self] urls in self?.openDroppedFiles(urls) ?? false }
     menu.setRestore(StudioController.autosaveDate(at: StudioController.defaultAutosaveURL))
     menu.setRecent(recent.shown)
     launchMenu = menu
@@ -212,54 +213,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
   }
 
-  // Quit, window commands, the start actions, Open Recent and Browse Scenes until StudioController installs the
-  // full menus.
+  // The studio's menu bar (StudioController.makeMenuBar) with this delegate as the target until StudioController
+  // installs its own: New Project, the open commands, Open Recent, Browse Scenes… and User Guide work; the commands
+  // that need the studio stay disabled, so the bar keeps its shape.
   private func installLaunchMenus() {
-    let main = NSMenu()
-    func menu(_ title: String, _ entries: [(String, String, Selector, AnyObject?)]) {
-      let item = NSMenuItem()
-      let sub = NSMenu(title: title)
-      item.submenu = sub
-      main.addItem(item)
-      for (title, key, selector, target) in entries {
-        let entry = NSMenuItem(title: title, action: selector, keyEquivalent: key)
-        entry.target = target
-        sub.addItem(entry)
-      }
-    }
-    menu("Metal Vibe Tracer", [
-      ("Hide Metal Vibe Tracer", "h", #selector(NSApplication.hide(_:)), nil),
-      ("Quit Metal Vibe Tracer", "q", #selector(NSApplication.terminate(_:)), nil),
-    ])
-    menu("File", [
-      ("Open Project…", "o", #selector(openProjectAction), self),
-      ("Open Scene File…", "", #selector(openSceneFileAction), self),
-      ("Browse Scenes…", "O", #selector(browseScenesAction), self),
-      ("Close Window", "w", #selector(NSWindow.performClose(_:)), nil),
-    ])
-    if let file = main.items.last?.submenu {
-      let item = recent.menuItem(target: self, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
-      openRecentMenu = item.submenu
-      file.insertItem(item, at: 1)
-    }
-    menu("Window", [("Minimize", "m", #selector(NSWindow.performMiniaturize(_:)), nil)])
-    NSApp.mainMenu = main
+    let menus = StudioController.makeMenuBar(target: self, recent: recent)
+    openRecentMenu = menus.openRecent
+    NSApp.mainMenu = menus.bar
+    NSApp.windowsMenu = menus.window
+    NSApp.helpMenu = menus.help
   }
-  @objc func openProjectAction() { queueStartAction(.openProject(nil)) }
+  @objc func newProjectAction() { queueStartAction(.newProject) }
+  @objc func openAction() { queueStartAction(.openProject(nil)) }
   @objc func openSceneFileAction() { queueStartAction(.openScene(nil)) }
   @objc func browseScenesAction() { scenes.show() }
   @objc func openRecentAction(_ sender: NSMenuItem) {
     if let url = sender.representedObject as? URL { openRecent(url) }
   }
   @objc func clearRecentAction() { recent.clear() }
+  @objc func userGuideAction() { NSWorkspace.shared.open(MainMenuView.userGuideURL) }
+  // A file dropped on the main menu before the studio exists: projects and scene files are queued like their open
+  // commands; anything else waits for the studio (StudioController.openDroppedFiles).
+  func openDroppedFiles(_ urls: [URL]) -> Bool {
+    if let studio { return studio.openDroppedFiles(urls) }
+    let refusal: String
+    if let url = urls.first, urls.count == 1, pendingStart == nil {
+      switch StudioController.dropKind(url) {
+      case .project:
+        queueStartAction(.openProject(url))
+        return true
+      case .scene:
+        queueStartAction(.openScene(url))
+        return true
+      case .environment, .materialX: refusal = "Open a project or scene before adding \(url.lastPathComponent)."
+      case nil: refusal = StudioController.unsupportedDropMessage(url)
+      }
+    } else {
+      refusal = pendingStart != nil ? "Wait for the queued action, or cancel it." : "Drop one file at a time."
+    }
+    launchMenu?.setMessage(refusal)
+    return false
+  }
 }
 
-// File › Open Recent and its Clear Menu wait, like the main menu, while an action is queued.
+// The commands that open a document wait, like the main menu, while an action is queued.
 extension AppDelegate: NSMenuItemValidation {
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
-    if item.action == #selector(openRecentAction(_:)) || item.action == #selector(clearRecentAction) {
-      return pendingStart == nil
+    switch item.action {
+    case #selector(userGuideAction), #selector(browseScenesAction): return true
+    default: return pendingStart == nil
     }
-    return true
   }
 }

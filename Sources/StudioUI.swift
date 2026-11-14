@@ -10,8 +10,13 @@ final class StudioController: NSViewController {
   weak var hostWindow: NSWindow?
   let viewport: InteractiveMTKView
   let sidebar = NSScrollView(), stack = TopAlignedStackView()
+  // The inspector's pinned header above the scrolling page (`sidebar`, whose document is `stack`): the scene row
+  // (title + Browse…) and the tab bar.
+  let inspectorHeader = InspectorHeaderView()
   // The status bar: render state and progress (and transient messages) on the left, frame figures on the right.
   let status = NSTextField(labelWithString: ""), statusDetail = NSTextField(labelWithString: "")
+  // The status bar's 22-pt strip along the bottom; its texts and controls are centred on it.
+  let statusBar = NSLayoutGuide()
   // The activity strip left of the status line: a progress bar, its phase and, for operations that
   // support it, a Cancel button (beginActivity). Background shader compilation shows there too.
   let activityStrip = NSStackView(), activityBar = NSProgressIndicator()
@@ -30,18 +35,22 @@ final class StudioController: NSViewController {
   // File › Open Recent's submenu, refilled when the recent projects change.
   var openRecentMenu: NSMenu?
   // The inspector's scene title, refreshed when the document's name changes.
-  private weak var sceneTitleLabel: NSTextField?
+  private let sceneTitleLabel = NSTextField(labelWithString: "")
   // The catalog title of a scene opened from the scene browser, shown in the inspector's scene row until the document
   // is saved or replaced (runtime state only; associate clears it).
   var catalogSceneTitle: String? { didSet { updateWindowTitle() } }
-  // The inspector's tab bar (rebuilt with the inspector) and the toolbar's view-mode popup and inspector toggle.
-  private(set) weak var tabBar: ActionSegmentedControl?
+  // The inspector's tab bar (in the pinned header) and the toolbar's view-mode popup and inspector toggle.
+  private(set) var tabBar: ActionSegmentedControl?
   private(set) var viewModePopup: ActionPopup?
   private(set) var inspectorToggle: ActionButton?
   private var resizeHandle: InspectorResizeHandle?
   var isBrowsingScenes: Bool { scenes.isVisible }
   // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
   var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
+  // Tests choose Render and Export…'s file (given its extension) through this instead of the save panel.
+  var exportDestination: ((String) -> URL?)?
+  // Shows an exported file in the Finder when "Show in Finder when done" is on; tests replace it.
+  var revealInFinder: ([URL]) -> Void = { NSWorkspace.shared.activateFileViewerSelecting($0) }
   // Tests are told an import report would be shown through this instead of the modal alert.
   var importReportShown: (() -> Void)?
   // Set while Restore Last Session restores the last session, which keeps its autosave file.
@@ -165,7 +174,7 @@ final class StudioController: NSViewController {
   }
   // The window names the project file (with its proxy icon); the app name is the subtitle.
   func updateWindowTitle() {
-    sceneTitleLabel?.stringValue = currentSceneTitle
+    sceneTitleLabel.stringValue = currentSceneTitle
     if startScreen != nil {
       hostWindow?.representedURL = nil
       hostWindow?.title = "Metal Vibe Tracer"
@@ -180,7 +189,9 @@ final class StudioController: NSViewController {
   var documentName: String { projectURL?.lastPathComponent ?? "Untitled" }
   required init?(coder: NSCoder) { fatalError() }
   override func loadView() {
-    let root = NSView()
+    // Files dropped on the window open like their menu commands (openDroppedFiles).
+    let root = FileDropView()
+    root.onDropFiles = { [weak self] urls in self?.openDroppedFiles(urls) ?? false }
     view = root
     // Toolbar: render transport and the view mode on the left; Export… and the inspector toggle on the right.
     let bar = NSStackView()
@@ -212,8 +223,9 @@ final class StudioController: NSViewController {
     stack.spacing = 10
     stack.setContentHuggingPriority(.required, for: .vertical)
     stack.setContentCompressionResistancePriority(.required, for: .vertical)
-    stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 16, right: 12)
+    stack.edgeInsets = NSEdgeInsets(top: 14, left: 12, bottom: 16, right: 12)
     sidebar.documentView = stack
+    buildInspectorHeader()
     status.font = .systemFont(ofSize: 11)
     status.lineBreakMode = .byTruncatingTail
     status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -226,7 +238,10 @@ final class StudioController: NSViewController {
     errorButton.font = .systemFont(ofSize: 11)
     errorButton.lineBreakMode = .byTruncatingTail
     errorButton.isHidden = true
-    errorButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    // In a narrow window the status message gives way first, then the activity phase, then the error indicator (up
+    // to a third of the width); the frame figures stay whole. All of them stay below the window's size priority, so
+    // long texts never widen the window.
+    errorButton.setContentCompressionResistancePriority(.init(490), for: .horizontal)
     activityStrip.orientation = .horizontal
     activityStrip.spacing = 6
     activityBar.style = .bar
@@ -236,7 +251,7 @@ final class StudioController: NSViewController {
     activityBar.widthAnchor.constraint(equalToConstant: 120).isActive = true
     activityLabel.font = .systemFont(ofSize: 11)
     activityLabel.lineBreakMode = .byTruncatingTail
-    activityLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    activityLabel.setContentCompressionResistancePriority(.init(260), for: .horizontal)
     activityCancel.controlSize = .small
     activityCancel.font = .systemFont(ofSize: 11)
     for v in [activityBar, activityLabel, activityCancel] { activityStrip.addArrangedSubview(v) }
@@ -248,7 +263,8 @@ final class StudioController: NSViewController {
     handle.onResize = { [weak self] travel in self?.setInspectorWidth(dragStartWidth - travel, remember: false) }
     handle.onEnd = { [weak self] in self.map { $0.setInspectorWidth($0.sidebarWidth.constant) } }
     resizeHandle = handle
-    for v in [bar, viewport, sidebar, handle, activityStrip, status, statusDetail, errorButton] {
+    root.addLayoutGuide(statusBar)
+    for v in [bar, viewport, inspectorHeader, sidebar, handle, activityStrip, status, statusDetail, errorButton] {
       v.translatesAutoresizingMaskIntoConstraints = false
       root.addSubview(v)
     }
@@ -259,27 +275,34 @@ final class StudioController: NSViewController {
       bar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
       bar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
       bar.heightAnchor.constraint(equalToConstant: 30),
-      status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
+      statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
+      statusBar.heightAnchor.constraint(equalToConstant: 22),
+      statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+      statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+      status.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
       activityStrip.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-      activityStrip.centerYAnchor.constraint(equalTo: status.centerYAnchor),
-      activityStrip.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.5),
+      activityStrip.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+      activityStrip.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.4),
       status.trailingAnchor.constraint(lessThanOrEqualTo: statusDetail.leadingAnchor, constant: -12),
       statusDetail.trailingAnchor.constraint(equalTo: errorButton.leadingAnchor, constant: -8),
-      statusDetail.centerYAnchor.constraint(equalTo: status.centerYAnchor),
+      statusDetail.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
       errorButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-      errorButton.centerYAnchor.constraint(equalTo: status.centerYAnchor),
-      errorButton.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.45),
-      status.heightAnchor.constraint(equalToConstant: 22),
-      sidebar.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 8),
+      errorButton.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+      errorButton.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.33),
+      status.widthAnchor.constraint(greaterThanOrEqualToConstant: 0),
+      inspectorHeader.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 8),
+      inspectorHeader.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+      inspectorHeader.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+      sidebar.topAnchor.constraint(equalTo: inspectorHeader.bottomAnchor),
       sidebar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-      sidebar.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6), sidebarWidth,
+      sidebar.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6), sidebarWidth,
       viewport.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-      viewport.topAnchor.constraint(equalTo: sidebar.topAnchor),
+      viewport.topAnchor.constraint(equalTo: inspectorHeader.topAnchor),
       viewport.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
       viewport.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
       handle.centerXAnchor.constraint(equalTo: sidebar.leadingAnchor),
       handle.widthAnchor.constraint(equalToConstant: 6),
-      handle.topAnchor.constraint(equalTo: sidebar.topAnchor),
+      handle.topAnchor.constraint(equalTo: inspectorHeader.topAnchor),
       handle.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
       stack.leadingAnchor.constraint(equalTo: sidebar.contentView.leadingAnchor),
       stack.trailingAnchor.constraint(equalTo: sidebar.contentView.trailingAnchor),
@@ -288,6 +311,7 @@ final class StudioController: NSViewController {
     statusAtEdge = status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12)
     statusAfterActivity = status.leadingAnchor.constraint(equalTo: activityStrip.trailingAnchor, constant: 10)
     statusAtEdge.isActive = true
+    updateTabBarStyle()
   }
   // The title of the current scene: the catalog's for a built-in scene or a scene just opened from the scene browser,
   // else the document's name (imported or opened content, and the imported-mesh studio, which has no catalog entry).
@@ -298,20 +322,58 @@ final class StudioController: NSViewController {
     }
     return builtIn?.title ?? catalogSceneTitle ?? documentName
   }
-  // The inspector's scene control: the current scene's title and a button that opens the scene browser.
-  func sceneControl() {
-    let title = NSTextField(labelWithString: currentSceneTitle)
-    title.font = .systemFont(ofSize: 13, weight: .medium)
-    title.lineBreakMode = .byTruncatingTail
-    sceneTitleLabel = title
-    title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+  // The inspector's pinned header: the scene row (the current scene's title and Browse…, which opens the scene
+  // browser) over the tab bar. It stays in view while the page below scrolls.
+  private func buildInspectorHeader() {
+    sceneTitleLabel.font = .systemFont(ofSize: 13, weight: .medium)
+    sceneTitleLabel.lineBreakMode = .byTruncatingTail
+    sceneTitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     let browse = ActionButton("Browse…") { [weak self] in self?.browseScenes() }
     browse.identifier = NSUserInterfaceItemIdentifier("scene-browse")
+    browse.toolTip = "Open the scene browser"
     let spacer = NSView()
     spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-    let row = NSStackView(views: [title, spacer, browse])
-    row.orientation = .horizontal
-    add(row)
+    let sceneRow = NSStackView(views: [sceneTitleLabel, spacer, browse])
+    sceneRow.orientation = .horizontal
+    let tabs = ActionSegmentedControl(Self.pageTitles, selected: page, label: "Inspector tabs") { [weak self] i in
+      self?.showPage(i)
+    }
+    tabs.segmentDistribution = .fillEqually
+    tabBar = tabs
+    inspectorHeader.content.addArrangedSubview(sceneRow)
+    inspectorHeader.content.addArrangedSubview(tabs)
+    for row in [sceneRow, tabs] as [NSView] {
+      row.widthAnchor.constraint(equalTo: inspectorHeader.content.widthAnchor).isActive = true
+    }
+  }
+  // The tab bar fits the inspector's width: labels in a wide inspector, smaller labels at the default width, a symbol
+  // per tab below about 320 pt; every tab keeps its name and shortcut in its tooltip.
+  enum TabBarStyle { case labels, smallLabels, symbols }
+  static let tabSymbols = ["slider.horizontal.3", "camera", "lightbulb", "paintpalette", "cube", "square.and.arrow.up"]
+  // The narrowest tab bar that shows every label at `size` with room around it: six equal segments as wide as the
+  // widest label plus a margin (regular labels get more, so they never touch the dividers).
+  static func tabLabelsWidth(_ size: NSControl.ControlSize) -> CGFloat {
+    let font = NSFont.systemFont(ofSize: NSFont.systemFontSize(for: size))
+    let widest = pageTitles.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+    return CGFloat(pageTitles.count) * (widest + (size == .regular ? 8 : 2)).rounded(.up)
+  }
+  var tabBarStyle: TabBarStyle {
+    let available = sidebarWidth.constant - InspectorHeaderView.horizontalInset * 2
+    if available >= Self.tabLabelsWidth(.regular) { return .labels }
+    return available >= Self.tabLabelsWidth(.small) ? .smallLabels : .symbols
+  }
+  func updateTabBarStyle() {
+    guard let tabs = tabBar else { return }
+    let style = tabBarStyle
+    tabs.controlSize = style == .labels ? .regular : .small
+    tabs.font = .systemFont(ofSize: NSFont.systemFontSize(for: tabs.controlSize))
+    for (i, title) in Self.pageTitles.enumerated() {
+      let symbols = style == .symbols
+      tabs.setLabel(symbols ? "" : title, forSegment: i)
+      tabs.setImage(
+        symbols ? NSImage(systemSymbolName: Self.tabSymbols[i], accessibilityDescription: title) : nil, forSegment: i)
+      tabs.setToolTip("\(title) (⌘\(i + 1))", forSegment: i)
+    }
   }
   // Inspector mutations are ignored while a document is restored or project I/O runs.
   var acceptsEdits: Bool { !isBusy && !isRestoring }
@@ -340,15 +402,9 @@ final class StudioController: NSViewController {
       child.removeFromSuperview()
     }
     viewModePopup?.selectItem(at: Int(renderer.viewportMode))
-    sceneControl()
-    let tabs = ActionSegmentedControl(Self.pageTitles, selected: page, label: "Inspector tabs") { [weak self] i in
-      self?.showPage(i)
-    }
-    tabs.segmentDistribution = .fillEqually
-    tabs.isEnabled = !isBusy
-    tabBar = tabs
-    add(tabs)
-    stack.setCustomSpacing(16, after: tabs)
+    sceneTitleLabel.stringValue = currentSceneTitle
+    tabBar?.selectedSegment = page
+    tabBar?.isEnabled = !isBusy
     if exportRenderer != nil {
       heading("Rendering export…")
       text("The preview is paused while the export renders.")
@@ -581,6 +637,7 @@ final class StudioController: NSViewController {
     scenes.browser.setActionsEnabled(enabled)
     startScreen?.setActionsEnabled(enabled)
     for button in busyButtons { button.isEnabled = enabled }
+    tabBar?.isEnabled = enabled
     pauseButton?.isEnabled = enabled
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
   }
@@ -1277,12 +1334,15 @@ final class StudioController: NSViewController {
   func setInspectorWidth(_ width: CGFloat, remember: Bool = true) {
     let clamped = min(Self.inspectorWidthRange.upperBound, max(Self.inspectorWidthRange.lowerBound, width))
     sidebarWidth.constant = clamped
+    updateTabBarStyle()
     if remember { preferences.set(Double(clamped), forKey: Self.inspectorWidthKey) }
   }
   func setInspectorVisible(_ visible: Bool) {
     sidebarVisible = visible
     sidebarWidth.constant = visible ? inspectorWidth : 0
     sidebar.isHidden = !visible
+    inspectorHeader.isHidden = !visible
+    if visible { updateTabBarStyle() }
     resizeHandle?.isHidden = !visible
     inspectorToggle?.toolTip = visible ? "Hide Inspector" : "Show Inspector"
   }
@@ -1294,6 +1354,39 @@ final class StudioController: NSViewController {
     changed(reset: false)
     rebuild()
   }
+}
+
+// The inspector's pinned header (StudioController.buildInspectorHeader): `content` stacks the scene row and the tab
+// bar on the inspector's background, with a separator below.
+final class InspectorHeaderView: NSView {
+  static let horizontalInset: CGFloat = 12
+  let content = NSStackView()
+  init() {
+    super.init(frame: .zero)
+    content.orientation = .vertical
+    content.alignment = .leading
+    content.spacing = 10
+    let separator = NSBox()
+    separator.boxType = .separator
+    for v in [content, separator] as [NSView] {
+      v.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(v)
+    }
+    // The trailing edge yields while the inspector is hidden (zero width).
+    let trailing = content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.horizontalInset)
+    trailing.priority = .defaultHigh
+    NSLayoutConstraint.activate([
+      content.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+      content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.horizontalInset), trailing,
+      separator.topAnchor.constraint(equalTo: content.bottomAnchor, constant: 10),
+      separator.leadingAnchor.constraint(equalTo: leadingAnchor),
+      separator.trailingAnchor.constraint(equalTo: trailingAnchor),
+      separator.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+  }
+  required init?(coder: NSCoder) { fatalError() }
+  override var wantsUpdateLayer: Bool { true }
+  override func updateLayer() { layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor }
 }
 
 // The inspector's leading edge: dragging it resizes the inspector.
@@ -1343,6 +1436,7 @@ extension StudioController {
     menu.onOpenRecent = { [weak self] url in self?.openRecent(url) }
     menu.onClearRecent = { [weak self] in self?.recent.clear() }
     menu.onCredits = { [weak self] in self?.showExampleCredits() }
+    menu.onDropFiles = { [weak self] urls in self?.openDroppedFiles(urls) ?? false }
     menu.setRestore(Self.autosaveDate(at: autosaveURL))
     menu.setRecent(recent.shown)
     menu.setActionsEnabled(!isBusy)
@@ -1353,7 +1447,7 @@ extension StudioController {
       menu.topAnchor.constraint(equalTo: view.topAnchor),
       menu.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       menu.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      menu.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
+      menu.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
     ])
     startScreen = menu
     viewport.isPaused = true
@@ -1421,6 +1515,47 @@ extension StudioController {
       guard let window = sheetWindow else { return }
       SceneBrowserView.chooseFile(for: action, window: window) { [weak self] chosen in self?.performStartAction(chosen) }
     }
+  }
+  // What a dropped file opens as, by its extension: a project, a scene file (File › Open Scene File…), an environment
+  // image or a MaterialX material; nil for anything else.
+  enum DroppedFile { case project, scene, environment, materialX }
+  nonisolated static func dropKind(_ url: URL) -> DroppedFile? {
+    let ext = url.pathExtension.lowercased()
+    if ext == "vtrace" { return .project }
+    if SceneFile.extensions.contains(ext) { return .scene }
+    if ["hdr", "exr"].contains(ext) { return .environment }
+    if ext == "mtlx" { return .materialX }
+    return nil
+  }
+  nonisolated static func unsupportedDropMessage(_ url: URL) -> String {
+    "\(url.lastPathComponent) can't be opened: drop a project (.vtrace), a scene file (USD, glTF, OBJ, Mitsuba XML), an .hdr or .exr environment or a MaterialX (.mtlx) file."
+  }
+  // Files dropped on the main window open through their menu command's path: a project like Open Project (with the
+  // unsaved-changes prompt), a scene file like Open Scene File…, an environment image like Load Environment Image…
+  // and a .mtlx like Import MaterialX…. One file at a time, not while busy; the last two need a loaded document.
+  // Anything else is refused with a status message. Returns whether the file is being opened.
+  @discardableResult func openDroppedFiles(_ urls: [URL]) -> Bool {
+    guard let url = urls.first, urls.count == 1 else {
+      show(urls.isEmpty ? "Only files can be dropped here." : "Drop one file at a time.")
+      return false
+    }
+    guard !isBusy else {
+      show("Wait for the current operation to finish before opening \(url.lastPathComponent).")
+      return false
+    }
+    switch Self.dropKind(url) {
+    case .project: performStartAction(.openProject(url))
+    case .scene: performStartAction(.openScene(url))
+    case .environment where startScreen == nil: beginLoadEnvironment(from: url)
+    case .materialX where startScreen == nil: beginImportMaterialX(from: url)
+    case .environment, .materialX:
+      show("Open a project or scene before adding \(url.lastPathComponent).")
+      return false
+    case nil:
+      show(Self.unsupportedDropMessage(url))
+      return false
+    }
+    return true
   }
   // A new untitled project of built-in scene `index`, with that scene's default camera.
   func startBuiltInScene(_ index: Int) {
