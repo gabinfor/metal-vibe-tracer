@@ -306,9 +306,9 @@ ReSTIR DI and GI reservoirs come from other pixels' samples, so they store u (§
   passed in `Uniforms` and as a Metal **function constant**. The spectral pipelines are a separate
   specialization, compiled lazily on first use, so RGB pipelines and their results stay bit
   identical (the `tests/benchmark.py` zero-tolerance check).
-- Render inspector: a **Light transport** popup (RGB / Spectral), next to the ReSTIR mode
-  controls (`StudioController.restirModeControls`). It follows the **Sampler** popup's pattern in
-  `Sources/StudioUI.swift`: a `lightTransportChoices` table of (mode, title), the shared popup
+- Render inspector: a **Light transport** popup (RGB / Spectral) under **Render › Method**, built with
+  the ReSTIR mode popups' `modeRow` (`Sources/InspectorRender.swift`). It follows the **Sampler** popup's
+  pattern in `Sources/InspectorRender.swift`: a `lightTransportChoices` table of (mode, title), the shared popup
   builder with the current and automatic labels, one undo step per change, and an accumulation
   reset. Persistence follows `ProjectDocument`'s optional `sampler: UInt32?` field. Lights get an optional **Spectrum** menu (RGB tint /
   preset).

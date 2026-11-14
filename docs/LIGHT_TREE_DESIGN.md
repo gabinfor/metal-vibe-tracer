@@ -1,6 +1,6 @@
 # Light tree: many-light sampling for imported emitters
 
-Status: **2026-11-04. Implemented** as **Render › Light sampling** (`LightSampling`) and the default for imported scenes (§5). Citations: `CONTY2018` (the method) and `PBRT2023` §12.6.3 (`BVHLightSampler`, the formulation followed here); see [REFERENCES.md](../REFERENCES.md).
+Status: **2026-11-04. Implemented** as **Render › Advanced › Light sampling** (`LightSampling`) and the default for imported scenes (§5). Citations: `CONTY2018` (the method) and `PBRT2023` §12.6.3 (`BVHLightSampler`, the formulation followed here); see [REFERENCES.md](../REFERENCES.md).
 
 ## 1. Problem
 
@@ -36,7 +36,7 @@ A sample can fail where every emitter below a node faces away from p although th
 
 ## 5. Default
 
-`LightSampling.automatic` resolves to the light tree. At equal time it lowered error by 60–87% in Lamp Spectra, 8–17% in the Bistro interior (37,436 emitters), 15% in the Tyndall Tank and 5–9% on the Shader Ball, tied in scenes with few or no emitters and in Abbe Row, and cost about 5% in San Miguel (4,032 emitters, +5% frame time for no error gain). The compact nodes and multi-emitter leaves cut the tree's frame-time cost from +8–11% to +5–8% in the largest scenes and halved its memory; see [tests/PERFORMANCE.md](../tests/PERFORMANCE.md), "Light tree". **Power** stays selectable on the Render page.
+`LightSampling.automatic` resolves to the light tree. At equal time it lowered error by 60–87% in Lamp Spectra, 8–17% in the Bistro interior (37,436 emitters), 15% in the Tyndall Tank and 5–9% on the Shader Ball, tied in scenes with few or no emitters and in Abbe Row, and cost about 5% in San Miguel (4,032 emitters, +5% frame time for no error gain). The compact nodes and multi-emitter leaves cut the tree's frame-time cost from +8–11% to +5–8% in the largest scenes and halved its memory; see [tests/PERFORMANCE.md](../tests/PERFORMANCE.md), "Light tree". **Power** stays selectable under **Render › Advanced**.
 
 ## 6. Not done
 
