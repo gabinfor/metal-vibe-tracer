@@ -68,14 +68,14 @@ extension StudioController {
     ) { [weak self] v in
       guard let self else { return }
       self.renderer.setEye(merge(v, shown: eye, into: self.renderer.eyePosition))
-    }
+    }.hidesReset = true
     vector(
       "Target", target, -100...100, target, entry: reach, step: step,
       help: "The point the camera looks at and orbits around. Moving it keeps the camera's direction and distance."
     ) { [weak self] v in
       guard let self else { return }
       self.renderer.target = merge(v, shown: target, into: self.renderer.target)
-    }
+    }.hidesReset = true
     button(
       "Reset View",
       help: "Returns to the scene's default view: the built-in camera of a built-in scene; for an imported scene, the "

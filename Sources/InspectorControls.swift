@@ -29,8 +29,8 @@ import Cocoa
 // Collapsible sections remember their state in `preferences` (UserDefaults) under "InspectorSection.<key>";
 // `forceSectionsOpen` (tests) builds every body.
 //
-// Older helpers for pages not yet converted: heading (section heading without the space above), text (= hint),
-// caption (a small label above a control), popup (a full-width popup without a row label).
+// The busy pages (export, denoising, project operations) use heading (a section heading without the space above)
+// and text (= hint).
 
 // The width of a row's reset button, which sits between the label and the control.
 let inspectorGutter: CGFloat = 18
@@ -506,9 +506,11 @@ final class VectorControl: NSStackView {
     guard value != defaultValue else { return }
     set(defaultValue)
   }
+  // Rows without a meaningful default (the camera's position: Reset View restores it) never show the reset button.
+  var hidesReset = false { didSet { resetButton.isHidden = hidesReset || value == defaultValue } }
   private func publish(_ v: SIMD3<Float>) {
     value = v
-    resetButton.isHidden = v == defaultValue
+    resetButton.isHidden = hidesReset || v == defaultValue
     update(v)
   }
 }
@@ -574,13 +576,6 @@ extension StudioController {
   }
   // One short secondary line; longer explanations belong in a control's `help` (tooltip and accessibility help).
   func hint(_ value: String) { text(value) }
-  // A small label naming the control below it.
-  func caption(_ value: String) {
-    let label = NSTextField(labelWithString: value)
-    label.font = .systemFont(ofSize: 11, weight: .medium)
-    label.textColor = .secondaryLabelColor
-    add(label)
-  }
   func heading(_ value: String) {
     let l = NSTextField(labelWithString: value)
     l.font = .systemFont(ofSize: 14, weight: .semibold)
@@ -754,16 +749,6 @@ extension StudioController {
   nonisolated static func srgbDecode(_ c: CGFloat) -> Float {
     let x = Float(c)
     return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
-  }
-  // A full-width popup without a row label; `label` is its accessibility label.
-  func popup(
-    _ titles: [String], _ value: Int, label: String? = nil, _ action: @escaping (Int) -> Void
-  ) {
-    add(
-      ActionPopup(titles, selected: value, label: label) { [weak self] i in
-        guard let self, self.acceptsEdits else { return }
-        action(i)
-      })
   }
   // A full-width button. Title case; "…" only when a panel or sheet follows; at most one .primary per page;
   // .destructive last in its section.
