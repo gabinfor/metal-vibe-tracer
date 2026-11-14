@@ -10099,7 +10099,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // after the previous frame's end; the busy time and samples decay by half every 16 frames.
     var gpuMillisecondsPerSample: Double { recentSamples > 0 ? recentBusyMilliseconds / recentSamples : 0 }
     private var recentBusyMilliseconds = 0.0, recentSamples = 0.0, lastGPUEnd: CFTimeInterval = 0
-    var framesPerSecond: Double = 0
+    // Frame rate over the recent completions. Completions the main thread handles together after a stall, and the
+    // first one after a pause, would show as a spike or a dip if each interval were reported on its own.
+    var framesPerSecond: Double { frameInterval > 0 ? 1 / frameInterval : 0 }
+    private var frameInterval = 0.0
     var completedSamples: UInt32 = 0
     // Awake seconds (awakeSeconds): the render time limit does not count system sleep.
     var lastTick = awakeSeconds()
@@ -10985,7 +10988,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     self.recentBusyMilliseconds = self.recentBusyMilliseconds * decay + busy
                     self.recentSamples = self.recentSamples * decay + Double(samples)
                     let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)
-                    self.framesPerSecond=interval>0 ? 1/interval : 0; self.lastCompletion=now
+                    self.frameInterval = self.frameInterval == 0 || interval > 1 ? interval
+                        : self.frameInterval * 0.8 + interval * 0.2
+                    self.lastCompletion=now
                     self.onFrameUpdate?(nextFrame)
                 } else {
                     self.resetAccumulation()
