@@ -60,7 +60,7 @@
   print("PASS: fix-frontend NumberControl commits, entry range and parsing (R-02, R-87, R-90)")
 
   // R-02: a focused field does not re-commit its stale value when undo rebuilds the inspector.
-  show(page: 0)
+  show(page: 1)
   let exposure = control("Exposure, EV")!
   grouped {
     exposure.field.stringValue = "2"
