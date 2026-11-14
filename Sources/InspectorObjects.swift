@@ -1,57 +1,104 @@
 import Cocoa
 import simd
 
-// The Objects inspector page for built-in scene slots, model import and framing.
+// The Objects inspector page: the selection, visibility and transform of built-in surface groups (imported scenes:
+// graphObjectPanel in SceneGraphUI.swift), framing, model import, instancing and deletion.
 extension StudioController {
   func objectPanel() {
     if renderer.sceneIndex == 6, project.graph != nil {
       graphObjectPanel()
       return
     }
-    heading("Object / surface group")
+    section("Selection")
     selectObject()
     legacyObjectControls()
-    heading("Add model")
-    text(project.meshName)
-    button("Add Model…") { [weak self] in self?.addModel() }
-    button("Frame imported mesh") { [weak self] in self?.frameMesh() }
-    text(
-      "OBJ positions, UVs and normals are supported. Object/group hierarchy and named material subsets are preserved. Imports append to the scene. MTL materials are imported. Triangulate concave polygons before import."
-    )
+    objectActions(node: nil)
   }
+  // A built-in surface group's Visible toggle and Transform section. Transforms pivot on the scene origin.
   func legacyObjectControls() {
     let slot = selectedSlot
     let o = renderer.materials.objects[slot]
-    button(o.rotationHidden.w > 0 ? "Hidden — click to show" : "Visible — click to hide") {
-      [weak self] in
+    visibilityToggle(hidden: o.rotationHidden.w > 0, help: "Hidden surfaces are not rendered.") { [weak self] hidden in
       guard let self else { return }
       self.checkpoint("Visibility")
-      self.renderer.materials.objects[slot].rotationHidden.w = o.rotationHidden.w > 0 ? 0 : 1
+      self.renderer.materials.objects[slot].rotationHidden.w = hidden ? 1 : 0
       self.changed()
-      self.rebuild()
     }
-    for i in 0..<3 {
-      number("Translation \(["X","Y","Z"][i])", o.positionScale[i], -100...100, 0) { [weak self] in
-        self?.renderer.materials.objects[slot].positionScale[i] = $0
-      }
-      number(
-        "Rotation \(["X","Y","Z"][i]), degrees", o.rotationHidden[i] * 180 / .pi, -180...180, 0
-      ) { [weak self] in self?.renderer.materials.objects[slot].rotationHidden[i] = $0 * .pi / 180 }
+    section("Transform")
+    let pivot = "About the scene origin. Room surfaces and architecture move as one group."
+    vector(
+      "Translation", SIMD3(o.positionScale.x, o.positionScale.y, o.positionScale.z), -100...100, .zero, help: pivot
+    ) { [weak self] v in
+      guard let self else { return }
+      self.renderer.materials.objects[slot].positionScale = SIMD4(v, self.renderer.materials.objects[slot].positionScale.w)
     }
-    number("Uniform scale", o.positionScale.w, 0.01...100, 1) { [weak self] in
+    vector(
+      "Rotation, °", SIMD3(o.rotationHidden.x, o.rotationHidden.y, o.rotationHidden.z) * 180 / .pi, -180...180, .zero,
+      step: 1, help: pivot
+    ) { [weak self] v in
+      guard let self else { return }
+      self.renderer.materials.objects[slot].rotationHidden =
+        SIMD4(v * .pi / 180, self.renderer.materials.objects[slot].rotationHidden.w)
+    }
+    number("Scale", o.positionScale.w, 0.01...100, 1, help: "Uniform scale about the scene origin.") { [weak self] in
       self?.renderer.materials.objects[slot].positionScale.w = $0
     }
-    button("Reset transform") { [weak self] in
+    button("Reset Transform") { [weak self] in
       guard let self else { return }
       self.checkpoint("Reset transform")
       self.renderer.materials.objects[slot].positionScale = SIMD4(0, 0, 0, 1)
-      self.renderer.materials.objects[slot].rotationHidden = .zero
+      // The visibility shares the rotation vector and survives the reset.
+      self.renderer.materials.objects[slot].rotationHidden.x = 0
+      self.renderer.materials.objects[slot].rotationHidden.y = 0
+      self.renderer.materials.objects[slot].rotationHidden.z = 0
       self.changed()
       self.rebuild()
     }
-    text(
-      "Transforms use the scene origin as pivot. Architecture and room surfaces are grouped. Emitters use the Lighting controls."
-    )
+  }
+  // The Visible switch: `apply(hidden)` records the undo step and makes the change; the page rebuilds afterwards, so
+  // the switch shows the outcome (a failed graph edit leaves it unchanged).
+  func visibilityToggle(hidden: Bool, help: String, _ apply: @escaping (Bool) -> Void) {
+    let control = ActionSwitch(!hidden, label: "Visible") { [weak self] on in
+      guard let self else { return }
+      if self.acceptsEdits { apply(!on) }
+      self.rebuild()
+    }
+    control.toolTip = help
+    control.setAccessibilityHelp(help)
+    add(inspectorRow(inspectorLabel("Visible", help: help), control))
+  }
+  static let addModelHelp =
+    "Adds an OBJ model to the Imported Mesh Studio. Objects, groups and material subsets (usemtl) are kept, MTL materials are imported, and imports append to the scene. Triangulate concave polygons before import."
+  // Framing (only where there is an imported mesh), instancing, model import and, last, deletion of `node`.
+  func objectActions(node: SceneNode?) {
+    section("Actions")
+    if sceneHasMesh {
+      let all = ActionButton("Frame All") { [weak self] in self?.frameAllAction() }
+      all.toolTip = "Frames every imported object."
+      if node != nil {
+        let selection = ActionButton("Frame Selection") { [weak self] in self?.frameMesh() }
+        selection.toolTip = "Frames the selected object and its children."
+        buttonRow([selection, all])
+      } else {
+        buttonRow([all])
+      }
+    }
+    let addModel = ActionButton("Add Model…") { [weak self] in self?.addModel() }
+    addModel.toolTip = Self.addModelHelp
+    if let node {
+      let instance = ActionButton("Create Instance") { [weak self] in
+        guard let self else { return }
+        self.editGraph("Create instance") { g in self.selectedNode = try g.instance(node.id) }
+      }
+      instance.toolTip =
+        "Adds a copy of the object and its children that shares their meshes; edit its transform independently."
+      buttonRow([instance, addModel])
+      button("Delete", style: .destructive, help: "Removes the object and its children from the scene.") {
+        [weak self] in self?.editGraph("Delete object") { g in g.remove(node.id) }
+      }
+    } else {
+      buttonRow([addModel])
+    }
   }
   func addModel() {
     chooseOpen("Add OBJ model", extensions: ["obj"]) { [weak self] url in

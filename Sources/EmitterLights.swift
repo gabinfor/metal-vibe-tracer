@@ -132,10 +132,11 @@ struct CIEObserver: Sendable {
   }
 }
 
-// The Materials page's controls for an imported light's spectrum and spot cone (StudioController.materialPanel).
+// The Materials tab for an imported area light (a UsdLux rect, disk or sphere light; StudioController.materialPanel):
+// its radiance, spectrum and spot cone.
 extension StudioController {
   static let emitterSpectrumTitles = ["Scene light spectrum"] + illuminantTitles.dropFirst() + ["Blackbody", "Narrow band (laser)"]
-  func emitterLightControls(_ slot: Int) {
+  func emitterLightControls(_ slot: Int, radiance: SIMD3<Float>) {
     let light = renderer.materials.emitterLights[slot] ?? EmitterLight()
     func update(rebuilds: Bool = false, _ change: (inout EmitterLight) -> Void) {
       var edited = renderer.materials.emitterLights[slot] ?? EmitterLight()
@@ -151,8 +152,15 @@ extension StudioController {
     case .blackbody: selected = 1 + presets
     case .narrowband: selected = 2 + presets
     }
-    heading("Light spectrum")
-    popup(Self.emitterSpectrumTitles, selected, label: "Spectrum") { [weak self] i in
+    section("Light")
+    vector(
+      "Radiance", radiance, 0...1000, radiance, labels: ["R", "G", "B"], entry: 0...1e8,
+      help: "Linear RGB radiance of the imported area light. Move and rotate the light on the Objects tab."
+    ) { [weak self] v in self?.renderer.materials.emissions[slot] = v }
+    popupRow(
+      "Spectrum", Self.emitterSpectrumTitles, selected,
+      help: "Spectral transport renders the spectrum; RGB transport uses its colour (presets stay white). A blackbody or narrow band is normalised to the same luminance, so the radiance keeps its brightness."
+    ) { [weak self] i in
       guard let self else { return }
       self.checkpoint("Light spectrum")
       update(rebuilds: true) { e in
@@ -163,25 +171,31 @@ extension StudioController {
     }
     switch light.spectrum {
     case .blackbody(let t):
-      number("Temperature (K)", t, 1000...12000, 2700, entry: EmitterLight.temperatureRange) { v in
+      number("Temperature, K", t, 1000...12000, 2700, entry: EmitterLight.temperatureRange, step: 50) { v in
         update { $0.spectrum = .blackbody(kelvin: v) }
       }
     case .narrowband(let c, let w):
-      number("Centre (nm)", c, 380...780, 532, entry: EmitterLight.wavelengthRange) { v in
+      number("Centre, nm", c, 380...780, 532, entry: EmitterLight.wavelengthRange, step: 1) { v in
         update { $0.spectrum = .narrowband(center: v, fwhm: w) }
       }
-      number("Width, FWHM (nm)", w, 1...50, 2, entry: EmitterLight.fwhmRange) { v in
+      number(
+        "Band width, nm", w, 1...50, 2, entry: EmitterLight.fwhmRange, step: 0.5,
+        help: "Full width at half maximum of the band."
+      ) { v in
         update { $0.spectrum = .narrowband(center: c, fwhm: v) }
       }
     default: break
     }
-    heading("Spot cone")
-    number("Cone angle (°)", light.coneAngle ?? 90, 0.5...90, 90) { v in
+    section("Spot cone")
+    let cone = "Measured from the light's facing direction (UsdLux ShapingAPI); a few degrees make a beam. 90° turns the cone off."
+    number("Cone angle, °", light.coneAngle ?? 90, 0.5...90, 90, step: 1, help: cone) { v in
       update { $0.coneAngle = v >= 90 ? nil : v }
     }
-    number("Cone softness", light.coneSoftness, 0...1, 0) { v in update { $0.coneSoftness = v } }
-    number("Focus", light.focus, 0...50, 0) { v in update { $0.focus = v } }
-    text(
-      "Spectral transport renders the spectrum; RGB transport uses its colour (presets stay white). A blackbody or narrow band is normalised to the same luminance, so the radiance above keeps its brightness. The cone (UsdLux ShapingAPI) is measured from the light's facing direction; a few degrees make a beam.")
+    number("Cone softness", light.coneSoftness, 0...1, 0, step: 0.01, help: "Softens the cone's edge.") { v in
+      update { $0.coneSoftness = v }
+    }
+    number("Focus", light.focus, 0...50, 0, help: "Concentrates the emission towards the light's axis.") { v in
+      update { $0.focus = v }
+    }
   }
 }
