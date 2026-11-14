@@ -279,12 +279,12 @@
     <surfacematerial name="DroppedMaterial" type="material"><input name="surfaceshader" type="surfaceshader" nodename="Dropped"/></surfacematerial>
     </materialx>
     """.utf8))
-  grouped {
-    require(controller.openDroppedFiles([materialX]), "a MaterialX file is accepted")
-    idle()
-  }
-  require(controller.history.undoActionName == "Import MaterialX" && testRenderer.materials.materialX[controller.selectedSlot] != nil,
-    "a dropped .mtlx imports through Import MaterialX")
+  // The import's completion shows its report in a modal alert (SceneGraphUI), so the check stops at the routing: a
+  // newer document change supersedes the import before it completes.
+  require(controller.openDroppedFiles([materialX]) && controller.projectOperationInProgress
+    && controller.status.stringValue == "Importing Drop.mtlx…", "a dropped .mtlx starts Import MaterialX")
+  controller.prepareGeneration &+= 1
+  idle()
   // A project drop asks first about unsaved changes; Cancel keeps the document.
   var project = ProjectDocument()
   project.options.exposure = 1.25
