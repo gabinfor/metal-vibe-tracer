@@ -214,14 +214,14 @@
   var busySave: Bool?
   controller.saveProject { busySave = $0 }
   require(busySave == false, "Save is rejected during project I/O")
-  require(button("Save", in: controller.view)?.isEnabled == false && controller.viewport.canEdit?() == false,
-    "toolbar Save and camera gestures are disabled while busy")
+  require(button("Restart", in: controller.view)?.isEnabled == false && controller.viewport.canEdit?() == false,
+    "toolbar Restart and camera gestures are disabled while busy")
   let untouched = testRenderer.options.exposure
   controller.newProject()
   controller.checkpoint("Busy")
   require(!history.canUndo && testRenderer.options.exposure == untouched, "busy New and checkpoints do nothing")
   controller.importInProgress = false
-  require(button("Save", in: controller.view)?.isEnabled == true, "toolbar Save re-enables after I/O")
+  require(button("Restart", in: controller.view)?.isEnabled == true, "toolbar Restart re-enables after I/O")
   let quitFile = folder.appendingPathComponent("quit.vtrace")
   controller.beginSaveProject(quitFile)
   var quitReply: String??

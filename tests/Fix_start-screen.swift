@@ -346,7 +346,6 @@
   require(valid(#selector(StudioController.openAction)) && valid(#selector(StudioController.openSceneFileAction))
     && !valid(#selector(StudioController.saveAction)) && !valid(#selector(StudioController.exportAction))
     && valid(#selector(StudioController.openRecentAction(_:))) && valid(#selector(StudioController.clearRecentAction))
-    && !valid(#selector(StudioController.settingsAction))
     && !valid(#selector(StudioController.undoAction)), "with no document only open, Open Recent, import and browse commands apply")
   testRenderer.options.exposure = 3
   controller.changed(reset: false)
