@@ -124,6 +124,21 @@
   require(completed == before && renderer.frameIndex == pausedCount && !renderer.presentationNeedsRefresh,
     "paused refresh after resize presents without tracing a sample")
 
+  // A still image (an export in progress) is presented in place of the paused render, once and without tracing; the
+  // render returns when it is cleared.
+  before = completed; requests = probe.drawableRequests
+  renderer.stillImage = sharedTexture(.bgra8Unorm, 32, 8)
+  require(renderer.presentationNeedsRefresh, "a still image requests a repaint")
+  probe.draw()
+  require(probe.drawableRequests == requests + 1 && !renderer.presentationNeedsRefresh, "the paused view presents the still image")
+  probe.draw()
+  require(probe.drawableRequests == requests + 1, "a still image is presented once")
+  renderer.stillImage = nil
+  probe.draw()
+  settle(seconds: 0.3)
+  require(probe.drawableRequests == requests + 2 && !renderer.presentationNeedsRefresh && completed == before
+      && renderer.frameIndex == pausedCount, "clearing the still image presents the paused render again without tracing")
+
   // R-16: paused refreshes never re-run MetalFX or consume its history reset.
   if renderer.supportsMetalFX, let fx = renderer.metalFX {
     let denoised = readTexture(fx.output)
@@ -186,6 +201,6 @@
   probe.delegate = nil
   renderer.onFrameUpdate = nil
   renderer.options = savedOptions
-  print("PASS: paused repaint, resize, MetalFX refresh, stale-frame, inspection-count and drawable-wait behaviour")
+  print("PASS: paused repaint, still image, resize, MetalFX refresh, stale-frame, inspection-count and drawable-wait behaviour")
 }
 try fixPresentationChecks()

@@ -76,6 +76,9 @@ extension StudioController {
     render.addItem(.separator())
     add(render, "Denoise Current Frame", #selector(oidnAction))
     add(render, "Clear Denoised Preview", #selector(clearOIDNAction))
+    render.addItem(.separator())
+    add(render, "Limit GPU Load", #selector(gpuLoadLimitAction)).toolTip =
+      "Leaves a tenth of the GPU's time free while rendering and exporting, so the rest of the system stays responsive. Turn it off for the fastest render."
 
     let view = menu("View")
     add(view, "Hide Inspector", #selector(inspectorAction), "i")
@@ -143,12 +146,13 @@ extension StudioController {
     history.redo()
   }
   @objc func pauseAction() { pause() }
+  @objc func gpuLoadLimitAction() { limitsGPULoad.toggle() }
   @objc func restartAction() { restart() }
 }
 
 extension StudioController: NSMenuItemValidation {
   // Titles and checkmarks follow the state; commands that need a document are disabled on the main menu, and every
-  // command but the inspector toggle, Help and Show Downloaded Scenes in Finder is disabled while busy.
+  // command but the inspector toggle, Limit GPU Load, Help and Show Downloaded Scenes in Finder is disabled while busy.
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     switch item.action {
     case #selector(viewportAction(_:)): item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
@@ -157,6 +161,9 @@ extension StudioController: NSMenuItemValidation {
     case #selector(inspectorAction):
       item.title = sidebarVisible ? "Hide Inspector" : "Show Inspector"
       return startScreen == nil
+    case #selector(gpuLoadLimitAction):
+      item.state = limitsGPULoad ? .on : .off
+      return true
     case #selector(exampleCreditsAction), #selector(revealExampleScenesAction), #selector(userGuideAction):
       return true
     default: break

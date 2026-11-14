@@ -198,7 +198,7 @@ The app opens instantly on a main menu: start a new project, open a project or a
 | Frame selection / all | ⌘F / ⇧⌘F |
 | Close window / minimize / hide | ⌘W / ⌘M / ⌘H |
 
-For a final image, open the **Export** tab, choose a size and sample count, select OIDN, raw, or MetalFX output and a format, and click **Render and Export…**. See the [user guide](docs/USER_GUIDE.md) for material controls, project behavior, import coverage, and export details.
+For a final image, open the **Export** tab, choose a size and sample count, select OIDN, raw, or MetalFX output and a format, and click **Render and Export…**; the viewport shows the export as it renders. See the [user guide](docs/USER_GUIDE.md) for material controls, project behavior, import coverage, and export details.
 
 <details>
 <summary><b>Export and project details</b></summary>

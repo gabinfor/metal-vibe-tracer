@@ -127,6 +127,7 @@ extension StudioController {
       r.options.compare = 0
       r.options.maxSamples = p.options.exportSamples
       r.options.timeLimit = 0
+      r.gpuLoadLimit = renderer.gpuLoadLimit
       p.camera.apply(r)
       if let message = r.renderMemoryError(width: p.options.outputWidth, height: p.options.outputHeight) {
         throw MaterialLibrary.error(message)
@@ -169,30 +170,59 @@ extension StudioController {
       }
       let start = Date()
       let progress = beginActivity("Rendering \(out.width)×\(out.height) export") { [weak self] in self?.cancelExport() }
-      // Two command buffers stay in flight, so the GPU runs the next batch while the main thread
-      // handles the last one; each batch holds about 100 ms of samples (samplesPerFrame).
-      func submit() {
-        guard exportRenderer === r, let out = exportOutput else { return }
-        let remaining = Int(r.options.exportSamples) - Int(r.frameIndex)
-        guard remaining > 0 else { return }
-        r.renderFrame(output: out, samples: r.samplesPerFrame(targetMilliseconds: 100, limit: remaining))
-      }
       r.onFrameUpdate = { [weak self, weak r] count in
         guard let self, let r, self.exportRenderer === r else { return }
+        // The viewport shows the export as it renders: `out` holds the displayed image of every finished batch.
+        self.renderer.stillImage = out
         self.status.stringValue =
           "Export: \(count) / \(r.options.exportSamples) spp · \(Int(Date().timeIntervalSince(start))) s"
         progress.update("Rendering \(out.width)×\(out.height) export", completed: Int(count), of: Int(r.options.exportSamples))
         if count >= r.options.exportSamples {
           self.finishExport()
         } else {
-          submit()
+          self.submitExportBatch(r)
         }
       }
       rebuild()
       show("Rendering \(out.width)×\(out.height) export…")
-      submit()
-      submit()
+      // Two command buffers stay in flight, so the GPU runs the next batch while the main thread handles the last
+      // one; with the GPU load limit on, a batch waits its turn instead (submitExportBatch).
+      submitExportBatch(r)
+      submitExportBatch(r)
     } catch { showError("Export failed: \(error.localizedDescription)") }
+  }
+  // Submits the export's next batch, about 100 ms of samples (samplesPerFrame), once the GPU load limit allows it
+  // (PathTracerRenderer.submissionDelay): now, after the idle share of the batches before it, or, while the first
+  // batch is being timed, not at all (that batch's completion submits the next).
+  private func submitExportBatch(_ r: PathTracerRenderer) {
+    guard exportRenderer === r, let out = exportOutput else { return }
+    let remaining = Int(r.options.exportSamples) - Int(r.frameIndex)
+    guard remaining > 0 else { return }
+    let delay = r.submissionDelay()
+    guard delay.isFinite else { return }
+    if delay > 0 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak r] in
+        guard let self, let r else { return }
+        self.submitExportBatch(r)
+      }
+      return
+    }
+    r.renderFrame(output: out, samples: r.samplesPerFrame(targetMilliseconds: 100, limit: remaining))
+  }
+  // Render › Limit GPU Load (on by default; remembered by the app, not saved in the project): the preview and
+  // exports leave a tenth of the GPU's time free for the rest of the system (PathTracerRenderer.gpuLoadLimit).
+  static let gpuLoadLimitKey = "LimitGPULoad"
+  var limitsGPULoad: Bool {
+    get { preferences.object(forKey: Self.gpuLoadLimitKey) as? Bool ?? true }
+    set {
+      preferences.set(newValue, forKey: Self.gpuLoadLimitKey)
+      applyGPULoadLimit()
+    }
+  }
+  func applyGPULoadLimit() {
+    let limit = limitsGPULoad ? PathTracerRenderer.limitedGPULoad : 1
+    renderer.gpuLoadLimit = limit
+    exportRenderer?.gpuLoadLimit = limit
   }
   func cancelExport() {
     exportDenoiseJob?.cancel()
@@ -202,6 +232,7 @@ extension StudioController {
     exportRenderer = nil
     exportOutput = nil
     exportURL = nil
+    renderer.stillImage = nil
     renderer.paused = previousPaused
     renderer.lastTick = awakeSeconds()
     viewport.renderer = renderer

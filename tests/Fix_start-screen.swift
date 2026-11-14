@@ -30,8 +30,8 @@
   waitUntil({ outcome.done }, seconds: 600)
   let compiled = outcome.result, compiledOnMain = outcome.onMain
   let launched = try PathTracerRenderer(device: gpu, shaders: compiled!.get())
-  require(!compiledOnMain && progress.snapshot.fraction == 1 && progress.snapshot.detail == "9 of 9",
-    "launch compiles the nine core pipelines off the main thread with counted progress")
+  require(!compiledOnMain && progress.snapshot.fraction == 1 && progress.snapshot.detail == "10 of 10",
+    "launch compiles the ten core pipelines off the main thread with counted progress")
   require(launched.sceneKernels.pt == nil && launched.meshKernels.splat == nil && launched.meshKernels.spmis == nil,
     "the optional kernel groups are not compiled at launch")
   launched.sceneIndex = 6

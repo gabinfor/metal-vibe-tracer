@@ -306,6 +306,8 @@ controller.autosaveURL=testOutputDirectory.appendingPathComponent("studio/Autosa
 // section is built so checks can reach its controls.
 let testPreferences=UserDefaults(suiteName:"VibeTracerTests")!
 testPreferences.removePersistentDomain(forName:"VibeTracerTests")
+// Checks render at full speed; the GPU load limit is switched on where it is checked.
+testPreferences.set(false,forKey:StudioController.gpuLoadLimitKey)
 controller.preferences=testPreferences
 controller.forceSectionsOpen=true
 // verify.py: end studio controller
