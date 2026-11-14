@@ -92,6 +92,13 @@ final class StudioController: NSViewController {
   var lastCheckpoint = Date.distantPast
   var isRestoring = false
   private var rebuilding = false, rebuildRequested = false
+  // A rebuild requested while a number row's slider is dragged runs when the drag ends (runDeferredRebuild), so the
+  // dragged slider is never torn down mid-drag.
+  private var rebuildAfterDrag = false
+  // Builds the body of every collapsible inspector section, whatever its saved state (tests).
+  var forceSectionsOpen = false
+  // Inspector state kept across launches (collapsed sections); tests redirect it to a volatile suite.
+  var preferences = UserDefaults.standard
   var cameraRefreshPending = false
   var mapThumbnails: [Int: (data: Data, image: NSImage)] = [:]
   var exportRenderer: PathTracerRenderer? { didSet { busyStateChanged() } }
@@ -283,6 +290,10 @@ final class StudioController: NSViewController {
       rebuildRequested = true
       return
     }
+    if let dragged = NumberControl.dragging, dragged.isDescendant(of: stack) {
+      rebuildAfterDrag = true
+      return
+    }
     rebuilding = true
     defer {
       rebuilding = false
@@ -339,6 +350,12 @@ final class StudioController: NSViewController {
     case 5: filePanel()
     default: settingsPanel()
     }
+  }
+  // Runs the rebuild deferred while a slider was dragged.
+  func runDeferredRebuild() {
+    guard rebuildAfterDrag, NumberControl.dragging == nil else { return }
+    rebuildAfterDrag = false
+    rebuild()
   }
   func show(_ message: String) {
     status.textColor = .labelColor
