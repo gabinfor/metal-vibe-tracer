@@ -10561,14 +10561,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return weights
     }
 
+    // The field of view, in degrees, of the scene's default view.
+    var defaultFieldOfView: Float { sceneIndex == 0 ? 38 : sceneIndex == 2 ? 40 : 42 }
+
     // The scene's default view; the user then orbits, pans and zooms from it.
     func applyDefaultCamera() {
         switch sceneIndex {
-        case 0: yaw = 0.42; pitch = 0.22; distance = 4.6; target = SIMD3<Float>(0.15, -0.25, 0.70); fov = 38.0
-        case 2: yaw = 0.52; pitch = 0.28; distance = 5.3; target = SIMD3<Float>(0, 0.1, 0.1); fov = 40.0
-        case 5: yaw = 0.65; pitch = 0.60; distance = 2.9; target = SIMD3<Float>(0.3, -0.6, -0.1); fov = 42.0
-        default: yaw = 0.45; pitch = 0.25; distance = 3.4; target = SIMD3<Float>(0, -0.1, 0); fov = 42.0
+        case 0: yaw = 0.42; pitch = 0.22; distance = 4.6; target = SIMD3<Float>(0.15, -0.25, 0.70)
+        case 2: yaw = 0.52; pitch = 0.28; distance = 5.3; target = SIMD3<Float>(0, 0.1, 0.1)
+        case 5: yaw = 0.65; pitch = 0.60; distance = 2.9; target = SIMD3<Float>(0.3, -0.6, -0.1)
+        default: yaw = 0.45; pitch = 0.25; distance = 3.4; target = SIMD3<Float>(0, -0.1, 0)
         }
+        fov = defaultFieldOfView
         resetAccumulation()
     }
 

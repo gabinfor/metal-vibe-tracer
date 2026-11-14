@@ -3,8 +3,8 @@ import Cocoa
 // The inspector's control vocabulary: the control classes and the row builders every inspector page uses.
 //
 // Each builder adds one row to `stack` (StudioController) and returns its control. Rows put the label on the left and
-// the control right-aligned in a column shared by every row, with an 18-pt slot at the end for reset buttons. Edits
-// are ignored while `acceptsEdits` is false.
+// the control at the row's right edge, with a number row's reset button between them. Edits are ignored while
+// `acceptsEdits` is false.
 //
 //   section("Quality")                                          section heading (14 pt semibold) with space above
 //   collapsible("Advanced", key: "render.advanced") { … }       disclosure + heading; the body is built only while open
@@ -32,7 +32,7 @@ import Cocoa
 // Older helpers for pages not yet converted: heading (section heading without the space above), text (= hint),
 // caption (a small label above a control), popup (a full-width popup without a row label).
 
-// The width of the trailing slot every row ends with (a reset button or empty space).
+// The width of a row's reset button, which sits between the label and the control.
 let inspectorGutter: CGFloat = 18
 
 enum InspectorButtonStyle { case normal, primary, destructive }
@@ -227,12 +227,11 @@ final class NumberControl: NSStackView, NSTextFieldDelegate {
       reset.widthAnchor.constraint(equalToConstant: inspectorGutter).isActive = true
       resetButton = reset
       field.widthAnchor.constraint(equalToConstant: 72).isActive = true
-      let row = inspectorRow(label, field, trailing: reset)
+      let row = inspectorRow(label, field, accessory: reset)
       addArrangedSubview(row)
       addArrangedSubview(slider)
       row.widthAnchor.constraint(equalTo: widthAnchor).isActive = true
-      // The slider ends under the field, clear of the reset column.
-      slider.widthAnchor.constraint(equalTo: widthAnchor, constant: -(inspectorGutter + 6)).isActive = true
+      slider.widthAnchor.constraint(equalTo: widthAnchor).isActive = true
     }
     show(value)
   }
@@ -479,6 +478,7 @@ final class VectorControl: NSStackView {
     reset.widthAnchor.constraint(equalToConstant: inspectorGutter).isActive = true
     resetButton = reset
     addArrangedSubview(inspectorLabel(title, help: help))
+    addArrangedSubview(reset)
     for (i, field) in fields.enumerated() {
       let letter = NSTextField(labelWithString: labels[i])
       letter.font = .systemFont(ofSize: 10)
@@ -495,7 +495,6 @@ final class VectorControl: NSStackView {
       }
       addArrangedSubview(pair)
     }
-    addArrangedSubview(reset)
     reset.isHidden = value == defaultValue
   }
   required init?(coder: NSCoder) { fatalError() }
@@ -540,13 +539,11 @@ final class TopAlignedStackView: NSStackView {
   label.setContentHuggingPriority(.defaultLow, for: .horizontal)
   return label
 }
-// Label on the left, `control` right-aligned, then `trailing` (or empty space) in the reset column.
-@MainActor func inspectorRow(_ label: NSView, _ control: NSView, trailing: NSView? = nil) -> NSStackView {
-  let slot = trailing ?? NSView()
-  if trailing == nil { slot.widthAnchor.constraint(equalToConstant: inspectorGutter).isActive = true }
+// Label on the left, `control` at the row's right edge, and `accessory` (a reset button) between them.
+@MainActor func inspectorRow(_ label: NSView, _ control: NSView, accessory: NSView? = nil) -> NSStackView {
   control.setContentHuggingPriority(.defaultHigh, for: .horizontal)
   control.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-  let row = NSStackView(views: [label, control, slot])
+  let row = NSStackView(views: [label] + (accessory.map { [$0] } ?? []) + [control])
   row.orientation = .horizontal
   row.alignment = .centerY
   row.distribution = .fill
@@ -647,7 +644,7 @@ extension StudioController {
       row.alignment = .leading
       row.spacing = 4
       add(row)
-      popup.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -(inspectorGutter + 6)).isActive = true
+      popup.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
       return popup
     }
     let row = inspectorRow(label, popup)

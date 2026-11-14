@@ -30,7 +30,7 @@ extension StudioController {
   func cameraPanel() {
     hint("Drag to orbit, Shift-drag to pan, scroll to zoom, click to select.")
     section("Lens")
-    number("Field of view, °", renderer.fov, 5...150, 38, step: 1, help: "Vertical field of view.") {
+    number("Field of view, °", renderer.fov, 5...150, renderer.defaultFieldOfView, step: 1, help: "Vertical field of view.") {
       [weak self] in self?.renderer.fov = $0
     }
     option(
