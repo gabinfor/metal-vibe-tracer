@@ -257,6 +257,7 @@ extension StudioController {
     objectActions(node: node)
   }
   func showMaterialXReport() {
+    if let shown = importReportShown { return shown() }
     let alert = NSAlert()
     alert.messageText = "MaterialX import report"
     alert.informativeText = materialXReport

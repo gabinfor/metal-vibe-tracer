@@ -83,14 +83,8 @@ extension StudioController {
       self?.exportsOpenEXR = i == 1
       self?.rebuild()
     }
-    // A preference: no undo step and no document change.
-    let reveal = toggle("Show in Finder when done", revealsExportInFinder, reset: false) { _ in }
-    reveal.actionBlock = { [weak self, weak reveal] on in
-      guard let self, self.acceptsEdits else {
-        reveal?.state = on ? .off : .on
-        return
-      }
-      self.revealsExportInFinder = on
+    toggle("Show in Finder when done", revealsExportInFinder, records: false) { [weak self] on in
+      self?.revealsExportInFinder = on
     }
     button("Render and Export…", style: .primary, help: "Renders the scene at the output size and saves it.") {
       [weak self] in

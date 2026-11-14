@@ -142,20 +142,20 @@
     && abs(testRenderer.distance / distance - expected) < 1e-3, "line scroll deltas are scaled for notched wheels")
   print("PASS: fix-frontend drag threshold, click picking and scroll zoom (R-42, R-85, R-88)")
 
-  // R-86: a colour-panel burst records one undo step (the Cornell Box has the Light color row).
+  // R-86: a colour-panel burst records one undo step (the Cornell Box has the Light colour row).
   try reset()
   var cornell = ProjectDocument()
   cornell.scene = 1
   try controller.restore(cornell)
   history.removeAllActions()
   show(page: 2)
-  let well = views(ActionColor.self, in: controller.stack).first { $0.accessibilityLabel() == "Light color" }!
+  let well = views(ActionColor.self, in: controller.stack).first { $0.accessibilityLabel() == "Light colour" }!
   for (i, red) in [0.2, 0.4, 0.6].enumerated() {
     grouped {
       well.color = NSColor(srgbRed: red, green: 0.5, blue: 0.5, alpha: 1)
       well.changed()
     }
-    if i == 0 { require(history.undoActionName == "Light color", "first colour change is undoable") }
+    if i == 0 { require(history.undoActionName == "Light colour", "first colour change is undoable") }
   }
   let finalColor = testRenderer.options.lightColor
   history.undo()

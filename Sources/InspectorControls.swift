@@ -654,9 +654,10 @@ extension StudioController {
   }
   // The share of a row an inline popup takes, and the width of a popup's bezel and arrows around its title.
   static let popupColumn: CGFloat = 0.58, popupChrome: CGFloat = 44
-  // An on/off setting. The row records an undo step named `title` and calls `changed(reset:)` after `action`.
+  // An on/off setting. The row records an undo step named `title` and calls `changed(reset:)` after `action`;
+  // `records: false` is for app preferences, which are neither undoable nor part of the document.
   @discardableResult func toggle(
-    _ title: String, _ isOn: Bool, reset: Bool = true, help: String? = nil, enabled: Bool = true,
+    _ title: String, _ isOn: Bool, reset: Bool = true, records: Bool = true, help: String? = nil, enabled: Bool = true,
     _ action: @escaping (Bool) -> Void
   ) -> ActionSwitch {
     let control = ActionSwitch(isOn, label: title) { _ in }
@@ -665,9 +666,9 @@ extension StudioController {
         control?.state = isOn ? .on : .off
         return
       }
-      self.checkpoint(title)
+      if records { self.checkpoint(title) }
       action(on)
-      self.changed(reset: reset)
+      if records { self.changed(reset: reset) }
     }
     control.toolTip = help
     if let help { control.setAccessibilityHelp(help) }

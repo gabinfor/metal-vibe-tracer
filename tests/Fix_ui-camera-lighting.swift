@@ -58,7 +58,7 @@
   require(shown.isSuperset(of: ["Environment", "Sun", "Atmosphere"]) && !shown.contains("Lights"),
     "the Pavilion shows Environment, Sun and Atmosphere, not Lights")
   require(popup("Sky preset") != nil && popup("Sun spectrum") != nil && popup("Light spectrum") == nil
-    && well("Light color") == nil && number("Brightness") != nil && number("Rotation, °") == nil
+    && well("Light colour") == nil && number("Brightness") != nil && number("Rotation, °") == nil
     && button("Load Environment Image…") != nil && button("Remove Image") == nil,
     "the procedural sky offers a preset and brightness, no image rotation or Remove Image")
   require(number("Azimuth, °")?.step == 1 && number("Elevation, °")?.step == 1
@@ -68,7 +68,7 @@
   shown = texts()
   require(shown.isSuperset(of: ["Lights", "Atmosphere"]) && !shown.contains("Environment") && !shown.contains("Sun"),
     "the Cornell Box shows Lights and Atmosphere only")
-  require(well("Light color") != nil && popup("Light spectrum") != nil && popup("Sky preset") == nil
+  require(well("Light colour") != nil && popup("Light spectrum") != nil && popup("Sky preset") == nil
     && popup("Sun spectrum") == nil && number("Intensity") != nil && number("Size") != nil,
     "finite-light scenes show intensity, size, colour and spectrum")
   try open(scene: 6)
@@ -76,7 +76,7 @@
   shown = texts()
   require(shown.isSuperset(of: ["Environment", "Sun", "Lights", "Atmosphere"])
     && shown.contains("Select a light to edit it on the Materials tab.")
-    && popup("Light spectrum") != nil && well("Light color") == nil && number("Size") == nil,
+    && popup("Light spectrum") != nil && well("Light colour") == nil && number("Size") == nil,
     "imported scenes keep the light spectrum with a pointer to the Materials tab")
   print("PASS: ui-camera-lighting Lighting sections per scene (sky, finite lights, imported)")
 

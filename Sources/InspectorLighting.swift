@@ -31,7 +31,7 @@ extension StudioController {
         "Intensity", \.lightIntensity, 0...100, 1, step: 0.01, scale: .logarithmic,
         help: "Multiplies the emission of the scene's lights. The Veach scene's four lights share these settings.")
       option("Size", \.lightSize, 0.05...4, 1, step: 0.01, help: "Multiplies the size of the scene's lights.")
-      colorRow("Light color", renderer.options.lightColor, help: "Tints the scene's lights (linear RGB).") {
+      colorRow("Light colour", renderer.options.lightColor, help: "Tints the scene's lights (linear RGB).") {
         [weak self] in self?.renderer.options.lightColor = $0
       }
       spectrumRow("Light spectrum", \.lightSpectrum)
