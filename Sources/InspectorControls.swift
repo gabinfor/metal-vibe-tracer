@@ -376,7 +376,7 @@ final class NumberControl: NSStackView, NSTextFieldDelegate {
     let factor: Float = modifiers.contains(.shift) ? 10 : modifiers.contains(.option) ? 0.1 : 1
     var delta = stepAt(value) * factor
     if integral { delta = max(1, delta.rounded()) }
-    set(Self.snap(value + direction * delta, to: delta))
+    set(Self.snap(value + direction * delta, to: min(delta, stepAt(value))))
   }
   func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
     guard let event = NSApp.currentEvent, event.type == .keyDown, event.keyCode == 125 || event.keyCode == 126,
@@ -452,6 +452,7 @@ final class VectorControl: NSStackView {
     super.init(frame: .zero)
     update = action
     orientation = .horizontal
+    distribution = .fill
     spacing = 6
     detachesHiddenViews = false
     let reset = NSButton(
@@ -534,6 +535,7 @@ final class TopAlignedStackView: NSStackView {
   let row = NSStackView(views: [label, control, slot])
   row.orientation = .horizontal
   row.alignment = .centerY
+  row.distribution = .fill
   row.spacing = 6
   row.detachesHiddenViews = false
   return row

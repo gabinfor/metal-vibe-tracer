@@ -114,6 +114,7 @@ extension StudioController {
       "The left side shows raw accumulation. Exposure and white balance affect the display and PNG export; EXR preserves linear radiance."
     )
     text("Inspection views bypass tone mapping and denoising, and do not reset the progressive render.")
+    renderSettingsSections()
   }
 
   // The sampler, light transport, light sampling and caustics popups (every strategy) and the four ReSTIR reuse
@@ -233,7 +234,8 @@ extension StudioController {
     rebuild()
   }
 
-  func settingsPanel() {
+  // Render limits, Open Image Denoise and Experimental, at the end of the Render page.
+  func renderSettingsSections() {
     heading("Render limits")
     number(
       "Sample limit (0 = unlimited)", Float(renderer.options.maxSamples), 0...16384, 0, reset: false, integral: true

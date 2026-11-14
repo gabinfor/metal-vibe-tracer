@@ -9,7 +9,9 @@ final class StudioController: NSViewController {
   let renderer: PathTracerRenderer
   weak var hostWindow: NSWindow?
   let viewport: InteractiveMTKView
-  let sidebar = NSScrollView(), stack = TopAlignedStackView(), status = NSTextField(labelWithString: "")
+  let sidebar = NSScrollView(), stack = TopAlignedStackView()
+  // The status bar: render state and progress (and transient messages) on the left, frame figures on the right.
+  let status = NSTextField(labelWithString: ""), statusDetail = NSTextField(labelWithString: "")
   // The activity strip left of the status line: a progress bar, its phase and, for operations that
   // support it, a Cancel button (beginActivity). Background shader compilation shows there too.
   let activityStrip = NSStackView(), activityBar = NSProgressIndicator()
@@ -29,6 +31,14 @@ final class StudioController: NSViewController {
   var openRecentMenu: NSMenu?
   // The inspector's scene title, refreshed when the document's name changes.
   private weak var sceneTitleLabel: NSTextField?
+  // The catalog title of a scene opened from the scene browser, shown in the inspector's scene row until the document
+  // is saved or replaced (runtime state only; associate clears it).
+  var catalogSceneTitle: String? { didSet { updateWindowTitle() } }
+  // The inspector's tab bar (rebuilt with the inspector) and the toolbar's view-mode popup and inspector toggle.
+  private(set) weak var tabBar: ActionSegmentedControl?
+  private(set) var viewModePopup: ActionPopup?
+  private(set) var inspectorToggle: ActionButton?
+  private var resizeHandle: InspectorResizeHandle?
   var isBrowsingScenes: Bool { scenes.isVisible }
   // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
   var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
@@ -83,7 +93,10 @@ final class StudioController: NSViewController {
     var written: (revision: UInt64, url: URL)?
   }
   private let autosaveState = Mutex(AutosaveState())
-  var selectedSlot = 1, page = 0, sidebarVisible = true
+  var selectedSlot = 1, sidebarVisible = true
+  // The inspector tab: an index into pageTitles.
+  var page = 0 { didSet { page = min(max(page, 0), Self.pageTitles.count - 1) } }
+  static let pageTitles = ["Render", "Camera", "Lighting", "Materials", "Objects", "Export"]
   var selectedNode: UUID?
   var selectedSubset = 0
   var materialXReport = ""
@@ -97,7 +110,7 @@ final class StudioController: NSViewController {
   private var rebuildAfterDrag = false
   // Builds the body of every collapsible inspector section, whatever its saved state (tests).
   var forceSectionsOpen = false
-  // Inspector state kept across launches (collapsed sections); tests redirect it to a volatile suite.
+  // Inspector state kept across launches (collapsed sections, inspector width); tests redirect it to a volatile suite.
   var preferences = UserDefaults.standard
   var cameraRefreshPending = false
   var mapThumbnails: [Int: (data: Data, image: NSImage)] = [:]
@@ -169,29 +182,29 @@ final class StudioController: NSViewController {
   override func loadView() {
     let root = NSView()
     view = root
+    // Toolbar: render transport and the view mode on the left; Export… and the inspector toggle on the right.
     let bar = NSStackView()
     bar.orientation = .horizontal
     bar.spacing = 8
-    let toggle = ActionButton("Inspector") { [weak self] in
-      self?.inspectorAction()
-    }
-    bar.addArrangedSubview(toggle)
-    let open = ActionButton("Open…") { [weak self] in self?.openProject() }
-    let save = ActionButton("Save") { [weak self] in self?.saveProject() }
-    bar.addArrangedSubview(open)
-    bar.addArrangedSubview(save)
     let pause = ActionButton("Pause") { [weak self] in self?.pause() }
     pauseButton = pause
-    bar.addArrangedSubview(pause)
     let restart = ActionButton("Restart") { [weak self] in self?.restart() }
-    bar.addArrangedSubview(restart)
-    let export = ActionButton("Export…") { [weak self] in self?.showPage(5) }
-    bar.addArrangedSubview(export)
+    let viewMode = ActionPopup(Self.viewportNames, selected: 0, label: "View mode") { [weak self] i in
+      self?.setViewportMode(i)
+    }
+    viewMode.toolTip = "View mode"
+    viewModePopup = viewMode
     let spacer = NSView()
-    bar.addArrangedSubview(spacer)
-    let settings = ActionButton("Settings…") { [weak self] in self?.settingsAction() }
-    bar.addArrangedSubview(settings)
-    busyButtons = [open, save, restart, export, settings]
+    spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+    let export = ActionButton("Export…") { [weak self] in self?.showPage(5) }
+    export.toolTip = "Show the Export tab"
+    let toggle = ActionButton("") { [weak self] in self?.inspectorAction() }
+    toggle.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "Inspector")
+    toggle.setAccessibilityLabel("Inspector")
+    toggle.toolTip = "Hide Inspector"
+    inspectorToggle = toggle
+    for v in [pause, restart, viewMode, spacer, export, toggle] { bar.addArrangedSubview(v) }
+    busyButtons = [restart, viewMode, export]
     sidebar.hasVerticalScroller = true
     sidebar.drawsBackground = true
     stack.orientation = .vertical
@@ -201,8 +214,13 @@ final class StudioController: NSViewController {
     stack.setContentCompressionResistancePriority(.required, for: .vertical)
     stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 16, right: 12)
     sidebar.documentView = stack
-    status.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    status.font = .systemFont(ofSize: 11)
     status.lineBreakMode = .byTruncatingTail
+    status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    statusDetail.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    statusDetail.textColor = .secondaryLabelColor
+    statusDetail.alignment = .right
+    statusDetail.setContentHuggingPriority(.required, for: .horizontal)
     errorButton.isBordered = false
     errorButton.contentTintColor = .systemRed
     errorButton.font = .systemFont(ofSize: 11)
@@ -223,12 +241,19 @@ final class StudioController: NSViewController {
     activityCancel.font = .systemFont(ofSize: 11)
     for v in [activityBar, activityLabel, activityCancel] { activityStrip.addArrangedSubview(v) }
     activityStrip.isHidden = true
-    for v in [bar, viewport, sidebar, activityStrip, status, errorButton] {
+    // Dragging the inspector's leading edge resizes it; the width is remembered.
+    let handle = InspectorResizeHandle()
+    var dragStartWidth: CGFloat = 0
+    handle.onBegin = { [weak self] in dragStartWidth = self?.sidebarWidth.constant ?? 0 }
+    handle.onResize = { [weak self] travel in self?.setInspectorWidth(dragStartWidth - travel, remember: false) }
+    handle.onEnd = { [weak self] in self.map { $0.setInspectorWidth($0.sidebarWidth.constant) } }
+    resizeHandle = handle
+    for v in [bar, viewport, sidebar, handle, activityStrip, status, statusDetail, errorButton] {
       v.translatesAutoresizingMaskIntoConstraints = false
       root.addSubview(v)
     }
     stack.translatesAutoresizingMaskIntoConstraints = false
-    sidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: 340)
+    sidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: inspectorWidth)
     NSLayoutConstraint.activate([
       bar.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
       bar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
@@ -238,7 +263,9 @@ final class StudioController: NSViewController {
       activityStrip.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
       activityStrip.centerYAnchor.constraint(equalTo: status.centerYAnchor),
       activityStrip.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.5),
-      status.trailingAnchor.constraint(equalTo: errorButton.leadingAnchor, constant: -8),
+      status.trailingAnchor.constraint(lessThanOrEqualTo: statusDetail.leadingAnchor, constant: -12),
+      statusDetail.trailingAnchor.constraint(equalTo: errorButton.leadingAnchor, constant: -8),
+      statusDetail.centerYAnchor.constraint(equalTo: status.centerYAnchor),
       errorButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
       errorButton.centerYAnchor.constraint(equalTo: status.centerYAnchor),
       errorButton.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.45),
@@ -250,6 +277,10 @@ final class StudioController: NSViewController {
       viewport.topAnchor.constraint(equalTo: sidebar.topAnchor),
       viewport.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
       viewport.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+      handle.centerXAnchor.constraint(equalTo: sidebar.leadingAnchor),
+      handle.widthAnchor.constraint(equalToConstant: 6),
+      handle.topAnchor.constraint(equalTo: sidebar.topAnchor),
+      handle.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
       stack.leadingAnchor.constraint(equalTo: sidebar.contentView.leadingAnchor),
       stack.trailingAnchor.constraint(equalTo: sidebar.contentView.trailingAnchor),
       stack.topAnchor.constraint(equalTo: sidebar.contentView.topAnchor),
@@ -258,14 +289,14 @@ final class StudioController: NSViewController {
     statusAfterActivity = status.leadingAnchor.constraint(equalTo: activityStrip.trailingAnchor, constant: 10)
     statusAtEdge.isActive = true
   }
-  // The title of the current scene: the catalog's for a built-in scene, the document's name for imported or opened
-  // content (the imported-mesh studio, which has no catalog entry).
+  // The title of the current scene: the catalog's for a built-in scene or a scene just opened from the scene browser,
+  // else the document's name (imported or opened content, and the imported-mesh studio, which has no catalog entry).
   var currentSceneTitle: String {
     let builtIn = SceneCatalog.entries.first { entry in
       if case .builtIn(let index) = entry.source { return index == Int(renderer.sceneIndex) }
       return false
     }
-    return builtIn?.title ?? documentName
+    return builtIn?.title ?? catalogSceneTitle ?? documentName
   }
   // The inspector's scene control: the current scene's title and a button that opens the scene browser.
   func sceneControl() {
@@ -304,25 +335,20 @@ final class StudioController: NSViewController {
     }
     for child in stack.arrangedSubviews {
       // End field editing without committing: removal would otherwise re-send stale text.
-      (child as? NumberControl)?.field.abortEditing()
+      for control in Self.numberControls(in: child) { control.field.abortEditing() }
       stack.removeArrangedSubview(child)
       child.removeFromSuperview()
     }
-    if page == 6 {
-      button("‹ Back to Inspector") { [weak self] in self?.page = 0; self?.rebuild() }
-      heading("Settings")
-    } else {
-      caption("Scene")
-      sceneControl()
-      caption("Inspector page")
-      popup(
-        ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page,
-        label: "Inspector page"
-      ) { [weak self] i in
-        self?.page = i
-        self?.rebuild()
-      }
+    viewModePopup?.selectItem(at: Int(renderer.viewportMode))
+    sceneControl()
+    let tabs = ActionSegmentedControl(Self.pageTitles, selected: page, label: "Inspector tabs") { [weak self] i in
+      self?.showPage(i)
     }
+    tabs.segmentDistribution = .fillEqually
+    tabs.isEnabled = !isBusy
+    tabBar = tabs
+    add(tabs)
+    stack.setCustomSpacing(16, after: tabs)
     if exportRenderer != nil {
       heading("Rendering export…")
       text("The preview is paused while the export renders.")
@@ -347,8 +373,7 @@ final class StudioController: NSViewController {
     case 2: lightingPanel()
     case 3: materialPanel()
     case 4: objectPanel()
-    case 5: filePanel()
-    default: settingsPanel()
+    default: filePanel()
     }
   }
   // Runs the rebuild deferred while a slider was dragged.
@@ -395,19 +420,39 @@ final class StudioController: NSViewController {
       if response == .alertFirstButtonReturn { self?.dismissError() }
     }
   }
+  // The status bar: "Rendering · 128 / 1024 samples · 12.3 s" on the left (until a message expires) and
+  // "5.0 fps · 81 ms GPU · 780×740" on the right; no render figures while the main menu is shown.
   func updateStatus() {
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
     busyStateChanged()
     if activityTimer == nil, backgroundShaderProgress != nil { refreshActivity() }
-    guard Date() >= messageUntil, exportRenderer == nil else { return }
-    let r = renderer
+    guard exportRenderer == nil else { return }
+    let r = renderer, idle = Date() >= messageUntil
+    guard startScreen == nil else {
+      statusDetail.stringValue = ""
+      if idle {
+        status.stringValue = ""
+        status.toolTip = nil
+      }
+      return
+    }
+    statusDetail.stringValue = Self.frameStatus(
+      fps: r.framesPerSecond, gpuMilliseconds: r.gpuMilliseconds, width: r.accumTexture?.width ?? 0,
+      height: r.accumTexture?.height ?? 0)
+    guard idle else { return }
     let state = r.paused ? "Paused" : r.reachedLimit ? "Complete" : "Rendering"
     status.textColor = .labelColor
-    status.stringValue = String(
-      format: "%@ · %u spp · %.1f fps · %.1f ms GPU · %.1f s · %d×%d", state, r.completedSamples,
-      r.framesPerSecond, r.gpuMilliseconds, r.renderElapsed, r.accumTexture?.width ?? 0,
-      r.accumTexture?.height ?? 0)
+    status.stringValue = Self.renderStatus(
+      state: state, samples: r.completedSamples, limit: r.options.maxSamples, elapsed: r.renderElapsed)
     status.toolTip = status.stringValue
+  }
+  nonisolated static func renderStatus(state: String, samples: UInt32, limit: UInt32, elapsed: Double) -> String {
+    let count = limit > 0 ? "\(samples) / \(limit) samples" : samples == 1 ? "1 sample" : "\(samples) samples"
+    return "\(state) · \(count) · " + String(format: "%.1f s", elapsed)
+  }
+  nonisolated static func frameStatus(fps: Double, gpuMilliseconds: Double, width: Int, height: Int) -> String {
+    String(format: gpuMilliseconds >= 10 ? "%.1f fps · %.0f ms GPU · %d×%d" : "%.1f fps · %.1f ms GPU · %d×%d",
+      fps, gpuMilliseconds, width, height)
   }
   func pause() {
     guard !isBusy else { return }
@@ -518,6 +563,7 @@ final class StudioController: NSViewController {
   // Records the file association after open/save/new and refreshes the recovery metadata. A replaced document
   // (an open or New, not an undo or redo of one) hides the Scenes window.
   func associate(_ url: URL?, edited: Bool, replaced: Bool, undoing: Bool = false) {
+    if replaced || url != nil { catalogSceneTitle = nil }
     projectURL = url
     if replaced { documentIdentity &+= 1 }
     if replaced && !undoing { scenes.hideAfterOpening() }
@@ -1204,12 +1250,66 @@ final class StudioController: NSViewController {
       self.show("Selected \(self.objectNames()[slot])")
     }
   }
-  // Page switches from menus, the toolbar and picks reveal a hidden inspector.
+  // Page switches from menus, the toolbar, the tab bar and picks reveal a hidden inspector; another tab starts at its
+  // top.
   func showPage(_ index: Int) {
-    if !sidebarVisible { inspectorAction() }
+    if !sidebarVisible { setInspectorVisible(true) }
+    let switching = index != page
     page = index
     rebuild()
+    if switching {
+      sidebar.contentView.scroll(to: .zero)
+      sidebar.reflectScrolledClipView(sidebar.contentView)
+    }
   }
+  // The inspector's width: 280–520 pt, remembered in `preferences`. Without a remembered width it is wide enough for
+  // the tab bar's labels (340–380 pt).
+  static let inspectorWidthRange: ClosedRange<CGFloat> = 280...520
+  static let inspectorWidthKey = "InspectorWidth"
+  var inspectorWidth: CGFloat {
+    let saved = CGFloat(preferences.double(forKey: Self.inspectorWidthKey))
+    if saved > 0 { return min(Self.inspectorWidthRange.upperBound, max(Self.inspectorWidthRange.lowerBound, saved)) }
+    let tabs = ActionSegmentedControl(Self.pageTitles, selected: 0, label: "") { _ in }
+    tabs.segmentDistribution = .fillEqually
+    let needed = tabs.fittingSize.width + 24 + NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+    return min(380, max(340, needed.rounded(.up)))
+  }
+  func setInspectorWidth(_ width: CGFloat, remember: Bool = true) {
+    let clamped = min(Self.inspectorWidthRange.upperBound, max(Self.inspectorWidthRange.lowerBound, width))
+    sidebarWidth.constant = clamped
+    if remember { preferences.set(Double(clamped), forKey: Self.inspectorWidthKey) }
+  }
+  func setInspectorVisible(_ visible: Bool) {
+    sidebarVisible = visible
+    sidebarWidth.constant = visible ? inspectorWidth : 0
+    sidebar.isHidden = !visible
+    resizeHandle?.isHidden = !visible
+    inspectorToggle?.toolTip = visible ? "Hide Inspector" : "Show Inspector"
+  }
+  // The toolbar's view mode (Beauty, Albedo, …): display only, one undo step.
+  func setViewportMode(_ mode: Int) {
+    guard !isBusy, mode != Int(renderer.viewportMode) else { return }
+    checkpoint("Viewport")
+    renderer.viewportMode = UInt32(mode)
+    changed(reset: false)
+    rebuild()
+  }
+}
+
+// The inspector's leading edge: dragging it resizes the inspector.
+final class InspectorResizeHandle: NSView {
+  var onBegin: (() -> Void)?
+  // The horizontal travel since the drag began, in window points (positive to the right).
+  var onResize: ((CGFloat) -> Void)?
+  var onEnd: (() -> Void)?
+  private var startX: CGFloat = 0
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
+  override func mouseDown(with event: NSEvent) {
+    startX = event.locationInWindow.x
+    onBegin?()
+  }
+  override func mouseDragged(with event: NSEvent) { onResize?(event.locationInWindow.x - startX) }
+  override func mouseUp(with event: NSEvent) { onEnd?() }
 }
 
 // The main menu shown while no document is loaded, recent projects, and the Scenes window (ScenesWindowController) with
@@ -1259,6 +1359,7 @@ extension StudioController {
     viewport.isPaused = true
     viewport.isHidden = true
     updateWindowTitle()
+    updateStatus()
   }
   // A loaded document (applyProject) removes the main menu and resumes the viewport. Unless the last session was
   // restored, its autosave becomes the recovery copy (Autosave-previous.vtrace) before this session's first autosave
@@ -1272,6 +1373,7 @@ extension StudioController {
     viewport.isPaused = false
     renderer.lastTick = awakeSeconds()
     updateWindowTitle()
+    updateStatus()
   }
   // Shows the Scenes window, or brings it to the front, whether or not a document is loaded. The viewport keeps
   // rendering and the document is untouched; opening a document hides the window again (associate, restoreAutosave).

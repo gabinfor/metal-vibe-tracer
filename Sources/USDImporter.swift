@@ -493,7 +493,9 @@ extension StudioController {
   }
   // `adjust` edits the imported document before its resources are prepared; with `opened`, that status
   // message replaces the import report sheet (the bundled spectral examples). `failed` also receives a failure's message.
-  func beginImportUSD(from url: URL, opened: String? = nil, failed: (@MainActor @Sendable (String) -> Void)? = nil,
+  // `sceneTitle` (a scene browser entry's title) names the opened scene in the inspector's scene row.
+  func beginImportUSD(from url: URL, opened: String? = nil, sceneTitle: String? = nil,
+                      failed: (@MainActor @Sendable (String) -> Void)? = nil,
                       adjust: (@Sendable (inout ProjectDocument) -> Void)? = nil) {
     guard !isBusy else { return }
     let record = undoRecord("Open scene", replacesDocument: true)
@@ -540,6 +542,7 @@ extension StudioController {
         switch result {
         case .success(let (imported, resources)):
           self.publishImportedUSD(imported, resources: resources, record: record)
+          self.catalogSceneTitle = sceneTitle
           if let opened { self.show(opened) } else { self.showUSDReport() }
         case .failure(let error):
           self.showError(error.localizedDescription)

@@ -16,7 +16,7 @@ extension StudioController {
         sub.addItem(e)
       }
     }
-    menu("Metal Vibe Tracer", [("Settings…", ",", #selector(settingsAction)), ("Quit Metal Vibe Tracer", "q", #selector(quit))])
+    menu("Metal Vibe Tracer", [("Quit Metal Vibe Tracer", "q", #selector(quit))])
     menu(
       "File",
       [
@@ -41,8 +41,8 @@ extension StudioController {
       others.keyEquivalentModifierMask = [.command, .option]
       let all = NSMenuItem(
         title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
-      // Inserted in order just above Quit.
-      for item in [NSMenuItem.separator(), hide, others, all, .separator()] {
+      // Inserted in order above Quit.
+      for item in [hide, others, all, .separator()] {
         app.insertItem(item, at: app.numberOfItems - 1)
       }
     }
@@ -86,15 +86,7 @@ extension StudioController {
     NSApp.mainMenu = main
     NSApp.windowsMenu = windowMenu
   }
-  @objc func inspectorAction() {
-    sidebarVisible.toggle()
-    sidebarWidth.constant = sidebarVisible ? 340 : 0
-    sidebar.isHidden = !sidebarVisible
-  }
-  @objc func settingsAction() {
-    guard !isBusy else { return }
-    showPage(6)
-  }
+  @objc func inspectorAction() { setInspectorVisible(!sidebarVisible) }
   @objc func oidnAction() { guard !isBusy else { return }; startOIDNPreview() }
   @objc func clearOIDNAction() { guard !isBusy else { return }; clearOIDNPreview(); rebuild() }
   @objc func viewportAction(_ sender: NSMenuItem) {

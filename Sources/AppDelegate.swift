@@ -93,6 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     window.delegate = self
     window.contentMinSize = NSSize(width: 700, height: 440)
     window.center()
+    // Restores the frame the window had when the app last quit.
+    window.setFrameAutosaveName("MainWindow")
     let scenes = ScenesWindowController(over: window)
     scenes.browser.onAction = { [weak self] action in self?.queueStartAction(action) }
     self.scenes = scenes
