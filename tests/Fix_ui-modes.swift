@@ -1,6 +1,6 @@
 // Render inspector controls for the ReSTIR reuse modes (IndirectReuse, SpatialNeighborSelection,
-// TemporalReuse, ControlVariates) and the sampler (SamplerMode, every strategy): popup items, labels and state; one undo step and an accumulation reset per
-// change; strategy gating and edit guards; project round trips, including projects written
+// TemporalReuse, ControlVariates) and the sampler (SamplerMode, every strategy): popup items, labels and state; one
+// undo step and an accumulation reset per change; strategy gating (the reuse popups only with ReSTIR) and edit guards; project round trips, including projects written
 // without the fields; "Automatic (currently: …)" per scene; exports; the GPU memory preflight.
 @MainActor func fixUIModesChecks() throws {
   let history = controller.history
@@ -101,8 +101,12 @@
   }
   let labels = views(NSTextField.self, in: controller.stack).map(\.stringValue)
   require([samplerLabel, indirect, spatial, temporal, shading].allSatisfy(labels.contains), "each popup has a visible label")
+  // The reuse popups exist only with ReSTIR Direct + Indirect; the sampler with every strategy.
   func reflects() -> Bool {
-    popup(indirect).indexOfSelectedItem == StudioController.indirectReuseChoices.firstIndex { $0.mode == testRenderer.indirectReuse }
+    guard testRenderer.samplingMode == 0 else {
+      return popup(samplerLabel).indexOfSelectedItem == StudioController.samplerChoices.firstIndex { $0.mode == testRenderer.sampler }
+    }
+    return popup(indirect).indexOfSelectedItem == StudioController.indirectReuseChoices.firstIndex { $0.mode == testRenderer.indirectReuse }
       && popup(spatial).indexOfSelectedItem
         == StudioController.spatialNeighborChoices.firstIndex { $0.mode == testRenderer.spatialNeighbors }
       && popup(temporal).indexOfSelectedItem
@@ -165,13 +169,13 @@
     "restoring a document with other modes restarts accumulation")
   print("PASS: fix-ui-modes each mode updates the renderer, resets accumulation and undoes in one step")
 
-  // Other strategies disable the popups; edits are ignored while restoring.
+  // Other strategies leave the reuse popups out, with a note; edits are ignored while restoring.
   try reset(procedural)
   testRenderer.samplingMode = 1
   controller.rebuild()
-  require([indirect, spatial, temporal, shading].allSatisfy { !popup($0).isEnabled }
+  require(!views(ActionPopup.self, in: controller.stack).contains { [indirect, spatial, temporal, shading].contains($0.accessibilityLabel() ?? "") }
     && views(NSTextField.self, in: controller.stack).contains { $0.stringValue.contains("apply only to ReSTIR") },
-    "non-ReSTIR strategies disable the reuse popups with a note")
+    "non-ReSTIR strategies leave out the reuse popups with a note")
   require(popup(samplerLabel).isEnabled, "the sampler applies to every strategy")
   exercise(samplerLabel, StudioController.samplerChoices) { testRenderer.sampler }
   testRenderer.samplingMode = 0
@@ -194,8 +198,8 @@
     && titles(shading)[0] == "Automatic (currently: \(automaticShading()))",
     "an imported scene graph resolves Automatic to unified ReSTIR PT and compatibility-guided neighbours")
   // The inspector's scene control shows the document's name for imported content and a catalog title otherwise.
-  func sceneLabels() -> [String] { views(NSTextField.self, in: controller.stack).map(\.stringValue) }
-  require(sceneLabels().contains("Untitled") && views(NSButton.self, in: controller.stack).contains { $0.identifier?.rawValue == "scene-browse" },
+  func sceneLabels() -> [String] { views(NSTextField.self, in: controller.inspectorHeader).map(\.stringValue) }
+  require(sceneLabels().contains("Untitled") && views(NSButton.self, in: controller.inspectorHeader).contains { $0.identifier?.rawValue == "scene-browse" },
     "an imported scene is named by its document in the inspector's scene control")
   controller.projectURL = URL(fileURLWithPath: "/tmp/Renamed.vtrace")
   require(sceneLabels().contains("Renamed.vtrace"), "the scene control follows the document's name without a rebuild")

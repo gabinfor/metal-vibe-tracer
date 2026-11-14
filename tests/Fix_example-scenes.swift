@@ -305,15 +305,16 @@
   var empty = ProjectDocument()
   require(empty.scaleImportedEmission(by: 0) == 0 && empty.scenes[6] == nil, "no imported scene, nothing to scale")
 
-  // Controller: File > Credits and Licenses… stays, and an installed scene opens as a new untitled project with its
+  // Controller: Help > Credits and Licenses… and File > Show Downloaded Scenes in Finder, and an installed scene opens as a new untitled project with its
   // shot and credit, undoably. The lamp stands in for the Bistro interior.
   let fileMenu = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu
+  let helpMenu = NSApp.mainMenu?.items.first { $0.title == "Help" }?.submenu
   let previousLibrary = controller.exampleLibrary
   controller.exampleLibrary = ExampleLibrary(root: folder.appendingPathComponent("controller", isDirectory: true))
   defer { controller.exampleLibrary = previousLibrary }
-  require(fileMenu?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true
+  require(helpMenu?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true
     && fileMenu?.items.contains { $0.action == #selector(StudioController.revealExampleScenesAction) } == true,
-    "File lists Credits and Licenses… and Show Downloaded Scenes in Finder")
+    "Help lists Credits and Licenses… and File Show Downloaded Scenes in Finder")
   let installed = controller.exampleLibrary
   // A download scene that is not installed opens nothing: the consent and download flow is the caller's.
   let encoder = JSONEncoder()

@@ -8,7 +8,7 @@ Run `python3 scripts/fetch_test_hdris.py` from the repository root to download:
 - [Studio Small 01](https://polyhaven.com/a/studio_small_01) — hard lamps and strong contrast
 - [Photo Studio Loft Hall](https://polyhaven.com/a/photo_studio_loft_hall) — warm daylight and directional shadows
 
-Load them through Lighting → Load HDRI / environment image…. The script writes only to this directory and can be rerun safely. Each download is checked against a pinned size and SHA-256 before it replaces a local file; a mismatched existing file is downloaded again.
+Load them with **Lighting › Environment › Load Environment Image…** (or **File › Load Environment Image…**, or drop the file on the window). The script writes only to this directory and can be rerun safely. Each download is checked against a pinned size and SHA-256 before it replaces a local file; a mismatched existing file is downloaded again.
 
 | File | Bytes | SHA-256 |
 | --- | --- | --- |

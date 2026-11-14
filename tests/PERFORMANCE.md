@@ -532,7 +532,7 @@ The reuse cells take 44 B per pixel: a 16 B `SPMISPixel` and a 16 B `SPMISChoice
 
 ## Default
 
-`SpatialNeighborSelection.automatic` is unchanged: uniform for the procedural scenes, compatibility-guided for imported scene graphs, and paired reuse for ReSTIR PT. SPMIS never wins with ReSTIR GI. With ReSTIR PT it wins at equal time only in static accumulations of the imported fixtures (4–13%). The interactive MetalFX preview, which those scenes show while the camera moves, gets no better. The mode is therefore listed on the Render page for final renders and for raw per-frame noise in disocclusions.
+`SpatialNeighborSelection.automatic` is unchanged: uniform for the procedural scenes, compatibility-guided for imported scene graphs, and paired reuse for ReSTIR PT. SPMIS never wins with ReSTIR GI. With ReSTIR PT it wins at equal time only in static accumulations of the imported fixtures (4–13%). The interactive MetalFX preview, which those scenes show while the camera moves, gets no better. The mode is therefore listed under **Render › Advanced** for final renders and for raw per-frame noise in disocclusions.
 
 # Multi-layer reservoir splatting — September 29, 2026
 

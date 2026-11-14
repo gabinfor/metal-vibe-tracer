@@ -508,7 +508,7 @@ extension StudioController {
     else { return }
     beginImportUSD(
       from: url, opened: "Opened \(entry.title) \(credit), \(license). Credits: File > Credits and Licenses….",
-      failed: { [weak self] in self?.catalogOpenFailed(entry, $0) },
+      sceneTitle: entry.title, failed: { [weak self] in self?.catalogOpenFailed(entry, $0) },
       adjust: {
         shot.apply(to: &$0)
         $0.importReport = [attribution] + ($0.importReport ?? [])
@@ -525,6 +525,7 @@ extension StudioController {
       // The credit travels with the project in its import report.
       document.importReport = [attribution] + (document.importReport ?? [])
     }) { [weak self] in
+      self?.catalogSceneTitle = entry.title
       self?.changed()
       self?.show("Opened \(entry.title) \(credit), \(license). Credits: File > Credits and Licenses….")
     }
@@ -618,7 +619,7 @@ extension StudioController {
     }
     confirmDiscardingChanges { [weak self] in
       self?.beginImportUSD(from: url, opened: "Opened \(example.title). Spectral light transport renders its effects.",
-        adjust: { shot.apply(to: &$0) })
+        sceneTitle: example.title, adjust: { shot.apply(to: &$0) })
     }
   }
   @objc func exampleCreditsAction() { showExampleCredits() }

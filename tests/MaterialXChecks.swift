@@ -242,7 +242,10 @@ require(
   "graph edit undo restores hierarchy")
 controller.page = 3
 controller.rebuild()
-let parameterControl = controller.stack.arrangedSubviews.compactMap { $0 as? NumberControl }.first!
+// The first parameter row: a number row, or the first field of a colour or vector row.
+let parameterControl = controller.stack.arrangedSubviews.compactMap {
+  $0 as? NumberControl ?? ($0 as? VectorControl)?.components[0]
+}.first!
 controller.history.beginUndoGrouping()
 parameterControl.set(0.6)
 controller.history.endUndoGrouping()

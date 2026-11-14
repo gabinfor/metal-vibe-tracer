@@ -66,7 +66,7 @@ display already does.
   `vibe:spectrum:fwhm` cover the other kinds.
 - `SceneState.emitterLights[slot]` stores the result and persists it in projects (optional,
   so older projects open unchanged).
-- The Materials page shows and edits an emitter's spectrum.
+- The Materials tab shows and edits an emitter's spectrum.
 
 ## 3. Spot lights (UsdLux ShapingAPI)
 
@@ -110,7 +110,7 @@ colour (single-scattering albedo, RGB), anisotropy, and a Rayleigh switch. With 
 σ_s(λ) = σ_s(550) (550/λ)⁴ (`BUCHOLTZ1995`; air's exponent is about 4.08, and particles much smaller
 than the wavelength give 4). In RGB transport the Rayleigh law is evaluated at the sRGB primaries'
 dominant wavelengths. Authoring:
-- UI: Lighting page, **Atmosphere**.
+- UI: Lighting tab, **Atmosphere** section (the **Atmosphere** popup's *Participating medium*).
 - USD: custom attributes on the default prim, `vibe:medium:density`, `vibe:medium:albedo`,
   `vibe:medium:anisotropy` and `vibe:medium:rayleigh`. USD has no homogeneous-fog schema, and
   `UsdVol` needs field assets.

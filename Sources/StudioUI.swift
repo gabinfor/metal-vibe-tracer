@@ -5,153 +5,18 @@ import Synchronization
 import UniformTypeIdentifiers
 import simd
 
-final class ActionButton: NSButton {
-  var actionBlock: (() -> Void)?
-  convenience init(_ title: String, _ action: @escaping () -> Void) {
-    self.init(frame: .zero)
-    self.title = title
-    bezelStyle = .rounded
-    target = self
-    self.action = #selector(invoke)
-    actionBlock = action
-  }
-  @objc func invoke() { actionBlock?() }
-}
-final class ActionPopup: NSPopUpButton {
-  var actionBlock: ((Int) -> Void)?
-  convenience init(
-    _ titles: [String], selected: Int, label: String? = nil, _ action: @escaping (Int) -> Void
-  ) {
-    self.init(frame: .zero, pullsDown: false)
-    // Menu items rather than addItems(withTitles:), which drops an earlier item of the same title: the action
-    // indexes `titles` (two nodes or materials can share a name).
-    for title in titles { menu?.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: "")) }
-    if let label { setAccessibilityLabel(label) }
-    selectItem(at: selected)
-    target = self
-    self.action = #selector(invoke)
-    actionBlock = action
-  }
-  @objc func invoke() { actionBlock?(indexOfSelectedItem) }
-}
-final class NumberControl: NSStackView {
-  let field = NSTextField(), slider = NSSlider()
-  var update: ((Float) -> Void)!
-  var minimum: Float = 0, maximum: Float = 1
-  // Typed values may exceed the slider range up to these limits.
-  var entryMinimum: Float = 0, entryMaximum: Float = 1
-  // Whole-number controls round typed and slider values and show no decimals.
-  var integral = false
-  // Text of the last published value; ending editing with it unchanged commits nothing.
-  private(set) var displayed = ""
-  var onReject: ((String) -> Void)?
-  init(
-    _ title: String, value: Float, range: ClosedRange<Float>, defaultValue: Float,
-    entry: ClosedRange<Float>? = nil, integral: Bool = false, _ action: @escaping (Float) -> Void
-  ) {
-    super.init(frame: .zero)
-    self.integral = integral
-    orientation = .vertical
-    alignment = .leading
-    spacing = 3
-    minimum = range.lowerBound
-    maximum = range.upperBound
-    entryMinimum = min(minimum, entry?.lowerBound ?? minimum)
-    entryMaximum = max(maximum, entry?.upperBound ?? maximum)
-    update = action
-    let row = NSStackView()
-    row.orientation = .horizontal
-    row.spacing = 6
-    let label = NSTextField(labelWithString: title)
-    label.font = .systemFont(ofSize: 12)
-    label.setContentHuggingPriority(.defaultLow, for: .horizontal)
-    field.stringValue = format(value)
-    displayed = field.stringValue
-    field.alignment = .right
-    field.widthAnchor.constraint(equalToConstant: 78).isActive = true
-    field.target = self
-    field.action = #selector(typed)
-    (field.cell as? NSTextFieldCell)?.sendsActionOnEndEditing = true
-    let reset = ActionButton("↺") { [weak self] in self?.set(defaultValue) }
-    reset.toolTip = "Reset \(title)"
-    reset.setAccessibilityLabel("Reset \(title)")
-    row.addArrangedSubview(label)
-    row.addArrangedSubview(field)
-    row.addArrangedSubview(reset)
-    slider.minValue = Double(minimum)
-    slider.maxValue = Double(maximum)
-    slider.floatValue = value
-    slider.isContinuous = false
-    slider.target = self
-    slider.action = #selector(slid)
-    field.setAccessibilityLabel(title)
-    slider.setAccessibilityLabel(title)
-    addArrangedSubview(row)
-    addArrangedSubview(slider)
-    row.widthAnchor.constraint(equalTo: widthAnchor).isActive = true
-    slider.widthAnchor.constraint(equalTo: widthAnchor).isActive = true
-  }
-  required init?(coder: NSCoder) { fatalError() }
-  func set(_ value: Float) {
-    guard value.isFinite else {
-      NSSound.beep()
-      return
-    }
-    let v = min(entryMaximum, max(entryMinimum, integral ? value.rounded() : value))
-    field.stringValue = format(v)
-    displayed = field.stringValue
-    slider.floatValue = min(maximum, max(minimum, v))
-    update(v)
-  }
-  func format(_ value: Float) -> String { String(format: integral ? "%.0f" : "%.8g", value) }
-  // Accepts POSIX input, then the current locale (for example "0,25"), ignoring whitespace.
-  static func parse(_ text: String, locale: Locale = .current) -> Float? {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let value = Float(trimmed) { return value }
-    let formatter = NumberFormatter()
-    formatter.locale = locale
-    formatter.numberStyle = .decimal
-    if let value = formatter.number(from: trimmed)?.floatValue { return value }
-    if !trimmed.contains("."), trimmed.filter({ $0 == "," }).count == 1 {
-      return Float(trimmed.replacingOccurrences(of: ",", with: "."))
-    }
-    return nil
-  }
-  @objc func typed() {
-    // Ending editing (focus loss, inspector rebuild) re-sends the unchanged text.
-    guard field.stringValue != displayed else { return }
-    guard let value = Self.parse(field.stringValue), value.isFinite else {
-      let rejected = field.stringValue
-      field.stringValue = displayed
-      NSSound.beep()
-      onReject?("“\(rejected)” is not a number.")
-      return
-    }
-    set(value)
-  }
-  @objc func slid() { set(slider.floatValue) }
-}
-final class ActionColor: NSColorWell {
-  var update: ((NSColor) -> Void)?
-  convenience init(_ color: NSColor, label: String? = nil, _ action: @escaping (NSColor) -> Void) {
-    self.init(frame: NSRect(x: 0, y: 0, width: 80, height: 28))
-    self.color = color
-    if let label { setAccessibilityLabel(label) }
-    update = action
-    target = self
-    self.action = #selector(changed)
-  }
-  @objc func changed() { update?(color) }
-}
-final class TopAlignedStackView: NSStackView {
-  override var isFlipped: Bool { true }
-}
-
 final class StudioController: NSViewController {
   let renderer: PathTracerRenderer
   weak var hostWindow: NSWindow?
   let viewport: InteractiveMTKView
-  let sidebar = NSScrollView(), stack = TopAlignedStackView(), status = NSTextField(labelWithString: "")
+  let sidebar = NSScrollView(), stack = TopAlignedStackView()
+  // The inspector's pinned header above the scrolling page (`sidebar`, whose document is `stack`): the scene row
+  // (title + Browse…) and the tab bar.
+  let inspectorHeader = InspectorHeaderView()
+  // The status bar: render state and progress (and transient messages) on the left, frame figures on the right.
+  let status = NSTextField(labelWithString: ""), statusDetail = NSTextField(labelWithString: "")
+  // The status bar's 22-pt strip along the bottom; its texts and controls are centred on it.
+  let statusBar = NSLayoutGuide()
   // The activity strip left of the status line: a progress bar, its phase and, for operations that
   // support it, a Cancel button (beginActivity). Background shader compilation shows there too.
   let activityStrip = NSStackView(), activityBar = NSProgressIndicator()
@@ -168,12 +33,24 @@ final class StudioController: NSViewController {
   // The recent projects of the main menu and File › Open Recent, created by AppDelegate at launch.
   let recent: RecentProjects
   // File › Open Recent's submenu, refilled when the recent projects change.
-  private var openRecentMenu: NSMenu?
+  var openRecentMenu: NSMenu?
   // The inspector's scene title, refreshed when the document's name changes.
-  private weak var sceneTitleLabel: NSTextField?
+  private let sceneTitleLabel = NSTextField(labelWithString: "")
+  // The catalog title of a scene opened from the scene browser, shown in the inspector's scene row until the document
+  // is saved or replaced (runtime state only; associate clears it).
+  var catalogSceneTitle: String? { didSet { updateWindowTitle() } }
+  // The inspector's tab bar (in the pinned header) and the toolbar's view-mode popup and inspector toggle.
+  private(set) var tabBar: ActionSegmentedControl?
+  private(set) var viewModePopup: ActionPopup?
+  private(set) var inspectorToggle: ActionButton?
+  private var resizeHandle: InspectorResizeHandle?
   var isBrowsingScenes: Bool { scenes.isVisible }
   // Tests answer the Save / Don't Save / Cancel prompt through this instead of showing the sheet.
   var unsavedChangesAnswer: ((@escaping (NSApplication.ModalResponse) -> Void) -> Void)?
+  // Tests choose Render and Export…'s file (given its extension) through this instead of the save panel.
+  var exportDestination: ((String) -> URL?)?
+  // Shows an exported file in the Finder when "Show in Finder when done" is on; tests replace it.
+  var revealInFinder: ([URL]) -> Void = { NSWorkspace.shared.activateFileViewerSelecting($0) }
   // Tests are told an import report would be shown through this instead of the modal alert.
   var importReportShown: (() -> Void)?
   // Set while Restore Last Session restores the last session, which keeps its autosave file.
@@ -199,6 +76,8 @@ final class StudioController: NSViewController {
     exportRenderer != nil || previewDenoiseJob != nil || importInProgress || projectOperationInProgress
   }
   var pauseButton: NSButton?
+  // The Render tab's Reset Render Settings button, enabled while a setting differs from its default (changed()).
+  weak var renderResetButton: ActionButton?
   private var busyButtons: [NSButton] = []
   private var projectActivity = ""
   let autosaveQueue = DispatchQueue(label: "VibeTracer.autosave", qos: .utility)
@@ -225,7 +104,10 @@ final class StudioController: NSViewController {
     var written: (revision: UInt64, url: URL)?
   }
   private let autosaveState = Mutex(AutosaveState())
-  var selectedSlot = 1, page = 0, sidebarVisible = true
+  var selectedSlot = 1, sidebarVisible = true
+  // The inspector tab: an index into pageTitles.
+  var page = 0 { didSet { page = min(max(page, 0), Self.pageTitles.count - 1) } }
+  static let pageTitles = ["Render", "Camera", "Lighting", "Materials", "Objects", "Export"]
   var selectedNode: UUID?
   var selectedSubset = 0
   var materialXReport = ""
@@ -234,8 +116,15 @@ final class StudioController: NSViewController {
   var lastCheckpoint = Date.distantPast
   var isRestoring = false
   private var rebuilding = false, rebuildRequested = false
-  private var cameraRefreshPending = false
-  private var mapThumbnails: [Int: (data: Data, image: NSImage)] = [:]
+  // A rebuild requested while a number row's slider is dragged runs when the drag ends (runDeferredRebuild), so the
+  // dragged slider is never torn down mid-drag.
+  private var rebuildAfterDrag = false
+  // Builds the body of every collapsible inspector section, whatever its saved state (tests).
+  var forceSectionsOpen = false
+  // Inspector state kept across launches (collapsed sections, inspector width); tests redirect it to a volatile suite.
+  var preferences = UserDefaults.standard
+  var cameraRefreshPending = false
+  var mapThumbnails: [Int: (data: Data, image: NSImage)] = [:]
   var exportRenderer: PathTracerRenderer? { didSet { busyStateChanged() } }
   var exportOutput: MTLTexture?
   var exportURL: URL?
@@ -247,60 +136,6 @@ final class StudioController: NSViewController {
   nonisolated static let sceneNames = [
     "Architectural Pavilion", "Cornell Box", "Veach MIS Benchmark", "Cornell Glass & Mirror",
     "Cornell Fog Study", "Reflective Ring Study", "Imported Mesh Studio",
-  ]
-  static let strategyNames = [
-    "ReSTIR Direct + Indirect", "Standard MIS", "Light Only (NEE)", "BSDF Only",
-  ]
-  // Render inspector choices for the ReSTIR reuse modes; index 0 is always .automatic.
-  static let indirectReuseChoices: [(mode: IndirectReuse, title: String)] = [
-    (.automatic, "Automatic"), (.restirGI, "ReSTIR GI"), (.restirPT, "ReSTIR PT"),
-    (.restirPTUnified, "ReSTIR PT (unified)"),
-  ]
-  static let spatialNeighborChoices: [(mode: SpatialNeighborSelection, title: String)] = [
-    (.automatic, "Automatic"), (.uniform, "Uniform"), (.compatibility, "Compatibility-guided"),
-    (.stochasticPairwise, "Stochastic pairwise MIS"),
-  ]
-  static let temporalReuseChoices: [(mode: TemporalReuse, title: String)] = [
-    (.automatic, "Automatic"), (.reprojection, "Reprojection"), (.splatting, "Reservoir splatting"),
-  ]
-  static let controlVariateChoices: [(mode: ControlVariates, title: String)] = [
-    (.automatic, "Automatic"), (.restcv, "Control variates"), (.off, "Resampled"),
-  ]
-  static let indirectReuseHelp =
-    "ReSTIR GI is fastest and reuses the first diffuse bounce; ReSTIR PT reuses whole paths (better glossy, mirror and deep light) at about 1.3–2.3× the GPU time and +114–210 B per pixel; unified also merges direct light."
-  static let spatialNeighborHelp =
-    "Compatibility-guided reuse prefers neighbours with a similar surface: lower noise on imported meshes for 3–26% more frame time. It applies to ReSTIR DI and GI, not unified ReSTIR PT. Stochastic pairwise MIS reuses DI, GI and PT samples without bias from 64-pixel cells: 6–33% lower noise per sample with ReSTIR PT for 13–55% more frame time and 44–92 B more per pixel."
-  static let temporalReuseHelp =
-    "Reservoir splatting lowers noise in newly revealed areas while the camera moves, for 5–26% more frame time and about 200 B more GPU memory per pixel. Still views render identically."
-  static let controlVariateHelp =
-    "ReSTIR PT only, with paired spatial reuse. Control variates (ReSTCV) shade each pixel from colour estimates accumulated over neighbouring pixels and frames: 5–47% less noise per frame while the camera moves (5–21% under MetalFX) and 1–14% less in still renders, for 0–3% more frame time. Single frames can hold a few dark pixels without the denoiser. Resampled shades from the reservoirs' samples."
-  static let samplerChoices: [(mode: SamplerMode, title: String)] = [
-    (.automatic, "Automatic"), (.zSampling, "Z++ (blue-noise LD)"), (.pcg, "Independent (PCG)"),
-  ]
-  static let samplerHelp =
-    "Z++ draws low-discrepancy samples ordered along a shuffled Z curve, so neighbouring pixels complement each other and every pixel's samples over a still render are stratified: 2–87% less noise at the same sample count (least through glass) for 0.4–5% more frame time, and finer-grained noise in each frame. Independent draws per-pixel random numbers, as before."
-  static let lightTransportChoices: [(mode: LightTransport, title: String)] = [
-    (.automatic, "Automatic"), (.spectral, "Spectral"), (.rgb, "RGB"),
-  ]
-  // Figures from tests/PERFORMANCE.md (Spectral transport cost).
-  static let lightTransportHelp =
-    "Spectral traces four wavelengths per path: illuminant presets (sodium, fluorescent, LED, incandescent), dispersion and thin film render physically, and saturated colours interreflect without RGB's errors, for about a third more frame time and some colour noise per frame. Automatic uses Spectral. RGB is faster and renders RGB-lit scenes almost the same; it ignores presets, dispersion and thin film. The spectral shaders compile in the background the first time."
-  static let lightSamplingChoices: [(mode: LightSampling, title: String)] = [
-    (.automatic, "Automatic"), (.tree, "Light tree"), (.power, "Power"),
-  ]
-  static let causticChoices: [(mode: CausticMode, title: String)] = [
-    (.automatic, "Automatic"), (.lightTracing, "Light tracing"), (.lightTracingGuided, "Light tracing, guided"),
-    (.photons, "Light tracing + photons"), (.photonsGuided, "Light tracing + photons, guided"), (.off, "Off"),
-  ]
-  // Figures from tests/PERFORMANCE.md (Caustic light tracing, Emission guiding).
-  static let causticHelp =
-    "Light tracing renders the caustics you see directly, light focused through glass or off polished metal onto other surfaces, by tracing paths from the imported scene's emitters, sky and sun and connecting them to the camera. It is unbiased and resolves small lights faster than path tracing alone. Light tracing + photons also renders the caustics seen through glass, water or a mirror, caustic light that bounces on to other surfaces, and light focused into fog: the same light paths leave photons that camera paths gather at up to two surfaces or points in a medium after the first, slightly blurred at first and converging as samples accumulate. Guided learns, as samples accumulate, which directions from each light lead to caustics the camera sees, and sends half the light paths there: less noise per sample, but each sample takes longer, so it pays only where few light paths find the glass and the rest are costly. All render with Standard MIS. Automatic is Off."
-  static let lightSamplingHelp =
-    "How imported scenes choose an emitter for each light sample. Light tree picks emitters by how much light they can send to the point being shaded (a light BVH), so scenes with many lights spread over a large space need fewer samples. Power picks them in proportion to their power alone, wherever they are. Both are unbiased; procedural scenes, the sky and the environment are unaffected."
-  // Emitter spectra (StudioOptions.lightSpectrum / sunSpectrum): nil is the RGB colour.
-  static let illuminantTitles = [
-    "RGB colour", "E (equal energy)", "D65 (daylight)", "A (incandescent, 2856 K)", "FL11 (narrow-band fluorescent)",
-    "HP1 (high-pressure sodium)", "LED-B3 (white LED)",
   ]
   static let viewportNames = ["Beauty", "Albedo", "World Normals", "Depth (log)", "Material / Roughness"]
   override var undoManager: UndoManager? { history }
@@ -341,7 +176,7 @@ final class StudioController: NSViewController {
   }
   // The window names the project file (with its proxy icon); the app name is the subtitle.
   func updateWindowTitle() {
-    sceneTitleLabel?.stringValue = currentSceneTitle
+    sceneTitleLabel.stringValue = currentSceneTitle
     if startScreen != nil {
       hostWindow?.representedURL = nil
       hostWindow?.title = "Metal Vibe Tracer"
@@ -356,31 +191,33 @@ final class StudioController: NSViewController {
   var documentName: String { projectURL?.lastPathComponent ?? "Untitled" }
   required init?(coder: NSCoder) { fatalError() }
   override func loadView() {
-    let root = NSView()
+    // Files dropped on the window open like their menu commands (openDroppedFiles).
+    let root = FileDropView()
+    root.onDropFiles = { [weak self] urls in self?.openDroppedFiles(urls) ?? false }
     view = root
+    // Toolbar: render transport and the view mode on the left; Export… and the inspector toggle on the right.
     let bar = NSStackView()
     bar.orientation = .horizontal
     bar.spacing = 8
-    let toggle = ActionButton("Inspector") { [weak self] in
-      self?.inspectorAction()
-    }
-    bar.addArrangedSubview(toggle)
-    let open = ActionButton("Open…") { [weak self] in self?.openProject() }
-    let save = ActionButton("Save") { [weak self] in self?.saveProject() }
-    bar.addArrangedSubview(open)
-    bar.addArrangedSubview(save)
     let pause = ActionButton("Pause") { [weak self] in self?.pause() }
     pauseButton = pause
-    bar.addArrangedSubview(pause)
     let restart = ActionButton("Restart") { [weak self] in self?.restart() }
-    bar.addArrangedSubview(restart)
-    let export = ActionButton("Export…") { [weak self] in self?.showPage(5) }
-    bar.addArrangedSubview(export)
+    let viewMode = ActionPopup(Self.viewportNames, selected: 0, label: "View mode") { [weak self] i in
+      self?.setViewportMode(i)
+    }
+    viewMode.toolTip = "View mode"
+    viewModePopup = viewMode
     let spacer = NSView()
-    bar.addArrangedSubview(spacer)
-    let settings = ActionButton("Settings…") { [weak self] in self?.settingsAction() }
-    bar.addArrangedSubview(settings)
-    busyButtons = [open, save, restart, export, settings]
+    spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+    let export = ActionButton("Export…") { [weak self] in self?.showPage(5) }
+    export.toolTip = "Show the Export tab"
+    let toggle = ActionButton("") { [weak self] in self?.inspectorAction() }
+    toggle.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "Inspector")
+    toggle.setAccessibilityLabel("Inspector")
+    toggle.toolTip = "Hide Inspector"
+    inspectorToggle = toggle
+    for v in [pause, restart, viewMode, spacer, export, toggle] { bar.addArrangedSubview(v) }
+    busyButtons = [restart, viewMode, export]
     sidebar.hasVerticalScroller = true
     sidebar.drawsBackground = true
     stack.orientation = .vertical
@@ -388,16 +225,25 @@ final class StudioController: NSViewController {
     stack.spacing = 10
     stack.setContentHuggingPriority(.required, for: .vertical)
     stack.setContentCompressionResistancePriority(.required, for: .vertical)
-    stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 16, right: 12)
+    stack.edgeInsets = NSEdgeInsets(top: 14, left: 12, bottom: 16, right: 12)
     sidebar.documentView = stack
-    status.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    buildInspectorHeader()
+    status.font = .systemFont(ofSize: 11)
     status.lineBreakMode = .byTruncatingTail
+    status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    statusDetail.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    statusDetail.textColor = .secondaryLabelColor
+    statusDetail.alignment = .right
+    statusDetail.setContentHuggingPriority(.required, for: .horizontal)
     errorButton.isBordered = false
     errorButton.contentTintColor = .systemRed
     errorButton.font = .systemFont(ofSize: 11)
     errorButton.lineBreakMode = .byTruncatingTail
     errorButton.isHidden = true
-    errorButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    // In a narrow window the status message gives way first, then the activity phase, then the error indicator (up
+    // to a third of the width); the frame figures stay whole. All of them stay below the window's size priority, so
+    // long texts never widen the window.
+    errorButton.setContentCompressionResistancePriority(.init(490), for: .horizontal)
     activityStrip.orientation = .horizontal
     activityStrip.spacing = 6
     activityBar.style = .bar
@@ -407,38 +253,59 @@ final class StudioController: NSViewController {
     activityBar.widthAnchor.constraint(equalToConstant: 120).isActive = true
     activityLabel.font = .systemFont(ofSize: 11)
     activityLabel.lineBreakMode = .byTruncatingTail
-    activityLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    activityLabel.setContentCompressionResistancePriority(.init(260), for: .horizontal)
     activityCancel.controlSize = .small
     activityCancel.font = .systemFont(ofSize: 11)
     for v in [activityBar, activityLabel, activityCancel] { activityStrip.addArrangedSubview(v) }
     activityStrip.isHidden = true
-    for v in [bar, viewport, sidebar, activityStrip, status, errorButton] {
+    // Dragging the inspector's leading edge resizes it; the width is remembered.
+    let handle = InspectorResizeHandle()
+    var dragStartWidth: CGFloat = 0
+    handle.onBegin = { [weak self] in dragStartWidth = self?.sidebarWidth.constant ?? 0 }
+    handle.onResize = { [weak self] travel in self?.setInspectorWidth(dragStartWidth - travel, remember: false) }
+    handle.onEnd = { [weak self] in self.map { $0.setInspectorWidth($0.sidebarWidth.constant) } }
+    resizeHandle = handle
+    root.addLayoutGuide(statusBar)
+    for v in [bar, viewport, inspectorHeader, sidebar, handle, activityStrip, status, statusDetail, errorButton] {
       v.translatesAutoresizingMaskIntoConstraints = false
       root.addSubview(v)
     }
     stack.translatesAutoresizingMaskIntoConstraints = false
-    sidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: 340)
+    sidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: inspectorWidth)
     NSLayoutConstraint.activate([
       bar.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
       bar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
       bar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
       bar.heightAnchor.constraint(equalToConstant: 30),
-      status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
+      statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
+      statusBar.heightAnchor.constraint(equalToConstant: 22),
+      statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+      statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+      status.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
       activityStrip.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-      activityStrip.centerYAnchor.constraint(equalTo: status.centerYAnchor),
-      activityStrip.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.5),
-      status.trailingAnchor.constraint(equalTo: errorButton.leadingAnchor, constant: -8),
+      activityStrip.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+      activityStrip.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.4),
+      status.trailingAnchor.constraint(lessThanOrEqualTo: statusDetail.leadingAnchor, constant: -12),
+      statusDetail.trailingAnchor.constraint(equalTo: errorButton.leadingAnchor, constant: -8),
+      statusDetail.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
       errorButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-      errorButton.centerYAnchor.constraint(equalTo: status.centerYAnchor),
-      errorButton.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.45),
-      status.heightAnchor.constraint(equalToConstant: 22),
-      sidebar.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 8),
+      errorButton.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+      errorButton.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, multiplier: 0.33),
+      status.widthAnchor.constraint(greaterThanOrEqualToConstant: 0),
+      inspectorHeader.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 8),
+      inspectorHeader.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+      inspectorHeader.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+      sidebar.topAnchor.constraint(equalTo: inspectorHeader.bottomAnchor),
       sidebar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-      sidebar.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6), sidebarWidth,
+      sidebar.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6), sidebarWidth,
       viewport.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-      viewport.topAnchor.constraint(equalTo: sidebar.topAnchor),
+      viewport.topAnchor.constraint(equalTo: inspectorHeader.topAnchor),
       viewport.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
       viewport.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+      handle.centerXAnchor.constraint(equalTo: sidebar.leadingAnchor),
+      handle.widthAnchor.constraint(equalToConstant: 6),
+      handle.topAnchor.constraint(equalTo: inspectorHeader.topAnchor),
+      handle.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
       stack.leadingAnchor.constraint(equalTo: sidebar.contentView.leadingAnchor),
       stack.trailingAnchor.constraint(equalTo: sidebar.contentView.trailingAnchor),
       stack.topAnchor.constraint(equalTo: sidebar.contentView.topAnchor),
@@ -446,94 +313,80 @@ final class StudioController: NSViewController {
     statusAtEdge = status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12)
     statusAfterActivity = status.leadingAnchor.constraint(equalTo: activityStrip.trailingAnchor, constant: 10)
     statusAtEdge.isActive = true
+    updateTabBarStyle()
   }
-  func add(_ v: NSView) {
-    if let control = v as? NumberControl, control.onReject == nil {
-      control.onReject = { [weak self] message in self?.show(message) }
-    }
-    stack.addArrangedSubview(v)
-    v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
-  }
-  func text(_ value: String) {
-    let label = NSTextField(wrappingLabelWithString: value)
-    label.font = .systemFont(ofSize: 11)
-    label.textColor = .secondaryLabelColor
-    add(label)
-  }
-  // A small label naming the control below it.
-  func caption(_ value: String) {
-    let label = NSTextField(labelWithString: value)
-    label.font = .systemFont(ofSize: 11, weight: .medium)
-    label.textColor = .secondaryLabelColor
-    add(label)
-  }
-  // The title of the current scene: the catalog's for a built-in scene, the document's name for imported or opened
-  // content (the imported-mesh studio, which has no catalog entry).
+  // The title of the current scene: the catalog's for a built-in scene or a scene just opened from the scene browser,
+  // else the document's name (imported or opened content, and the imported-mesh studio, which has no catalog entry).
   var currentSceneTitle: String {
     let builtIn = SceneCatalog.entries.first { entry in
       if case .builtIn(let index) = entry.source { return index == Int(renderer.sceneIndex) }
       return false
     }
-    return builtIn?.title ?? documentName
+    return builtIn?.title ?? catalogSceneTitle ?? documentName
   }
-  // The inspector's scene control: the current scene's title and a button that opens the scene browser.
-  func sceneControl() {
-    let title = NSTextField(labelWithString: currentSceneTitle)
-    title.font = .systemFont(ofSize: 13, weight: .medium)
-    title.lineBreakMode = .byTruncatingTail
-    sceneTitleLabel = title
-    title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+  // The inspector's pinned header: the scene row (the current scene's title and Browse…, which opens the scene
+  // browser) over the tab bar. It stays in view while the page below scrolls.
+  private func buildInspectorHeader() {
+    sceneTitleLabel.font = .systemFont(ofSize: 13, weight: .medium)
+    sceneTitleLabel.lineBreakMode = .byTruncatingTail
+    sceneTitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     let browse = ActionButton("Browse…") { [weak self] in self?.browseScenes() }
     browse.identifier = NSUserInterfaceItemIdentifier("scene-browse")
+    browse.toolTip = "Open the scene browser"
     let spacer = NSView()
     spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-    let row = NSStackView(views: [title, spacer, browse])
-    row.orientation = .horizontal
-    add(row)
-  }
-  func heading(_ value: String) {
-    let l = NSTextField(labelWithString: value)
-    l.font = .systemFont(ofSize: 14, weight: .semibold)
-    add(l)
-  }
-  func number(
-    _ title: String, _ value: Float, _ range: ClosedRange<Float>, _ fallback: Float,
-    reset: Bool = true, entry: ClosedRange<Float>? = nil, integral: Bool = false, _ set: @escaping (Float) -> Void
-  ) {
-    add(
-      NumberControl(title, value: value, range: range, defaultValue: fallback, entry: entry, integral: integral) {
-        [weak self] v in
-        guard let self, self.acceptsEdits else { return }
-        self.checkpoint(title)
-        set(v)
-        self.changed(reset: reset)
-      })
-  }
-  func option(
-    _ title: String, _ key: WritableKeyPath<StudioOptions, Float>, _ range: ClosedRange<Float>,
-    _ fallback: Float, reset: Bool = true, entry: ClosedRange<Float>? = nil
-  ) {
-    number(title, renderer.options[keyPath: key], range, fallback, reset: reset, entry: entry) {
-      [weak self] in
-      self?.renderer.options[keyPath: key] = $0
+    let sceneRow = NSStackView(views: [sceneTitleLabel, spacer, browse])
+    sceneRow.orientation = .horizontal
+    let tabs = ActionSegmentedControl(Self.pageTitles, selected: page, label: "Inspector tabs") { [weak self] i in
+      self?.showPage(i)
+    }
+    tabs.segmentDistribution = .fillEqually
+    tabBar = tabs
+    inspectorHeader.content.addArrangedSubview(sceneRow)
+    inspectorHeader.content.addArrangedSubview(tabs)
+    for row in [sceneRow, tabs] as [NSView] {
+      row.widthAnchor.constraint(equalTo: inspectorHeader.content.widthAnchor).isActive = true
     }
   }
-  func popup(
-    _ titles: [String], _ value: Int, label: String? = nil, _ action: @escaping (Int) -> Void
-  ) {
-    add(
-      ActionPopup(titles, selected: value, label: label) { [weak self] i in
-        guard let self, self.acceptsEdits else { return }
-        action(i)
-      })
+  // The tab bar fits the inspector's width: labels in a wide inspector, smaller labels at the default width, a symbol
+  // per tab below about 320 pt; every tab keeps its name and shortcut in its tooltip.
+  enum TabBarStyle { case labels, smallLabels, symbols }
+  static let tabSymbols = ["slider.horizontal.3", "camera", "lightbulb", "paintpalette", "cube", "square.and.arrow.up"]
+  // The narrowest tab bar that shows every label at `size` with room around it: six equal segments as wide as the
+  // widest label plus a margin (regular labels get more, so they never touch the dividers).
+  static func tabLabelsWidth(_ size: NSControl.ControlSize) -> CGFloat {
+    let font = NSFont.systemFont(ofSize: NSFont.systemFontSize(for: size))
+    let widest = pageTitles.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+    return CGFloat(pageTitles.count) * (widest + (size == .regular ? 8 : 2)).rounded(.up)
   }
-  func button(_ title: String, _ action: @escaping () -> Void) { add(ActionButton(title, action)) }
+  var tabBarStyle: TabBarStyle {
+    let available = sidebarWidth.constant - InspectorHeaderView.horizontalInset * 2
+    if available >= Self.tabLabelsWidth(.regular) { return .labels }
+    return available >= Self.tabLabelsWidth(.small) ? .smallLabels : .symbols
+  }
+  func updateTabBarStyle() {
+    guard let tabs = tabBar else { return }
+    let style = tabBarStyle
+    tabs.controlSize = style == .labels ? .regular : .small
+    tabs.font = .systemFont(ofSize: NSFont.systemFontSize(for: tabs.controlSize))
+    for (i, title) in Self.pageTitles.enumerated() {
+      let symbols = style == .symbols
+      tabs.setLabel(symbols ? "" : title, forSegment: i)
+      tabs.setImage(
+        symbols ? NSImage(systemSymbolName: Self.tabSymbols[i], accessibilityDescription: title) : nil, forSegment: i)
+      tabs.setToolTip("\(title) (⌘\(i + 1))", forSegment: i)
+    }
+  }
   // Inspector mutations are ignored while a document is restored or project I/O runs.
   var acceptsEdits: Bool { !isBusy && !isRestoring }
   func rebuild() {
     // Re-entrant requests (from callbacks fired while controls are torn down) run afterwards.
     guard !rebuilding else {
       rebuildRequested = true
+      return
+    }
+    if let dragged = NumberControl.dragging, dragged.isDescendant(of: stack) {
+      rebuildAfterDrag = true
       return
     }
     rebuilding = true
@@ -546,25 +399,14 @@ final class StudioController: NSViewController {
     }
     for child in stack.arrangedSubviews {
       // End field editing without committing: removal would otherwise re-send stale text.
-      (child as? NumberControl)?.field.abortEditing()
+      for control in Self.numberControls(in: child) { control.field.abortEditing() }
       stack.removeArrangedSubview(child)
       child.removeFromSuperview()
     }
-    if page == 6 {
-      button("‹ Back to Inspector") { [weak self] in self?.page = 0; self?.rebuild() }
-      heading("Settings")
-    } else {
-      caption("Scene")
-      sceneControl()
-      caption("Inspector page")
-      popup(
-        ["Render", "Camera", "Lighting", "Materials & Textures", "Objects", "Project & Export"], page,
-        label: "Inspector page"
-      ) { [weak self] i in
-        self?.page = i
-        self?.rebuild()
-      }
-    }
+    viewModePopup?.selectItem(at: Int(renderer.viewportMode))
+    sceneTitleLabel.stringValue = currentSceneTitle
+    tabBar?.selectedSegment = page
+    tabBar?.isEnabled = !isBusy
     if exportRenderer != nil {
       heading("Rendering export…")
       text("The preview is paused while the export renders.")
@@ -589,706 +431,14 @@ final class StudioController: NSViewController {
     case 2: lightingPanel()
     case 3: materialPanel()
     case 4: objectPanel()
-    case 5: filePanel()
-    default: settingsPanel()
+    default: filePanel()
     }
   }
-  func renderPanel() {
-    heading("Sampling")
-    popup(Self.strategyNames, Int(renderer.samplingMode), label: "Sampling strategy") { [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Strategy")
-      self.renderer.samplingMode = UInt32(i)
-      self.changed()
-      self.rebuild()
-    }
-    number("Indirect clamp (0 = off)", renderer.options.indirectClamp ?? 0, 0...100, 0, entry: StudioOptions.indirectClampRange) {
-      [weak self] v in self?.renderer.options.indirectClamp = v > 0 ? v : nil
-    }
-    text(
-      "Caps the luminance each sample's indirect light can add, which removes fireflies. It is biased: bright indirect effects such as caustics lose energy, the more so the lower the cap. 0 keeps the unbiased render. Values of about 10-50 times a lit surface's brightness rarely change anything but the fireflies. With ReSTIR PT on imported scenes it caps the whole reused estimate, direct light included.")
-    if renderer.hasMedia && renderer.samplingMode == 0 {
-      text("This scene has participating media, which render with Standard MIS; the ReSTIR settings below apply to scenes without media.")
-    }
-    restirModeControls()
-    let metalFX = ActionButton("MetalFX denoiser (preview)") { [weak self] in
-      guard let self, self.acceptsEdits else { return }
-      self.checkpoint("MetalFX")
-      self.renderer.denoiserEnabled.toggle()
-      self.changed(reset: false)
-      self.rebuild()
-    }
-    metalFX.setButtonType(.switch)
-    metalFX.state = renderer.denoiserEnabled ? .on : .off
-    add(metalFX)
-    if renderer.activeSamplingMode != 0 {
-      text("MetalFX is available with ReSTIR Direct + Indirect. This strategy displays raw accumulation.")
-    }
-    if !renderer.supportsMetalFX { text("MetalFX is not supported by this GPU.") }
-    if renderer.offlineDenoisedPreview != nil {
-      button("Clear OIDN Preview") { [weak self] in self?.clearOIDNPreview() }
-      text("The viewport and preview capture show the OIDN result. Clearing it restores the previous render state.")
-    } else {
-      button("OIDN Preview Current Frame") { [weak self] in self?.startOIDNPreview() }
-      text("Freezes and denoises the current accumulated samples at the preview render resolution.")
-    }
-    heading("Display")
-    popup(Self.viewportNames, Int(renderer.viewportMode), label: "Viewport mode") { [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Viewport mode")
-      self.renderer.viewportMode = UInt32(i)
-      self.changed(reset: false)
-      self.rebuild()
-    }
-    option("Exposure, EV", \.exposure, -16...16, 0, reset: false)
-    option("White balance, cool → warm", \.whiteBalance, -1...1, 0, reset: false)
-    popup(
-      ["Tone map: Filmic fit", "Tone map: Reinhard", "Tone map: Linear / clip"],
-      renderer.options.toneMap, label: "Tone map"
-    ) { [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Tone map")
-      self.renderer.options.toneMap = i
-      self.changed(reset: false)
-    }
-    option("Raw / MetalFX divider (0 = off)", \.compare, 0...1, 0, reset: false)
-    text(
-      "The left side shows raw accumulation. Exposure and white balance affect the display and PNG export; EXR preserves linear radiance."
-    )
-    text("Inspection views bypass tone mapping and denoising, and do not reset the progressive render.")
-  }
-
-  // The sampler, light transport, light sampling and caustics popups (every strategy) and the four ReSTIR reuse
-  // popups, which apply only to ReSTIR Direct + Indirect and are disabled (with a note) for the other strategies.
-  func restirModeControls() {
-    let r = renderer, restir = r.samplingMode == 0
-    func choice<Mode: Equatable>(
-      _ title: String, _ choices: [(mode: Mode, title: String)], current: Mode, automatic: String,
-      help: String, enabled: Bool = restir, _ set: @escaping (inout ReSTIRModes, Mode) -> Void
-    ) {
-      let label = NSTextField(labelWithString: title)
-      label.font = .systemFont(ofSize: 12)
-      label.textColor = enabled ? .labelColor : .disabledControlTextColor
-      add(label)
-      let titles = choices.map { $0.title == "Automatic" ? "Automatic (currently: \(automatic))" : $0.title }
-      let popup = ActionPopup(titles, selected: choices.firstIndex { $0.mode == current } ?? 0, label: title) {
-        [weak self] i in
-        guard let self, self.acceptsEdits else { return }
-        let mode = choices[i].mode
-        self.setReSTIRModes(title) { set(&$0, mode) }
-      }
-      popup.toolTip = help
-      popup.setAccessibilityHelp(help)
-      popup.isEnabled = enabled
-      add(popup)
-    }
-    func name<Mode: Equatable>(_ mode: Mode, _ choices: [(mode: Mode, title: String)]) -> String {
-      choices.first { $0.mode == mode }?.title ?? "\(mode)"
-    }
-    // The sampler applies to every strategy.
-    choice(
-      "Sampler", Self.samplerChoices, current: r.sampler,
-      automatic: name(r.resolvedSampler(.automatic), Self.samplerChoices),
-      help: Self.samplerHelp, enabled: true
-    ) { $0.sampler = $1 }
-    // The light transport applies to every strategy.
-    choice(
-      "Light transport", Self.lightTransportChoices, current: r.lightTransport,
-      automatic: name(r.resolvedLightTransport(.automatic), Self.lightTransportChoices),
-      help: Self.lightTransportHelp, enabled: true
-    ) { $0.lightTransport = $1 }
-    // The light sampling applies to every strategy's imported emitters.
-    choice(
-      "Light sampling", Self.lightSamplingChoices, current: r.lightSampling,
-      automatic: name(LightSampling.automatic.resolved(), Self.lightSamplingChoices),
-      help: Self.lightSamplingHelp, enabled: true
-    ) { $0.lightSampling = $1 }
-    // Caustic light tracing applies to imported scenes, whatever the strategy (it renders Standard MIS).
-    choice(
-      "Caustics", Self.causticChoices, current: r.caustics,
-      automatic: name(CausticMode.automatic.resolved(), Self.causticChoices),
-      help: Self.causticHelp, enabled: true
-    ) { $0.caustics = $1 }
-    if r.activeLightTransport == .spectral && !r.spectralShaders.compiling && r.spectralShaders.kernels == nil,
-      let failure = r.spectralShaders.failure
-    {
-      text(failure)
-    } else if r.activeLightTransport == .spectral && r.spectralShaders.compiling {
-      text("Compiling the spectral shaders; the view renders in RGB until they are ready.")
-    }
-    let compiling = PathTracerRenderer.KernelGroup.allCases.filter { r.sceneShaders.compiling.contains($0) }
-    if !compiling.isEmpty {
-      text("Compiling the \(compiling.map(\.title).joined(separator: ", ")) shaders; until they are ready the view renders with ReSTIR GI, reprojection and automatic neighbours.")
-    }
-    choice(
-      "Indirect reuse", Self.indirectReuseChoices, current: r.indirectReuse,
-      automatic: name(r.resolvedIndirectReuse(.automatic), Self.indirectReuseChoices),
-      help: Self.indirectReuseHelp
-    ) { $0.indirectReuse = $1 }
-    choice(
-      "Spatial neighbours", Self.spatialNeighborChoices, current: r.spatialNeighbors,
-      automatic: name(r.resolvedSpatialNeighbors(.automatic), Self.spatialNeighborChoices),
-      help: Self.spatialNeighborHelp
-    ) { $0.spatialNeighbors = $1 }
-    choice(
-      "Temporal reuse", Self.temporalReuseChoices, current: r.temporalReuse,
-      automatic: name(r.resolvedTemporalReuse(.automatic, indirectReuse: r.indirectReuse), Self.temporalReuseChoices),
-      help: Self.temporalReuseHelp
-    ) { $0.temporalReuse = $1 }
-    choice(
-      "Path shading", Self.controlVariateChoices, current: r.controlVariates,
-      automatic: name(r.resolvedControlVariates(.automatic), Self.controlVariateChoices),
-      help: Self.controlVariateHelp
-    ) { $0.controlVariates = $1 }
-    if !restir {
-      text("Indirect reuse, spatial neighbours, temporal reuse and path shading apply only to ReSTIR Direct + Indirect.")
-    }
-  }
-  // The render size a mode switch is preflighted at: the live accumulation, else the viewport.
-  var previewRenderSize: (width: Int, height: Int)? {
-    if let accum = renderer.accumTexture { return (accum.width, accum.height) }
-    let size = viewport.drawableSize, scale = renderer.options.previewScale
-    guard size.width >= 1, size.height >= 1 else { return nil }
-    return (max(1, Int(Float(size.width) * scale)), max(1, Int(Float(size.height) * scale)))
-  }
-  // Applies a ReSTIR mode change as one undo step, after the GPU memory preflight. A switch
-  // the budget cannot hold (when the current modes fit) is refused: the error is shown, the
-  // popup reverts and rendering continues with the current modes.
-  func setReSTIRModes(_ name: String, _ update: (inout ReSTIRModes) -> Void) {
-    guard acceptsEdits else { return }
-    var modes = ReSTIRModes(renderer)
-    update(&modes)
-    guard modes != ReSTIRModes(renderer) else { return }
-    if let size = previewRenderSize,
-      let message = renderer.renderMemoryError(
-        width: size.width, height: size.height, indirectReuse: modes.indirectReuse, temporalReuse: modes.temporalReuse,
-        spatialNeighbors: modes.spatialNeighbors),
-      renderer.renderMemoryError(width: size.width, height: size.height) == nil
-    {
-      showError("\(name) was not changed. \(message)")
-      rebuild()
-      return
-    }
-    checkpoint(name)
-    modes.apply(renderer)
-    changed()
+  // Runs the rebuild deferred while a slider was dragged.
+  func runDeferredRebuild() {
+    guard rebuildAfterDrag, NumberControl.dragging == nil else { return }
+    rebuildAfterDrag = false
     rebuild()
-  }
-
-  func settingsPanel() {
-    heading("Render limits")
-    number(
-      "Sample limit (0 = unlimited)", Float(renderer.options.maxSamples), 0...16384, 0, reset: false, integral: true
-    ) { [weak self] in self?.renderer.options.maxSamples = UInt32($0) }
-    number(
-      "Time limit, seconds (0 = unlimited)", Float(renderer.options.timeLimit), 0...3600, 0,
-      reset: false
-    ) { [weak self] in self?.renderer.options.timeLimit = Double($0) }
-    option("Preview resolution scale", \.previewScale, 0.1...1, 0.5)
-    number("Path depth (1 = direct light only)", Float(renderer.options.depth), 1...64, 16, integral: true) {
-      [weak self] in self?.renderer.options.depth = Int($0)
-    }
-
-    heading("Open Image Denoise")
-    popup(["Quality: Fast", "Quality: Balanced", "Quality: High"], Int(renderer.oidnOptions.quality)) {
-      [weak self] i in self?.setOIDN("OIDN quality") { $0.quality = UInt32(i) }
-    }
-    popup(["Guides: Color only", "Guides: Albedo", "Guides: Albedo + normal"], Int(renderer.oidnOptions.guides)) {
-      [weak self] i in self?.setOIDN("OIDN guides") { $0.guides = UInt32(i) }
-    }
-    button("Treat guides as noisy: \(renderer.oidnOptions.treatGuidesAsNoisy ? "On" : "Off")") { [weak self] in
-      self?.setOIDN("OIDN guide noise") { $0.treatGuidesAsNoisy.toggle() }
-    }
-    button("Robust HDR input scale: \(renderer.oidnOptions.robustInputScale ? "On" : "Off")") { [weak self] in
-      self?.setOIDN("OIDN HDR scale") { $0.robustInputScale.toggle() }
-    }
-    button("Diffuse firefly suppression: \(renderer.oidnOptions.suppressDiffuseFireflies ? "On" : "Off")") { [weak self] in
-      self?.setOIDN("OIDN firefly suppression") { $0.suppressDiffuseFireflies.toggle() }
-    }
-    text("By default OIDN chooses its own HDR input scale; the robust scale instead keys exposure on lit, non-emissive surfaces. The diffuse firefly filter prevents isolated HDR samples from expanding into false bright patches. Both affect only OIDN output; raw accumulation is preserved.")
-
-    heading("Experimental")
-    popup(["Ring boost: Off", "Ring boost: On"], Int(renderer.enableSMS)) { [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Ring boost")
-      self.renderer.enableSMS = UInt32(i)
-      self.changed()
-    }
-    text("Ring boost is an artistic approximation for the original ring position.")
-  }
-
-  func setOIDN(_ name: String, _ update: (inout OIDNOptions) -> Void) {
-    guard acceptsEdits else { return }
-    checkpoint(name)
-    update(&renderer.oidnOptions)
-    if renderer.offlineDenoisedPreview != nil {
-      renderer.offlineDenoisedPreview = nil
-      renderer.paused = oidnPreviewWasPaused
-    }
-    renderer.presentationNeedsRefresh = true
-    changed(reset: false)
-    rebuild()
-  }
-  // Mouse navigation refreshes the Camera page fields at most four times a second.
-  func scheduleCameraPanelRefresh() {
-    guard page == 1, sidebarVisible, !cameraRefreshPending else { return }
-    cameraRefreshPending = true
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-      guard let self else { return }
-      self.cameraRefreshPending = false
-      if self.page == 1, !self.isBusy { self.rebuild() }
-    }
-  }
-  func cameraPanel() {
-    heading("Camera")
-    text(
-      "Drag to orbit. Shift-drag to pan. Scroll to zoom. Click a surface to select its material/object group."
-    )
-    number("Field of view, degrees", renderer.fov, 5...150, 38) { [weak self] in
-      self?.renderer.fov = $0
-    }
-    let eye = renderer.eyePosition
-    // Typed coordinates reach the full navigation range; the sliders cover ±100.
-    let reach: ClosedRange<Float> = -1_000_000...1_000_000
-    for axis in 0..<3 {
-      number("Position \(["X","Y","Z"][axis])", eye[axis], -100...100, eye[axis], entry: reach) {
-        [weak self] v in
-        guard let self else { return }
-        var p = self.renderer.eyePosition
-        p[axis] = v
-        self.renderer.setEye(p)
-      }
-      number("Target \(["X","Y","Z"][axis])", renderer.target[axis], -100...100, 0, entry: reach) {
-        [weak self] v in self?.renderer.target[axis] = v
-      }
-    }
-    heading("Depth of field")
-    option("Aperture radius (0 = pinhole)", \.aperture, 0...0.5, 0)
-    option("Focus distance", \.focusDistance, 0.01...1000, 4.6, entry: 0.0001...1_000_000)
-    button("Focus at camera target") { [weak self] in
-      guard let self else { return }
-      self.checkpoint("Focus")
-      self.renderer.options.focusDistance = self.renderer.distance
-      self.changed()
-      self.rebuild()
-    }
-    heading("Saved views")
-    button("Save current view…") { [weak self] in self?.saveView() }
-    let names = project.views.keys.sorted()
-    if !names.isEmpty {
-      popup(["Restore view…"] + names, 0, label: "Saved views") { [weak self] i in
-        guard let self, i > 0, let camera = self.project.views[names[i - 1]] else { return }
-        self.checkpoint("Restore view")
-        camera.apply(self.renderer)
-        self.changed()
-        self.rebuild()
-      }
-    }
-  }
-  func lightingPanel() {
-    heading("Environment")
-    popup(["Golden Hour", "High Noon", "Twilight / Studio"], Int(renderer.skyMode), label: "Sky preset") {
-      [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Sky preset")
-      self.renderer.skyMode = UInt32(i)
-      let p: [SIMD3<Float>] = [SIMD3(133, 27, 850), SIMD3(131, 62, 1100), SIMD3(128, 19, 550)]
-      self.renderer.options.sunAzimuth = p[i].x
-      self.renderer.options.sunElevation = p[i].y
-      self.renderer.options.sunIntensity = p[i].z
-      self.renderer.options.sunAngle = nil
-      self.changed()
-      self.rebuild()
-    }
-    text(project.environmentName)
-    button("Load HDRI / environment image…") { [weak self] in self?.loadEnvironment() }
-    button("Use procedural sky") { [weak self] in
-      guard let self, !self.isBusy else { return }
-      let record = self.undoRecord("Clear environment")
-      do {
-        try self.renderer.materials.setEnvironment(nil)
-        self.project.environmentData = nil
-        self.project.environmentName = "Procedural sky"
-        self.commit(record)
-        self.changed()
-        self.rebuild()
-      } catch { self.showError(error.localizedDescription) }
-    }
-    option("Environment brightness", \.environmentIntensity, 0...100, 1)
-    option("Environment rotation, degrees", \.environmentRotation, -180...180, 0)
-    option("Sun azimuth, degrees", \.sunAzimuth, -180...180, 133)
-    option("Sun elevation, degrees", \.sunElevation, -89...89, 27)
-    option("Sun intensity", \.sunIntensity, 0...10000, 850)
-    text(
-      "Sky/HDRI lighting is used in the Pavilion and Imported Mesh Studio. Sun controls apply to the procedural sky."
-    )
-    if let angle = renderer.options.sunAngle {
-      text(String(format: "Imported distant light: %.2f° sun, intensity is irradiance, independent of the environment. A sky preset restores the procedural sun.", angle))
-    }
-    heading("Scene lights")
-    option("Light intensity", \.lightIntensity, 0...100, 1)
-    option("Light size multiplier", \.lightSize, 0.05...4, 1)
-    // Light color is linear, like material tint; the well shows sRGB.
-    func encode(_ c: Float) -> CGFloat {
-      CGFloat(c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1 / 2.4) - 0.055)
-    }
-    func decode(_ c: CGFloat) -> Float {
-      let x = Float(c)
-      return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
-    }
-    let c = renderer.options.lightColor
-    text("Light color")
-    add(
-      ActionColor(
-        NSColor(srgbRed: encode(c.x), green: encode(c.y), blue: encode(c.z), alpha: 1),
-        label: "Light color"
-      ) { [weak self] c in
-        guard let self, self.acceptsEdits, let c = c.usingColorSpace(.sRGB) else { return }
-        // A colour-panel drag sends many changes; one undo step covers the burst.
-        self.checkpoint("Light color", coalesce: true)
-        self.renderer.options.lightColor = SIMD3(
-          decode(c.redComponent), decode(c.greenComponent), decode(c.blueComponent))
-        self.changed()
-      })
-    text(
-      "Applies to the finite lights in Cornell, Veach, and Ring scenes. Veach lights share these controls."
-    )
-    heading("Light spectra")
-    func spectrum(_ title: String, _ path: WritableKeyPath<StudioOptions, UInt32?>) {
-      let current = renderer.options[keyPath: path].map { Int($0) + 1 } ?? 0
-      popup(Self.illuminantTitles, min(current, Self.illuminantTitles.count - 1), label: title) { [weak self] i in
-        guard let self else { return }
-        self.checkpoint(title)
-        self.renderer.options[keyPath: path] = i == 0 ? nil : UInt32(i - 1)
-        self.changed()
-        self.rebuild()
-      }
-    }
-    text("Light spectrum")
-    spectrum("Light spectrum", \.lightSpectrum)
-    text("Sun spectrum")
-    spectrum("Sun spectrum", \.sunSpectrum)
-    text(
-      "Spectral light transport only: a preset replaces the RGB colour's daylight-like spectrum, and the light colour tints it like a filter. Light spectrum covers area and sphere lights and imported emitters; the sky and environment images stay RGB."
-    )
-    let atmosphere = renderer.medium != nil ? 2 : Int(renderer.enableFog)
-    popup(["Atmosphere: Clear", "Atmosphere: Fog preview", "Atmosphere: Participating medium"], atmosphere, label: "Atmosphere") {
-      [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Atmosphere")
-      self.renderer.enableFog = i == 1 ? 1 : 0
-      self.renderer.medium = i == 2 ? (self.renderer.medium ?? SceneMedium()) : nil
-      self.changed()
-      self.rebuild()
-    }
-    if let medium = renderer.medium { mediumControls(medium) }
-  }
-  // The scene medium (SceneMedium; docs/VOLUME_DESIGN.md §4), on the Lighting page.
-  func mediumControls(_ medium: SceneMedium) {
-    func update(_ change: (inout SceneMedium) -> Void) {
-      var edited = renderer.medium ?? SceneMedium()
-      change(&edited)
-      renderer.medium = edited
-    }
-    number("Density (per metre)", medium.density, 0...5, 0.05, entry: SceneMedium.densityRange) { v in update { $0.density = v } }
-    for (i, channel) in ["R", "G", "B"].enumerated() {
-      number("Scattering albedo \(channel)", medium.albedo[i], 0...1, 0.9) { v in update { $0.albedo[i] = v } }
-    }
-    number("Anisotropy (g)", medium.anisotropy, -0.99...0.99, 0) { v in update { $0.anisotropy = v } }
-    popup(["Grey scattering", "Rayleigh scattering (λ⁻⁴)"], medium.rayleigh ? 1 : 0, label: "Scattering law") { [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Scattering law")
-      update { $0.rayleigh = i == 1 }
-      self.changed()
-    }
-    text(
-      "Homogeneous haze in the scene's bounding box: density is the extinction per metre (at 550 nm with the Rayleigh law), albedo the scattered fraction, and anisotropy the Henyey-Greenstein g (positive scatters forward). Scenes with media render with Standard MIS instead of ReSTIR. Rayleigh scattering is bluer at short wavelengths, so beams turn orange as they cross it.")
-  }
-  func objectNames() -> [String] {
-    switch renderer.sceneIndex {
-    case 1, 4:
-      return [
-        "Room surfaces", "Unused floor slot", "Tall box", "Unused ring slot", "Unused chrome slot",
-        "Unused glass slot", "Short box", "Imported mesh (Studio only)",
-      ]
-    case 2:
-      return [
-        "Unassigned", "Floor", "Plate 1", "Plate 2", "Plate 3", "Plate 4", "Unused plinth slot",
-        "Imported mesh (Studio only)",
-      ]
-    case 3:
-      return [
-        "Room surfaces", "Unused floor slot", "Unused copper slot", "Unused ring slot",
-        "Mirror sphere", "Glass sphere", "Unused plinth slot", "Imported mesh (Studio only)",
-      ]
-    case 5:
-      return [
-        "Back wall", "Floor", "Unused copper slot", "Gold ring", "Chrome sphere",
-        "Unused glass slot", "Unused plinth slot", "Imported mesh (Studio only)",
-      ]
-    case 6:
-      return [
-        "Unassigned", "Floor", "Unused copper slot", "Unused ring slot", "Unused chrome slot",
-        "Unused glass slot", "Unused plinth slot", "Imported mesh",
-      ]
-    default: return ["Architecture"] + Array(MaterialLibrary.names.dropFirst())
-    }
-  }
-  func selectObject() {
-    if renderer.sceneIndex == 6, project.graph != nil {
-      selectGraphNode()
-      return
-    }
-    let names = objectNames()
-    let slots = names.indices.filter {
-      !names[$0].hasPrefix("Unused") && names[$0] != "Unassigned"
-        && !names[$0].contains("Studio only")
-    }
-    if !slots.contains(selectedSlot) { selectedSlot = slots.first ?? 0 }
-    popup(slots.map { names[$0] }, slots.firstIndex(of: selectedSlot) ?? 0, label: "Object") { [weak self] i in
-      self?.selectedSlot = slots[i]
-      self?.rebuild()
-    }
-  }
-  // Small cached previews: full-resolution maps are never decoded for the inspector.
-  func mapThumbnail(_ data: Data, index: Int) -> NSImage? {
-    if let cached = mapThumbnails[index], cached.data == data { return cached.image }
-    mapThumbnails[index] = nil
-    let options: [CFString: Any] = [
-      kCGImageSourceCreateThumbnailFromImageAlways: true,
-      kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 160,
-    ]
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-    else { return nil }
-    let image = NSImage(cgImage: thumbnail, size: NSSize(width: thumbnail.width, height: thumbnail.height))
-    mapThumbnails[index] = (data, image)
-    return image
-  }
-  func materialPanel() {
-    heading("Material")
-    selectObject()
-    if renderer.sceneIndex == 6, project.graph != nil, selectedNode != nil { graphBindings() }
-    let slot = selectedSlot
-    button("Import MaterialX…") { [weak self] in self?.importMaterialX() }
-    if !materialXReport.isEmpty {
-      button("Last MaterialX import report…") { [weak self] in self?.showMaterialXReport() }
-    }
-    if let program = renderer.materials.materialX[slot] {
-      materialXPanel(program, slot: slot)
-      return
-    }
-    if let emission = renderer.materials.emissions[slot] {
-      heading("USD area emitter")
-      for i in 0..<3 {
-        number("Radiance \(["R","G","B"][i])", emission[i], 0...max(1000, emission[i]), emission[i])
-        { [weak self] v in self?.renderer.materials.emissions[slot]?[i] = v }
-      }
-      text(
-        "One-sided rectangular light. Move and rotate it in Objects. Values are linear radiance.")
-      emitterLightControls(slot)
-      return
-    }
-    let material = renderer.materials.settings[slot]
-    popup(
-      [
-        "Original scene material", "Plastic", "Copper", "Coated metal", "Fabric", "Rough glass",
-        "Custom OpenPBR",
-      ], material.enabled == 0 ? 0 : 6, label: "Material preset"
-    ) { [weak self] i in self?.materialPreset(i) }
-    func encode(_ c: Float) -> CGFloat {
-      CGFloat(c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1 / 2.4) - 0.055)
-    }
-    text("Material tint")
-    add(
-      ActionColor(
-        NSColor(
-          srgbRed: encode(material.color.x), green: encode(material.color.y),
-          blue: encode(material.color.z), alpha: 1), label: "Material tint"
-      ) { [weak self] color in
-        guard let self, self.acceptsEdits, let c = color.usingColorSpace(.sRGB) else { return }
-        self.checkpoint("Material tint", coalesce: true)
-        func decode(_ c: CGFloat) -> Float {
-          let x = Float(c)
-          return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
-        }
-        self.renderer.materials.settings[slot].color = SIMD4(
-          decode(c.redComponent), decode(c.greenComponent), decode(c.blueComponent), 1)
-        self.renderer.materials.settings[slot].enabled = 1
-        self.changed()
-      })
-    for (i, name) in ["Roughness", "Metalness", "Coat", "Anisotropy"].enumerated() {
-      number(name, material.surface[i], i == 0 ? 0.03...1 : 0...1, i == 0 ? 0.3 : 0) {
-        [weak self] v in
-        self?.renderer.materials.settings[slot].surface[i] = v
-        self?.renderer.materials.settings[slot].enabled = 1
-      }
-    }
-    for (i, name) in ["Fuzz", "IOR", "Transmission", "UV repeat"].enumerated() {
-      let range: ClosedRange<Float> = i == 1 ? 1.01...2.5 : i == 3 ? 0.01...100 : 0...1
-      number(name, material.detail[i], range, i == 1 ? 1.5 : i == 3 ? 1 : 0) { [weak self] v in
-        self?.renderer.materials.settings[slot].detail[i] = v
-        if i != 3 { self?.renderer.materials.settings[slot].enabled = 1 }
-      }
-    }
-    number("Normal strength", material.normalStrength, 0...4, 1) { [weak self] in
-      self?.renderer.materials.settings[slot].normalStrength = $0
-    }
-    for (i, name) in ["UV offset U", "UV offset V", "UV rotation, degrees"].enumerated() {
-      let value = renderer.materials.objects[slot].uvTransform[i] * (i == 2 ? 180 / .pi : 1)
-      number(name, value, i == 2 ? -180...180 : -10...10, 0) { [weak self] v in
-        self?.renderer.materials.objects[slot].uvTransform[i] = v * (i == 2 ? .pi / 180 : 1)
-      }
-    }
-    heading("Textures")
-    for channel in 0..<4 {
-      text(
-        MaterialLibrary.mapNames[channel] + "\n" + renderer.materials.fileNames[slot * 4 + channel])
-      if let data = renderer.materials.payloads[slot * 4 + channel],
-        let image = mapThumbnail(data, index: slot * 4 + channel)
-      {
-        let preview = NSImageView()
-        preview.image = image
-        preview.imageScaling = .scaleProportionallyUpOrDown
-        preview.heightAnchor.constraint(equalToConstant: 80).isActive = true
-        add(preview)
-      }
-      button("Load \(["base color","roughness","metalness","normal map"][channel])…") {
-        [weak self] in self?.loadMap(slot, channel)
-      }
-      button("Clear map") { [weak self] in
-        guard let self, !self.isBusy else { return }
-        do {
-          let record = self.undoRecord("Clear texture")
-          try self.renderer.materials.clear(slot: slot, channel: channel)
-          self.commit(record)
-          self.changed()
-          self.rebuild()
-        } catch { self.showError(error.localizedDescription) }
-      }
-      if channel == 1 || channel == 2 {
-        popup(
-          ["Channel: Red", "Channel: Green", "Channel: Blue", "Channel: Alpha"],
-          Int(renderer.materials.objects[slot].channels[channel - 1]),
-          label: "\(MaterialLibrary.mapNames[channel]) channel"
-        ) { [weak self] i in
-          guard let self else { return }
-          self.checkpoint("Texture channel")
-          self.renderer.materials.objects[slot].channels[channel - 1] = UInt32(i)
-          self.changed()
-        }
-      }
-    }
-    text(
-      "Base color multiplies tint. Roughness and metalness maps replace their sliders. Normal maps use +Y. Clear maps to restore scalar values."
-    )
-    button("Save material preset…") { [weak self] in self?.saveMaterial() }
-    button("Load material preset…") { [weak self] in self?.loadMaterial() }
-    button("Reset material and maps") { [weak self] in
-      guard let self, !self.isBusy else { return }
-      let record = self.undoRecord("Reset material")
-      // Publish settings and all four maps in one transactional restore.
-      var state = self.renderer.materials.state()
-      state.surfaces[slot] = SurfaceSettings()
-      for c in 0..<4 {
-        state.maps[slot * 4 + c] = nil
-        state.names[slot * 4 + c] = "None"
-      }
-      do {
-        try self.renderer.materials.restore(state)
-        self.commit(record)
-        self.changed()
-        self.rebuild()
-      } catch { self.showError(error.localizedDescription) }
-    }
-  }
-  func objectPanel() {
-    if renderer.sceneIndex == 6, project.graph != nil {
-      graphObjectPanel()
-      return
-    }
-    heading("Object / surface group")
-    selectObject()
-    legacyObjectControls()
-    heading("Add model")
-    text(project.meshName)
-    button("Add Model…") { [weak self] in self?.addModel() }
-    button("Frame imported mesh") { [weak self] in self?.frameMesh() }
-    text(
-      "OBJ positions, UVs and normals are supported. Object/group hierarchy and named material subsets are preserved. Imports append to the scene. MTL materials are imported. Triangulate concave polygons before import."
-    )
-  }
-  func legacyObjectControls() {
-    let slot = selectedSlot
-    let o = renderer.materials.objects[slot]
-    button(o.rotationHidden.w > 0 ? "Hidden — click to show" : "Visible — click to hide") {
-      [weak self] in
-      guard let self else { return }
-      self.checkpoint("Visibility")
-      self.renderer.materials.objects[slot].rotationHidden.w = o.rotationHidden.w > 0 ? 0 : 1
-      self.changed()
-      self.rebuild()
-    }
-    for i in 0..<3 {
-      number("Translation \(["X","Y","Z"][i])", o.positionScale[i], -100...100, 0) { [weak self] in
-        self?.renderer.materials.objects[slot].positionScale[i] = $0
-      }
-      number(
-        "Rotation \(["X","Y","Z"][i]), degrees", o.rotationHidden[i] * 180 / .pi, -180...180, 0
-      ) { [weak self] in self?.renderer.materials.objects[slot].rotationHidden[i] = $0 * .pi / 180 }
-    }
-    number("Uniform scale", o.positionScale.w, 0.01...100, 1) { [weak self] in
-      self?.renderer.materials.objects[slot].positionScale.w = $0
-    }
-    button("Reset transform") { [weak self] in
-      guard let self else { return }
-      self.checkpoint("Reset transform")
-      self.renderer.materials.objects[slot].positionScale = SIMD4(0, 0, 0, 1)
-      self.renderer.materials.objects[slot].rotationHidden = .zero
-      self.changed()
-      self.rebuild()
-    }
-    text(
-      "Transforms use the scene origin as pivot. Architecture and room surfaces are grouped. Emitters use the Lighting controls."
-    )
-  }
-  func filePanel() {
-    heading("Project")
-    text(projectURL?.lastPathComponent ?? "Untitled project")
-    button("New project") { [weak self] in
-      self?.confirmDiscardingChanges { self?.newProject() }
-    }
-    button("Open project…") { [weak self] in self?.openProject() }
-    button("Save project") { [weak self] in self?.saveProject() }
-    button("Save project as…") { [weak self] in self?.saveProject(asNew: true) }
-    text(
-      "Projects embed textures, the environment image, and imported geometry. Changes are also autosaved locally; the main menu offers to restore them at the next launch."
-    )
-    heading("Export")
-    number("Output width", Float(renderer.options.outputWidth), 16...8192, 1920, reset: false, integral: true) {
-      [weak self] in self?.renderer.options.outputWidth = Int($0)
-    }
-    number("Output height", Float(renderer.options.outputHeight), 16...8192, 1080, reset: false, integral: true) {
-      [weak self] in self?.renderer.options.outputHeight = Int($0)
-    }
-    number("Export samples", Float(renderer.options.exportSamples), 1...16384, 128, reset: false, integral: true) {
-      [weak self] in self?.renderer.options.exportSamples = UInt32($0)
-    }
-    let exportSource = exportDenoise ? 0 : (exportRaw ? 1 : 2)
-    popup([
-      "Export source: OIDN offline (configured)",
-      "Export source: raw accumulation",
-      "Export source: MetalFX display",
-    ], exportSource, label: "Export source") { [weak self] i in
-      self?.exportDenoise = i == 0
-      self?.exportRaw = i == 1
-    }
-    button("Render and export PNG…") { [weak self] in self?.beginExport(hdr: false) }
-    button("Render and export HDR OpenEXR…") { [weak self] in self?.beginExport(hdr: true) }
-    button("Capture current preview PNG…") { [weak self] in self?.capturePreview() }
-    text(
-      "OIDN filters the converged linear render with albedo and normal guides. EXR stores linear floating-point radiance. PNG uses the current exposure, white balance and tone map."
-    )
   }
   func show(_ message: String) {
     status.textColor = .labelColor
@@ -1328,19 +478,39 @@ final class StudioController: NSViewController {
       if response == .alertFirstButtonReturn { self?.dismissError() }
     }
   }
+  // The status bar: "Rendering · 128 / 1024 samples · 12.3 s" on the left (until a message expires) and
+  // "5.0 fps · 81 ms GPU · 780×740" on the right; no render figures while the main menu is shown.
   func updateStatus() {
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
     busyStateChanged()
     if activityTimer == nil, backgroundShaderProgress != nil { refreshActivity() }
-    guard Date() >= messageUntil, exportRenderer == nil else { return }
-    let r = renderer
+    guard exportRenderer == nil else { return }
+    let r = renderer, idle = Date() >= messageUntil
+    guard startScreen == nil else {
+      statusDetail.stringValue = ""
+      if idle {
+        status.stringValue = ""
+        status.toolTip = nil
+      }
+      return
+    }
+    statusDetail.stringValue = Self.frameStatus(
+      fps: r.framesPerSecond, gpuMilliseconds: r.gpuMilliseconds, width: r.accumTexture?.width ?? 0,
+      height: r.accumTexture?.height ?? 0)
+    guard idle else { return }
     let state = r.paused ? "Paused" : r.reachedLimit ? "Complete" : "Rendering"
     status.textColor = .labelColor
-    status.stringValue = String(
-      format: "%@ · %u spp · %.1f fps · %.1f ms GPU · %.1f s · %d×%d", state, r.completedSamples,
-      r.framesPerSecond, r.gpuMilliseconds, r.renderElapsed, r.accumTexture?.width ?? 0,
-      r.accumTexture?.height ?? 0)
+    status.stringValue = Self.renderStatus(
+      state: state, samples: r.completedSamples, limit: r.options.maxSamples, elapsed: r.renderElapsed)
     status.toolTip = status.stringValue
+  }
+  nonisolated static func renderStatus(state: String, samples: UInt32, limit: UInt32, elapsed: Double) -> String {
+    let count = limit > 0 ? "\(samples) / \(limit) samples" : samples == 1 ? "1 sample" : "\(samples) samples"
+    return "\(state) · \(count) · " + String(format: "%.1f s", elapsed)
+  }
+  nonisolated static func frameStatus(fps: Double, gpuMilliseconds: Double, width: Int, height: Int) -> String {
+    String(format: gpuMilliseconds >= 10 ? "%.1f fps · %.0f ms GPU · %d×%d" : "%.1f fps · %.1f ms GPU · %d×%d",
+      fps, gpuMilliseconds, width, height)
   }
   func pause() {
     guard !isBusy else { return }
@@ -1439,6 +609,7 @@ final class StudioController: NSViewController {
     documentRevision &+= 1
     documentEdited = true
     if reset { renderer.resetAccumulation() }
+    renderResetButton?.isEnabled = !renderSettingsAreDefault
     scheduleAutosave(after: autosaveDelay)
   }
   private func scheduleAutosave(after delay: TimeInterval = 1) {
@@ -1451,6 +622,7 @@ final class StudioController: NSViewController {
   // Records the file association after open/save/new and refreshes the recovery metadata. A replaced document
   // (an open or New, not an undo or redo of one) hides the Scenes window.
   func associate(_ url: URL?, edited: Bool, replaced: Bool, undoing: Bool = false) {
+    if replaced || url != nil { catalogSceneTitle = nil }
     projectURL = url
     if replaced { documentIdentity &+= 1 }
     if replaced && !undoing { scenes.hideAfterOpening() }
@@ -1468,6 +640,7 @@ final class StudioController: NSViewController {
     scenes.browser.setActionsEnabled(enabled)
     startScreen?.setActionsEnabled(enabled)
     for button in busyButtons { button.isEnabled = enabled }
+    tabBar?.isEnabled = enabled
     pauseButton?.isEnabled = enabled
     pauseButton?.title = renderer.paused ? "Resume" : "Pause"
   }
@@ -2103,167 +1276,6 @@ final class StudioController: NSViewController {
       }
     }
   }
-  func saveView() {
-    guard acceptsEdits, let window = hostWindow else { return }
-    let alert = NSAlert()
-    alert.messageText = "Name this camera view"
-    alert.addButton(withTitle: "Save")
-    alert.addButton(withTitle: "Cancel")
-    let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-    input.stringValue = "View \(project.views.count+1)"
-    alert.accessoryView = input
-    alert.beginSheetModal(for: window) { [weak self] response in
-      guard let self, !self.isBusy, response == .alertFirstButtonReturn else { return }
-      let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !name.isEmpty else { return }
-      self.checkpoint("Save view")
-      self.project.views[name] = CameraState(self.renderer)
-      self.changed(reset: false)
-      self.rebuild()
-    }
-  }
-  func materialPreset(_ index: Int) {
-    checkpoint("Material preset")
-    var s = renderer.materials.settings[selectedSlot]
-    s.enabled = index == 0 ? 0 : 1
-    if index > 0 && index < 6 {
-      s.color = SIMD4(0.8, 0.8, 0.8, 1)
-      s.surface = SIMD4(0.3, 0, 0, 0)
-      s.detail.x = 0
-      s.detail.y = 1.5
-      s.detail.z = 0
-      if index == 2 || index == 3 {
-        s.color = SIMD4(0.95, 0.64, 0.54, 1)
-        s.surface = SIMD4(0.22, 1, index == 3 ? 1 : 0, 0)
-      }
-      if index == 4 {
-        s.color = SIMD4(0.25, 0.08, 0.06, 1)
-        s.surface.x = 0.65
-        s.detail.x = 0.8
-      }
-      if index == 5 {
-        s.color = SIMD4(repeating: 1)
-        s.surface.x = 0.12
-        s.detail.z = 1
-        s.detail.y = 1.52
-      }
-    }
-    renderer.materials.settings[selectedSlot] = s
-    changed()
-    rebuild()
-  }
-  func loadMap(_ slot: Int, _ channel: Int) {
-    chooseOpen(
-      "Load texture image", extensions: ["png", "jpg", "jpeg", "tif", "tiff", "heic", "exr"]
-    ) { [weak self] url in self?.loadTexture(from: url, slot: slot, channel: channel) }
-  }
-  func loadTexture(from url: URL, slot: Int, channel: Int) {
-    guard !isBusy else { return }
-    let record = undoRecord("Load texture")
-    do {
-      let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-      let old = renderer.materials.payloads[slot * 4 + channel]?.count ?? 0
-      try requireEmbeddedCapacity(snapshot().embeddedAssetBytes - old + size)
-      try renderer.materials.load(url: url, slot: slot, channel: channel)
-      commit(record)
-      changed()
-      rebuild()
-    } catch { showError(error.localizedDescription) }
-  }
-  func saveMaterial() {
-    var state = SceneState()
-    let source = renderer.materials.state()
-    let slot = selectedSlot
-    state.materialX = [:]
-    if let program = source.materialX?[slot] { state.materialX?[1] = program }
-    state.surfaces[1] = source.surfaces[slot]
-    state.objects[1].uvTransform = source.objects[slot].uvTransform
-    state.objects[1].channels = source.objects[slot].channels
-    for c in 0..<4 {
-      state.maps[4 + c] = source.maps[slot * 4 + c]
-      state.names[4 + c] = source.names[slot * 4 + c]
-    }
-    var document = ProjectDocument()
-    document.scenes[0] = state
-    chooseSave("Save material preset", name: "Material.vmat", ext: "vmat") { [weak self] url in
-      do { try document.encodedProject().json.write(to: url, options: .atomic) } catch {
-        self?.showError(error.localizedDescription)
-      }
-    }
-  }
-  func loadMaterial() {
-    let slot = selectedSlot
-    chooseOpen("Load material preset", extensions: ["vmat"]) { [weak self] url in
-      self?.beginLoadMaterial(from: url, slot: slot)
-    }
-  }
-  // Presets are decoded, merged and prepared on projectIOQueue.
-  func beginLoadMaterial(from url: URL, slot: Int) {
-    guard !isBusy else { return }
-    let record = undoRecord("Load material")
-    let document = snapshot()
-    let scene = Int(renderer.sceneIndex)
-    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] _ -> (ProjectDocument, Void) in
-      guard let self else { throw MaterialLibrary.error("Material preset load cancelled.") }
-      var document = document  // The build runs on projectIOQueue with its own copy.
-      let p = try ProjectDocument.decodeProject(
-        self.readBounded(url, maximum: ProjectDocument.maximumFileBytes), near: nil)
-      try p.validate()
-      // Padding keeps short (legacy or hand-written) presets within bounds.
-      guard let source = p.scenes[0]?.padded else {
-        throw MaterialLibrary.error("Empty material preset.")
-      }
-      var state = (document.scenes[scene] ?? SceneState()).padded
-      var graphs = state.materialX ?? [:]
-      graphs[slot] = source.materialX?[1]
-      state.materialX = graphs
-      state.surfaces[slot] = source.surfaces[1]
-      state.objects[slot].uvTransform = source.objects[1].uvTransform
-      state.objects[slot].channels = source.objects[1].channels
-      for c in 0..<4 {
-        state.maps[slot * 4 + c] = source.maps[4 + c]
-        state.names[slot * 4 + c] = source.names[4 + c]
-      }
-      document.scenes[scene] = state
-      try self.requireEmbeddedCapacity(document.embeddedAssetBytes)
-      return (document, ())
-    }) { [weak self] result in
-      guard let self else { return }
-      switch result {
-      case .success:
-        self.commit(record)
-        self.changed()
-      case .failure(let error): self.showError(error.localizedDescription)
-      }
-    }
-  }
-  func loadEnvironment() {
-    chooseOpen(
-      "Load equirectangular environment", extensions: ["hdr", "exr", "png", "jpg", "tif", "tiff"]
-    ) { [weak self] url in self?.beginLoadEnvironment(from: url) }
-  }
-  // HDRI conversion and importance CDFs are built on projectIOQueue.
-  func beginLoadEnvironment(from url: URL) {
-    guard !isBusy else { return }
-    let record = undoRecord("Environment image")
-    let document = snapshot()
-    beginDocumentChange("Loading \(url.lastPathComponent)…", build: { [weak self] _ -> (ProjectDocument, Void) in
-      guard let self else { throw MaterialLibrary.error("Environment load cancelled.") }
-      var document = document  // The build runs on projectIOQueue with its own copy.
-      document.environmentData = try self.readBounded(url, maximum: 256 * 1024 * 1024)
-      document.environmentName = url.lastPathComponent
-      try self.requireEmbeddedCapacity(document.embeddedAssetBytes)
-      return (document, ())
-    }) { [weak self] result in
-      guard let self else { return }
-      switch result {
-      case .success:
-        self.commit(record)
-        self.changed()
-      case .failure(let error): self.showError(error.localizedDescription)
-      }
-    }
-  }
   // Keeps edits within the aggregate embedded-asset limit that open enforces.
   nonisolated func requireEmbeddedCapacity(_ total: Int) throws {
     guard total <= ProjectDocument.embeddedAssetLimit else {
@@ -2271,119 +1283,6 @@ final class StudioController: NSViewController {
         "Embedded images would total \(total / 1_048_576) MiB across all scenes, above the \(ProjectDocument.embeddedAssetLimit / 1_048_576) MiB project limit. Remove or downsize other maps, MaterialX images or the environment first."
       )
     }
-  }
-  func addModel() {
-    chooseOpen("Add OBJ model", extensions: ["obj"]) { [weak self] url in
-      self?.beginImportOBJ(from: url)
-    }
-  }
-  // Reading, parsing and resource preparation run on projectIOQueue.
-  func beginImportOBJ(from url: URL) {
-    guard !isBusy else { return }
-    let record = undoRecord("Add model")
-    let document = snapshot()
-    beginDocumentChange("Importing \(url.lastPathComponent)…", build: { [weak self] progress -> (ProjectDocument, (UUID, Int, Int, [String])) in
-      guard let self else { throw MaterialLibrary.error("OBJ import cancelled.") }
-      var document = document  // The build runs on projectIOQueue with its own copy.
-      // Memory-mapped and streamed: files of several GB parse without a text copy.
-      let objData = try self.readBounded(url, maximum: 1 << 40)
-      var skipped = 0
-      var report: [String] = []
-      let root = try document.appendOBJ(objData, name: url.lastPathComponent, folder: url.deletingLastPathComponent(),
-        skipped: &skipped, report: &report, progress: progress)
-      return (document, (root, document.graph?.materials.last?.slot ?? 1, skipped, report))
-    }) { [weak self] result in
-      guard let self else { return }
-      switch result {
-      case .success(let (root, slot, skipped, report)):
-        self.commit(record)
-        self.selectedNode = root
-        self.selectedSlot = slot
-        self.frameMesh(recordUndo: false)
-        self.changed()
-        if skipped > 0 || !report.isEmpty {
-          self.show("Imported \(url.lastPathComponent)"
-            + (skipped > 0 ? "; skipped \(skipped) degenerate faces" : "")
-            + (report.isEmpty ? "." : "; see the import report in the scene hierarchy."))
-        }
-      case .failure(let error): self.showError(error.localizedDescription)
-      }
-    }
-  }
-  func frameMesh(recordUndo: Bool = true) {
-    if renderer.sceneIndex != 6 {
-      // The switch may prepare scene resources off the main thread; frame afterwards.
-      switchScene(6) { [weak self] in self?.frameMesh(recordUndo: recordUndo) }
-      return
-    }
-    // Reads the shared GPU buffer (BVH order); no host copy of the mesh is kept for this.
-    let materials = renderer.materials
-    let tris = materials.orderedTriangles
-    guard !tris.isEmpty else { return }
-    if recordUndo { checkpoint("Frame mesh") }
-    var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-    var hi = -lo
-    let o = materials.hasSceneGraph ? ObjectSettings() : materials.objects[7]
-    let family = selectedNode.flatMap { project.graph?.descendants(of: $0) }
-    let rotation = SIMD3(o.rotationHidden.x, o.rotationHidden.y, o.rotationHidden.z)
-    if let layout = materials.meshLayout {
-      // Two-level: each instance of the family, exactly. A translated instance is bounded by
-      // its asset's bounds plus the translation (rounding is monotonic), others by vertices.
-      func add(_ p: SIMD3<Float>) {
-        let v = rotateObject(p * o.positionScale.w, rotation) + SIMD3(o.positionScale.x, o.positionScale.y, o.positionScale.z)
-        lo = simd_min(lo, v)
-        hi = simd_max(hi, v)
-      }
-      for (i, instance) in layout.instances.enumerated() {
-        if let graph = project.graph, let family, instance.node >= 0,
-          !graph.nodes.indices.contains(instance.node) || !family.contains(graph.nodes[instance.node].id)
-        {
-          continue
-        }
-        let asset = layout.assets[instance.asset]
-        if rotation == .zero, MeshSceneLayout.linear(instance.world) == matrix_identity_float3x3 {
-          let t = SIMD3(instance.world.columns.3.x, instance.world.columns.3.y, instance.world.columns.3.z)
-          if asset.count > 0 { add(asset.lo + t); add(asset.hi + t) }
-          continue
-        }
-        for k in 0..<asset.count {
-          let w = layout.worldTriangle(tris[asset.triangleBase + k], instance: i)
-          for p in [w.a, w.b, w.c] { add(SIMD3(p.x, p.y, p.z)) }
-        }
-      }
-    } else if family == nil, rotation == .zero, materials.nodeCount > 0 {
-      // Unrotated whole-mesh framing: the BVH root already bounds every vertex.
-      let root = materials.nodeBuffer.contents().load(as: MeshNode.self)
-      for v in [SIMD3(root.lo.x, root.lo.y, root.lo.z), SIMD3(root.hi.x, root.hi.y, root.hi.z)] {
-        let p = v * o.positionScale.w + SIMD3(o.positionScale.x, o.positionScale.y, o.positionScale.z)
-        lo = simd_min(lo, p)
-        hi = simd_max(hi, p)
-      }
-    }
-    for t in lo.x <= hi.x || materials.meshLayout != nil ? tris[0..<0] : tris[...] {
-      if let graph = project.graph, let family, Int(t.uvc.w) > 0,
-        !family.contains(graph.nodes[Int(t.uvc.w) - 1].id)
-      {
-        continue
-      }
-      for p in [t.a, t.b, t.c] {
-        let v =
-          rotateObject(
-            SIMD3(p.x, p.y, p.z) * o.positionScale.w,
-            SIMD3(o.rotationHidden.x, o.rotationHidden.y, o.rotationHidden.z))
-          + SIMD3(o.positionScale.x, o.positionScale.y, o.positionScale.z)
-        lo = simd_min(lo, v)
-        hi = simd_max(hi, v)
-      }
-    }
-    guard lo.x.isFinite, lo.x <= hi.x else { return }
-    renderer.target = (lo + hi) * 0.5
-    let aspect = Float(max(1, viewport.bounds.width) / max(1, viewport.bounds.height))
-    let tangent = tan(renderer.fov * .pi / 360) * min(1, aspect)
-    renderer.distance = min(1_000_000, max(0.0001, simd_length(hi - lo) / (2 * tangent) * 1.2))
-    renderer.options.focusDistance = renderer.distance
-    changed()
-    rebuild()
   }
   func pick(_ pixel: SIMD2<Float>) {
     guard !isBusy else { return }
@@ -2411,137 +1310,102 @@ final class StudioController: NSViewController {
       self.show("Selected \(self.objectNames()[slot])")
     }
   }
-  func installMenus() {
-    let main = NSMenu()
-    func menu(_ title: String, _ entries: [(String, String, Selector)]) {
-      let item = NSMenuItem()
-      item.title = title
-      let sub = NSMenu(title: title)
-      item.submenu = sub
-      main.addItem(item)
-      for (title, key, selector) in entries {
-        let e = NSMenuItem(title: title, action: selector, keyEquivalent: key)
-        e.target = self
-        sub.addItem(e)
-      }
-    }
-    menu("Metal Vibe Tracer", [("Settings…", ",", #selector(settingsAction)), ("Quit Metal Vibe Tracer", "q", #selector(quit))])
-    menu(
-      "File",
-      [
-        ("Open Project…", "o", #selector(openAction)), ("Save Project", "s", #selector(saveAction)),
-        ("Save Project As…", "S", #selector(saveAsAction)),
-        ("Open Scene File…", "", #selector(openSceneFileAction)),
-        ("Browse Scenes…", "O", #selector(browseScenesAction)),
-        ("Credits and Licenses…", "", #selector(exampleCreditsAction)),
-        ("Show Downloaded Scenes in Finder", "", #selector(revealExampleScenesAction)),
-        ("Export…", "e", #selector(exportAction)),
-      ])
-    if let file = main.items.last?.submenu {
-      let item = recent.menuItem(target: self, open: #selector(openRecentAction(_:)), clear: #selector(clearRecentAction))
-      openRecentMenu = item.submenu
-      file.insertItem(item, at: 1)
-    }
-    // Standard application and window commands go to NSApp and the key window.
-    if let app = main.items.first?.submenu {
-      let hide = NSMenuItem(title: "Hide Metal Vibe Tracer", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-      let others = NSMenuItem(
-        title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
-      others.keyEquivalentModifierMask = [.command, .option]
-      let all = NSMenuItem(
-        title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
-      // Inserted in order just above Quit.
-      for item in [NSMenuItem.separator(), hide, others, all, .separator()] {
-        app.insertItem(item, at: app.numberOfItems - 1)
-      }
-    }
-    main.items.last?.submenu?.addItem(.separator())
-    main.items.last?.submenu?.addItem(
-      NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
-    menu("Edit", [("Undo", "z", #selector(undoAction)), ("Redo", "Z", #selector(redoAction))])
-    // Standard responder-chain editing shortcuts remain available in numeric fields.
-    if let edit = main.items.last?.submenu {
-      for (title, key, selector) in [
-        ("Cut", "x", #selector(NSText.cut(_:))), ("Copy", "c", #selector(NSText.copy(_:))),
-        ("Paste", "v", #selector(NSText.paste(_:))),
-        ("Select All", "a", #selector(NSText.selectAll(_:))),
-      ] { edit.addItem(NSMenuItem(title: title, action: selector, keyEquivalent: key)) }
-    }
-    menu(
-      "Render",
-      [("Pause / Resume", "p", #selector(pauseAction)), ("Restart", "r", #selector(restartAction)),
-       ("Denoise Current Frame with OIDN", "", #selector(oidnAction)),
-       ("Clear OIDN Preview", "", #selector(clearOIDNAction))])
-    menu("View", [("Show / Hide Inspector", "i", #selector(inspectorAction)), ("Frame Selection", "f", #selector(frameSelectionAction)), ("Frame All Imported Objects", "F", #selector(frameAllAction))])
-    if let viewMenu = main.items.last?.submenu {
-      viewMenu.addItem(.separator())
-      for (index, title) in Self.viewportNames.enumerated() {
-        let item = NSMenuItem(title: title, action: #selector(viewportAction(_:)), keyEquivalent: "")
-        item.tag = index
-        item.target = self
-        viewMenu.addItem(item)
-      }
-    }
-    let windowItem = NSMenuItem()
-    let windowMenu = NSMenu(title: "Window")
-    windowItem.submenu = windowMenu
-    windowMenu.addItem(
-      NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
-    windowMenu.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
-    windowMenu.addItem(.separator())
-    windowMenu.addItem(
-      NSMenuItem(title: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
-    main.addItem(windowItem)
-    NSApp.mainMenu = main
-    NSApp.windowsMenu = windowMenu
-  }
-  @objc func inspectorAction() {
-    sidebarVisible.toggle()
-    sidebarWidth.constant = sidebarVisible ? 340 : 0
-    sidebar.isHidden = !sidebarVisible
-  }
-  @objc func settingsAction() {
-    guard !isBusy else { return }
-    showPage(6)
-  }
-  // Page switches from menus, the toolbar and picks reveal a hidden inspector.
+  // Page switches from menus, the toolbar, the tab bar and picks reveal a hidden inspector; another tab starts at its
+  // top.
   func showPage(_ index: Int) {
-    if !sidebarVisible { inspectorAction() }
+    if !sidebarVisible { setInspectorVisible(true) }
+    let switching = index != page
     page = index
     rebuild()
+    if switching {
+      sidebar.contentView.scroll(to: .zero)
+      sidebar.reflectScrolledClipView(sidebar.contentView)
+    }
   }
-  @objc func oidnAction() { guard !isBusy else { return }; startOIDNPreview() }
-  @objc func clearOIDNAction() { guard !isBusy else { return }; clearOIDNPreview(); rebuild() }
-  @objc func viewportAction(_ sender: NSMenuItem) {
-    guard !isBusy else { return }
+  // The inspector's width: 280–520 pt, remembered in `preferences`. Without a remembered width it is wide enough for
+  // the tab bar's labels (340–380 pt).
+  static let inspectorWidthRange: ClosedRange<CGFloat> = 280...520
+  static let inspectorWidthKey = "InspectorWidth"
+  var inspectorWidth: CGFloat {
+    let saved = CGFloat(preferences.double(forKey: Self.inspectorWidthKey))
+    if saved > 0 { return min(Self.inspectorWidthRange.upperBound, max(Self.inspectorWidthRange.lowerBound, saved)) }
+    let tabs = ActionSegmentedControl(Self.pageTitles, selected: 0, label: "") { _ in }
+    tabs.segmentDistribution = .fillEqually
+    let needed = tabs.fittingSize.width + 24 + NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+    return min(380, max(340, needed.rounded(.up)))
+  }
+  func setInspectorWidth(_ width: CGFloat, remember: Bool = true) {
+    let clamped = min(Self.inspectorWidthRange.upperBound, max(Self.inspectorWidthRange.lowerBound, width))
+    sidebarWidth.constant = clamped
+    updateTabBarStyle()
+    if remember { preferences.set(Double(clamped), forKey: Self.inspectorWidthKey) }
+  }
+  func setInspectorVisible(_ visible: Bool) {
+    sidebarVisible = visible
+    sidebarWidth.constant = visible ? inspectorWidth : 0
+    sidebar.isHidden = !visible
+    inspectorHeader.isHidden = !visible
+    if visible { updateTabBarStyle() }
+    resizeHandle?.isHidden = !visible
+    inspectorToggle?.toolTip = visible ? "Hide Inspector" : "Show Inspector"
+  }
+  // The toolbar's view mode (Beauty, Albedo, …): display only, one undo step.
+  func setViewportMode(_ mode: Int) {
+    guard !isBusy, mode != Int(renderer.viewportMode) else { return }
     checkpoint("Viewport")
-    renderer.viewportMode = UInt32(sender.tag)
+    renderer.viewportMode = UInt32(mode)
     changed(reset: false)
     rebuild()
   }
-  @objc func saveAsAction() { saveProject(asNew: true) }
-  @objc func openSceneFileAction() { openSceneFile() }
-  @objc func browseScenesAction() { browseScenes() }
-  @objc func openRecentAction(_ sender: NSMenuItem) {
-    if let url = sender.representedObject as? URL { openRecent(url) }
+}
+
+// The inspector's pinned header (StudioController.buildInspectorHeader): `content` stacks the scene row and the tab
+// bar on the inspector's background, with a separator below.
+final class InspectorHeaderView: NSView {
+  static let horizontalInset: CGFloat = 12
+  let content = NSStackView()
+  init() {
+    super.init(frame: .zero)
+    content.orientation = .vertical
+    content.alignment = .leading
+    content.spacing = 10
+    let separator = NSBox()
+    separator.boxType = .separator
+    for v in [content, separator] as [NSView] {
+      v.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(v)
+    }
+    // The trailing edge yields while the inspector is hidden (zero width).
+    let trailing = content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.horizontalInset)
+    trailing.priority = .defaultHigh
+    NSLayoutConstraint.activate([
+      content.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+      content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.horizontalInset), trailing,
+      separator.topAnchor.constraint(equalTo: content.bottomAnchor, constant: 10),
+      separator.leadingAnchor.constraint(equalTo: leadingAnchor),
+      separator.trailingAnchor.constraint(equalTo: trailingAnchor),
+      separator.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
   }
-  @objc func clearRecentAction() { recent.clear() }
-  @objc func frameSelectionAction() { guard !isBusy else { return }; frameMesh() }
-  @objc func frameAllAction() { guard !isBusy else { return }; selectedNode = nil; frameMesh() }
-  @objc func quit() { NSApp.terminate(nil) }
-  @objc func openAction() { openProject() }
-  @objc func saveAction() { saveProject() }
-  @objc func exportAction() { showPage(5) }
-  @objc func undoAction() {
-    guard !isBusy else { return }
-    history.undo()
+  required init?(coder: NSCoder) { fatalError() }
+  override var wantsUpdateLayer: Bool { true }
+  override func updateLayer() { layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor }
+}
+
+// The inspector's leading edge: dragging it resizes the inspector.
+final class InspectorResizeHandle: NSView {
+  var onBegin: (() -> Void)?
+  // The horizontal travel since the drag began, in window points (positive to the right).
+  var onResize: ((CGFloat) -> Void)?
+  var onEnd: (() -> Void)?
+  private var startX: CGFloat = 0
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
+  override func mouseDown(with event: NSEvent) {
+    startX = event.locationInWindow.x
+    onBegin?()
   }
-  @objc func redoAction() {
-    guard !isBusy else { return }
-    history.redo()
-  }
-  @objc func pauseAction() { pause() }
-  @objc func restartAction() { restart() }
+  override func mouseDragged(with event: NSEvent) { onResize?(event.locationInWindow.x - startX) }
+  override func mouseUp(with event: NSEvent) { onEnd?() }
 }
 
 // The main menu shown while no document is loaded, recent projects, and the Scenes window (ScenesWindowController) with
@@ -2575,6 +1439,7 @@ extension StudioController {
     menu.onOpenRecent = { [weak self] url in self?.openRecent(url) }
     menu.onClearRecent = { [weak self] in self?.recent.clear() }
     menu.onCredits = { [weak self] in self?.showExampleCredits() }
+    menu.onDropFiles = { [weak self] urls in self?.openDroppedFiles(urls) ?? false }
     menu.setRestore(Self.autosaveDate(at: autosaveURL))
     menu.setRecent(recent.shown)
     menu.setActionsEnabled(!isBusy)
@@ -2585,12 +1450,13 @@ extension StudioController {
       menu.topAnchor.constraint(equalTo: view.topAnchor),
       menu.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       menu.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      menu.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -6),
+      menu.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
     ])
     startScreen = menu
     viewport.isPaused = true
     viewport.isHidden = true
     updateWindowTitle()
+    updateStatus()
   }
   // A loaded document (applyProject) removes the main menu and resumes the viewport. Unless the last session was
   // restored, its autosave becomes the recovery copy (Autosave-previous.vtrace) before this session's first autosave
@@ -2604,6 +1470,7 @@ extension StudioController {
     viewport.isPaused = false
     renderer.lastTick = awakeSeconds()
     updateWindowTitle()
+    updateStatus()
   }
   // Shows the Scenes window, or brings it to the front, whether or not a document is loaded. The viewport keeps
   // rendering and the document is untouched; opening a document hides the window again (associate, restoreAutosave).
@@ -2652,6 +1519,47 @@ extension StudioController {
       SceneBrowserView.chooseFile(for: action, window: window) { [weak self] chosen in self?.performStartAction(chosen) }
     }
   }
+  // What a dropped file opens as, by its extension: a project, a scene file (File › Open Scene File…), an environment
+  // image or a MaterialX material; nil for anything else.
+  enum DroppedFile { case project, scene, environment, materialX }
+  nonisolated static func dropKind(_ url: URL) -> DroppedFile? {
+    let ext = url.pathExtension.lowercased()
+    if ext == "vtrace" { return .project }
+    if SceneFile.extensions.contains(ext) { return .scene }
+    if ["hdr", "exr"].contains(ext) { return .environment }
+    if ext == "mtlx" { return .materialX }
+    return nil
+  }
+  nonisolated static func unsupportedDropMessage(_ url: URL) -> String {
+    "\(url.lastPathComponent) can't be opened: drop a project (.vtrace), a scene file (USD, glTF, OBJ, Mitsuba XML), an .hdr or .exr environment or a MaterialX (.mtlx) file."
+  }
+  // Files dropped on the main window open through their menu command's path: a project like Open Project (with the
+  // unsaved-changes prompt), a scene file like Open Scene File…, an environment image like Load Environment Image…
+  // and a .mtlx like Import MaterialX…. One file at a time, not while busy; the last two need a loaded document.
+  // Anything else is refused with a status message. Returns whether the file is being opened.
+  @discardableResult func openDroppedFiles(_ urls: [URL]) -> Bool {
+    guard let url = urls.first, urls.count == 1 else {
+      show(urls.isEmpty ? "Only files can be dropped here." : "Drop one file at a time.")
+      return false
+    }
+    guard !isBusy else {
+      show("Wait for the current operation to finish before opening \(url.lastPathComponent).")
+      return false
+    }
+    switch Self.dropKind(url) {
+    case .project: performStartAction(.openProject(url))
+    case .scene: performStartAction(.openScene(url))
+    case .environment where startScreen == nil: beginLoadEnvironment(from: url)
+    case .materialX where startScreen == nil: beginImportMaterialX(from: url)
+    case .environment, .materialX:
+      show("Open a project or scene before adding \(url.lastPathComponent).")
+      return false
+    case nil:
+      show(Self.unsupportedDropMessage(url))
+      return false
+    }
+    return true
+  }
   // A new untitled project of built-in scene `index`, with that scene's default camera.
   func startBuiltInScene(_ index: Int) {
     var p = ProjectDocument()
@@ -2671,40 +1579,5 @@ extension StudioController {
       self.associate(nil, edited: false, replaced: true)
       self.rebuild()
     }
-  }
-}
-
-extension StudioController: NSMenuItemValidation {
-  func validateMenuItem(_ item: NSMenuItem) -> Bool {
-    if item.action == #selector(quit) { return true }
-    if item.action == #selector(inspectorAction) { return true }
-    if item.action == #selector(exampleCreditsAction) || item.action == #selector(revealExampleScenesAction) {
-      return true
-    }
-    if item.action == #selector(viewportAction(_:)) {
-      item.state = Int(renderer.viewportMode) == item.tag ? .on : .off
-    }
-    if isBusy { return false }
-    // With no document loaded only the commands that open one apply.
-    if startScreen != nil {
-      return [
-        #selector(openAction), #selector(openRecentAction(_:)), #selector(clearRecentAction), #selector(openSceneFileAction),
-        #selector(browseScenesAction),
-      ].contains(item.action)
-    }
-    if item.action == #selector(undoAction) {
-      item.title = history.undoMenuItemTitle
-      return history.canUndo
-    }
-    if item.action == #selector(redoAction) {
-      item.title = history.redoMenuItemTitle
-      return history.canRedo
-    }
-    if item.action == #selector(clearOIDNAction) { return renderer.offlineDenoisedPreview != nil }
-    if item.action == #selector(oidnAction) { return renderer.offlineDenoisedPreview == nil }
-    if item.action == #selector(frameSelectionAction) || item.action == #selector(frameAllAction) {
-      return project.graph?.nodes.contains { $0.mesh != nil } == true || !project.triangles.isEmpty
-    }
-    return true
   }
 }

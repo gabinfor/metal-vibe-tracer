@@ -302,8 +302,14 @@ testWindow.contentView=controller.view
 controller.viewport.isPaused=true
 // Autosaves from test edits stay in the run directory, never the user's Application Support.
 controller.autosaveURL=testOutputDirectory.appendingPathComponent("studio/Autosave.vtrace")
+// Inspector state (collapsed sections, inspector width) stays in a suite cleared for each run, and every collapsible
+// section is built so checks can reach its controls.
+let testPreferences=UserDefaults(suiteName:"VibeTracerTests")!
+testPreferences.removePersistentDomain(forName:"VibeTracerTests")
+controller.preferences=testPreferences
+controller.forceSectionsOpen=true
 // verify.py: end studio controller
-for page in 0..<7 {
+for page in 0..<StudioController.pageTitles.count {
     controller.page=page;controller.rebuild();controller.view.layoutSubtreeIfNeeded()
     require(controller.stack.arrangedSubviews.count>3,"inspector page \(page) contains controls")
     require(controller.sidebar.frame.width>300 && controller.viewport.frame.width>300,"inspector layout leaves room for viewport")
@@ -320,6 +326,8 @@ oidnPreviewCommand.commit();oidnPreviewCommand.waitUntilCompleted()
 require(oidnPreviewCommand.status == .completed && !testRenderer.lastPresentationUsedMetalFX,"OIDN viewport preview bypasses MetalFX")
 controller.clearOIDNPreview()
 require(testRenderer.offlineDenoisedPreview == nil && !testRenderer.paused,"clearing OIDN preview restores live rendering")
+controller.page=6
+require(controller.page==5,"inspector tabs stop at Export")
 controller.page=3;controller.rebuild();controller.view.layoutSubtreeIfNeeded()
 if let rep=controller.sidebar.bitmapImageRepForCachingDisplay(in:controller.sidebar.bounds) {
     controller.sidebar.cacheDisplay(in:controller.sidebar.bounds,to:rep)

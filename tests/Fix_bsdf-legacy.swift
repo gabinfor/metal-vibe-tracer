@@ -164,7 +164,8 @@
   try library.restore(SceneState())
 
   // R-93: the light well shows sRGB and stores linear light color.
-  let savedLight = testRenderer.options.lightColor
+  let savedLight = testRenderer.options.lightColor, savedScene = testRenderer.sceneIndex
+  testRenderer.sceneIndex = 1  // The Lighting page shows the light colour on finite-light scenes.
   controller.page = 2; controller.rebuild(); controller.view.layoutSubtreeIfNeeded()
   func wells(_ view: NSView) -> [ActionColor] {
     (view as? ActionColor).map { [$0] } ?? view.subviews.flatMap(wells)
@@ -182,6 +183,7 @@
   require(shown.map { abs($0.redComponent - 0.5) < 0.002 && abs($0.greenComponent - 0.25) < 0.002 } == true,
     "light color well re-encodes linear color for display")
   testRenderer.options.lightColor = savedLight
+  testRenderer.sceneIndex = savedScene
   controller.saveTimer?.invalidate()
   print("PASS: legacy normal-map frame, promoted original materials, delta Fresnel and geometric sides, light color well")
 }

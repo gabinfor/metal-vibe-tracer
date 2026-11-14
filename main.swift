@@ -10099,7 +10099,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // after the previous frame's end; the busy time and samples decay by half every 16 frames.
     var gpuMillisecondsPerSample: Double { recentSamples > 0 ? recentBusyMilliseconds / recentSamples : 0 }
     private var recentBusyMilliseconds = 0.0, recentSamples = 0.0, lastGPUEnd: CFTimeInterval = 0
-    var framesPerSecond: Double = 0
+    // Frame rate over the recent completions. Completions the main thread handles together after a stall, and the
+    // first one after a pause, would show as a spike or a dip if each interval were reported on its own.
+    var framesPerSecond: Double { frameInterval > 0 ? 1 / frameInterval : 0 }
+    private var frameInterval = 0.0
     var completedSamples: UInt32 = 0
     // Awake seconds (awakeSeconds): the render time limit does not count system sleep.
     var lastTick = awakeSeconds()
@@ -10561,14 +10564,18 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         return weights
     }
 
+    // The field of view, in degrees, of the scene's default view.
+    var defaultFieldOfView: Float { sceneIndex == 0 ? 38 : sceneIndex == 2 ? 40 : 42 }
+
     // The scene's default view; the user then orbits, pans and zooms from it.
     func applyDefaultCamera() {
         switch sceneIndex {
-        case 0: yaw = 0.42; pitch = 0.22; distance = 4.6; target = SIMD3<Float>(0.15, -0.25, 0.70); fov = 38.0
-        case 2: yaw = 0.52; pitch = 0.28; distance = 5.3; target = SIMD3<Float>(0, 0.1, 0.1); fov = 40.0
-        case 5: yaw = 0.65; pitch = 0.60; distance = 2.9; target = SIMD3<Float>(0.3, -0.6, -0.1); fov = 42.0
-        default: yaw = 0.45; pitch = 0.25; distance = 3.4; target = SIMD3<Float>(0, -0.1, 0); fov = 42.0
+        case 0: yaw = 0.42; pitch = 0.22; distance = 4.6; target = SIMD3<Float>(0.15, -0.25, 0.70)
+        case 2: yaw = 0.52; pitch = 0.28; distance = 5.3; target = SIMD3<Float>(0, 0.1, 0.1)
+        case 5: yaw = 0.65; pitch = 0.60; distance = 2.9; target = SIMD3<Float>(0.3, -0.6, -0.1)
+        default: yaw = 0.45; pitch = 0.25; distance = 3.4; target = SIMD3<Float>(0, -0.1, 0)
         }
+        fov = defaultFieldOfView
         resetAccumulation()
     }
 
@@ -10981,7 +10988,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     self.recentBusyMilliseconds = self.recentBusyMilliseconds * decay + busy
                     self.recentSamples = self.recentSamples * decay + Double(samples)
                     let now=Date(), interval=now.timeIntervalSince(self.lastCompletion)
-                    self.framesPerSecond=interval>0 ? 1/interval : 0; self.lastCompletion=now
+                    self.frameInterval = self.frameInterval == 0 || interval > 1 ? interval
+                        : self.frameInterval * 0.8 + interval * 0.2
+                    self.lastCompletion=now
                     self.onFrameUpdate?(nextFrame)
                 } else {
                     self.resetAccumulation()

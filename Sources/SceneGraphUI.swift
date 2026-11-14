@@ -7,7 +7,10 @@ enum GraphEditKind {
   case geometry
 }
 
+// Imported scenes (a scene graph in the Imported Mesh Studio): the hierarchy popup, material bindings, the Objects
+// tab's node controls, and MaterialX import and parameters.
 extension StudioController {
+  // The Object popup of imported scenes: the studio floor, then the hierarchy indented by depth (▸ groups, ◇ meshes).
   func selectGraphNode() {
     guard let graph = project.graph else { return }
     if !graph.nodes.contains(where: { $0.id == selectedNode }) {
@@ -24,13 +27,13 @@ extension StudioController {
       }
     }
     visit(nil, 0)
-    popup(
+    popupRow(
+      "Object",
       ["Studio floor"]
         + ordered.map {
           String(repeating: "  ", count: $0.1) + ($0.0.mesh == nil ? "▸ " : "◇ ") + $0.0.name
         },
-      selectedNode.flatMap { id in ordered.firstIndex(where: { $0.0.id == id }).map { $0 + 1 } }
-        ?? 0, label: "Scene object"
+      selectedNode.flatMap { id in ordered.firstIndex(where: { $0.0.id == id }).map { $0 + 1 } } ?? 0
     ) { [weak self] i in
       guard let self else { return }
       self.selectedNode = i == 0 ? nil : ordered[i - 1].0.id
@@ -41,24 +44,26 @@ extension StudioController {
         : graph.materials.first(where: { $0.id == ordered[i - 1].0.bindings.first })?.slot ?? graph
           .materials.first?.slot ?? 1
       self.rebuild()
-    }
+    }.setAccessibilityLabel("Scene object")
   }
+  // The selected node's material: a mesh's face subset and the material assigned to it, or (for a group) any
+  // material of the scene; then New Material and Remove Unused Materials.
   func graphBindings() {
     guard let graph = project.graph, let node = graph.nodes.first(where: { $0.id == selectedNode })
     else { return }
     if let mesh = node.mesh, let asset = graph.assets.first(where: { $0.id == mesh }) {
       selectedSubset = min(max(0, selectedSubset), asset.subsets.count - 1)
-      popup(asset.subsets.map { "Subset: " + $0 }, selectedSubset, label: "Material subset") { [weak self] i in
+      popupRow("Subset", asset.subsets, selectedSubset, help: "A face group of the selected mesh.") { [weak self] i in
         guard let self else { return }
         self.selectedSubset = i
         self.selectedSlot = graph.materials.first(where: { $0.id == node.bindings[i] })?.slot ?? 1
         self.rebuild()
-      }
+      }.setAccessibilityLabel("Material subset")
       let binding = node.bindings[selectedSubset]
       selectedSlot = graph.materials.first(where: { $0.id == binding })?.slot ?? 1
-      popup(
-        graph.materials.map(\.name), graph.materials.firstIndex(where: { $0.id == binding }) ?? 0,
-        label: "Subset material"
+      popupRow(
+        "Assigned material", graph.materials.map(\.name), graph.materials.firstIndex(where: { $0.id == binding }) ?? 0,
+        help: "The material of this subset. Material edits apply to every subset assigned to the same material."
       ) { [weak self] i in
         guard let self else { return }
         let subset = self.selectedSubset
@@ -68,20 +73,17 @@ extension StudioController {
           else { throw MaterialLibrary.error("Object was removed.") }
           g.nodes[index].bindings[subset] = g.materials[i].id
         }
-      }
+      }.setAccessibilityLabel("Subset material")
     } else {
-      text(
-        "Select a mesh child to assign a face subset. Material edits affect every object using that material."
-      )
-      popup(
-        graph.materials.map(\.name),
-        graph.materials.firstIndex(where: { $0.slot == selectedSlot }) ?? 0, label: "Material"
+      popupRow(
+        "Material", graph.materials.map(\.name), graph.materials.firstIndex(where: { $0.slot == selectedSlot }) ?? 0,
+        help: "Choose a material to edit. Select a mesh to assign materials to its subsets."
       ) { [weak self] i in
         self?.selectedSlot = graph.materials[i].slot
         self?.rebuild()
       }
     }
-    button("New material for selection") { [weak self] in
+    let new = ActionButton("New Material") { [weak self] in
       guard let self else { return }
       let subset = self.selectedSubset
       self.editGraph("New material", kind: .bindings) { g in
@@ -94,13 +96,18 @@ extension StudioController {
         self.selectedSlot = m.slot
       }
     }
+    new.toolTip = node.mesh == nil
+      ? "Adds a material to the scene." : "Adds a material and assigns it to the selected subset."
     // Object deletion keeps unassigned materials; this removes them explicitly.
     if graph.materials.contains(where: { m in !graph.nodes.contains { $0.bindings.contains(m.id) } }) {
-      button("Remove unused materials") { [weak self] in
+      let prune = ActionButton("Remove Unused Materials") { [weak self] in
         self?.editGraph("Remove unused materials", kind: .bindings) { g in g.pruneUnusedMaterials() }
       }
+      prune.toolTip = "Removes the materials no object uses."
+      buttonRow([new, prune])
+    } else {
+      buttonRow([new])
     }
-    text("Material edits are shared by all subsets assigned to the same material.")
   }
   func editGraph(_ title: String, kind: GraphEditKind = .geometry,
                  _ edit: (inout SceneGraph) throws -> Void) {
@@ -153,104 +160,104 @@ extension StudioController {
       }
     }
   }
+  // The Objects tab on imported scenes. Graph edits rebuild the flattened mesh (and its acceleration structure), so
+  // number fields here commit once, on release or on entry, each one undo step through editGraph.
   func graphObjectPanel() {
-    heading("Scene hierarchy")
-    if project.importReport != nil {
-      button("Import report…") { [weak self] in self?.showUSDReport() }
-    }
+    section("Selection")
     selectGraphNode()
-    if let graph = project.graph, let node = graph.nodes.first(where: { $0.id == selectedNode }) {
-      let o = node.transform
-      button("Rename…") { [weak self] in
-        guard let self, self.acceptsEdits, let window = self.hostWindow else { return }
-        let alert = NSAlert()
-        alert.messageText = "Object name"
-        let field = NSTextField(string: node.name)
-        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-        // A sheet keeps project I/O from finishing inside a nested modal loop; editGraph
-        // re-checks busy state and resolves the node against the graph current at return.
-        alert.beginSheetModal(for: window) { [weak self] response in
-          guard response == .alertFirstButtonReturn,
-            !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-          else { return }
-          self?.editGraph("Rename object", kind: .metadata) { g in
-            g.nodes[try g.nodeIndex(node.id)].name = field.stringValue
-          }
-        }
-      }
-      let family = graph.descendants(of: node.id)
-      let parents = graph.nodes.filter { !family.contains($0.id) }
-      popup(
-        ["Parent: Scene root"] + parents.map { "Parent: " + $0.name },
-        node.parent.flatMap { id in parents.firstIndex(where: { $0.id == id }).map { $0 + 1 } } ?? 0,
-        label: "Parent"
-      ) { [weak self] i in
-        self?.editGraph("Change parent") { g in
-          g.nodes[try g.nodeIndex(node.id)].parent =
-            i == 0 ? nil : parents[i - 1].id
-        }
-      }
-      text("Transforms are relative to the parent. Reparenting preserves local values.")
-      button(o.rotationHidden.w > 0 ? "Hidden — click to show" : "Visible — click to hide") {
-        [weak self] in
-        self?.editGraph("Visibility") { g in
-          g.nodes[try g.nodeIndex(node.id)].transform.rotationHidden.w =
-            o.rotationHidden.w > 0 ? 0 : 1
-        }
-      }
-      func control(
-        _ title: String, _ value: Float, _ range: ClosedRange<Float>, _ fallback: Float,
-        _ setter: @escaping (inout ObjectSettings, Float) -> Void
-      ) {
-        add(
-          NumberControl(title, value: value, range: range, defaultValue: fallback) {
-            [weak self] v in
-            self?.editGraph(title) { g in
-              setter(&g.nodes[try g.nodeIndex(node.id)].transform, v)
-            }
-          })
-      }
-      for i in 0..<3 {
-        control("Translation \(["X","Y","Z"][i])", o.positionScale[i], -100...100, 0) {
-          $0.positionScale[i] = $1
-        }
-        control(
-          "Rotation \(["X","Y","Z"][i]), degrees", o.rotationHidden[i] * 180 / .pi, -180...180, 0
-        ) { $0.rotationHidden[i] = $1 * .pi / 180 }
-      }
-      control("Uniform scale", o.positionScale.w, 0.01...100, 1) { $0.positionScale.w = $1 }
-      button("Reset transform") { [weak self] in
-        self?.editGraph("Reset transform") { g in
-          g.nodes[try g.nodeIndex(node.id)].transform = ObjectSettings()
-        }
-      }
-      button("Frame selection") { [weak self] in self?.frameMesh() }
-      button("Create instance") { [weak self] in
-        guard let self else { return }
-        self.editGraph("Create instance") { g in self.selectedNode = try g.instance(node.id) }
-      }
-      button("Delete selection and children") { [weak self] in
-        self?.editGraph("Delete object") { g in g.remove(node.id) }
-      }
-      if let mesh = node.mesh, let asset = graph.assets.first(where: { $0.id == mesh }) {
-        text(
-          "\(asset.geometry.count) triangles · \(asset.subsets.count) material subsets · \(graph.nodes.filter{$0.mesh==mesh}.count) instances"
-        )
-      }
-    } else {
-      legacyObjectControls()
+    if project.importReport != nil {
+      button("Import Report…") { [weak self] in self?.showUSDReport() }
     }
-    button("Frame all imported objects") { [weak self] in self?.frameAllAction() }
-    heading("Import")
-    button("Add Model…") { [weak self] in self?.addModel() }
-    text(
-      "OBJ objects, groups and usemtl subsets are preserved. Imports append. Instances share mesh assets and render as instances: moving, hiding or rebinding one keeps every mesh's acceleration structure. MTL materials are imported; triangulate concave polygons before import."
-    )
+    guard let graph = project.graph, let node = graph.nodes.first(where: { $0.id == selectedNode }) else {
+      // The studio floor: a built-in surface.
+      legacyObjectControls()
+      objectActions(node: nil)
+      return
+    }
+    let o = node.transform
+    visibilityToggle(hidden: o.rotationHidden.w > 0, help: "Hiding an object also hides its children.") {
+      [weak self] hidden in
+      self?.editGraph("Visibility") { g in
+        g.nodes[try g.nodeIndex(node.id)].transform.rotationHidden.w = hidden ? 1 : 0
+      }
+    }
+    let family = graph.descendants(of: node.id)
+    let parents = graph.nodes.filter { !family.contains($0.id) }
+    popupRow(
+      "Parent", ["Scene root"] + parents.map(\.name),
+      node.parent.flatMap { id in parents.firstIndex(where: { $0.id == id }).map { $0 + 1 } } ?? 0,
+      help: "Transforms are relative to the parent. Changing the parent keeps the local values."
+    ) { [weak self] i in
+      self?.editGraph("Change parent") { g in
+        g.nodes[try g.nodeIndex(node.id)].parent = i == 0 ? nil : parents[i - 1].id
+      }
+    }
+    button("Rename…") { [weak self] in
+      guard let self, self.acceptsEdits, let window = self.hostWindow else { return }
+      let alert = NSAlert()
+      alert.messageText = "Object name"
+      let field = NSTextField(string: node.name)
+      field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+      alert.accessoryView = field
+      alert.addButton(withTitle: "Rename")
+      alert.addButton(withTitle: "Cancel")
+      // A sheet keeps project I/O from finishing inside a nested modal loop; editGraph
+      // re-checks busy state and resolves the node against the graph current at return.
+      alert.beginSheetModal(for: window) { [weak self] response in
+        guard response == .alertFirstButtonReturn,
+          !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+        self?.editGraph("Rename object", kind: .metadata) { g in
+          g.nodes[try g.nodeIndex(node.id)].name = field.stringValue
+        }
+      }
+    }
+    if let mesh = node.mesh, let asset = graph.assets.first(where: { $0.id == mesh }) {
+      let instances = graph.nodes.filter { $0.mesh == mesh }.count
+      hint(
+        "\(asset.geometry.count) triangles · \(asset.subsets.count) subset\(asset.subsets.count == 1 ? "" : "s")"
+          + " · \(instances) instance\(instances == 1 ? "" : "s")")
+    }
+    section("Transform")
+    let relative = "Relative to the parent."
+    add(
+      VectorControl(
+        "Translation", value: SIMD3(o.positionScale.x, o.positionScale.y, o.positionScale.z), range: -100...100,
+        defaultValue: .zero, help: relative
+      ) { [weak self] v in
+        self?.editGraph("Translation") { g in
+          let i = try g.nodeIndex(node.id)
+          g.nodes[i].transform.positionScale = SIMD4(v, g.nodes[i].transform.positionScale.w)
+        }
+      })
+    add(
+      VectorControl(
+        "Rotation, °", value: SIMD3(o.rotationHidden.x, o.rotationHidden.y, o.rotationHidden.z) * 180 / .pi,
+        range: -180...180, defaultValue: .zero, step: 1, help: relative
+      ) { [weak self] v in
+        self?.editGraph("Rotation, °") { g in
+          let i = try g.nodeIndex(node.id)
+          g.nodes[i].transform.rotationHidden = SIMD4(v * .pi / 180, g.nodes[i].transform.rotationHidden.w)
+        }
+      })
+    add(
+      NumberControl("Scale", value: o.positionScale.w, range: 0.01...100, defaultValue: 1, help: "Uniform scale.") {
+        [weak self] v in
+        self?.editGraph("Scale") { g in g.nodes[try g.nodeIndex(node.id)].transform.positionScale.w = v }
+      })
+    button("Reset Transform") { [weak self] in
+      self?.editGraph("Reset transform") { g in
+        let i = try g.nodeIndex(node.id)
+        // The visibility shares the rotation vector and survives the reset.
+        let hidden = g.nodes[i].transform.rotationHidden.w
+        g.nodes[i].transform = ObjectSettings()
+        g.nodes[i].transform.rotationHidden.w = hidden
+      }
+    }
+    objectActions(node: node)
   }
   func showMaterialXReport() {
+    if let shown = importReportShown { return shown() }
     let alert = NSAlert()
     alert.messageText = "MaterialX import report"
     alert.informativeText = materialXReport
@@ -328,59 +335,101 @@ extension StudioController {
       self.showMaterialXReport()
     }
   }
+  // A MaterialX material's constant graph inputs, one row per parameter: three-component values (colours, vectors) as
+  // one R/G/B or X/Y/Z row, scalars as number rows. Every edit recompiles the material, so rows commit on release
+  // or entry, each one "MaterialX parameter" undo step.
   func materialXPanel(_ program: MaterialXProgram, slot: Int) {
-    heading(program.name)
-    text(
-      "MaterialX · \(program.source)\n\(program.instructions.count) expressions · \(program.images.count) embedded images"
-    )
-    text(
-      "Edit constant graph inputs below. Connected expressions evaluate on every surface hit. Changes affect all objects using this material."
-    )
-    for parameter in program.parameters {
+    section("MaterialX graph")
+    hint("\(program.name) · \(program.instructions.count) expressions · \(program.images.count) images")
+    let names = Self.materialXDisplayNames(program.parameters.map(\.name))
+    for (parameter, name) in zip(program.parameters, names) {
       let value = program.instructions[parameter.instruction].value
-      for component in 0..<parameter.components {
-        let label = parameter.name + (parameter.components > 1 ? " [\(component+1)]" : "")
-        let range: ClosedRange<Float> = min(-10, value[component])...max(10, value[component])
+      let fallback = parameter.defaultValue ?? value
+      let components = (0..<min(4, max(1, parameter.components))).map { value[$0] }
+      // 0…1 weights get a 0…1 slider; typed values may go to ±10 (or beyond, to the current value).
+      let entry = min(-10, components.min()!)...max(10, components.max()!)
+      let unit = components.allSatisfy { (0...1).contains($0) } && (0..<components.count).allSatisfy {
+        (0...1).contains(fallback[$0])
+      }
+      let range = unit ? 0...1 : entry
+      let help = "MaterialX input \(parameter.name). Changes apply to every object using this material."
+      let instruction = parameter.instruction
+      if parameter.components == 3 {
+        // Parameters carry no MaterialX type; colours are recognised by name.
+        let port = parameter.name.split(separator: "/").last.map { $0.lowercased() } ?? ""
+        let color = ["color", "colour", "tint", "albedo"].contains { port.contains($0) }
+        add(
+          VectorControl(
+            name, value: SIMD3(value.x, value.y, value.z), range: range,
+            defaultValue: SIMD3(fallback.x, fallback.y, fallback.z), labels: color ? ["R", "G", "B"] : ["X", "Y", "Z"],
+            entry: entry, step: unit ? 0.01 : nil, help: help
+          ) { [weak self] v in
+            self?.materialXCommit(slot: slot, instruction: instruction) { $0.x = v.x; $0.y = v.y; $0.z = v.z }
+          })
+        continue
+      }
+      let letters = parameter.components == 4 ? ["R", "G", "B", "A"] : ["X", "Y"]
+      for component in components.indices {
         add(
           NumberControl(
-            label, value: value[component], range: range,
-            defaultValue: parameter.defaultValue?[component] ?? value[component]
+            name + (parameter.components > 1 ? " " + letters[component] : ""), value: value[component], range: range,
+            defaultValue: fallback[component], entry: entry, step: unit ? 0.01 : nil, help: help
           ) { [weak self] v in
-            guard let self, self.acceptsEdits,
-              var next = self.renderer.materials.materialX[slot]
-            else { return }
-            if parameter.components == 1 {
-              next.instructions[parameter.instruction].value = SIMD4(repeating: v)
-            } else {
-              next.instructions[parameter.instruction].value[component] = v
+            self?.materialXCommit(slot: slot, instruction: instruction) { value in
+              if parameter.components == 1 { value = SIMD4(repeating: v) } else { value[component] = v }
             }
-            var programs = self.renderer.materials.materialX
-            programs[slot] = next
-            do {
-              let record = self.undoRecord("MaterialX parameter")
-              try self.renderer.materials.prepareMaterialX(programs)
-              self.commit(record)
-              self.changed()
-            } catch { self.showError(error.localizedDescription) }
           })
       }
     }
-    button("Save material preset…") { [weak self] in self?.saveMaterial() }
-    button("Load material preset…") { [weak self] in self?.loadMaterial() }
-    button("Remove graph and use manual material") { [weak self] in
-      guard let self, !self.isBusy else { return }
-      var programs = self.renderer.materials.materialX
-      programs.removeValue(forKey: slot)
-      do {
-        let record = self.undoRecord("Remove MaterialX")
-        try self.renderer.materials.prepareMaterialX(programs)
-        self.commit(record)
-        self.changed()
-        self.rebuild()
-      } catch { self.showError(error.localizedDescription) }
+  }
+  // Recompiles the material with one edited constant; one undo step once the program is prepared.
+  func materialXCommit(slot: Int, instruction: Int, _ edit: (inout SIMD4<Float>) -> Void) {
+    guard acceptsEdits, var next = renderer.materials.materialX[slot] else { return }
+    edit(&next.instructions[instruction].value)
+    var programs = renderer.materials.materialX
+    programs[slot] = next
+    do {
+      let record = undoRecord("MaterialX parameter")
+      try renderer.materials.prepareMaterialX(programs)
+      commit(record)
+      changed()
+    } catch { showError(error.localizedDescription) }
+  }
+  func removeMaterialX(_ slot: Int) {
+    guard !isBusy else { return }
+    var programs = renderer.materials.materialX
+    programs.removeValue(forKey: slot)
+    do {
+      let record = undoRecord("Remove MaterialX")
+      try renderer.materials.prepareMaterialX(programs)
+      commit(record)
+      changed()
+      rebuild()
+    } catch { showError(error.localizedDescription) }
+  }
+  // Port names that say little without their node ("Mix" of which node?): these keep the node name.
+  nonisolated static let genericMaterialXPorts: Set<String> = [
+    "value", "in", "in1", "in2", "in3", "in4", "fg", "bg", "mix", "low", "high", "amount", "default", "input",
+  ]
+  // Readable names for MaterialX parameter paths ("Paint/base_color" → "Base color"): the shortest trailing part of
+  // the path that is unique within the material (at least the node and port for generic ports such as "in1"),
+  // underscores as spaces ("ior" as "IOR"), parts joined by " › ", in sentence case.
+  nonisolated static func materialXDisplayNames(_ paths: [String]) -> [String] {
+    let parts = paths.map { $0.split(separator: "/").map(String.init) }
+    return parts.indices.map { i in
+      let path = parts[i]
+      guard !path.isEmpty else { return paths[i] }
+      var count = genericMaterialXPorts.contains(path.last!.lowercased()) ? min(2, path.count) : 1
+      while count < path.count,
+        parts.indices.contains(where: { j in j != i && parts[j].suffix(count) == path.suffix(count) })
+      {
+        count += 1
+      }
+      let text = path.suffix(count).map { part in
+        part.split(separator: "_").map { $0 == "ior" ? "IOR" : String($0) }.joined(separator: " ")
+      }.joined(separator: " › ")
+      return text.prefix(1).uppercased() + text.dropFirst()
     }
-    text(
-      "Supported: OpenPBR surface, constants, images, UV0, arithmetic, mix, clamp, extract, normalmap and limited convert. Unsupported nodes are reported at import. No USD or MaterialX graph export yet."
-    )
   }
 }
+

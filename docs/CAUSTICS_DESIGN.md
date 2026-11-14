@@ -1,6 +1,6 @@
 # Caustics: guided light tracing, then photon gathering
 
-Status: **2026-11-10. Phases 1 and 2 and emission guiding implemented** (§4–6) as **Render › Caustics** › *Light tracing* and *Light tracing + photons*, each also *guided* (`CausticMode`), off by default: light paths from emitter triangles and the environment (sky, image and sun), photons at surfaces and in media, spectral photons at shared wavelengths. Proposed: arXiv 2403.03641's Gaussian-mixture guiding instead of the histograms, and ReSTIR reuse (phase 4). The **Ring boost** (`sample_specular_manifold_caustic`) is an artistic approximation for procedural scenes 0 and 5 and is unrelated. Implemented methods are cited in [REFERENCES.md](../REFERENCES.md) (`VEACH1997`, `PBRT2023` light tracing, SPPM grid and equal-area mapping, `KNAUS2011`, `JENSEN1998`; `HEDSTROM2025` and `HUANG2024` as related work); the others are added when they are implemented (AGENTS.md).
+Status: **2026-11-10. Phases 1 and 2 and emission guiding implemented** (§4–6) as **Render › Method › Caustics** › *Light tracing* and *Light tracing + photons*, each also *guided* (`CausticMode`), off by default: light paths from emitter triangles and the environment (sky, image and sun), photons at surfaces and in media, spectral photons at shared wavelengths. Proposed: arXiv 2403.03641's Gaussian-mixture guiding instead of the histograms, and ReSTIR reuse (phase 4). The **Ring boost** (`sample_specular_manifold_caustic`) is an artistic approximation for procedural scenes 0 and 5 and is unrelated. Implemented methods are cited in [REFERENCES.md](../REFERENCES.md) (`VEACH1997`, `PBRT2023` light tracing, SPPM grid and equal-area mapping, `KNAUS2011`, `JENSEN1998`; `HEDSTROM2025` and `HUANG2024` as related work); the others are added when they are implemented (AGENTS.md).
 
 ## 1. Problem
 
@@ -66,7 +66,7 @@ Not done: photon gathering in ReSTIR modes (phase 4); a third gathering vertex p
 
 ## 7. Integration
 
-- **Setting:** **Render › Caustics: Automatic / Light tracing / Light tracing, guided / Light tracing + photons / Light tracing + photons, guided / Off**, saved as `ProjectDocument.caustics: UInt32?` (`CausticMode` 0–5), copied by `startExport`, `ShowcaseShot.caustics`, test override `VIBE_CAUSTICS` (`off`, `light`, `photons`). Automatic is Off until measured.
+- **Setting:** **Render › Method › Caustics: Automatic / Light tracing / Light tracing, guided / Light tracing + photons / Light tracing + photons, guided / Off**, saved as `ProjectDocument.caustics: UInt32?` (`CausticMode` 0–5), copied by `startExport`, `ShowcaseShot.caustics`, test override `VIBE_CAUSTICS` (`off`, `light`, `photons`). Automatic is Off until measured.
 - **Strategy:** with caustics on, imported scenes render with Standard MIS, as scenes with media already do (`activeSamplingMode`); ReSTIR PT would need the exclusion in `pt_generate` and `pt_shift` (phase 4).
 - **Kernels:** a `KernelGroup.caustics` (trace, gather and guide build), compiled in the background like the ReSTIR PT group and added to the spectral name list; mesh libraries only. The spectral media-photon `shading_kernel` compiles on demand (§6).
 - **Parameters:** `Uniforms.indirectReuse` bits 9 (caustics) and 10 (photons); the light-path count, pixel area, radii, grid and guide state in `CausticParams`, passed with `setBytes`.

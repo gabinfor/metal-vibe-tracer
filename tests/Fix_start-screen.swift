@@ -346,7 +346,6 @@
   require(valid(#selector(StudioController.openAction)) && valid(#selector(StudioController.openSceneFileAction))
     && !valid(#selector(StudioController.saveAction)) && !valid(#selector(StudioController.exportAction))
     && valid(#selector(StudioController.openRecentAction(_:))) && valid(#selector(StudioController.clearRecentAction))
-    && !valid(#selector(StudioController.settingsAction))
     && !valid(#selector(StudioController.undoAction)), "with no document only open, Open Recent, import and browse commands apply")
   testRenderer.options.exposure = 3
   controller.changed(reset: false)
@@ -383,17 +382,18 @@
   // The inspector's scene control names the current scene and opens the browser; the scene lists are gone.
   controller.page = 0
   controller.rebuild()
-  func browseButton() -> NSButton? { views(NSButton.self, in: controller.stack).first { $0.identifier?.rawValue == "scene-browse" } }
+  func browseButton() -> NSButton? { views(NSButton.self, in: controller.inspectorHeader).first { $0.identifier?.rawValue == "scene-browse" } }
   require(browseButton()?.title == "Browse…"
     && !views(ActionPopup.self, in: controller.stack).contains { $0.accessibilityLabel() == "Scene" }
-    && views(NSTextField.self, in: controller.stack).map(\.stringValue).contains("Cornell Box"),
+    && views(NSTextField.self, in: controller.inspectorHeader).map(\.stringValue).contains("Cornell Box"),
     "the inspector shows the current scene's title and a Browse… button instead of a Scene selector")
   let fileMenu = NSApp.mainMenu?.items.first { $0.title == "File" }?.submenu
+  let helpMenu = NSApp.mainMenu?.items.first { $0.title == "Help" }?.submenu
   let browseItem = fileMenu?.items.first { $0.title == "Browse Scenes…" }
   require(browseItem?.keyEquivalent == "O" && browseItem?.keyEquivalentModifierMask.contains(.command) == true
     && fileMenu?.items.contains { $0.title == "Open Example Scene" } == false
-    && fileMenu?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true,
-    "File > Browse Scenes… (shift-command-O) replaces Open Example Scene; Credits and Licenses… stays")
+    && helpMenu?.items.contains { $0.action == #selector(StudioController.exampleCreditsAction) } == true,
+    "File > Browse Scenes… (shift-command-O) replaces Open Example Scene; Credits and Licenses… is in Help")
   if let rep = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) {
     controller.view.cacheDisplay(in: controller.view.bounds, to: rep)
     try rep.representation(using: .png, properties: [:])!.write(to: studioDirectory.appendingPathComponent("inspector-scene.png"))
