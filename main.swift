@@ -8263,6 +8263,32 @@ kernel void present_kernel(
     output.write(float4(c,1),gid);
 }
 
+// A finished display image (sRGB-encoded) scaled to fit `output` and centred on a dark surround: the viewport's view
+// of an export while it renders (PathTracerRenderer.stillImage). Each output pixel averages its footprint in the
+// image in linear light (one tap per image pixel, up to 4x4), so a large export shown small neither aliases nor darkens.
+// REFERENCES.md: SRGB1999 (the EOTF below).
+kernel void fit_image_kernel(
+    texture2d<float, access::sample> image [[texture(0)]],
+    texture2d<float, access::write> output [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+    float2 outputSize=float2(output.get_width(),output.get_height());
+    float2 imageSize=float2(image.get_width(),image.get_height());
+    // Image pixels per output pixel.
+    float scale=max(imageSize.x/outputSize.x,imageSize.y/outputSize.y);
+    float2 centre=(float2(gid)+0.5f-0.5f*outputSize)*scale+0.5f*imageSize;
+    if(any(centre<0.0f)||any(centre>=imageSize)) { output.write(float4(0.11f,0.11f,0.11f,1),gid); return; }
+    constexpr sampler bilinear(filter::linear,address::clamp_to_edge);
+    uint taps=clamp(uint(ceil(scale)),1u,4u);
+    float3 sum=float3(0.0f);
+    for(uint y=0u;y<taps;++y) for(uint x=0u;x<taps;++x) {
+        float2 p=centre+((float2(x,y)+0.5f)/float(taps)-0.5f)*scale;
+        float3 c=image.sample(bilinear,p/imageSize).rgb;
+        sum+=select(pow((c+0.055f)/1.055f,float3(2.4f)),c/12.92f,c<=0.04045f);
+    }
+    output.write(float4(srgb_encode(sum/float(taps*taps)),1),gid);
+}
+
 """
 
 // ============================================================================
@@ -9464,6 +9490,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     let materialFunction: MTLFunction
     let restirTemporalPipeline: MTLComputePipelineState
     let presentPipeline: MTLComputePipelineState
+    let fitImagePipeline: MTLComputePipelineState
     // The scene kernels. Scenes 0-5 use a library compiled with VIBE_MESHES=0: the imported-mesh
     // traversal is dead code there, but its registers slowed them by 13-17% (tests/PERFORMANCE.md).
     struct SceneKernels {
@@ -9598,7 +9625,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // main actor (metalSource, shaderCompileOptions).
     struct CompiledShaders: Sendable {
         let library, proceduralLibrary: MTLLibrary
-        let present: MTLComputePipelineState
+        let present, fitImage: MTLComputePipelineState
         let mesh, procedural: SceneKernels
     }
     nonisolated static func compileShaders(device: MTLDevice, source: String, mathMode: MTLMathMode,
@@ -9626,16 +9653,16 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         if let failure = built.failure { throw failure }
         let lib = built.libraries[0]!, procedural = built.libraries[1]!
         let core: [(MTLLibrary, String)] = ["pick_kernel", "restir_temporal_kernel", "shading_kernel", "metalfx_guides_kernel",
-            "present_kernel"].map { (lib, $0) } + ["restir_temporal_kernel", "shading_kernel", "metalfx_guides_kernel",
-            "pick_kernel"].map { (procedural, $0) }
+            "present_kernel", "fit_image_kernel"].map { (lib, $0) } + ["restir_temporal_kernel", "shading_kernel",
+            "metalfx_guides_kernel", "pick_kernel"].map { (procedural, $0) }
         let states = try pipelines(device, core, progress: progress)
         let optional = groups.isEmpty ? [OptionalKernels(), OptionalKernels()]
             : try compileKernelGroups(groups, device: device, libraries: [lib, procedural], progress: progress)
         return CompiledShaders(
-            library: lib, proceduralLibrary: procedural, present: states[4],
+            library: lib, proceduralLibrary: procedural, present: states[4], fitImage: states[5],
             mesh: SceneKernels(temporal: states[1], shading: states[2], guides: states[3], pick: states[0],
                                pt: optional[0].pt, splat: optional[0].splat, spmis: optional[0].spmis, caustics: optional[0].caustics),
-            procedural: SceneKernels(temporal: states[5], shading: states[6], guides: states[7], pick: states[8],
+            procedural: SceneKernels(temporal: states[6], shading: states[7], guides: states[8], pick: states[9],
                                      pt: optional[1].pt, splat: optional[1].splat, spmis: optional[1].spmis, caustics: optional[1].caustics))
     }
     // Spectral transport's scene kernels (VIBE_SPECTRAL=1 libraries, after the generated tables), and
@@ -10103,6 +10130,30 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // first one after a pause, would show as a spike or a dip if each interval were reported on its own.
     var framesPerSecond: Double { frameInterval > 0 ? 1 / frameInterval : 0 }
     private var frameInterval = 0.0
+    // Pacing. `gpuLoadLimit` is the share of the time the GPU may spend on this renderer's frames (1: no limit).
+    // Frames submitted back to back starve the GPU's other clients, the window server among them: on an M4 a second
+    // command queue waited about a second behind 0.3 s frames, and one frame at most once a tenth of the time was
+    // left free (tests/PERFORMANCE.md, GPU load limit). Below 1, draw and the export loop submit a frame only when
+    // submissionDelay is 0: each frame is charged its expected GPU time against a credit that refills at
+    // `gpuLoadLimit` milliseconds per millisecond (at most gpuCreditLimit, and full when the limit is set), so a long
+    // frame is followed by its idle share and short frames still queue behind one another between display refreshes.
+    var gpuLoadLimit = 1.0 { didSet { gpuCredit = Self.gpuCreditLimit; gpuCreditTime = awakeSeconds() } }
+    static let limitedGPULoad = 0.9, gpuCreditLimit = 32.0
+    private var gpuCredit = PathTracerRenderer.gpuCreditLimit, gpuCreditTime = awakeSeconds()
+    private var framesInFlight = 0, lastSampleMilliseconds = 0.0
+    // GPU time a sample is expected to take: the larger of the recent average and the last frame's, so the first
+    // frame of a heavier scene or size corrects it; 0 until a frame has been timed.
+    private var expectedSampleMilliseconds: Double { max(gpuMillisecondsPerSample, lastSampleMilliseconds) }
+    // Seconds until the next frame may be submitted under `gpuLoadLimit`: 0 now, infinity while it waits for the
+    // frame in flight (frames go one at a time until one has been timed).
+    func submissionDelay() -> TimeInterval {
+        guard gpuLoadLimit < 1 else { return 0 }
+        let now = awakeSeconds()
+        gpuCredit = min(Self.gpuCreditLimit, gpuCredit + (now - gpuCreditTime) * 1000 * gpuLoadLimit)
+        gpuCreditTime = now
+        if framesInFlight > 0 && expectedSampleMilliseconds == 0 { return .infinity }
+        return gpuCredit >= 0 ? 0 : -gpuCredit / (1000 * gpuLoadLimit) + 0.0005
+    }
     var completedSamples: UInt32 = 0
     // Awake seconds (awakeSeconds): the render time limit does not count system sleep.
     var lastTick = awakeSeconds()
@@ -10110,6 +10161,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     var presentationNeedsRefresh = true
     var lastDisplay: MTLTexture?
     var offlineDenoisedPreview: MTLTexture?
+    // A display image the view shows, scaled to fit, in place of this renderer's own while it is paused: the export
+    // in progress (StudioController.startExport).
+    var stillImage: MTLTexture? { didSet { presentationNeedsRefresh = true } }
     var lastUniforms: Uniforms?
     var onFrameUpdate: ((UInt32) -> Void)?
     var onError: ((String) -> Void)?
@@ -10331,6 +10385,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         self.materials = materials
         self.restirTemporalPipeline = shaders.mesh.temporal
         self.presentPipeline = shaders.present
+        self.fitImagePipeline = shaders.fitImage
         super.init()
         measuredMetalFXScalerBytesPerPixel = other.flatMap {
             $0.device.registryID == device.registryID ? $0.measuredMetalFXScalerBytesPerPixel : nil
@@ -10711,6 +10766,16 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         encoder.endEncoding(); return true
     }
 
+    // `image` scaled to fit `output` and centred (MSL fit_image_kernel).
+    func encodeFit(_ commandBuffer: MTLCommandBuffer, image: MTLTexture, output: MTLTexture) -> Bool {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        encoder.label = "Still image, fitted"
+        encoder.setComputePipelineState(fitImagePipeline)
+        encoder.setTexture(image,index:0); encoder.setTexture(output,index:1)
+        encoder.dispatchThreads(MTLSize(width:output.width,height:output.height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
+        encoder.endEncoding(); return true
+    }
+
     // Refresh only the display while paused/stopped; never trace another sample.
     func presentCurrentFrame(_ command: MTLCommandBuffer, output: MTLTexture) -> Bool {
         guard let raw=accumTexture else { return false }
@@ -10736,8 +10801,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         guard view.drawableSize.width > 0, view.drawableSize.height > 0 else { return }
         if paused || reachedLimit {
             // Refresh only the display while stopped; never trace another sample.
-            guard presentationNeedsRefresh, accumTexture != nil,
-                  lastDisplay != nil || offlineDenoisedPreview != nil,
+            guard presentationNeedsRefresh else { return }
+            if paused, let image=stillImage {
+                guard let drawable=view.currentDrawable, let command=commandQueue.makeCommandBuffer(),
+                      encodeFit(command,image:image,output:drawable.texture) else { return }
+                presentationNeedsRefresh = false
+                command.present(drawable);command.commit()
+                return
+            }
+            guard accumTexture != nil, lastDisplay != nil || offlineDenoisedPreview != nil,
                   let drawable=view.currentDrawable else { return }
             if let command=commandQueue.makeCommandBuffer(), presentCurrentFrame(command,output:drawable.texture) {
                 presentationNeedsRefresh = false
@@ -10746,6 +10818,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             return
         }
         renderElapsed += max(0,now-lastTick)
+        guard submissionDelay() == 0 else { return }
         // Reserve an in-flight slot before currentDrawable: nextDrawable blocks
         // the main thread while in-flight frames hold every drawable.
         guard inFlightFrames.wait(timeout: .now()) == .success else { return }
@@ -10970,6 +11043,10 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         guard let (nextFrame, spectralWeights) = encoded else { return }
         let submittedGeneration = generation
         let semaphore = inFlightFrames
+        // The frame's expected GPU time is charged now and corrected by its measured time (submissionDelay).
+        let charged = gpuLoadLimit < 1 ? Double(samples) * expectedSampleMilliseconds : 0
+        gpuCredit -= charged
+        framesInFlight += 1
         cmdBuffer.addCompletedHandler { [weak self] completedBuffer in
             semaphore.signal()
             let errorMessage = completedBuffer.error?.localizedDescription
@@ -10978,12 +11055,15 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             let gpuMilliseconds = (gpuEnd - gpuStart) * 1000
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                self.framesInFlight -= 1
                 if succeeded {
+                    let busy = max(0, gpuEnd - max(gpuStart, self.lastGPUEnd)) * 1000
+                    self.lastGPUEnd = max(self.lastGPUEnd, gpuEnd)
+                    self.lastSampleMilliseconds = busy / Double(samples)
+                    if self.gpuLoadLimit < 1 { self.gpuCredit -= busy - charged }
                     guard self.generation == submittedGeneration else { return }
                     self.completedSamples=nextFrame
                     self.gpuMilliseconds=gpuMilliseconds
-                    let busy = max(0, gpuEnd - max(gpuStart, self.lastGPUEnd)) * 1000
-                    self.lastGPUEnd = max(self.lastGPUEnd, gpuEnd)
                     let decay = pow(0.5, 1.0 / 16)
                     self.recentBusyMilliseconds = self.recentBusyMilliseconds * decay + busy
                     self.recentSamples = self.recentSamples * decay + Double(samples)

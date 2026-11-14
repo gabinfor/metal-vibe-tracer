@@ -29,6 +29,7 @@
     for key in [StudioController.exportFormatKey, StudioController.exportRevealKey, StudioController.inspectorWidthKey] {
       controller.preferences.removeObject(forKey: key)
     }
+    controller.limitsGPULoad = false
     controller.setInspectorVisible(true)
   }
   func idle() { waitUntil({ !controller.isBusy }, seconds: 120) }
@@ -79,8 +80,9 @@
     && key(file, "Save") == "s" && key(file, "Save As…") == "S" && key(file, "Export…") == "e"
     && key(file, "Close Window") == "w", "File shortcuts")
   require(titles(edit) == ["Undo", "Redo", "", "Cut", "Copy", "Paste", "Select All"], "Edit menu: \(titles(edit))")
-  require(titles(render) == ["Pause", "Restart", "", "Denoise Current Frame", "Clear Denoised Preview"]
-    && key(render, "Pause") == "p" && key(render, "Restart") == "r", "Render menu: \(titles(render))")
+  require(titles(render) == ["Pause", "Restart", "", "Denoise Current Frame", "Clear Denoised Preview", "", "Limit GPU Load"]
+    && key(render, "Pause") == "p" && key(render, "Restart") == "r"
+    && render.items.last?.toolTip?.isEmpty == false, "Render menu: \(titles(render))")
   require(titles(view) == ["Hide Inspector", ""] + StudioController.pageTitles + ["", "Frame Selection", "Frame All", ""]
     + StudioController.viewportNames && key(view, "Hide Inspector") == "i"
     && (0..<6).allSatisfy { key(view, StudioController.pageTitles[$0]) == "\($0 + 1)" }
@@ -116,7 +118,8 @@
   require(!enabled(#selector(StudioController.saveAction)) && !enabled(#selector(StudioController.showTabAction(_:)))
     && !enabled(#selector(StudioController.newProjectAction)) && !enabled(#selector(StudioController.addModelAction))
     && enabled(#selector(StudioController.userGuideAction)) && enabled(#selector(StudioController.exampleCreditsAction))
-    && controller.tabBar?.isEnabled == false, "while busy only Help, Finder and the inspector toggle apply")
+    && enabled(#selector(StudioController.gpuLoadLimitAction))
+    && controller.tabBar?.isEnabled == false, "while busy only Help, Finder, Limit GPU Load and the inspector toggle apply")
   controller.exportRenderer = nil
   require(controller.tabBar?.isEnabled == true, "the tab bar re-enables")
   print("PASS: fix-ui-export-menus state-aware titles, tab shortcuts and busy validation")
@@ -199,6 +202,115 @@
   require(asked == ["exr", "png"] && Array(png.prefix(4)) == [0x89, 0x50, 0x4e, 0x47] && revealed.count == 1,
     "PNG writes a PNG file; with the toggle off nothing is revealed")
   print("PASS: fix-ui-export-menus Export tab presets, source, format, Render and Export… and Show in Finder")
+
+  // The viewport shows the export while it renders (PathTracerRenderer.stillImage), then the preview again.
+  testRenderer.options.outputWidth = 64; testRenderer.options.outputHeight = 16; testRenderer.options.exportSamples = 16384
+  let wasPaused = testRenderer.paused, progressURL = folder.appendingPathComponent("progress.png")
+  controller.startExport(url: progressURL, hdr: false)
+  require(controller.exportRenderer != nil && testRenderer.stillImage == nil, "the preview stays until the export has an image")
+  waitUntil({ testRenderer.stillImage != nil || controller.exportRenderer == nil }, seconds: 60)
+  require(controller.exportRenderer != nil && testRenderer.stillImage === controller.exportOutput && testRenderer.paused,
+    "the viewport shows the export in progress")
+  controller.cancelExport()
+  require(testRenderer.stillImage == nil && testRenderer.paused == wasPaused && testRenderer.presentationNeedsRefresh
+    && !FileManager.default.fileExists(atPath: progressURL.path), "a cancelled export returns the viewport to the preview")
+  // The fitted image is centred on the surround and averaged in linear light when it is shown smaller.
+  func fitted(_ image: MTLTexture, width: Int, height: Int) -> [SIMD4<Float>] {
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+    descriptor.usage = [.shaderRead, .shaderWrite]
+    let target = gpu.makeTexture(descriptor: descriptor)!, command = testRenderer.commandQueue.makeCommandBuffer()!
+    require(testRenderer.encodeFit(command, image: image, output: target), "the fit pass encodes")
+    command.commit(); command.waitUntilCompleted()
+    return readTexture(target)
+  }
+  // 64x16: black and white columns on the left half, red on the right.
+  let stripes = gpu.makeTexture(descriptor: MTLTextureDescriptor.texture2DDescriptor(
+    pixelFormat: .bgra8Unorm, width: 64, height: 16, mipmapped: false))!
+  var bytes = [UInt8](repeating: 255, count: 64 * 16 * 4)
+  for y in 0..<16 { for x in 0..<64 {
+    let i = (y * 64 + x) * 4
+    if x < 32 { for c in 0..<3 { bytes[i + c] = x % 2 == 0 ? 0 : 255 } } else { bytes[i] = 0; bytes[i + 1] = 0 }
+  }}
+  stripes.replace(region: MTLRegionMake2D(0, 0, 64, 16), mipmapLevel: 0, withBytes: bytes, bytesPerRow: 256)
+  func near(_ a: SIMD4<Float>, _ r: Float, _ g: Float, _ b: Float) -> Bool {
+    simd_reduce_max(simd_abs(SIMD3(a.x, a.y, a.z) - SIMD3(r, g, b))) < 0.01
+  }
+  let small = fitted(stripes, width: 32, height: 32), large = fitted(stripes, width: 128, height: 64)
+  require(near(small[11 * 32 + 8], 0.11, 0.11, 0.11) && near(small[20 * 32 + 24], 0.11, 0.11, 0.11)
+    && near(small[12 * 32 + 24], 1, 0, 0) && near(small[19 * 32 + 24], 1, 0, 0),
+    "a wide image is centred between surround bands")
+  require(near(small[16 * 32 + 8], 0.7354, 0.7354, 0.7354), "halving averages black and white in linear light (sRGB 0.735)")
+  require(near(large[15 * 128 + 100], 0.11, 0.11, 0.11) && near(large[16 * 128 + 100], 1, 0, 0)
+    && near(large[47 * 128 + 100], 1, 0, 0) && near(large[48 * 128 + 100], 0.11, 0.11, 0.11),
+    "a small image is enlarged to fit")
+  print("PASS: fix-ui-export-menus export shown in the viewport while it renders")
+
+  // Render › Limit GPU Load: checked and on by default, remembered by the app, applied to the preview and exports.
+  let limit = #selector(StudioController.gpuLoadLimitAction), limited = PathTracerRenderer.limitedGPULoad
+  controller.preferences.removeObject(forKey: StudioController.gpuLoadLimitKey)
+  controller.applyGPULoadLimit()
+  require(controller.limitsGPULoad && testRenderer.gpuLoadLimit == limited && valid(limit)?.state == .on,
+    "the GPU load limit is on by default")
+  controller.gpuLoadLimitAction()
+  require(!controller.limitsGPULoad && testRenderer.gpuLoadLimit == 1 && valid(limit)?.state == .off
+    && controller.preferences.object(forKey: StudioController.gpuLoadLimitKey) as? Bool == false,
+    "the menu item switches the limit off and remembers it")
+  controller.gpuLoadLimitAction()
+  require(controller.limitsGPULoad && testRenderer.gpuLoadLimit == limited, "and on again")
+  testRenderer.options.outputWidth = 64; testRenderer.options.outputHeight = 16; testRenderer.options.exportSamples = 64
+  controller.startExport(url: progressURL, hdr: false)
+  require(controller.exportRenderer?.gpuLoadLimit == limited, "an export renders under the limit")
+  idle()
+  require(FileManager.default.fileExists(atPath: progressURL.path), "a limited export completes")
+  controller.limitsGPULoad = false
+
+  // The limit itself (PathTracerRenderer.submissionDelay), on a renderer of its own.
+  let paced = try PathTracerRenderer(device: gpu, sharing: testRenderer)
+  paced.sceneIndex = 1; paced.samplingMode = 1; paced.denoiserEnabled = false
+  let pacedDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 640, height: 480, mipmapped: false)
+  pacedDescriptor.usage = [.shaderRead, .shaderWrite]
+  let pacedOutput = gpu.makeTexture(descriptor: pacedDescriptor)!
+  var frames = 0, busy = 0.0
+  paced.onFrameUpdate = { [unowned paced] _ in frames += 1; busy += paced.gpuMilliseconds }
+  defer { paced.onFrameUpdate = nil }
+  paced.renderFrame(output: pacedOutput)
+  require(paced.submissionDelay() == 0, "without a limit a frame may always be submitted")
+  waitUntil({ frames == 1 })
+  let untimed = try PathTracerRenderer(device: gpu, sharing: testRenderer)
+  untimed.sceneIndex = 1; untimed.samplingMode = 1; untimed.denoiserEnabled = false
+  untimed.gpuLoadLimit = limited
+  var untimedDone = false
+  untimed.onFrameUpdate = { _ in untimedDone = true }
+  require(untimed.submissionDelay() == 0, "a limited renderer starts at once")
+  untimed.renderFrame(output: pacedOutput)
+  require(untimed.submissionDelay() == .infinity, "until a frame has been timed, frames go one at a time")
+  waitUntil({ untimedDone })
+  require(untimed.submissionDelay().isFinite, "a timed frame ends the wait")
+  untimed.onFrameUpdate = nil
+  // A frame longer than the credit is followed by its idle share: 120 ms of samples wait at least (120 - 32) / 0.9 ms.
+  paced.gpuLoadLimit = limited
+  let sample = max(busy, 0.01)
+  paced.renderFrame(output: pacedOutput, samples: Int((120 / sample).rounded(.up)))
+  let wait = paced.submissionDelay()
+  require(wait.isFinite && wait > 0.09, "a long frame is followed by its idle share: \(wait) s")
+  waitUntil({ frames == 2 })
+  waitUntil({ paced.submissionDelay() == 0 }, seconds: 5)
+  // Over time the frames use at most the limit's share of the GPU (plus the credit and the frame in flight).
+  frames = 0; busy = 0
+  var submitted = 0
+  let batch = max(1, Int(40 / max(paced.gpuMillisecondsPerSample, 0.01))), start = awakeSeconds()
+  while awakeSeconds() - start < 2.5 {
+    if paced.submissionDelay() == 0 {
+      paced.renderFrame(output: pacedOutput, samples: batch)
+      submitted += 1
+    }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.001))
+  }
+  let elapsed = (awakeSeconds() - start) * 1000
+  waitUntil({ frames == submitted })
+  require(frames >= 8 && busy <= limited * elapsed + PathTracerRenderer.gpuCreditLimit + 2.5 * busy / Double(frames)
+    && busy >= 0.5 * elapsed, "limited frames leave the GPU its idle share: \(Int(busy)) ms of \(Int(elapsed)) ms in \(frames) frames")
+  print(String(format: "PASS: fix-ui-export-menus GPU load limit (%.0f%% of the GPU's time in %d frames)", 100 * busy / elapsed, frames))
 
   // The pinned header: scene row and tab bar above the scrolling page.
   try reset()

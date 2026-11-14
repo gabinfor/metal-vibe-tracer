@@ -121,8 +121,9 @@ final class StudioController: NSViewController {
   private var rebuildAfterDrag = false
   // Builds the body of every collapsible inspector section, whatever its saved state (tests).
   var forceSectionsOpen = false
-  // Inspector state kept across launches (collapsed sections, inspector width); tests redirect it to a volatile suite.
-  var preferences = UserDefaults.standard
+  // State kept across launches (collapsed sections, inspector width, the export format, the GPU load limit); tests
+  // redirect it to a volatile suite.
+  var preferences = UserDefaults.standard { didSet { applyGPULoadLimit() } }
   var cameraRefreshPending = false
   var mapThumbnails: [Int: (data: Data, image: NSImage)] = [:]
   var exportRenderer: PathTracerRenderer? { didSet { busyStateChanged() } }
@@ -154,6 +155,7 @@ final class StudioController: NSViewController {
     viewport.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
     viewport.framebufferOnly = false
     viewport.preferredFramesPerSecond = 60
+    applyGPULoadLimit()
     loadView()
     viewport.onBeginEdit = { [weak self] in self?.checkpoint("Camera", coalesce: true) }
     // Camera-only changes use a longer autosave debounce than document edits.
@@ -409,7 +411,7 @@ final class StudioController: NSViewController {
     tabBar?.isEnabled = !isBusy
     if exportRenderer != nil {
       heading("Rendering export…")
-      text("The preview is paused while the export renders.")
+      text("The viewport shows the export as it renders.")
       button("Cancel Export") { [weak self] in self?.cancelExport() }
       return
     }

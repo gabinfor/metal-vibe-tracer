@@ -1,3 +1,20 @@
+# GPU load limit — November 15, 2026
+
+**Render › Limit GPU Load** (`PathTracerRenderer.gpuLoadLimit`, 0.9 when on) leaves a tenth of the GPU's time free. `scripts/measure_gpu_load.py` on the Apple M4 (16 GB, macOS 27): a second command queue copies a 2560×1600 texture 60 times a second, a stand-in for another GPU client such as the window server, and its commit-to-completion latency is recorded while the app renders (idle: 2–5 ms median). Viewport: a simulated 60 Hz display on a 1280×800 drawable, camera still, 6 s. Export: raw 1920×1080 through `StudioController.startExport`.
+
+| Case | GPU time per frame | Limit off | Limit on | Other client's wait, off (median / max) | on (median / max) |
+| --- | --- | --- | --- | --- | --- |
+| Cornell Box, Standard MIS, viewport 640×400 | 14 ms | 60.0 samples/s | 60.0 samples/s | 14 / 15 ms | 14 / 15 ms |
+| Cornell Box, Standard MIS, viewport 1280×800 | 40 ms | 21.8 samples/s | 19.8 samples/s | 22 / 44 ms | 13 / 31 ms |
+| Cornell Box, Standard MIS, export, 96 samples | 93 ms per sample | 8.2 s | 9.0 s | 34 / 66 ms | 33 / 67 ms |
+| Architectural Pavilion, ReSTIR, viewport 640×400 | 40 ms | 25.8 samples/s | 22.5 samples/s | 18 / 38 ms | 13 / 38 ms |
+| Architectural Pavilion, ReSTIR, viewport 1280×800 | 148 ms | 4.3 samples/s | 6.0 samples/s | 887 / 1,602 ms | 50 / 132 ms |
+| Architectural Pavilion, ReSTIR, export, 32 samples | 0.3 s per sample | 9.7 s | 10.7 s | 1,002 / 1,379 ms | 96 / 228 ms |
+
+- Frames submitted back to back starve the other client once a frame takes a few display refreshes: it waited about a second behind the Pavilion's 0.15–0.3 s frames, three or more of them. With a tenth of the time left free after each frame it waits one frame at most.
+- The cost is the idle share: GPU-bound renders take about a tenth longer (exports 10%, viewports 9–13%). A view that already finishes its frame within a display refresh (Cornell at 640×400) is unchanged. The Pavilion's full-resolution viewport was faster with the limit in this run (6.0 against 4.3 samples/s), which is not explained.
+- What remains is the frame in progress: the other client still waits up to one sample (0.1–0.2 s for the Pavilion at 1920×1080). A larger idle share does not shorten that: in a first experiment (not in the script: the export loop with one batch in flight and a pause after each), a pause of 20% of the batch gave the same waits as 10% (Pavilion 80 / 227 ms against 95 / 228 ms), and one batch in flight without a pause was as slow as two (932 / 1,227 ms). Shorter units of GPU work would shorten it: a 640×360 Cornell export, 9 ms per sample, kept the other client's wait under 11 ms even with eleven samples in one command buffer, so the GPU appears to switch clients between a command buffer's passes.
+
 # Caustic light tracing — November 9, 2026 (re-measured November 10)
 
 Cornell Box 2026 (`CORNELLBOX2026`), its `camera_caustics` view at 480×270 (the showcase driver, `--scale 0.25`), spectral transport, Standard MIS, the mirrored environment; Apple M4, 16 GB, macOS 27; raw OpenEXR exports. Reference: light tracing at 4,096 spp (710 s, unbiased like both estimators compared; `tests/Fix_caustics.swift`). Relative MSE of luminance, (x − r)² / (r² + 0.01), at 256 spp; efficiency is the inverse of MSE × time.
