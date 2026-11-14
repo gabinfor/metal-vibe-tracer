@@ -254,13 +254,15 @@
   require(abs(testRenderer.materials.settings[1].surface.x - 0.77) < 1e-6 && history.undoActionName != "Reset material",
     "failed material reset leaves the material unchanged")
   controller.project.environmentName = "studio.exr"
+  controller.project.environmentData = Data([0])
   controller.page = 2
   controller.rebuild()
   testRenderer.materials.bindingAllocationFailureCountdown = 0
-  grouped { button("Use procedural sky", in: controller.stack)?.invoke() }
+  grouped { button("Remove Image", in: controller.stack)?.invoke() }
   testRenderer.materials.bindingAllocationFailureCountdown = nil
   require(controller.project.environmentName == "studio.exr" && history.undoActionName != "Clear environment",
     "failed environment clear keeps the environment name")
+  controller.project.environmentData = nil
   print("PASS: fix-persistence failed operations register no undo step (R-75, R-78)")
 
   // R-38: legacy triangles with out-of-range material slots are rejected.

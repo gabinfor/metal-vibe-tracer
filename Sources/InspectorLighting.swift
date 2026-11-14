@@ -1,102 +1,132 @@
 import Cocoa
 import simd
 
-// The Lighting inspector page: environment, sun, scene lights, light spectra and the atmosphere.
+// The Lighting inspector page: only the lighting the current scene reads. The shader evaluates the sky, the
+// environment image and the sun in the Pavilion and imported scenes (sceneIndex 0 and 6), and scales the finite area
+// and sphere lights of the Cornell, Veach, Glass & Mirror, Fog and Ring scenes (1–5) by the light intensity, size and
+// colour. The atmosphere applies to every scene.
 extension StudioController {
   // Emitter spectra (StudioOptions.lightSpectrum / sunSpectrum): nil is the RGB colour.
   static let illuminantTitles = [
     "RGB colour", "E (equal energy)", "D65 (daylight)", "A (incandescent, 2856 K)", "FL11 (narrow-band fluorescent)",
     "HP1 (high-pressure sodium)", "LED-B3 (white LED)",
   ]
+  static let skyPresetTitles = ["Golden Hour", "High Noon", "Twilight / Studio"]
+  // Sun azimuth and elevation (degrees) and intensity of each sky preset.
+  static let skyPresetSuns: [SIMD3<Float>] = [SIMD3(133, 27, 850), SIMD3(131, 62, 1100), SIMD3(128, 19, 550)]
+  var sceneUsesSky: Bool { renderer.sceneIndex == 0 || renderer.sceneIndex == 6 }
+  var sceneHasFiniteLights: Bool { (1...5).contains(renderer.sceneIndex) }
+  // Whether the project has an environment image (otherwise the procedural sky lights sky scenes).
+  var hasEnvironmentImage: Bool { project.environmentData != nil }
+
   func lightingPanel() {
-    heading("Environment")
-    popup(["Golden Hour", "High Noon", "Twilight / Studio"], Int(renderer.skyMode), label: "Sky preset") {
-      [weak self] i in
-      guard let self else { return }
-      self.checkpoint("Sky preset")
-      self.renderer.skyMode = UInt32(i)
-      let p: [SIMD3<Float>] = [SIMD3(133, 27, 850), SIMD3(131, 62, 1100), SIMD3(128, 19, 550)]
-      self.renderer.options.sunAzimuth = p[i].x
-      self.renderer.options.sunElevation = p[i].y
-      self.renderer.options.sunIntensity = p[i].z
-      self.renderer.options.sunAngle = nil
-      self.changed()
-      self.rebuild()
+    if sceneUsesSky {
+      environmentSection()
+      // With an environment image only an imported distant light is a sun; the procedural sun is part of the sky.
+      if !hasEnvironmentImage || renderer.options.sunAngle != nil { sunSection() }
     }
-    text(project.environmentName)
-    button("Load HDRI / environment image…") { [weak self] in self?.loadEnvironment() }
-    button("Use procedural sky") { [weak self] in
-      guard let self, !self.isBusy else { return }
-      let record = self.undoRecord("Clear environment")
-      do {
-        try self.renderer.materials.setEnvironment(nil)
-        self.project.environmentData = nil
-        self.project.environmentName = "Procedural sky"
-        self.commit(record)
-        self.changed()
-        self.rebuild()
-      } catch { self.showError(error.localizedDescription) }
+    if sceneHasFiniteLights {
+      section("Lights")
+      option(
+        "Intensity", \.lightIntensity, 0...100, 1, step: 0.01, scale: .logarithmic,
+        help: "Multiplies the emission of the scene's lights. The Veach scene's four lights share these settings.")
+      option("Size", \.lightSize, 0.05...4, 1, step: 0.01, help: "Multiplies the size of the scene's lights.")
+      colorRow("Light color", renderer.options.lightColor, help: "Tints the scene's lights (linear RGB).") {
+        [weak self] in self?.renderer.options.lightColor = $0
+      }
+      spectrumRow("Light spectrum", \.lightSpectrum)
+    } else if renderer.sceneIndex == 6 {
+      section("Lights")
+      spectrumRow("Light spectrum", \.lightSpectrum)
+      hint("Select a light to edit it on the Materials tab.")
     }
-    option("Environment brightness", \.environmentIntensity, 0...100, 1)
-    option("Environment rotation, degrees", \.environmentRotation, -180...180, 0)
-    option("Sun azimuth, degrees", \.sunAzimuth, -180...180, 133)
-    option("Sun elevation, degrees", \.sunElevation, -89...89, 27)
-    option("Sun intensity", \.sunIntensity, 0...10000, 850)
-    text(
-      "Sky/HDRI lighting is used in the Pavilion and Imported Mesh Studio. Sun controls apply to the procedural sky."
-    )
-    if let angle = renderer.options.sunAngle {
-      text(String(format: "Imported distant light: %.2f° sun, intensity is irradiance, independent of the environment. A sky preset restores the procedural sun.", angle))
-    }
-    heading("Scene lights")
-    option("Light intensity", \.lightIntensity, 0...100, 1)
-    option("Light size multiplier", \.lightSize, 0.05...4, 1)
-    // Light color is linear, like material tint; the well shows sRGB.
-    func encode(_ c: Float) -> CGFloat {
-      CGFloat(c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1 / 2.4) - 0.055)
-    }
-    func decode(_ c: CGFloat) -> Float {
-      let x = Float(c)
-      return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
-    }
-    let c = renderer.options.lightColor
-    text("Light color")
-    add(
-      ActionColor(
-        NSColor(srgbRed: encode(c.x), green: encode(c.y), blue: encode(c.z), alpha: 1),
-        label: "Light color"
-      ) { [weak self] c in
-        guard let self, self.acceptsEdits, let c = c.usingColorSpace(.sRGB) else { return }
-        // A colour-panel drag sends many changes; one undo step covers the burst.
-        self.checkpoint("Light color", coalesce: true)
-        self.renderer.options.lightColor = SIMD3(
-          decode(c.redComponent), decode(c.greenComponent), decode(c.blueComponent))
-        self.changed()
-      })
-    text(
-      "Applies to the finite lights in Cornell, Veach, and Ring scenes. Veach lights share these controls."
-    )
-    heading("Light spectra")
-    func spectrum(_ title: String, _ path: WritableKeyPath<StudioOptions, UInt32?>) {
-      let current = renderer.options[keyPath: path].map { Int($0) + 1 } ?? 0
-      popup(Self.illuminantTitles, min(current, Self.illuminantTitles.count - 1), label: title) { [weak self] i in
+    atmosphereSection()
+  }
+  private func environmentSection() {
+    section("Environment")
+    if hasEnvironmentImage {
+      hint("Image: " + project.environmentName)
+    } else {
+      popupRow(
+        "Sky preset", Self.skyPresetTitles, Int(renderer.skyMode),
+        help: "The procedural sky and its sun. Choosing a preset also sets the sun's position and intensity."
+      ) { [weak self] i in
         guard let self else { return }
-        self.checkpoint(title)
-        self.renderer.options[keyPath: path] = i == 0 ? nil : UInt32(i - 1)
+        self.checkpoint("Sky preset")
+        self.renderer.skyMode = UInt32(i)
+        let sun = Self.skyPresetSuns[i]
+        self.renderer.options.sunAzimuth = sun.x
+        self.renderer.options.sunElevation = sun.y
+        self.renderer.options.sunIntensity = sun.z
+        self.renderer.options.sunAngle = nil
         self.changed()
         self.rebuild()
       }
     }
-    text("Light spectrum")
-    spectrum("Light spectrum", \.lightSpectrum)
-    text("Sun spectrum")
-    spectrum("Sun spectrum", \.sunSpectrum)
-    text(
-      "Spectral light transport only: a preset replaces the RGB colour's daylight-like spectrum, and the light colour tints it like a filter. Light spectrum covers area and sphere lights and imported emitters; the sky and environment images stay RGB."
-    )
+    button(
+      "Load Environment Image…",
+      help: "An equirectangular image (HDR, EXR, PNG, JPEG or TIFF) that replaces the procedural sky."
+    ) { [weak self] in self?.loadEnvironment() }
+    if hasEnvironmentImage {
+      button("Remove Image", style: .destructive, help: "Returns to the procedural sky.") { [weak self] in
+        self?.removeEnvironmentImage()
+      }
+    }
+    option(
+      "Brightness", \.environmentIntensity, 0...100, 1, step: 0.01, scale: .logarithmic,
+      help: "Multiplies the sky or environment image.")
+    if hasEnvironmentImage {
+      option(
+        "Rotation, °", \.environmentRotation, -180...180, 0, step: 1,
+        help: "Turns the environment image about the vertical axis.")
+    }
+  }
+  private func sunSection() {
+    section("Sun")
+    let preset = Self.skyPresetSuns[min(Int(renderer.skyMode), Self.skyPresetSuns.count - 1)]
+    option("Azimuth, °", \.sunAzimuth, -180...180, preset.x, entry: -360...360, step: 1,
+      help: "The sun's compass direction.")
+    option("Elevation, °", \.sunElevation, -89...89, preset.y, entry: -90...90, step: 1,
+      help: "The sun's height above the horizon.")
+    option(
+      "Intensity", \.sunIntensity, 0...10000, preset.z,
+      help: renderer.options.sunAngle == nil
+        ? "The procedural sun's brightness." : "The imported sun's irradiance at normal incidence.")
+    spectrumRow("Sun spectrum", \.sunSpectrum)
+    if let angle = renderer.options.sunAngle {
+      let note = String(format: "Imported distant light: %.2f° sun.", angle)
+      hint(note)
+      if let last = stack.arrangedSubviews.last {
+        last.toolTip = note + " Its intensity is irradiance, independent of the environment brightness. "
+          + "Choosing a sky preset restores the procedural sun."
+      }
+    }
+  }
+  // An emitter spectrum popup: the RGB colour or an illuminant preset (spectral light transport only).
+  private func spectrumRow(_ title: String, _ path: WritableKeyPath<StudioOptions, UInt32?>) {
+    let current = renderer.options[keyPath: path].map { Int($0) + 1 } ?? 0
+    let covers = path == \.sunSpectrum
+      ? "the sun's" : "the area and sphere lights' and imported emitters' (the light colour tints it like a filter)"
+    popupRow(
+      title, Self.illuminantTitles, min(current, Self.illuminantTitles.count - 1),
+      help: "Spectral light transport only: a preset replaces \(covers) daylight-like RGB spectrum. The sky and "
+        + "environment images stay RGB."
+    ) { [weak self] i in
+      guard let self else { return }
+      self.checkpoint(title)
+      self.renderer.options[keyPath: path] = i == 0 ? nil : UInt32(i - 1)
+      self.changed()
+      self.rebuild()
+    }
+  }
+  private func atmosphereSection() {
+    section("Atmosphere")
     let atmosphere = renderer.medium != nil ? 2 : Int(renderer.enableFog)
-    popup(["Atmosphere: Clear", "Atmosphere: Fog preview", "Atmosphere: Participating medium"], atmosphere, label: "Atmosphere") {
-      [weak self] i in
+    popupRow(
+      "Atmosphere", ["Clear", "Fog preview", "Participating medium"], atmosphere,
+      help: "Fog preview is a fast single-scatter camera fog. A participating medium is a physically based haze "
+        + "in the scene's bounding box."
+    ) { [weak self] i in
       guard let self else { return }
       self.checkpoint("Atmosphere")
       self.renderer.enableFog = i == 1 ? 1 : 0
@@ -106,26 +136,47 @@ extension StudioController {
     }
     if let medium = renderer.medium { mediumControls(medium) }
   }
-  // The scene medium (SceneMedium; docs/VOLUME_DESIGN.md §4), on the Lighting page.
+  // The scene medium (SceneMedium; docs/VOLUME_DESIGN.md §4), in the Atmosphere section.
   func mediumControls(_ medium: SceneMedium) {
     func update(_ change: (inout SceneMedium) -> Void) {
       var edited = renderer.medium ?? SceneMedium()
       change(&edited)
       renderer.medium = edited
     }
-    number("Density (per metre)", medium.density, 0...5, 0.05, entry: SceneMedium.densityRange) { v in update { $0.density = v } }
-    for (i, channel) in ["R", "G", "B"].enumerated() {
-      number("Scattering albedo \(channel)", medium.albedo[i], 0...1, 0.9) { v in update { $0.albedo[i] = v } }
-    }
-    number("Anisotropy (g)", medium.anisotropy, -0.99...0.99, 0) { v in update { $0.anisotropy = v } }
-    popup(["Grey scattering", "Rayleigh scattering (λ⁻⁴)"], medium.rayleigh ? 1 : 0, label: "Scattering law") { [weak self] i in
+    number(
+      "Density, 1/m", medium.density, 0...5, 0.05, entry: SceneMedium.densityRange, step: 0.001, scale: .logarithmic,
+      help: "Extinction per metre (at 550 nm with the Rayleigh law)."
+    ) { v in update { $0.density = v } }
+    colorRow(
+      "Scattering albedo", medium.albedo,
+      help: "The fraction of extinguished light that scatters rather than being absorbed, per channel."
+    ) { v in update { $0.albedo = simd_clamp(v, SIMD3(repeating: 0), SIMD3(repeating: 1)) } }
+    number(
+      "Anisotropy", medium.anisotropy, -0.99...0.99, 0, step: 0.01,
+      help: "Henyey-Greenstein g: positive scatters forward, negative backward, 0 evenly."
+    ) { v in update { $0.anisotropy = v } }
+    popupRow(
+      "Scattering law", ["Grey", "Rayleigh (λ⁻⁴)"], medium.rayleigh ? 1 : 0,
+      help: "Rayleigh scattering is bluer at short wavelengths, so beams turn orange as they cross the medium."
+    ) { [weak self] i in
       guard let self else { return }
       self.checkpoint("Scattering law")
       update { $0.rayleigh = i == 1 }
       self.changed()
     }
-    text(
-      "Homogeneous haze in the scene's bounding box: density is the extinction per metre (at 550 nm with the Rayleigh law), albedo the scattered fraction, and anisotropy the Henyey-Greenstein g (positive scatters forward). Scenes with media render with Standard MIS instead of ReSTIR. Rayleigh scattering is bluer at short wavelengths, so beams turn orange as they cross it.")
+    hint("Scenes with a medium render with Standard MIS instead of ReSTIR.")
+  }
+  func removeEnvironmentImage() {
+    guard !isBusy else { return }
+    let record = undoRecord("Clear environment")
+    do {
+      try renderer.materials.setEnvironment(nil)
+      project.environmentData = nil
+      project.environmentName = "Procedural sky"
+      commit(record)
+      changed()
+      rebuild()
+    } catch { showError(error.localizedDescription) }
   }
   func loadEnvironment() {
     chooseOpen(
