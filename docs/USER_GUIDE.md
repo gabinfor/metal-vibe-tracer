@@ -24,7 +24,7 @@ The window has a toolbar across the top, the viewport, the inspector on the righ
 
 Every number in the inspector is a row with the label on the left, an editable field at the right edge and, for most, a slider underneath. Fields, popups, switches and buttons all end at the inspector's right edge. Hover a label or control for a tooltip: the longer explanations of an option are tooltips, not text in the inspector.
 
-- **Sliders** update the render live while you drag, and one drag is one undo step. The two exceptions commit when you release the knob: the Export tab's **Width** and **Height**, and the scene graph's transforms and MaterialX parameters on the Objects and Materials tabs, whose edits rebuild meshes or recompile the material.
+- **Sliders** update the render live while you drag, and one drag is one undo step. The exceptions commit when you release the knob: the Export tab's **Width** and **Height**, and, on the Objects and Materials tabs, the scene graph's transforms, MaterialX parameters and an imported light's spectrum and spot-cone rows, whose edits rebuild meshes, recompile the material or rebuild the light tables. Clicking a knob without moving it changes nothing.
 - **Snapping.** A slider snaps to a step (a 1–2–5 value near 1/200 of the range unless the row has its own, such as 0.01 for most 0–1 values). Hold **Option** while dragging to turn snapping off.
 - **Logarithmic sliders.** Ranges that span more than two decades use a logarithmic slider, so the low end stays usable: for example **Sun** intensity, **Sample limit**, **Time limit, seconds**, **Focus distance**, **Scale**, **UV repeat**, the export **Width**, **Height** and **Samples**. A logarithmic slider snaps to about 2% of the value.
 - **Fields.** Type a value and press Return (or leave the field) to apply it. Where a row says so, typed values may go beyond the slider's range up to a larger limit (for example **Sample limit** up to 16,777,214 and **Indirect clamp** up to 100,000); otherwise a typed value is clamped to the slider's range. Whole-number rows round what you type. A decimal comma is accepted where the system locale uses it, and whitespace is ignored. Text that is not a number is refused with a message in the status bar and the field keeps its value. Fields show a value at the precision of the row's step, without trailing zeros; typed values keep their precision.
@@ -84,7 +84,7 @@ Each scene opens at its default view (an imported USD scene at its own camera). 
 
 **Lens**
 
-- **Field of view, °:** 5 to 150, the vertical angle. The default is the scene's own: 38° for the Architectural Pavilion, 40° for the Veach MIS Benchmark, 42° for the others.
+- **Field of view, °:** 5 to 150, the vertical angle. The default is the scene's own: 38° for the Architectural Pavilion, 40° for the Veach MIS Benchmark, 42° for the others, and on an imported scene the field of view of its imported camera (the saved view **USD: …**, **glTF: …** or **Mitsuba: camera**) when it has one.
 - **Aperture radius:** **Pinhole** (0, the default) keeps everything in focus; up to 0.5 in scene units, larger blurs more.
 - **Focus distance:** the distance to the plane in focus, which applies when the aperture is open. The slider runs from 0.01 to 1,000 (default 4.6) and a typed value from 0.0001 to 1,000,000 is accepted.
 - **Focus at Camera Target** sets the focus distance to the distance between the camera and its target.
