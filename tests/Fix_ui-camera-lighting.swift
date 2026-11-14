@@ -126,8 +126,9 @@
   // Camera: vector rows, Reset View, Image controls.
   try open(scene: 1)
   show(page: 1)
-  require(vector("Position") != nil && vector("Target") != nil && number("Position X") == nil
-    && views(NumberControl.self, in: controller.stack).contains { $0.field.accessibilityLabel() == "Target Z" },
+  require(vector("Position") != nil && vector("Target") != nil
+    && !controller.stack.arrangedSubviews.contains { $0 is NumberControl && ($0 as! NumberControl).field.accessibilityLabel() == "Position X" }
+    && number("Target Z")?.isDescendant(of: vector("Target")!) == true,
     "position and target are vector rows with per-axis field labels")
   require(number("Aperture radius")?.field.stringValue == "Pinhole" && number("Focus distance")?.scale == .logarithmic
     && number("Field of view, °")?.step == 1, "lens rows: pinhole aperture, logarithmic focus, 1° field of view")
