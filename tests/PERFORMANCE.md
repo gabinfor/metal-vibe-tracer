@@ -1,3 +1,28 @@
+# MaterialX interpreter register file — November 25, 2026 (not adopted)
+
+The GPU MaterialX interpreter (`resolve_materialx`, and `material_cut` in the cutout traversal) keeps one `float4` per instruction in `float4 values[64]` (plus `float2 densities[64]`), indexed at run time. MuTracer allocates its graph registers by liveness from a budget of 16 (`docs/technical/material-graph-codegen.md`), so the plan (item 2.1 of the MuTracer comparison) was to do the same and shrink these arrays. Measured on the Apple M4 (16 GB), macOS 27.2.1, Swift 6.4, against `866c176`; raw reports in [`PERFORMANCE-materialx-registers-raw.txt`](PERFORMANCE-materialx-registers-raw.txt).
+
+**Slots needed.** A liveness allocation over the 337 MaterialX programs of the examples and the downloaded reference scenes (ASWF Standard Shader Ball, the Bistro exterior, nine Bitterli scenes) needs at most 15 slots, 11 or more because the surface outputs stay live to the end; reading constant outputs from their instruction instead brings it to 1–6.
+
+**Cost of smaller arrays.** `tests/benchmark.py` gained two MaterialX scenarios: *MaterialX cutout leaves over Paint.mtlx* (400 leaf quads with an image colour and an image `geometry_opacity`, over a floor of `Examples/MaterialX/Paint.mtlx`) and *ASWF Standard Shader Ball* (when `scripts/fetch_reference_scene.py` has downloaded it). Every program in them has at most 16 instructions, so `main` with the two arrays cut to 16 entries (indices masked with `& 15`) renders the same images and has the access pattern of a 16-slot register file. `VIBE_LIGHT_TRANSPORT=rgb VIBE_ACCELERATION=flat python3 tests/benchmark.py --baseline <that main.swift> --rounds 3 --frames 12 --output-tolerance 0.005`, median GPU ms per frame, 640×480 (mean radiance within 1e-5 relative on the MaterialX scenarios and the procedural scenes, 0.15% on the imported sphere):
+
+| Scenario | MetalFX | 64 entries (`main`) | 16 entries | Change |
+| --- | --- | ---: | ---: | ---: |
+| ASWF Standard Shader Ball | off | 234.03 | 400.94 | +71% |
+| ASWF Standard Shader Ball | on | 267.11 | 355.93 | +33% |
+| MaterialX cutout leaves over Paint.mtlx | off | 101.34 | 116.45 | +15% |
+| MaterialX cutout leaves over Paint.mtlx | on | 106.59 | 122.21 | +15% |
+| Default Pavilion | off | 39.60 | 47.81 | +21% |
+| Cornell box | off | 14.41 | 21.16 | +47% |
+| Imported mesh (8,130 triangles) | off | 30.02 | 41.26 | +37% |
+| Instanced scene graph | off | 72.34 | 89.34 | +24% |
+
+Every scenario got slower, including those without any MaterialX material, so the cost is not the interpreter's work: with 16 entries the compiler apparently keeps the arrays in registers, which raises the register footprint of the whole shading kernel, while the 64-entry arrays stay in stack memory, where the interpreter's few live values are cheap. Neither Xcode's GPU counters nor the Metal compiler's register statistics were collected to confirm this.
+
+**Compiler failures.** The full change (liveness slots chosen at upload, opcode and destination slot packed in `code.x`, constant outputs read from their instruction, `MATERIALX_REGISTERS` 16) also made the Metal compiler fail with an internal compiler error (`AGXMetalG16G_B0` code 3) on the mesh `shading_kernel`, RGB or spectral depending on small details, for array sizes 8, 16 and 32, with `material_cut` or `resolve_materialx` inlined or not; the masked 16-entry `main` above also fails in the spectral mesh library, which is why its timings are RGB only. `main` with 64 entries compiles.
+
+**Result:** the arrays stay at 64 entries. Earlier evidence agrees: replacing the whole interpreter with constants took 34.0 s against 34.8 s (−2%) for the Fireplace and Living Rooms ("Where a bounce's time goes", Mitsuba 3 at equal settings, November 5). Any further work on the interpreter's cost should start from a GPU counter profile of the shading kernel's register use rather than from the arrays' size.
+
 # GPU load limit — November 15, 2026
 
 **Render › Limit GPU Load** (`PathTracerRenderer.gpuLoadLimit`, 0.9 when on) leaves a tenth of the GPU's time free. `scripts/measure_gpu_load.py` on the Apple M4 (16 GB, macOS 27): a second command queue copies a 2560×1600 texture 60 times a second, a stand-in for another GPU client such as the window server, and its commit-to-completion latency is recorded while the app renders (idle: 2–5 ms median). Viewport: a simulated 60 Hz display on a 1280×800 drawable, camera still, 6 s. Export: raw 1920×1080 through `StudioController.startExport`.
