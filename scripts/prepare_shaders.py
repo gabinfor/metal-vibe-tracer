@@ -10,11 +10,19 @@ root = Path(__file__).resolve().parents[1]
 # without replacing the shared resource that build.sh and tests/verify.py bundle.
 target = Path(sys.argv[sys.argv.index('--output') + 1]) if '--output' in sys.argv else \
     build_directory(root) / 'ShaderResources' / 'OpenPBR.metal'
+# The upstream feature toggles (openpbr_settings.h, OPENPBR_GET_SPECIALIZATION_CONSTANT) stay macros in the
+# shipped source, so a scene's shader library can compile without the lobes its materials never use.
+TOGGLES = ['EnableSheenAndCoat', 'EnableDispersion', 'EnableTranslucency', 'EnableMetallic']
 # -C keeps the upstream per-file copyright and license comments in the shipped source.
 result = subprocess.run(['xcrun', 'clang', '-E', '-P', '-C', '-x', 'c++',
     '-D__METAL_VERSION__=310', '-DOPENPBR_LANGUAGE_TARGET_MSL=1',
+    '-DOPENPBR_GET_SPECIALIZATION_CONSTANT(name)=VIBE_OPENPBR_##name',
     str(root / 'Vendor/OpenPBR/openpbr.h')], check=True, capture_output=True, text=True)
 source = result.stdout
+for toggle in TOGGLES:
+    if 'VIBE_OPENPBR_' + toggle not in source:
+        raise RuntimeError('Unexpected upstream feature toggle: ' + toggle)
+toggles = ''.join(f'#ifndef VIBE_OPENPBR_{t}\n#define VIBE_OPENPBR_{t} 1\n#endif\n' for t in TOGGLES)
 adaptation = ''
 if '--upstream-only' not in sys.argv:
     adaptation = (root / 'Shaders/MetalEnergy.metal').read_text()
@@ -42,8 +50,8 @@ if '--upstream-only' not in sys.argv:
         raise RuntimeError('Unexpected upstream dielectric multiple-scattering lobe')
 atomic_write_text(target, '// Copyright 2026 Adobe. Apache-2.0; see bundled OpenPBR-LICENSE.\n'
     '// Modified by Metal Vibe Tracer: preprocessed from the pinned Vendor/OpenPBR headers for\n'
-    '// Metal runtime compilation' + ('' if not adaptation else
-    '; the two ideal-metal energy lookups now call Shaders/MetalEnergy.metal, and on thin walls the\n'
+    '// Metal runtime compilation, with the feature toggles as VIBE_OPENPBR_ macros (default 1)' + ('' if not adaptation else
+    ';\n// the two ideal-metal energy lookups now call Shaders/MetalEnergy.metal, and on thin walls the\n'
     '// dielectric multiple-scattering lobe leaves out the subsurface share') + '.\n'
-    '#include <metal_stdlib>\nusing namespace metal;\n' + adaptation + source)
+    '#include <metal_stdlib>\nusing namespace metal;\n' + toggles + adaptation + source)
 print('Prepared pinned Adobe OpenPBR shader resource')
