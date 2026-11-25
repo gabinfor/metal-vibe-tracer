@@ -1,0 +1,85 @@
+# MaterialX register file experiment, November 25, 2026: raw reports
+
+## Interleaved: 16-entry arrays (baseline) against main's 64 (current); VIBE_LIGHT_TRANSPORT=rgb VIBE_ACCELERATION=flat, --rounds 3 --frames 12 --output-tolerance 0.005
+
+Date: 2026-11-25T13:52:39+08:00
+Source: 866c176f1a912d29c4b5b47808575f8f26943ff5 with uncommitted changes
+Baseline: main.swift of 866c176 with 16-entry interpreter arrays (indices masked with & 15)
+Machine: Apple M4, 16 GB
+macOS: 27.2.1 (26B131)
+Compiler: Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)
+Settings: 640x480, previewScale 1, 12 frames per run (first 4 untimed), 3 rounds, depth 16, sampling from tests/GPUChecks.swift render()
+PASS: runtime shader compilation on Apple M4
+PASS: inside-box exit, parallel-box miss, random endpoints, small-PDF MIS, glass total internal reflection, emission weighting, sphere emitter endpoints, finite-roughness grazing cylinder, terminal ReSTIR GI weighting
+Baseline layout: Uniforms 336 B and offsets, material arguments 65664 B, kernel bindings: compatible
+RESULT ASWF Standard Shader Ball (USD, MaterialX) | MetalFX off | baseline | medianMS=400.94 min=311.89 max=416.57 n=24
+RESULT ASWF Standard Shader Ball (USD, MaterialX) | MetalFX off | current | medianMS=234.03 min=216.93 max=259.69 n=24
+RESULT ASWF Standard Shader Ball (USD, MaterialX) | MetalFX on | baseline | medianMS=355.93 min=316.47 max=454.88 n=24
+RESULT ASWF Standard Shader Ball (USD, MaterialX) | MetalFX on | current | medianMS=267.11 min=224.08 max=317.73 n=24
+RESULT Cornell box | MetalFX off | baseline | medianMS=21.16 min=19.37 max=22.39 n=24
+RESULT Cornell box | MetalFX off | current | medianMS=14.41 min=13.64 max=15.96 n=24
+RESULT Cornell box | MetalFX on | baseline | medianMS=21.54 min=19.80 max=23.76 n=24
+RESULT Cornell box | MetalFX on | current | medianMS=15.53 min=15.01 max=17.80 n=24
+RESULT Default Pavilion | MetalFX off | baseline | medianMS=47.81 min=43.46 max=52.32 n=24
+RESULT Default Pavilion | MetalFX off | current | medianMS=39.60 min=32.44 max=41.01 n=24
+RESULT Default Pavilion | MetalFX on | baseline | medianMS=52.55 min=50.95 max=58.36 n=24
+RESULT Default Pavilion | MetalFX on | current | medianMS=44.89 min=37.32 max=47.24 n=24
+RESULT Default Pavilion, MIS | MetalFX off | baseline | medianMS=42.49 min=39.92 max=45.66 n=24
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=35.53 min=33.27 max=36.93 n=24
+RESULT Default Pavilion, orbiting | MetalFX off | baseline | medianMS=47.46 min=46.45 max=57.50 n=24
+RESULT Default Pavilion, orbiting | MetalFX off | current | medianMS=39.51 min=38.17 max=42.13 n=24
+RESULT Default Pavilion, orbiting | MetalFX on | baseline | medianMS=55.25 min=50.79 max=58.47 n=24
+RESULT Default Pavilion, orbiting | MetalFX on | current | medianMS=44.68 min=42.14 max=46.45 n=24
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | baseline | medianMS=51.73 min=50.97 max=60.79 n=24
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | current | medianMS=36.55 min=35.69 max=39.13 n=24
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | baseline | medianMS=56.74 min=53.40 max=62.49 n=24
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | current | medianMS=40.13 min=37.84 max=42.88 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | baseline | medianMS=41.26 min=39.05 max=49.50 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=30.02 min=28.02 max=31.08 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | baseline | medianMS=44.93 min=42.18 max=49.42 n=24
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=33.28 min=31.20 max=34.60 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | baseline | medianMS=89.34 min=85.86 max=102.11 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=72.34 min=70.59 max=76.61 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | baseline | medianMS=95.07 min=90.42 max=105.76 n=24
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=80.94 min=74.93 max=83.60 n=24
+RESULT MaterialX cutout leaves over Paint.mtlx (scene graph) | MetalFX off | baseline | medianMS=116.45 min=110.65 max=127.51 n=24
+RESULT MaterialX cutout leaves over Paint.mtlx (scene graph) | MetalFX off | current | medianMS=101.34 min=96.74 max=114.44 n=24
+RESULT MaterialX cutout leaves over Paint.mtlx (scene graph) | MetalFX on | baseline | medianMS=122.21 min=113.49 max=144.91 n=24
+RESULT MaterialX cutout leaves over Paint.mtlx (scene graph) | MetalFX on | current | medianMS=106.59 min=100.47 max=109.87 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | baseline | medianMS=74.18 min=60.76 max=78.01 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=59.52 min=47.13 max=61.44 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | baseline | medianMS=78.21 min=70.68 max=83.74 n=24
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=60.82 min=48.91 max=67.00 n=24
+Thermal state: 1 (0 nominal, 1 fair, 2 serious, 3 critical)
+
+## Main, default settings (spectral, hardware traversal), --rounds 2 --frames 12
+
+Date: 2026-11-25T13:49:18+08:00
+Source: 866c176f1a912d29c4b5b47808575f8f26943ff5 with uncommitted changes
+Baseline: none
+Machine: Apple M4, 16 GB
+macOS: 27.2.1 (26B131)
+Compiler: Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)
+Settings: 640x480, previewScale 1, 12 frames per run (first 4 untimed), 2 rounds, depth 16, sampling from tests/GPUChecks.swift render()
+PASS: runtime shader compilation on Apple M4
+PASS: inside-box exit, parallel-box miss, random endpoints, small-PDF MIS, glass total internal reflection, emission weighting, sphere emitter endpoints, finite-roughness grazing cylinder, terminal ReSTIR GI weighting
+RESULT ASWF Standard Shader Ball (USD, MaterialX) | MetalFX off | current | medianMS=290.26 min=279.03 max=295.21 n=16
+RESULT ASWF Standard Shader Ball (USD, MaterialX) | MetalFX on | current | medianMS=304.76 min=284.17 max=307.13 n=16
+RESULT Cornell box | MetalFX off | current | medianMS=21.22 min=18.91 max=23.36 n=16
+RESULT Cornell box | MetalFX on | current | medianMS=22.24 min=19.61 max=24.26 n=16
+RESULT Default Pavilion | MetalFX off | current | medianMS=54.95 min=49.06 max=60.60 n=16
+RESULT Default Pavilion | MetalFX on | current | medianMS=62.51 min=56.18 max=68.16 n=16
+RESULT Default Pavilion, MIS | MetalFX off | current | medianMS=53.89 min=52.17 max=56.51 n=16
+RESULT Default Pavilion, orbiting | MetalFX off | current | medianMS=58.75 min=58.40 max=61.88 n=16
+RESULT Default Pavilion, orbiting | MetalFX on | current | medianMS=67.42 min=62.42 max=69.76 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX off | current | medianMS=38.99 min=38.55 max=40.33 n=16
+RESULT Imported mesh (scene 6), orbiting | MetalFX on | current | medianMS=42.41 min=41.49 max=43.81 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX off | current | medianMS=30.60 min=28.31 max=31.73 n=16
+RESULT Imported mesh (scene 6, 8130 triangles) | MetalFX on | current | medianMS=32.94 min=32.00 max=35.22 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX off | current | medianMS=42.76 min=41.36 max=45.15 n=16
+RESULT Instanced scene graph (scene 6, 25 x 19,968 triangles) | MetalFX on | current | medianMS=46.50 min=45.49 max=48.15 n=16
+RESULT MaterialX cutout leaves over Paint.mtlx (scene graph) | MetalFX off | current | medianMS=167.11 min=160.52 max=172.01 n=16
+RESULT MaterialX cutout leaves over Paint.mtlx (scene graph) | MetalFX on | current | medianMS=172.46 min=165.36 max=176.99 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX off | current | medianMS=88.20 min=77.71 max=99.20 n=16
+RESULT Pavilion with coated OpenPBR floor | MetalFX on | current | medianMS=91.31 min=79.36 max=106.75 n=16
+Thermal state: 0 (0 nominal, 1 fair, 2 serious, 3 critical)

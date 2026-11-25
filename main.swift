@@ -2065,13 +2065,23 @@ bool scene_occluded(Ray r, uint sceneIndex, float tMax, constant MaterialResourc
     }
     return false;
 }
-// The marginal row CDF is a 1 x H texture; each conditional column CDF is a row
-// of the W x H texture. `marginal` selects the axis explicitly, so 1-wide maps work.
+// Environment sampling tables (MaterialLibrary.environmentImportance). ENV_COMPENSATED is MIS compensation
+// (KARLIK2019): its density is zero below the map's mean luminance, where only BSDF or phase sampling reaches the
+// environment. emission_weight gives such a hit full weight (its light PDF is zero), so a next-event estimate may
+// use this table only at a vertex whose BSDF or phase continuation is traced and weighs its environment hits with
+// eval_environment_pdf, which reads this table. Every other estimate (the path's last vertex, depth 1, fog single
+// scattering, light paths from the environment, the ring-caustic boost) is the sole strategy for those directions
+// and uses ENV_ORIGINAL, which is positive wherever the map is.
+constant uint ENV_COMPENSATED = 0u;
+constant uint ENV_ORIGINAL = 1u;
+// The marginal row CDFs are the columns of a 2 x H texture (one per table); the conditional column CDFs are the
+// rows of a W x 2H texture, the compensated table's H rows first. `marginal` selects the axis explicitly, so
+// 1-wide maps work; for a marginal search `row` is the table.
 uint environment_cdf_index(texture2d<float> cdf, uint count, uint row, float value, bool marginal) {
     uint low = 0, high = max(1u, count) - 1;
     for (uint iteration = 0; iteration < 16 && low < high; ++iteration) {
         uint middle = (low + high) / 2;
-        float cumulative = cdf.read(marginal ? uint2(0, middle) : uint2(middle, row), 0).x;
+        float cumulative = cdf.read(marginal ? uint2(row, middle) : uint2(middle, row), 0).x;
         if (cumulative >= value) high = middle; else low = middle + 1;
     }
     return low;
@@ -2081,24 +2091,25 @@ float environment_cdf_value(texture2d<float> cdf, uint x, uint y) {
     return cdf.read(uint2(x, y), 0).x;
 }
 
-// Solid-angle density of a lat-long texel; the sampler uses its chosen cell.
-float environment_cell_pdf(uint x, uint y, float sinTheta, constant MaterialResources &images) {
+// Solid-angle density of a lat-long texel in `table`; the sampler uses its chosen cell.
+float environment_cell_pdf(uint x, uint y, float sinTheta, constant MaterialResources &images, uint table) {
     uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
-    float row = environment_cdf_value(images.environmentRows, 0, y);
-    float previousRow = y == 0 ? 0.0f : environment_cdf_value(images.environmentRows, 0, y - 1);
-    float column = environment_cdf_value(images.environmentColumns, x, y);
-    float previousColumn = x == 0 ? 0.0f : environment_cdf_value(images.environmentColumns, x - 1, y);
+    uint conditional = y + table * height;
+    float row = environment_cdf_value(images.environmentRows, table, y);
+    float previousRow = y == 0 ? 0.0f : environment_cdf_value(images.environmentRows, table, y - 1);
+    float column = environment_cdf_value(images.environmentColumns, x, conditional);
+    float previousColumn = x == 0 ? 0.0f : environment_cdf_value(images.environmentColumns, x - 1, conditional);
     float cellProbability = max(0.0f, row - previousRow) * max(0.0f, column - previousColumn);
     return cellProbability * float(width * height) / (2.0f * PI * PI * max(1e-5f, sinTheta));
 }
 
-float environment_image_pdf(float3 wi, constant Uniforms &u, constant MaterialResources &images) {
+float environment_image_pdf(float3 wi, constant Uniforms &u, constant MaterialResources &images, uint table) {
     uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
     float theta = acos(clamp(wi.y, -1.0f, 1.0f));
     float2 uv = float2(atan2(wi.z, wi.x) / TWO_PI + 0.5f + u.environment.y / TWO_PI, theta / PI);
     uv.x = fract(uv.x); uv.y = clamp(uv.y, 0.0f, 1.0f - 1e-7f);
     uint x = min(width - 1, uint(uv.x * float(width))), y = min(height - 1, uint(uv.y * float(height)));
-    return environment_cell_pdf(x, y, sin(theta), images);
+    return environment_cell_pdf(x, y, sin(theta), images, table);
 }
 
 // REFERENCES.md: PBRT2023. Lat-long lookup with luminance-weighted image sampling.
@@ -2830,15 +2841,19 @@ float3 imported_graph_emission(uint index,float b1,float b2,float3 p,float3 posi
     resolve_materialx(h,ray,images,TextureFootprint{});
     return openpbr_emission(h.mat,h.normal,-wi);
 }
-float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant MaterialResources &images) {
-    float image = u.environment.z > 0.5f ? environment_image_pdf(wi,u,images) : 0.0f;
+// The density of sample_direct_light's environment proposal in `table`. Hits of BSDF and phase continuations use the
+// default, the compensated table their vertex's next-event estimate used (ENV_COMPENSATED above).
+float eval_environment_pdf(float3 wi,float3 n,constant Uniforms &u,constant MaterialResources &images,uint table = ENV_COMPENSATED) {
+    float image = u.environment.z > 0.5f ? environment_image_pdf(wi,u,images,table) : 0.0f;
     return (1.0f-imported_light_probability(u,images))*environment_mixture_pdf(wi,n,image,u);
 }
-// Both proposals sample the same environment, with their full mixture PDF.
+// Both proposals sample the same environment, with their full mixture PDF; the image proposal reads `table`
+// (ENV_COMPENSATED by default; see there for when a caller must pass ENV_ORIGINAL).
 // Emitter choice and the point on the emitter form one 3D constituent (rand_f3) in Z mode;
 // the draws keep the order of the PCG stream.
 template <typename R>
-LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages) {
+LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread R &seed, constant MaterialResources &materialImages,
+                                uint table = ENV_COMPENSATED) {
     LightSample ls = {};
     float importedProbability=imported_light_probability(u,materialImages);
     if(importedProbability>0 && rand_f(seed)<importedProbability) {
@@ -2882,12 +2897,12 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
             float3 su, sv;
             make_basis(sun_d, su, sv);
             ls.wi = normalize(su * (cos(phi) * sin_th) + sv * (sin(phi) * sin_th) + sun_d * cos_th);
-            if (u.environment.z > 0.5f) imagePdf = environment_image_pdf(ls.wi, u, materialImages);
+            if (u.environment.z > 0.5f) imagePdf = environment_image_pdf(ls.wi, u, materialImages, table);
         } else if (u.environment.z > 0.5f) {
             uint width = materialImages.environmentMap.get_width(), height = materialImages.environmentMap.get_height();
             float2 c = sunProbability > 0.0f ? q.yz : rand_f2(seed);
-            uint y = environment_cdf_index(materialImages.environmentRows, height, 0, c.x, true);
-            uint x = environment_cdf_index(materialImages.environmentColumns, width, y, c.y, false);
+            uint y = environment_cdf_index(materialImages.environmentRows, height, table, c.x, true);
+            uint x = environment_cdf_index(materialImages.environmentColumns, width, y + table * height, c.y, false);
             // Keep the in-texel offset inside the chosen cell and use that cell's
             // probability; re-deriving it from the direction can pick a neighbour.
             float2 size = float2(width, height), cell = float2(x, y);
@@ -2895,7 +2910,7 @@ LightSample sample_direct_light(float3 p, float3 n, constant Uniforms &u, thread
             float theta = uv.y * PI, phi = (uv.x - 0.5f - u.environment.y / TWO_PI) * TWO_PI;
             float sinTheta = sin(theta);
             ls.wi = normalize(float3(sinTheta * cos(phi), cos(theta), sinTheta * sin(phi)));
-            imagePdf = environment_cell_pdf(x, y, sinTheta, materialImages);
+            imagePdf = environment_cell_pdf(x, y, sinTheta, materialImages, table);
         } else {
             // Ambient sky cosine hemisphere sampling -> illuminates shadows & cylinder interior
             ls.wi = sunProbability > 0.0f ? sample_cosine_hemisphere(n, q.yz) : sample_cosine_hemisphere(n, seed);
@@ -3033,7 +3048,7 @@ float3 sample_specular_manifold_caustic(float3 x, float3 n_x, constant Uniforms 
     if (u.sceneIndex != 0 && u.sceneIndex != 5) return float3(0.0f);
 
     float3 total_caustic = float3(0.0f);
-    LightSample ls = sample_direct_light(x, n_x, u, seed, materialImages);
+    LightSample ls = sample_direct_light(x, n_x, u, seed, materialImages, ENV_ORIGINAL);
     if (ls.pdf <= 0.0f) return float3(0.0f);
     float3 y_light = ((u.sceneIndex == 0 || u.sceneIndex == 6)) ? (x + ls.wi * 80.0f) : (x + ls.wi * ls.dist);
 
@@ -3946,7 +3961,8 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
 #endif
             if (u.samplingMode != 3u) {
                 sampler_event(seed, uint(vertices), Z_NEE);
-                LightSample ls = sample_direct_light(p, n, u, seed, images);
+                // The phase continuation follows below the scattering limit (ENV_COMPENSATED).
+                LightSample ls = sample_direct_light(p, n, u, seed, images, scatter < limit ? ENV_COMPENSATED : ENV_ORIGINAL);
                 Spectrum Tr = medium_shadow(p, ray.direction, 0.0f, ls, mediumSlot, medium, lo, hi, u, images, wl);
                 if (spectrum_max(Tr) > 0.0f) {
                     float phase = hg_phase(dot(ray.direction, ls.wi), medium.g);
@@ -4026,7 +4042,7 @@ __attribute__((noinline)) float3 volume_path(Ray ray, constant Uniforms &u, cons
             && !(rec.mat.usesMaterialX && rec.mat.transmissionTint.w > 0.0f);
         if (!delta && u.samplingMode != 3u && caustic < 1) {
             sampler_event(seed, uint(vertices), Z_NEE);
-            LightSample ls = sample_direct_light(rec.position, rec.normal, u, seed, images);
+            LightSample ls = sample_direct_light(rec.position, rec.normal, u, seed, images, scatter < limit ? ENV_COMPENSATED : ENV_ORIGINAL);
             if (ls.pdf > 0.0f) {
                 uint shadowSlot = mediumSlot;
                 Medium shadowMedium = medium;
@@ -4089,7 +4105,8 @@ float caustic_source_share(constant Uniforms &u, uint triangles, device atomic_f
     return e > 0.0f && t > 0.0f && isfinite(e + t) ? clamp(e / (e + t), 0.1f, 0.9f) : 0.5f;
 }
 // A direction toward the environment for light paths, with its density: the sun's cone (with sample_direct_light's
-// sun probability), else the image's luminance distribution, or the uniform sphere for the procedural sky.
+// sun probability), else the image's uncompensated luminance distribution (ENV_ORIGINAL: camera paths leave this
+// light out), or the uniform sphere for the procedural sky.
 template <typename R>
 float3 caustic_environment_direction(constant Uniforms &u, constant MaterialResources &images, thread R &seed, thread float &pdf) {
     float sunProbability = environment_sun_probability(u), w = sun_one_minus_cos(u);
@@ -4103,8 +4120,8 @@ float3 caustic_environment_direction(constant Uniforms &u, constant MaterialReso
     } else if (u.environment.z > 0.5f) {
         uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
         float2 c = rand_f2(seed);
-        uint y = environment_cdf_index(images.environmentRows, height, 0, c.x, true);
-        uint x = environment_cdf_index(images.environmentColumns, width, y, c.y, false);
+        uint y = environment_cdf_index(images.environmentRows, height, ENV_ORIGINAL, c.x, true);
+        uint x = environment_cdf_index(images.environmentColumns, width, y + ENV_ORIGINAL * height, c.y, false);
         float2 size = float2(width, height), cell = float2(x, y);
         float2 uv = min(cell / size + rand_f2(seed) / size, nextafter((cell + 1.0f) / size, float2(0.0f)));
         float theta = uv.y * PI, phi = (uv.x - 0.5f - u.environment.y / TWO_PI) * TWO_PI;
@@ -4115,7 +4132,7 @@ float3 caustic_environment_direction(constant Uniforms &u, constant MaterialReso
         d = float3(s * cos(TWO_PI * r.y), z, s * sin(TWO_PI * r.y));
     }
     float sunPdf = sunProbability > 0.0f && in_sun_cone(d, sun, w) ? 1.0f / (TWO_PI * w) : 0.0f;
-    float rest = u.environment.z > 0.5f ? environment_image_pdf(d, u, images) : 1.0f / (4.0f * PI);
+    float rest = u.environment.z > 0.5f ? environment_image_pdf(d, u, images, ENV_ORIGINAL) : 1.0f / (4.0f * PI);
     pdf = sunProbability * sunPdf + (1.0f - sunProbability) * rest;
     return d;
 }
@@ -4497,7 +4514,7 @@ float3 apply_camera_fog(float3 color, Ray ray, float surfaceDistance,
         sampler_event(seed, uint(i), Z_FOG);
         float t = entry + (float(i) + rand_f(seed)) * step;
         float3 point = ray.origin + ray.direction * t;
-        LightSample ls = sample_direct_light(point, float3(0, 1, 0), u, seed, materialImages);
+        LightSample ls = sample_direct_light(point, float3(0, 1, 0), u, seed, materialImages, ENV_ORIGINAL);
         if (light_visible(point, float3(0), ls, u.sceneIndex, materialImages, u)) {
             float lightDistance = ls.isDirectional == 1 ? 3.0f : ls.dist;
             float transmittance = exp(-sigmaT * (t - entry + lightDistance));
@@ -4597,7 +4614,10 @@ DIReservoir restir_di_initial(HitRecord rec, float3 view, constant Uniforms &u, 
     r.M = 0.0f;
     for (int i = 0; i < 4; ++i) {
         sampler_candidate(seed, 1u, Z_DI, uint(i), 2u);
-        LightSample cand = sample_direct_light(rec.position, rec.normal, u, seed, images);
+        // The primary hit's BSDF continuation (shading_kernel) covers the compensated table's zeros, unless the
+        // path depth is 1.
+        LightSample cand = sample_direct_light(rec.position, rec.normal, u, seed, images,
+            scattering_limit(u.cameraTarget.w) > 0 ? ENV_COMPENSATED : ENV_ORIGINAL);
         cand.u = wavelength_u(wl);
         r.M += 1.0f; // Zero-weight candidates still count in the estimator.
         if (cand.pdf > 0.0f) {
@@ -4692,7 +4712,8 @@ GIReservoir restir_gi_initial(HitRecord rec, float3 view, float fovScale, consta
             if (secondary.mat.type == DIFFUSE) {
                 Spectrum secondaryRadiance = Spectrum(0.0f);
                 sampler_event(seed, 2u, Z_GI_NEE);
-                LightSample giLight = sample_direct_light(secondary.position, secondary.normal, u, seed, images);
+                LightSample giLight = sample_direct_light(secondary.position, secondary.normal, u, seed, images,
+                    restir_gi_has_complementary_bsdf(u.cameraTarget.w) ? ENV_COMPENSATED : ENV_ORIGINAL);
                 if (giLight.pdf > 0.0f && light_visible(secondary.position,
                     secondary.geometricNormal, giLight, u.sceneIndex, images, u, secondary.error)) {
                     float secondaryCosine = max(0.0f, dot(secondary.normal, giLight.wi));
@@ -5396,13 +5417,15 @@ PTReservoir pt_generate(HitRecord x1, float3 view, uint seed, float threshold, f
             // Z mode: the RIS light candidates are one stratified block of the event.
             uint candidateBits = candidates > 1.0f ? 2u : 0u;
             sampler_candidate(neeSeed, j, Z_PT + 1u, 0u, candidateBits);
-            LightSample ls = sample_direct_light(current.position, current.normal, u, neeSeed, images);
+            // x_j's BSDF continuation follows below the scattering limit (ENV_COMPENSATED).
+            uint table = scatter < limit ? ENV_COMPENSATED : ENV_ORIGINAL;
+            LightSample ls = sample_direct_light(current.position, current.normal, u, neeSeed, images, table);
             if (candidates > 1.0f) {
                 // RIS over light samples with target luminance(f cos Le); lightWeight = W_RIS p1.
                 float sum = 0.0f, chosenTarget = 0.0f;
                 for (uint i = 0u; i < PT_NEE_CANDIDATES; ++i) {
                     if (i > 0u) sampler_candidate(neeSeed, j, Z_PT + 1u, i, candidateBits);
-                    LightSample candidate = i == 0u ? ls : sample_direct_light(current.position, current.normal, u, neeSeed, images);
+                    LightSample candidate = i == 0u ? ls : sample_direct_light(current.position, current.normal, u, neeSeed, images, table);
                     float target = 0.0f;
                     if (candidate.pdf > 0.0f) {
                         float ignored;
@@ -5688,7 +5711,7 @@ PTShift pt_shift(PTReservoir r, HitRecord y1, float3 view, float threshold, floa
         ls.dist = environment ? 1e6f : sqrt(distance2);
         // L_k of a light vertex is its emission (at the path's wavelengths).
         Spectrum emission = pt_rc_radiance(r);
-        ls.pdf = environment ? eval_environment_pdf(direction, current.normal, u, images)
+        ls.pdf = environment ? eval_environment_pdf(direction, current.normal, u, images, scatter < limit ? ENV_COMPENSATED : ENV_ORIGINAL)
             : eval_light_pdf(current.position, ls.position, current.mat, u, images, ls.isDirectional >= 2u ? ls.isDirectional - 2u : 0xffffffffu);
         float geometry = light_geometry(current.position, ls, u.sceneIndex, u.light.w, images);
         if (!(ls.pdf > 0.0f) || !(geometry > 0.0f) || !any(emission > 0.0f)) return result;
@@ -7599,7 +7622,8 @@ kernel void shading_kernel(
                 }
             } else if (mat.type != DIELECTRIC && !(mat.type == GLOSSY && mat.roughness < 0.02f) && uniforms.samplingMode != 3) {
                 sampler_event(seed, 1u, Z_NEE);
-                LightSample ls = sample_direct_light(pos, norm, uniforms, seed, materialImages);
+                LightSample ls = sample_direct_light(pos, norm, uniforms, seed, materialImages,
+                    scattering_limit(uniforms.cameraTarget.w) > 0 ? ENV_COMPENSATED : ENV_ORIGINAL);
                 if (ls.pdf > 0.0f) {
                     if (light_visible(pos, primaryHit.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, primaryHit.error)) {
                         float cos_th = abs(dot(norm, ls.wi));
@@ -7744,7 +7768,8 @@ kernel void shading_kernel(
                     bounce == 1 && rec.mat.type == DIFFUSE;
                 if (!is_delta(rec.mat) && uniforms.samplingMode != 3 && !restirGISecondary && caustic < 1) {
                     sampler_event(seed, uint(bounce) + 1u, Z_NEE);
-                    LightSample ls = sample_direct_light(rec.position, rec.normal, uniforms, seed, materialImages);
+                    LightSample ls = sample_direct_light(rec.position, rec.normal, uniforms, seed, materialImages,
+                        scatteringDepth < scatteringLimit ? ENV_COMPENSATED : ENV_ORIGINAL);
                     if (light_visible(rec.position, rec.geometricNormal, ls, uniforms.sceneIndex, materialImages, uniforms, rec.error)) {
                         float cosine = abs(dot(rec.normal, ls.wi));
                         float pdf;
@@ -8419,12 +8444,13 @@ enum SamplerMode: UInt32, Sendable {
     // Z++: Owen-scrambled 1D / 2D Sobol' and 3D O2m3 constituents indexed along a recursively
     // shuffled Morton curve, with Z++ temporal indexing (MSL z_pixel_key, Sampler).
     case zSampling = 1
-    // Host-side default: PCG until the Z++ key-layout fix of 2026-10-04 (each pixel accumulates its
-    // own scrambled nets instead of sharing its block's sample sets) is re-measured at equal time;
-    // Z++ stays selectable. See tests/PERFORMANCE.md.
+    // Host-side default: Z++. Measured at equal time with the key layout of 2026-10-04 (each pixel
+    // accumulates its own scrambled nets), it beat PCG in 45 of 48 strategy/transport/scene cases (the
+    // rest within 11%) for a median 2.5% more frame time, without block-correlated error (tests/PERFORMANCE.md, "Z++ sampler
+    // re-measured at equal time").
     case automatic = 2
     func resolved() -> SamplerMode {
-        self == .automatic ? .pcg : self
+        self == .automatic ? .zSampling : self
     }
 }
 

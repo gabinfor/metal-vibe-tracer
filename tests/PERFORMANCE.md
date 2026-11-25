@@ -1,3 +1,170 @@
+# Z++ sampler re-measured at equal time — November 25, 2026
+
+The October 2 Z++ figures (see "Z++ sampler — October 2, 2026" below) predate the 2026-10-04 key-layout fix, and **Sampler → Automatic** resolved to PCG until Z++ was measured again. `scripts/measure_sampler.py` (an extension of `scripts/measure_light_sampling.py`; unlike the October scratch drivers it is in the repository) repeats the measurement through the production `renderFrame` path: Apple M4 (10-core GPU, 16 GB), macOS 27, source `866c176` plus the script, 320×180, path depth 16, MetalFX and OIDN off, one sample per pixel per frame. For every scene, strategy (Standard MIS, ReSTIR GI, ReSTIR PT, unified ReSTIR PT) and transport (RGB, spectral) it renders a reference of 512 frames per sampler (PCG and Z++ averaged; Shader Ball 256), then 2 independent accumulations of 256 frames per sampler (Shader Ball 3 of 64), alternating the two, and reports the MSE at 16, 64 and 256 frames, the median GPU frame time and the equal-time ratio (Z++ MSE × time) / (PCG MSE × time), below 1 where Z++ wins. Reference noise adds the same amount to both MSEs and pulls the ratios toward 1; other GPU work was serialized with a lock. The unedited report is [`PERFORMANCE-sampler-raw.txt`](PERFORMANCE-sampler-raw.txt). The scenes are the Pavilion (default view and the HDRI showcase view, here with the default sky), Cornell box, Cornell glass & mirror, Veach MIS benchmark, Reflective ring and two imported USD scenes (the ASWF Shader Ball and the Lantern arcade); the downloadable archive scenes were not installed.
+
+Linear MSE change at equal sample count, Z++ against PCG at 256 frames (Shader Ball 64), RGB / spectral:
+
+| Scene | MIS | ReSTIR GI | ReSTIR PT | Unified PT |
+| --- | ---: | ---: | ---: | ---: |
+| Cornell box | -33% / -37% | -9% / -12% | -10% / -10% | -9% / -14% |
+| Pavilion | -20% / -7% | +1% / +3% | -12% / -6% | -12% / -10% |
+| Cornell glass & mirror | -13% / -13% | -11% / -13% | -15% / -16% | -16% / -14% |
+| Reflective ring | -9% / -15% | -7% / -12% | -11% / -19% | -4% / -5% |
+| Lantern arcade (USD) | -11% / -14% | -13% / -12% | -5% / -15% | -11% / -9% |
+| Pavilion, showcase view | -27% / -26% | -13% / -15% | -26% / -18% | -20% / -31% |
+| Shader ball (USD) | -35% / -44% | -36% / -41% | -36% / -36% | -18% / -22% |
+
+Linear MSE equal-time ratio at the same frame counts, RGB / spectral:
+
+| Scene | MIS | ReSTIR GI | ReSTIR PT | Unified PT |
+| --- | ---: | ---: | ---: | ---: |
+| Cornell box | 0.69 / 0.61 | 0.99 / 1.06 | 0.91 / 0.93 | 0.92 / 0.91 |
+| Pavilion | 0.81 / 0.97 | 1.11 / 1.05 | 0.89 / 0.96 | 0.89 / 0.91 |
+| Cornell glass & mirror | 0.90 / 0.83 | 0.93 / 0.90 | 0.89 / 0.87 | 0.93 / 0.93 |
+| Reflective ring | 0.97 / 0.91 | 0.96 / 0.91 | 0.97 / 0.87 | 0.98 / 0.96 |
+| Lantern arcade (USD) | 0.90 / 0.87 | 0.88 / 0.89 | 0.96 / 0.86 | 0.88 / 0.90 |
+| Pavilion, showcase view | 0.75 / 0.76 | 0.94 / 0.88 | 0.76 / 0.84 | 0.81 / 0.71 |
+| Shader ball (USD) | 0.66 / 0.58 | 0.66 / 0.61 | 0.66 / 0.65 | 0.84 / 0.79 |
+
+Tone-mapped (x / (1 + x)) MSE equal-time ratio, RGB / spectral:
+
+| Scene | MIS | ReSTIR GI | ReSTIR PT | Unified PT |
+| --- | ---: | ---: | ---: | ---: |
+| Cornell box | 0.55 / 0.52 | 0.86 / 0.97 | 0.75 / 0.82 | 0.75 / 0.77 |
+| Pavilion | 0.91 / 0.96 | 1.08 / 0.98 | 0.99 / 1.02 | 0.97 / 1.01 |
+| Cornell glass & mirror | 1.00 / 0.93 | 0.99 / 1.02 | 0.99 / 0.99 | 1.01 / 1.07 |
+| Reflective ring | 0.99 / 1.01 | 0.97 / 0.97 | 1.03 / 0.97 | 1.00 / 0.97 |
+| Lantern arcade (USD) | 0.95 / 1.23 | 0.91 / 0.29 | 0.94 / 0.71 | 0.94 / 2.46 |
+| Pavilion, showcase view | 0.94 / 0.92 | 1.01 / 0.95 | 0.96 / 1.01 | 0.98 / 0.98 |
+| Shader ball (USD) | 0.67 / 0.51 | 0.67 / 0.63 | 0.69 / 0.68 | 0.83 / 0.80 |
+
+Across the 56 scene, strategy and transport cases (Veach excluded, below), the linear equal-time ratio at 64 frames was below 1 in 49 and at most 1.05 in 53; at 256 frames it was below 1 in 45 of 48 and at most 1.05 in 46 (range 0.58–1.11). The tone-mapped ratio, which is what the display shows, was below 1 in 43 of 56 at 64 frames and 34 of 48 at 256 (the ones above 1 are 1.01–1.08 in the Pavilion, Cornell glass & mirror and Reflective ring, within the seed-to-seed spread of the earlier tables, plus the Lantern arcade's spectral rows below). Z++ costs a median 2.5% more frame time (−4% to +20% over the 56 cases at 64 frames; single configurations vary with the GPU's clocks). The gain is largest where the first vertices decide the pixel (Cornell box with MIS −33 to −37% MSE at equal samples, the Shader Ball −18 to −44%) and smallest in the Pavilion's ReSTIR GI (+1 to +3% MSE: break-even at equal samples; 1.01–1.21 at equal time in the linear metric, 0.92–1.08 tone-mapped) and in the scenes dominated by specular chains, where it still does not lose beyond noise.
+
+**Caveats.** The Veach scene's linear MSE is dominated by the four lamps' own anti-aliasing, and its frame times varied between 2 and 9 ms for one configuration in both runs (the GPU's clocks at this small size), so its equal-time ratios are not given; its tone-mapped MSE fell at equal samples by 27 / 35% (MIS), 14 / 48% (ReSTIR GI), 30 / 32% (ReSTIR PT) and 25 / 8% (unified PT) at 256 frames (RGB / spectral), while its linear MSE changed by −50% at 16 frames, +20% at 64 and +25% at 256 (first run, RGB; −21% at 64 frames in the second run), which is a few lamp pixels' noise. The Lantern arcade's spectral tone-mapped MSE ratios (0.29 to 2.46 at 256 frames, up to 560 at 64) come from a handful of bright lamp pixels in an otherwise dark image and are not meaningful; its linear equal-time ratios are 0.86–0.96 in all eight cases, and its images show Z++ cleaner than PCG. The Pavilion's tone-mapped ReSTIR PT spectral ratio of 0.35 at 64 frames is one firefly. The two samplers' references agree in mean radiance within 0.26% in every case (Z++ / PCG 0.9983–1.0026; the largest differences are in the Pavilion and Lantern arcade, whose means carry fireflies) and within 0.03% in the Cornell box and Shader Ball.
+
+## Block artefacts
+
+For each case the script computes the tone-mapped luma error after 64 frames and its block statistics: the energy of the mean error of aligned s × s pixel blocks relative to independent noise (1 without block correlation), s = 2, 4, 8, and the correlation of horizontally adjacent pixels' errors. Cornell box (MIS, RGB): PCG 1.00 / 1.04 / 1.03, Z++ 1.07 / 1.10 / 1.06; adjacent correlation −0.001 and 0.014. Shader Ball (unified, RGB): PCG 1.01 / 1.04 / 1.12, Z++ 1.02 / 1.06 / 1.07; −0.00 and 0.00. In the Pavilion, the Lantern arcade and Cornell with ReSTIR GI the excess is large for both samplers (3–9 at 8 pixels) and equal for both (Pavilion MIS 1.16 / 1.62 / 3.21 against 1.17 / 1.68 / 3.42): the error there is the low-frequency structure of the image (sky, specular reflections, ReSTIR's spatial reuse), not a property of the sampler. Over all 64 cases the difference of Z++'s excess from PCG's is −0.21 to +0.07 at 2 pixels, −0.81 to +0.27 at 4 and −2.48 to +0.84 at 8 (the extremes are in the Lantern arcade's spectral cases, where Z++ is lower, and in the Pavilion's ReSTIR PT spectral case, where it is higher), so Z++ is not systematically above PCG; in the Cornell box with MIS, ReSTIR PT and unified PT it is +0.02 to +0.17, which agrees with the 2026-10-04 check of `tests/Fix_zsampler-blocks.swift` (1.03 / 1.10 / 1.24 against 1.01 / 1.05 / 1.19). Error images of the Cornell box and Lantern arcade (written by `--dump`) show fine-grained noise without square tiles.
+
+## Default
+
+**Sampler → Automatic** resolves to Z++ (`SamplerMode.resolved`). Z++ matched or beat PCG at equal time in every strategy and in both transports, except for noise-level losses (Pavilion with ReSTIR GI in RGB, up to 1.21 in the linear metric), with no block-correlated error beyond the 2026-10-04 level. `VIBE_SAMPLER=pcg|z` still selects either sampler in `-D VIBE_TESTING` builds. Moving-camera and MetalFX figures were not repeated; the October 2 results below (within about ±1%, up to −12%) still describe the temporal behaviour, which the key-layout fix changed only for still accumulations.
+
+# MIS compensation of environment sampling — November 25, 2026
+
+`MaterialLibrary.environmentImportance` builds a second, compensated environment table from max(0, L − L̄), the dilated luminance less its solid-angle mean (`KARLIK2019`, Eq. 14 with half the samples from each strategy), used by next-event estimates whose BSDF or phase continuation covers the texels it leaves at zero; sole-strategy estimates keep the original table (`ENV_COMPENSATED` in main.swift). Apple M4, 320×180, the Architectural Pavilion at the `pavilion-hdri` view, undenoised, path depth 16. Reference: 4,096 samples per pixel with the uncompensated distribution, separate from the runs scored against it. Error: mean linear and tone-mapped (x / (1 + x)) MSE of four independent 64-sample accumulations per setting (two of 256 for the synthetic sky), from a temporary switch in a copy of `scripts/measure_light_sampling.py` (not in the tree). Only the host-built table changes, so GPU time per frame is unchanged (medians agree within run-to-run spread, ±1 ms); equal samples are equal time. Mean: the runs' mean luminance over the reference's.
+
+The prototype measured applied one table to every estimate: compensated with α = 0.5 or 1 (the subtracted constant α L̄), alone (ε = 0) or mixed with a share ε = 0.1 of the original. α = 1, ε = 0 is what the tree uses, except that the last vertex and the other sole-strategy estimates now read the original table, which at depth 16 carries little light.
+
+| Scene | Strategy | Linear MSE, α = 0 | α = 0.5, ε = 0.1 | α = 1, ε = 0.1 | α = 1, ε = 0 | Tone-mapped, α = 1, ε = 0 | Mean, α = 1, ε = 0 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Art Studio | Standard MIS, RGB | 0.0162 | −25% | −31% | −28% | −29% | 1.0001 |
+| Art Studio | Standard MIS, spectral | 0.01629 | −16% | −23% | −23% | −29% | 1.0004 |
+| Art Studio | ReSTIR GI, RGB | 0.01298 | −2% | −7% | −16% | −26% | 0.9875 |
+| Art Studio | ReSTIR GI, spectral | 0.0147 | −6% | −9% | −17% | −25% | 0.9865 |
+| Art Studio | ReSTIR PT, spectral | 0.01185 | −3% | −7% | −12% | −21% | 0.9994 |
+| Studio Small 01 | Standard MIS, RGB | 0.3439 | −8% | −5% | −8% | −1% | 1.0011 |
+| Studio Small 01 | Standard MIS, spectral | 0.3276 | +7% | +12% | +6% | +0% | 1.0033 |
+| Studio Small 01 | ReSTIR GI, RGB | 0.3355 | −6% | −6% | −13% | −3% | 0.9967 |
+| Studio Small 01 | ReSTIR GI, spectral | 0.3672 | +2% | −8% | +1% | −2% | 1.0002 |
+| Studio Small 01 | ReSTIR PT, spectral | 0.3062 | +2% | −6% | +2% | −1% | 0.9953 |
+| Photo Studio Loft Hall | Standard MIS, RGB | 0.02224 | −7% | −3% | −7% | −10% | 0.9992 |
+| Photo Studio Loft Hall | Standard MIS, spectral | 0.0241 | −5% | −5% | −7% | −8% | 0.9993 |
+| Synthetic dim sky and 4° sun (below) | Standard MIS, RGB | 0.2185 | −14% | −4% | −18% | −8% | 0.9987 |
+| Synthetic sky | Light sampling only | 0.316 | +278% | +87% | −20% | −44% | 1.0035 |
+| Synthetic sky | ReSTIR GI, RGB | 0.2472 | −27% | −14% | −28% | −20% | 1.0015 |
+| Synthetic sky | ReSTIR PT (indirect), spectral | 0.2264 | +27% | +58% | −6% | −26% | 0.9997 |
+| Lantern Arcade (416 lamps) + Studio Small 01 | Standard MIS, spectral | 6.585 | −5% | −9% | +5% | not usable | 1.0005 |
+| Lantern Arcade + Studio Small 01 | ReSTIR PT (unified), spectral | 6.149 | −8% | −9% | +6% | not usable | 1.0011 |
+
+- The mean column is the α = 1, ε = 0 runs' mean over the α = 0 runs' mean (both against the same reference). Under ReSTIR GI the 64-sample runs are brighter than the 4,096-sample reference already without compensation (3–4%: its accumulation converges from above), and compensation reduces that; the synthetic sky's 512-sample runs agree within 0.4%. All other means agree within 0.5%.
+- The gain is largest for a map with a dominant bright region over a dim remainder (Art Studio's lamps, the synthetic sun): 21–29% lower tone-mapped error in every strategy. Studio Small 01, whose error is dominated by fireflies from its small bright softboxes, does not change beyond the spread (about ±10% here). The Loft Hall's ReSTIR runs were not completed (a frame timed out while another process used the GPU).
+- Synthetic sky: a 1024×512 map with a sky of luminance 0.59 over the upper hemisphere, ground 0.07 and a 4°-wide sun (82% of a horizontal floor's irradiance; the map's mean luminance is 1.51, so the compensated table leaves the whole sky to BSDF sampling). Compensation does not lose the sky light in any strategy, including light sampling alone: at every vertex with a continuation, a BSDF sample that finds the environment where the table is zero takes full weight (`emission_weight`).
+- The defensive mixture (ε = 0.1) is worse than either table alone wherever the light sample is not MIS-weighted (light sampling only: +190% tone-mapped; ReSTIR PT: +1,186% in one run): it gives the sky a tenth of its original density while BSDF hits there get no weight.
+- Lantern Arcade at night under Studio Small 01 (emitters and environment, `imported_light_probability` 0.5): the linear error changes within the spread. Its tone-mapped error is not usable (it exceeds 1, from pixels whose spectral-to-RGB value is negative), so it is not compared.
+- The prototype's single table was biased at the last vertex, which has no continuation; the tree samples the original table there (`tests/Fix_lights.swift` checks a furnace at path depth 1, where the last vertex is the only one).
+
+
+# Dilated environment sampling — November 25, 2026
+
+`MaterialLibrary.environmentImportance` builds the sampling weights from a separable 3×3 maximum of the texels' luminance (`MUTRACER2026`), because radiance is read bilinearly but the PDF is constant per texel. Only the host-built CDF changes, so the GPU time per frame is the same (the table below agrees within 0.1 ms). Apple M4, 320×180, the Architectural Pavilion lit by an environment image at the `pavilion-hdri` view, undenoised. Reference: 512 samples per pixel, the mean of a build with the dilation and one without (4,096 samples per build for the one-texel-sun Standard MIS case, below). Error: MSE of three independent 64-sample accumulations per setting against the reference, measured by a temporary switch (not in the tree) in a copy of `scripts/measure_light_sampling.py`. Equal sample count is equal time here. Fireflies: pixel channels whose tone-mapped value is off the reference by more than 0.1, over the three accumulations; at 64 samples this counts general noise as well.
+
+| Environment image | Strategy | MSE without | MSE with | Change | Fireflies without / with | Mean with / without |
+| --- | --- | --- | --- | --- | --- | --- |
+| Art Studio (Poly Haven, 4K) | ReSTIR | 0.01564 | 0.01467 | −6% | 11,996 / 11,773 | 0.9998 |
+| Art Studio | Standard MIS | 0.01615 | 0.01623 | +0% | 13,569 / 13,525 | 1.0005 |
+| Studio Small 01 | ReSTIR | 0.3806 | 0.3528 | −7% | 36,507 / 36,572 | 0.9976 |
+| Studio Small 01 | Standard MIS | 0.3637 | 0.3703 | +2% | 47,973 / 48,054 | 1.0029 |
+| Photo Studio Loft Hall | ReSTIR | 0.02245 | 0.02216 | −1% | 24,784 / 24,831 | 0.9999 |
+| Photo Studio Loft Hall | Standard MIS | 0.02422 | 0.02447 | +1% | 30,203 / 30,720 | 1.0002 |
+| Synthetic sky, Gaussian sun (σ 0.26°, peak 60,000, 2048×1024) | ReSTIR | 0.005134 | 0.005117 | −0% | 4,519 / 4,764 | 1.0003 |
+| Synthetic sky, Gaussian sun | Standard MIS | 0.003113 | 0.003028 | −3% | 335 / 332 | 1.0000 |
+| Synthetic sky, one-texel sun (60,000) | ReSTIR | 0.1658 | 0.1585 | −4% | 2,075 / 2,122 | 1.0015 |
+| Synthetic sky, one-texel sun, 4,096-spp reference per build (below) | Standard MIS | 0.4089 | 0.3531 | −14% | 2,070 / 2,012 | 1.0003 |
+
+- The three Poly Haven studio maps have no sharp sun, and the dilation does not change the error beyond the run-to-run spread (about ±7%). A sun a few texels wide gives no change either: its own texels already carry the weight.
+- Only a sun one texel wide, the case the dilation targets, changes the error, and only the linear error, modestly. A first run (512-spp reference, the mean of both builds) showed the linear MSE falling by 55% and the tone-mapped MSE rising by 1,233%; that was an artefact of the small shared reference, whose own noise dominated the small tone-mapped error. Re-measured with a separate 4,096-spp reference per build (Standard MIS, three 64-sample runs each), against each build's own reference and against the other's:
+
+  | Build | Reference | Linear MSE | Tone-mapped MSE | Outlier channels |
+  | --- | --- | --- | --- | --- |
+  | raw | raw | 0.4089 | 0.000645 | 2,070 |
+  | raw | dilated | 0.4095 | 0.000651 | 2,032 |
+  | dilated | raw | 0.3525 | 0.000644 | 2,079 |
+  | dilated | dilated | 0.3531 | 0.000650 | 2,012 |
+
+  The result does not depend on which reference is used: the dilation lowers the linear MSE by 14% (the bright outliers it spreads out) and leaves the tone-mapped MSE and the outlier count unchanged (±1%). The reference means differ by 0.03%. Under ReSTIR the one-texel-sun change is −4%, inside the spread.
+- The two builds' reference means agree within 0.3%, as the unbiased estimate requires .
+- The Poly Haven maps are local (`Examples/HDRI`, not in the repository); the synthetic maps were generated for the measurement and are not kept.
+
+# Emitter and environment light selection — November 25, 2026 (not adopted)
+
+Imported scenes with both emitter triangles and an environment or sun send half their light samples to each (`imported_light_probability`). A branch replaced the half by the emitters' estimated share of the light (`MUTRACER2026`): their flux, π × Σ area × selection weight, against the environment's flux through the scene's bounding sphere, πR² × (brightness × the luminance integral over the sphere + the sun's irradiance), clamped to [0.1, 0.9], passed in a new `Uniforms` field that every pdf of both strategies read. Apple M4, 16 GB, macOS 27; every imported README shot with emitters and a sky, plus Bistro exterior with its lamps on (emission × 1 and × 60, the twilight sky); 320×180, preview scale 1, each shot's own strategy and transport (ReSTIR PT, spectral); linear and tone-mapped (x / (1 + x)) MSE of 32 accumulated frames against a 512-frame reference at 0.5, mean of 3 sequences, times the median GPU frame time, as a ratio to 0.5 (below 1 is better). Mean radiance agreed with 0.5 within 1% everywhere (spectral fireflies), as any share in (0, 1) must.
+
+| Scene | Power estimate | 0.1 | 0.25 | 0.75 | 0.9 | At the estimate |
+| --- | --- | --- | --- | --- | --- | --- |
+| Newton Series | 0.10 | 1.27 / 1.44 | 1.06 / 1.15 | 0.95 / 0.91 | 0.96 / 0.89 | 1.26 / 1.44 |
+| Lamp Spectra | 0.10 | 4.92 / 2.82 | 2.21 / 1.62 | 0.79 / 0.72 | 2.20 / 0.61 | 11.2 / 2.78 |
+| Lantern Arcade | 0.90 | 1.16 / 0.70 | 1.27 / 1.70 | 1.01 / 0.11 | 0.98 / 0.07 | 0.96 / 3.95 |
+| Abbe Row | 0.10 | 0.96 / 8.10 | 1.00 / 29.7 | 1.01 / 1.17 | 1.03 / 1.45 | 0.95 / 65.4 |
+| San Miguel | 0.10 | 1.06 / 1.06 | 1.01 / 1.02 | 1.07 / 1.08 | 1.40 / 1.39 | 1.15 / 1.15 |
+| Bistro interior | 0.35 | 0.91 / 1.47 | 0.81 / 1.14 | 0.99 / 0.94 | 1.23 / 0.91 | 0.92 / 1.10 |
+| Bedroom | 0.56 | 0.69 / 0.68 | 0.73 / 0.75 | 1.44 / 1.39 | 1.75 / 1.62 | 1.06 / 1.05 |
+| Fireplace Room | 0.17 | 1.03 / 1.18 | 1.01 / 1.10 | 0.97 / 0.97 | 0.95 / 0.94 | 1.03 / 1.13 |
+| Living Room | 0.14 | 1.37 / 1.42 | 1.14 / 1.17 | 0.92 / 0.91 | 0.92 / 0.87 | 1.34 / 1.33 |
+| Bistro exterior, lamps × 1 | 0.10 | 1.17 / 0.89 | 1.59 / 0.98 | 1.52 / 1.20 | 2.01 / 1.49 | 0.98 / 0.89 |
+| Bistro exterior, lamps × 60 | 0.13 | 1.08 / 1.62 | 0.94 / 1.17 | 0.81 / 0.92 | 1.03 / 0.96 | 0.94 / 1.45 |
+
+Equal-time ratio to 0.5, linear / tone-mapped. The power estimate is the share the branch computed; its column repeats the run at that share.
+
+- At the estimate, tone-mapped error was higher than with the even split in 10 of 11 scenes (lower only in Bistro exterior with its lamps × 1, 0.89); linear error was higher in 6, up to 11× (Lamp Spectra), and at most 8% lower in the other 5. It points the wrong way in most rooms and studio scenes: πR² counts sky that walls and large ground planes keep from the receivers, and the sky's light is also found by BSDF sampling, while small emitters are found almost only by light samples. The best fixed share differs by scene (0.1 in the Bedroom, 0.75–0.9 in Lamp Spectra, Living Room and Newton Series, 0.25–0.5 in San Miguel) and no power ratio, with or without the scene's area, ranks them correctly; MuTracer's own units (the environment's luminance integral against luminance × π × area) would give 0.9 in the Bedroom and Bistro exterior, the two scenes where 0.9 is worst.
+- Single tone-mapped entries such as Abbe Row's 29.7 and Lantern Arcade's 0.07 against 3.95 at the same share come from a few spectral fireflies in 32 frames; the conclusion rests on the consistent rows.
+- `imported_light_probability` keeps 0.5, and the sun keeps its 0.60 share of the environment's samples (not measured). An estimate from the image itself, like `caustic_source_share`'s count of what each source has added, would need the light each strategy contributes in every shading pass and was not tried.
+- Scripts: a variant of `scripts/measure_light_sampling.py` that overrides the share (not in the repository).
+# MaterialX interpreter register file — November 25, 2026 (not adopted)
+
+The GPU MaterialX interpreter (`resolve_materialx`, and `material_cut` in the cutout traversal) keeps one `float4` per instruction in `float4 values[64]` (plus `float2 densities[64]`), indexed at run time. MuTracer allocates its graph registers by liveness from a budget of 16 (`docs/technical/material-graph-codegen.md`), so the plan (item 2.1 of the MuTracer comparison) was to do the same and shrink these arrays. Measured on the Apple M4 (16 GB), macOS 27.2.1, Swift 6.4, against `866c176`; raw reports in [`PERFORMANCE-materialx-registers-raw.txt`](PERFORMANCE-materialx-registers-raw.txt).
+
+**Slots needed.** A liveness allocation over the 337 MaterialX programs of the examples and the downloaded reference scenes (ASWF Standard Shader Ball, the Bistro exterior, nine Bitterli scenes) needs at most 15 slots, 11 or more because the surface outputs stay live to the end; reading constant outputs from their instruction instead brings it to 1–6.
+
+**Cost of smaller arrays.** `tests/benchmark.py` gained two MaterialX scenarios: *MaterialX cutout leaves over Paint.mtlx* (400 leaf quads with an image colour and an image `geometry_opacity`, over a floor of `Examples/MaterialX/Paint.mtlx`) and *ASWF Standard Shader Ball* (when `scripts/fetch_reference_scene.py` has downloaded it). Every program in them has at most 16 instructions, so `main` with the two arrays cut to 16 entries (indices masked with `& 15`) renders the same images and has the access pattern of a 16-slot register file. `VIBE_LIGHT_TRANSPORT=rgb VIBE_ACCELERATION=flat python3 tests/benchmark.py --baseline <that main.swift> --rounds 3 --frames 12 --output-tolerance 0.005`, median GPU ms per frame, 640×480 (mean radiance within 1e-5 relative on the MaterialX scenarios and the procedural scenes, 0.15% on the imported sphere):
+
+| Scenario | MetalFX | 64 entries (`main`) | 16 entries | Change |
+| --- | --- | ---: | ---: | ---: |
+| ASWF Standard Shader Ball | off | 234.03 | 400.94 | +71% |
+| ASWF Standard Shader Ball | on | 267.11 | 355.93 | +33% |
+| MaterialX cutout leaves over Paint.mtlx | off | 101.34 | 116.45 | +15% |
+| MaterialX cutout leaves over Paint.mtlx | on | 106.59 | 122.21 | +15% |
+| Default Pavilion | off | 39.60 | 47.81 | +21% |
+| Cornell box | off | 14.41 | 21.16 | +47% |
+| Imported mesh (8,130 triangles) | off | 30.02 | 41.26 | +37% |
+| Instanced scene graph | off | 72.34 | 89.34 | +24% |
+
+Every scenario got slower, including those without any MaterialX material, so the cost is not the interpreter's work: with 16 entries the compiler apparently keeps the arrays in registers, which raises the register footprint of the whole shading kernel, while the 64-entry arrays stay in stack memory, where the interpreter's few live values are cheap. Neither Xcode's GPU counters nor the Metal compiler's register statistics were collected to confirm this.
+
+**Compiler failures.** The full change (liveness slots chosen at upload, opcode and destination slot packed in `code.x`, constant outputs read from their instruction, `MATERIALX_REGISTERS` 16) also made the Metal compiler fail with an internal compiler error (`AGXMetalG16G_B0` code 3) on the mesh `shading_kernel`, RGB or spectral depending on small details, for array sizes 8, 16 and 32, with `material_cut` or `resolve_materialx` inlined or not; the masked 16-entry `main` above also fails in the spectral mesh library, which is why its timings are RGB only. `main` with 64 entries compiles.
+
+**Result:** the arrays stay at 64 entries. Earlier evidence agrees: replacing the whole interpreter with constants took 34.0 s against 34.8 s (−2%) for the Fireplace and Living Rooms ("Where a bounce's time goes", Mitsuba 3 at equal settings, November 5). Any further work on the interpreter's cost should start from a GPU counter profile of the shading kernel's register use rather than from the arrays' size.
+
 # GPU load limit — November 15, 2026
 
 **Render › Limit GPU Load** (`PathTracerRenderer.gpuLoadLimit`, 0.9 when on) leaves a tenth of the GPU's time free. `scripts/measure_gpu_load.py` on the Apple M4 (16 GB, macOS 27): a second command queue copies a 2560×1600 texture 60 times a second, a stand-in for another GPU client such as the window server, and its commit-to-completion latency is recorded while the app renders (idle: 2–5 ms median). Viewport: a simulated 60 Hz display on a 1280×800 drawable, camera still, 6 s. Export: raw 1920×1080 through `StudioController.startExport`.
@@ -319,7 +486,7 @@ With **Light transport → RGB** (and Automatic in RGB scenes) every procedural 
 
 # Z++ sampler — October 2, 2026
 
-**Update, October 4:** the key-layout fix passed its GPU block check on 2026-10-04 (`tests/Fix_zsampler-blocks.swift`, Pavilion ReSTIR GI, 16 frames: luma block-error excess at 2/4/8 px 1.03/1.10/1.24 for Z++ against 1.01/1.05/1.19 for PCG; adjacent-pixel correlation 0.0047 against 0.0039). The measurements in this section predate the key-layout fix (`REFERENCES.md` `ZPP2026`, "One key per pixel and frame"). Before the fix, still accumulations shared sample sets across aligned pixel blocks and showed square tiles. The static, moving-camera, bias and timing tables below have to be re-measured with the fixed layout; `tests/Fix_zsampler-blocks.swift` checks the absence of block-correlated error against PCG. **Sampler → Automatic** resolves to PCG until then.
+**Update, October 4:** the key-layout fix passed its GPU block check on 2026-10-04 (`tests/Fix_zsampler-blocks.swift`, Pavilion ReSTIR GI, 16 frames: luma block-error excess at 2/4/8 px 1.03/1.10/1.24 for Z++ against 1.01/1.05/1.19 for PCG; adjacent-pixel correlation 0.0047 against 0.0039). The measurements in this section predate the key-layout fix (`REFERENCES.md` `ZPP2026`, "One key per pixel and frame"). Before the fix, still accumulations shared sample sets across aligned pixel blocks and showed square tiles. The static equal-time comparison was repeated with the fixed layout on November 25, 2026 (section above); the static, moving-camera, bias and timing tables below are the October figures, and `tests/Fix_zsampler-blocks.swift` checks the absence of block-correlated error against PCG. **Sampler → Automatic** resolved to PCG until that re-measurement.
 
 The Z++ sampler (`REFERENCES.md` `ZPP2026`; `SamplerMode.zSampling`, **Sampler → Z++**) against the earlier per-pixel PCG streams (`SamplerMode.pcg`). Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `1124b00` plus this change (uncommitted at measurement; the shaders measured equal the committed ones except that the static and timing runs used the PerPixel temporal model, which renders still views statistically identically to the default ReShuffle-like model; and, before the last change, every accumulation shared one Owen scramble, which leaves error magnitudes unchanged; the bias runs below use the final shaders). Scratch drivers render through the production `renderFrame` path at 320×240 (errors) and 640×480 (times), path depth 16; other GPU work shared the machine. The unedited figures are in [`PERFORMANCE-zsampling-raw.txt`](PERFORMANCE-zsampling-raw.txt).
 
@@ -373,7 +540,7 @@ No GPU memory is added: the sampler state lives in registers, and ReSTIR PT keep
 
 ## Default
 
-`SamplerMode.automatic` resolved to Z++ until October 3, 2026 (now PCG; see the update above): it lowered static equal-sample MSE in 22 of 23 measured scene/strategy pairs (Cornell glass & mirror with ReSTIR GI: +0.3%) at 256 frames, for 0.4–4.9% more frame time, and kept moving-camera errors within about +1% (MetalFX −12% to +1%). `VIBE_SAMPLER=pcg|z` and `VIBE_Z_TEMPORAL=perpixel|tz|stz|reshuffle` select the variants in `-D VIBE_TESTING` builds.
+`SamplerMode.automatic` resolved to Z++ until October 3, 2026, to PCG until November 25, 2026, and to Z++ again since the re-measurement above: it lowered static equal-sample MSE in 22 of 23 measured scene/strategy pairs (Cornell glass & mirror with ReSTIR GI: +0.3%) at 256 frames, for 0.4–4.9% more frame time, and kept moving-camera errors within about +1% (MetalFX −12% to +1%). `VIBE_SAMPLER=pcg|z` and `VIBE_Z_TEMPORAL=perpixel|tz|stz|reshuffle` select the variants in `-D VIBE_TESTING` builds.
 
 # Spatio-temporal control variates (ReSTCV) — September 29, 2026
 

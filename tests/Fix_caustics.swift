@@ -138,7 +138,11 @@
       r.medium = medium
       r.lightTransport = transport
       r.caustics = .off
-      let reference = render(view(aperture: aperture, sun: name.contains("sun")), samples: 8192)
+      // Both renders run in `batches` independent batches (render's `batches`), batch k of each starting the same fresh
+      // sample sequence, so the traced batch shares its samples with the reference batch, as a single render did.
+      let batches = 32
+      let reference = render(view(aperture: aperture, sun: name.contains("sun")), samples: 8192, batches: batches)
+      let referenceBatches = lastBatches
       // The floor: pixels whose primary hit is the floor plane (y = 0), and its middle under the mirror or slab (chosen by
       // position, not by brightness, which would favour pixels where the reference's noise runs high).
       let floorPixels = reference.indices.filter { lastPositions[$0].w > 0 && abs(lastPositions[$0].y) < 1e-3 }
@@ -149,21 +153,23 @@
       r.caustics = mode
       require(r.activeCaustics && r.activePhotons == mode.photons && r.activeSamplingMode == 1,
         "\(label): caustic light paths are active with Standard MIS")
-      let traced = render(view(aperture: aperture, sun: name.contains("sun")), samples: 512)
+      let traced = render(view(aperture: aperture, sun: name.contains("sun")), samples: 512, batches: batches)
+      let tracedBatches = lastBatches
       require(r.activeMediaPhotons == (mode.photons && r.hasMedia), "\(label): photons are gathered in media")
       func mean(_ image: [SIMD4<Float>], _ pixels: [Int]) -> Float { pixels.reduce(0) { $0 + luminance(image[$1]) } / Float(pixels.count) }
-      // Standard error of a region's mean from the pixels' noise, estimated by differences with the right-hand
-      // neighbour (half their mean square), which the smooth floor lighting barely affects.
-      func standardError(_ image: [SIMD4<Float>], _ pixels: [Int]) -> Float {
-        let inside = Set(pixels)
-        let d = pixels.filter { $0 % w + 1 < w && inside.contains($0 + 1) }.map { luminance(image[$0]) - luminance(image[$0 + 1]) }
-        return (d.reduce(0) { $0 + $1 * $1 } / Float(max(1, 2 * d.count)) / Float(pixels.count)).squareRoot()
+      // Standard error of the difference of a region's means, from the spread of the batches' paired differences.
+      // Independent batches make no assumption about how a pixel's noise correlates with its neighbours', which a
+      // low-discrepancy sampler (Z++, ZPP2026) makes complementary by design.
+      func standardError(_ pixels: [Int]) -> Float {
+        let d = (0..<batches).map { mean(tracedBatches[$0], pixels) - mean(referenceBatches[$0], pixels) }
+        let m = d.reduce(0, +) / Float(batches)
+        return (d.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Float(batches - 1) / Float(batches)).squareRoot()
       }
-      // Both estimators are unbiased: their means agree within four combined standard errors.
+      // Both estimators are unbiased: their means agree within 4.5 standard errors (Student's t with 31 degrees of
+      // freedom; as rare as 4 normal standard errors).
       func agreement(_ pixels: [Int]) -> (ratio: Float, sigmas: Float) {
         let a = mean(traced, pixels), b = mean(reference, pixels)
-        let error = (pow(standardError(traced, pixels), 2) + pow(standardError(reference, pixels), 2)).squareRoot()
-        return (a / b, abs(a - b) / max(error, 1e-12))
+        return (a / b, abs(a - b) / max(standardError(pixels), 1e-12))
       }
       savePreview([reference, traced], width: w, height: hgt, name: "caustics-\(name.replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: ",", with: ""))-\(transport == .rgb ? "rgb" : "spectral").png")
       // The immersed floor is seen only through the glass; in haze, volume photons light every pixel.
@@ -171,7 +177,7 @@
         let whole = agreement(floorPixels), caustic = agreement(middle)
         print("caustics \(label): \(floorPixels.count) floor pixels (\(middle.count) in the middle), light-traced / path-traced mean "
           + "\(whole.ratio) (\(whole.sigmas) sigma), middle \(caustic.ratio) (\(caustic.sigmas) sigma)")
-        require(floorPixels.count > 600 && middle.count > 150 && mean(reference, floorPixels) > 0.001 && whole.sigmas < 4 && caustic.sigmas < 4
+        require(floorPixels.count > 600 && middle.count > 150 && mean(reference, floorPixels) > 0.001 && whole.sigmas < 4.5 && caustic.sigmas < 4.5
             && abs(whole.ratio - 1) < 0.1 && abs(caustic.ratio - 1) < 0.15,
           "\(label): caustic light tracing matches path tracing on a caustic-lit floor (\(whole), \(caustic))")
       }
@@ -187,26 +193,23 @@
       let through = throughAll.filter { !shared.contains($0) }
       if medium != nil {
         let all = reference.indices.filter { !shared.contains($0) }, whole = agreement(all)
-        let a = mean(traced, all), b = mean(reference, all)
-        let error = (pow(standardError(traced, all), 2) + pow(standardError(reference, all), 2)).squareRoot()
+        let a = mean(traced, all), b = mean(reference, all), error = standardError(all)
         print("caustics \(label): whole image, photons / path-traced mean \(whole.ratio) (\(whole.sigmas) sigma)")
-        require(abs(a - b) < 4 * error + 0.03 * b, "\(label): volume photons match path tracing over the image (\(whole))")
+        require(abs(a - b) < 4.5 * error + 0.03 * b, "\(label): volume photons match path tracing over the image (\(whole))")
       }
       if mode.photons {
         // The floor seen through the slab: photon gathering is consistent, not unbiased, so its radius may add a few
         // per cent on top of the noise.
         let seen = agreement(through)
-        let a = mean(traced, through), b = mean(reference, through)
-        let error = (pow(standardError(traced, through), 2) + pow(standardError(reference, through), 2)).squareRoot()
+        let a = mean(traced, through), b = mean(reference, through), error = standardError(through)
         print("caustics \(label): \(through.count) pixels see the floor through the slab, photons / path-traced mean \(seen.ratio) (\(seen.sigmas) sigma)")
-        require(through.count > 300 && abs(a - b) < 4 * error + 0.03 * b,
+        require(through.count > 300 && abs(a - b) < 4.5 * error + 0.03 * b,
           "\(label): photons gathered through glass match path tracing (\(seen))")
         // The back wall, lit by the floor's caustic after a diffuse bounce: photons gathered at a later receiver.
         let bounced = agreement(wall)
-        let c = mean(traced, wall), d = mean(reference, wall)
-        let wallError = (pow(standardError(traced, wall), 2) + pow(standardError(reference, wall), 2)).squareRoot()
+        let c = mean(traced, wall), d = mean(reference, wall), wallError = standardError(wall)
         print("caustics \(label): \(wall.count) back-wall pixels, photons / path-traced mean \(bounced.ratio) (\(bounced.sigmas) sigma)")
-        require(wall.count > 60 && abs(c - d) < 4 * wallError + 0.03 * d,
+        require(wall.count > 60 && abs(c - d) < 4.5 * wallError + 0.03 * d,
           "\(label): photons gathered after a diffuse bounce match path tracing (\(bounced))")
       }
     }

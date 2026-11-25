@@ -99,6 +99,7 @@ var lastPositions = [SIMD4<Float>]()
 var lastSamples = [SIMD4<Float>]()
 var lastMotion = [SIMD4<Float>]()
 var lastGIWeights = [SIMD4<Float>]()
+var lastBatches = [[SIMD4<Float>]]()
 var lastResets = [Bool]()
 var lastDenoiseMilliseconds = 0.0
 // GPU command-buffer time of every frame render() traced (tests/benchmark.py reads it).
@@ -179,8 +180,15 @@ var renderOutputs = [SIMD2<Int>: MTLTexture]()
 // Renders `samples` frames of a view through PathTracerRenderer.renderFrame, starting
 // from a reset accumulation and the first jitter/seed of the sequence, and reads back
 // the raw accumulation (returned), display, G-buffer, samples, GI reservoirs and motion.
-@MainActor func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool = false) -> [SIMD4<Float>] {
+// `batches` > 1 splits the accumulation into that many equal batches, each starting a fresh sample sequence
+// (restartSampleSequence at batch << 20, so a low-discrepancy sampler randomizes each batch independently) while the
+// accumulation, and with it the photon radius schedule, continues; each batch's own mean image goes to `lastBatches`.
+@MainActor func render(_ input: Uniforms, samples: Int, denoise: Bool = false, orbit: Bool = false, batches: Int = 1) -> [SIMD4<Float>] {
     let r = testRenderer
+    require(batches >= 1 && samples % batches == 0, "render: \(samples) samples split into \(batches) equal batches")
+    let perBatch = samples / batches
+    var previous: [SIMD4<Float>] = []
+    lastBatches = []
     let camera = (r.yaw, r.pitch, r.distance, r.target, r.fov)
     let modes = (r.samplingMode, r.enableSMS, r.skyMode, r.enableFog, r.viewportMode)
     let savedOptions = r.options, savedFrameUpdate = r.onFrameUpdate, savedError = r.onError
@@ -214,6 +222,7 @@ var renderOutputs = [SIMD2<Int>: MTLTexture]()
             let offset = eye - r.target
             r.distance = simd_length(offset); r.pitch = asin(offset.y / r.distance); r.yaw = atan2(offset.x, -offset.z)
         }
+        if batches > 1 && frame > 1 && (frame - 1) % perBatch == 0 { r.restartSampleSequence(at: UInt32((frame - 1) / perBatch) << 20) }
         let target = completed + 1, submitted = r.frameIndex, generation = r.interactionGeneration
         r.renderFrame(output: output)
         require(r.frameIndex == submitted + 1, "\(label): renderFrame did not submit a frame")
@@ -229,6 +238,14 @@ var renderOutputs = [SIMD2<Int>: MTLTexture]()
             + (r.interactionGeneration != generation ? " (accumulation was reset while the frame was in flight)" : ""))
         lastDenoiseMilliseconds = r.gpuMilliseconds
         frameMilliseconds.append(r.gpuMilliseconds)
+        if batches > 1 && frame % perBatch == 0 {
+            // The accumulation is a running mean: a batch's mean is the difference of the sums it ends and starts with.
+            let current = readTexture(r.accumTexture!), before = Float(frame - perBatch)
+            lastBatches.append(current.indices.map { i in
+                (Float(frame) * current[i] - (previous.isEmpty ? .zero : before * previous[i])) / Float(perBatch)
+            })
+            previous = current
+        }
     }
     require(simd_length(SIMD3(r.lastUniforms!.cameraPos.x, r.lastUniforms!.cameraPos.y, r.lastUniforms!.cameraPos.z) - eye)
         < 1e-4 * max(1, r.distance), "production camera reproduces the test view")
