@@ -205,7 +205,7 @@ values become `Spectrum`. The exception is dispersion, below.
   an Apache-2.0 §4(b) modification like the energy-table substitution, and measures the
   difference. Vendored files stay unmodified.
 - **Base / diffuse (EON, local Lambert fast path):** ρ_base(λ) from moments. The Lambert fast
-  path is ρ(λ)/π.
+  path is ρ(λ)/π; it also shades MaterialX materials in OpenPBR's Lambert limit (`material_lambert`).
 - **Metal (F82-tint):** F0(λ) = ρ_base(λ) and the F82 tint is ρ_specular(λ), per wavelength, with
   the same formula. Measured complex-IOR spectra (n(λ), k(λ)) are optional later presets.
 - **Dielectric specular / transmission:** `specular_ior` is scalar. Fresnel is evaluated per

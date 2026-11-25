@@ -351,6 +351,15 @@ struct Material {
 bool material_transmits(Material m) {
     return m.transmission > 0.0f || (m.usesMaterialX && m.transmissionTint.w > 0.0f && m.subsurface.w > 0.0f);
 }
+// A MaterialX material in the Lambert limit of OpenPBR: the smooth base diffuse lobe alone at full
+// base_weight (specular_weight 0 and no metal, coat, fuzz, transmission, thin-walled subsurface,
+// diffuse roughness or emission), whose BSDF is base_color / pi. Mitsuba's `diffuse` imports like
+// this. resolve_material gives it the DIFFUSE type, which is evaluated and sampled directly
+// instead of preparing the layered BSDF.
+bool material_lambert(Material m) {
+    return m.type == OPENPBR && m.usesMaterialX && m.specularWeight <= 0.0f && m.baseWeight >= 1.0f && m.metalness <= 0.0f
+        && m.coat <= 0.0f && m.fuzz <= 0.0f && m.diffuseRoughness <= 0.0f && !material_transmits(m) && !any(m.emission > 0.0f);
+}
 
 struct HitRecord {
     float t;
@@ -2280,8 +2289,7 @@ float3 tangent_space_normal(thread const HitRecord &hit, float3 m) {
 // REFERENCES.md: MATERIALX. Bounded, topologically sorted graph expressions.
 // `footprint` is the hit's texture footprint in its base UV coordinates; graph densities track how
 // each register's coordinates scale with them (1 at texcoord).
-void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, TextureFootprint footprint) {
-    GraphHeader h=images.graphHeaders[hit.mat.slot]; if(h.info.y==0) return;
+void resolve_materialx_graph(thread HitRecord &hit, Ray ray, constant MaterialResources &images, TextureFootprint footprint, GraphHeader h) {
     // A cutout slot reads its images at mip 0, like its coverage (material_cut): a coarser mip would
     // average in the colours of cut-out texels (often white or black in foliage maps), which the
     // surviving texels would then reflect. Diffuse bounces widen the cone to whole-leaf footprints.
@@ -2352,6 +2360,10 @@ void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResource
         }
     }
 }
+void resolve_materialx(thread HitRecord &hit, Ray ray, constant MaterialResources &images, TextureFootprint footprint) {
+    GraphHeader h=images.graphHeaders[hit.mat.slot];
+    if(h.info.y!=0) resolve_materialx_graph(hit, ray, images, footprint, h);
+}
 void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
                       constant SurfaceSettings *settings, constant MaterialResources &images, float footprint) {
     hit.mat.inside = !hit.front_face;
@@ -2377,7 +2389,11 @@ void resolve_material(thread HitRecord &hit, Ray ray, constant Uniforms &u,
         hit.mat.transmission = config.detail.z;
     }
     if(images.graphHeaders[slot].info.y>0) {
-        resolve_materialx(hit,ray,images,surface_footprint(hit, ray, footprint));return;
+        resolve_materialx(hit,ray,images,surface_footprint(hit, ray, footprint));
+        // Promoted here, after the graph's evaluation: the same test inside resolve_materialx made the Metal
+        // backend compiler fail on the mesh shading_kernel ("Internal compiler error", AGX, macOS 27, 2026-11-15).
+        if (material_lambert(hit.mat)) hit.mat.type = DIFFUSE;
+        return;
     }
     if (config.mapMask == 0) return;
     TextureFootprint fp = surface_footprint(hit, ray, footprint);
@@ -2565,6 +2581,21 @@ PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavele
     if (!p.flat) p.b = prepare_openpbr_lanes(mat, n, wo, float3(rho.w), float3(lambda.w), sm, float3(tau.w), float3(sigma.w));
     return p;
 }
+OpenPBR_PreparedBsdf prepare_bsdf_a(Material mat, float3 n, float3 wo, thread const Wavelengths &wl) {
+    SpectralMaterial sm = spectral_material(mat, wl);
+    float3 albedo = clamp(mat.albedo, 0.0f, 1.0f);
+    Spectrum rho = spectral_albedo(mat, albedo, wl);
+    Spectrum tau = spectral_transmission(mat, wl);
+    Spectrum sigma = spectral_subsurface(mat, wl);
+    if (wl.heroOnly && spectral_dispersive(mat, wl)) {
+        uint hero = spectral_hero(wl);
+        return prepare_openpbr_lanes(mat, n, wo, float3(rho[hero]), float3(spectral_lambda(wl, hero)), sm, float3(tau[hero]),
+                                     float3(sigma[hero]));
+    }
+    float4 lambda = sm.thinFilmWeight > 0.0f || sm.dispersion > 0.0f ? spectral_lambdas(wl)
+        : float4(OpenPBR_BaseRgbWavelengths_nm, OpenPBR_BaseRgbWavelengths_nm.x);
+    return prepare_openpbr_lanes(mat, n, wo, rho.xyz, lambda.xyz, sm, tau.xyz, sigma.xyz);
+}
 Spectrum prepared_lanes(thread const PreparedBsdf &p, float3 a, float b) {
     return p.hero < 4u ? select(Spectrum(0.0f), Spectrum(a.x), uint4(0u, 1u, 2u, 3u) == p.hero) : Spectrum(a, b);
 }
@@ -2574,6 +2605,7 @@ Spectrum prepared_eval(thread const PreparedBsdf &p, float3 wi) {
     return prepared_lanes(p, a, p.flat || p.hero < 4u ? a.x : openpbr_get_sum_of_diffuse_specular(openpbr_eval(p.b, wi)).x);
 }
 float prepared_pdf(thread const PreparedBsdf &p, float3 wi) { return openpbr_pdf(p.a, wi); }
+float prepared_pdf_a(thread const OpenPBR_PreparedBsdf &a, float3 wi) { return openpbr_pdf(a, wi); }
 // Direction and PDF of `a`; weight = f |cos| / pdf for every lane.
 void prepared_sample(thread const PreparedBsdf &p, float3 random, thread float3 &direction, thread Spectrum &weight,
                      thread float &pdf) {
@@ -2588,8 +2620,10 @@ void prepared_sample(thread const PreparedBsdf &p, float3 random, thread float3 
 #else
 typedef OpenPBR_PreparedBsdf PreparedBsdf;
 PreparedBsdf prepare_bsdf(Material mat, float3 n, float3 wo, thread const Wavelengths &) { return prepare_openpbr(mat, n, wo); }
+OpenPBR_PreparedBsdf prepare_bsdf_a(Material mat, float3 n, float3 wo, thread const Wavelengths &) { return prepare_openpbr(mat, n, wo); }
 Spectrum prepared_eval(thread const PreparedBsdf &p, float3 wi) { return openpbr_get_sum_of_diffuse_specular(openpbr_eval(p, wi)); }
 float prepared_pdf(thread const PreparedBsdf &p, float3 wi) { return openpbr_pdf(p, wi); }
+float prepared_pdf_a(thread const OpenPBR_PreparedBsdf &p, float3 wi) { return openpbr_pdf(p, wi); }
 void prepared_sample(thread const PreparedBsdf &p, float3 random, thread float3 &direction, thread Spectrum &weight,
                      thread float &pdf) {
     OpenPBR_DiffuseSpecular result;
@@ -2626,8 +2660,8 @@ Spectrum eval_bsdf(Material mat, float3 n, float3 wo, float3 wi, thread const Wa
 float eval_bsdf_pdf(Material mat, float3 n, float3 wo, float3 wi, thread const Wavelengths &wl) {
     if (dot(n, wo) <= 0.0f) return 0.0f;
     if (mat.type == DIFFUSE) return max(0.0f, dot(n, wi)) / PI;
-    PreparedBsdf prepared = prepare_bsdf(mat, n, wo, wl);
-    return prepared_pdf(prepared, wi);
+    OpenPBR_PreparedBsdf prepared = prepare_bsdf_a(mat, n, wo, wl);
+    return prepared_pdf_a(prepared, wi);
 }
 
 // Direct lighting needs both values; prepare the layered BSDF only once.
@@ -10296,7 +10330,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                            temporalReuse candidateTemporal: TemporalReuse? = nil,
                            spatialNeighbors candidateSpatial: SpatialNeighborSelection? = nil) -> String? {
         let usesReSTIR = activeSamplingMode == 0 && viewportMode == 0
-        let usesMetalFX = denoiserEnabled && supportsMetalFX && usesReSTIR
+        let usesMetalFX = denoiserEnabled && supportsMetalFX && activeSamplingMode <= 1 && viewportMode == 0
         let indirectMode = candidateIndirect ?? indirectReuse
         let activeIndirect = resolvedIndirectReuse(indirectMode)
         let splatting = resolvedTemporalReuse(candidateTemporal ?? temporalReuse, indirectReuse: indirectMode) == .splatting
@@ -10678,7 +10712,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         let group = MTLSize(width: 8, height: 8, depth: 1)
         var display = accumulation
         lastPresentationUsedMetalFX = false
-        if denoiserEnabled && supportsMetalFX && uniforms.samplingMode == 0 && viewportMode == 0 {
+        if denoiserEnabled && supportsMetalFX && uniforms.samplingMode <= 1 && viewportMode == 0 {
             if metalFX?.output.width != accumulation.width || metalFX?.output.height != accumulation.height {
                 do {
                     metalFX = try MetalFXDenoiser(device: device, width: accumulation.width, height: accumulation.height)
@@ -10846,7 +10880,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // accumulation restarts (the view changes, and the first frames measure) and while MetalFX
     // runs, whose temporal history takes one jittered sample per frame (encodePresentation).
     func samplesPerFrame(targetMilliseconds: Double, limit: Int) -> Int {
-        let metalFX = denoiserEnabled && supportsMetalFX && activeSamplingMode == 0 && viewportMode == 0
+        let metalFX = denoiserEnabled && supportsMetalFX && activeSamplingMode <= 1 && viewportMode == 0
         guard frameIndex >= 4, gpuMillisecondsPerSample > 0, !metalFX else { return 1 }
         return max(1, min(Int(targetMilliseconds / gpuMillisecondsPerSample), limit, 64))
     }

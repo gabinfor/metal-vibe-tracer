@@ -223,8 +223,12 @@
     "temporal reuse resumes on the following frame")
   renderer.samplingMode = 1
   frame()
+  require(renderer.accumTexture === beautyAccum && renderer.resPosDirA?.width == 1 && (!renderer.supportsMetalFX || renderer.metalFX != nil),
+    "switching to Standard MIS swaps reservoirs only and keeps MetalFX")
+  renderer.samplingMode = 2
+  frame()
   require(renderer.accumTexture === beautyAccum && renderer.resPosDirA?.width == 1 && renderer.metalFX == nil,
-    "switching strategy swaps reservoirs only and releases MetalFX")
+    "switching to Light Only swaps reservoirs only and releases MetalFX")
   renderer.samplingMode = 0
   print("PASS: inspection/strategy changes reallocate only reservoirs, MetalFX released and fully budgeted")
 

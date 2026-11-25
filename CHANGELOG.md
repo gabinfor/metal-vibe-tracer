@@ -4,6 +4,11 @@ Metal Vibe Tracer is in early development: releases are validated builds, not st
 
 ## Unreleased
 
+### Rendering & Performance
+
+- **MetalFX preview in Standard MIS:** **MetalFX preview** now denoises **Standard MIS** renders (including scenes with caustics or participating media) in addition to **ReSTIR Direct + Indirect**.
+- **MaterialX & BSDF register/preparation trim:** `resolve_materialx` skips its 64-entry graph stack when a material has no graph, and `eval_bsdf_pdf` prepares only the primary spectral BSDF lane (`OpenPBR_PreparedBsdf`) needed for PDF evaluation.
+
 ### Interface
 
 - **Tabs replace the page popup and the Settings page:** the inspector's **Inspector page** popup is now a tab bar under the scene row with six always-visible tabs, **Render**, **Camera**, **Lighting**, **Materials** (was Materials & Textures), **Objects** and **Export** (was Project & Export), switched with ⌘1 to ⌘6 or the **View** menu. The scene row and the tab bar stay at the top while a long tab scrolls, a new tab starts at its top, and a narrow inspector shows an icon per tab. The Settings page, **Settings…** and ⌘, are gone: their controls are on the Render tab.
@@ -24,6 +29,10 @@ Metal Vibe Tracer is in early development: releases are validated builds, not st
 - **Resizable inspector and remembered window:** drag the inspector's left edge to resize it from 280 to 520 pt (380 pt by default, remembered), and the main window reopens at the size and position it had at quit.
 - **Removed:** the **Inspector page** popup, the Settings page with **‹ Back to Inspector**, **Settings…** and ⌘,; the toolbar's **Open…**, **Save** and **Settings…**; the Project & Export tab's project buttons (**New project**, **Open project…**, **Save project**, **Save project as…**); the Render page's Display section; the paragraphs under inspector controls.
 - **Behaviour changes:** **Reset Transform** keeps an object's **Visible** state (it used to show a hidden object). The **Field of view, °** reset returns to the scene's own default (38° Pavilion, 40° Veach MIS Benchmark, 42° the others, or an imported scene's camera) instead of 38°. A scene opened from the scene browser shows its catalog title in the scene row until the project is saved or replaced, instead of "Untitled".
+
+### Rendering
+
+- **Matte imported materials skip the layered BSDF:** a MaterialX material whose only lobe is the smooth base diffuse one at full weight (`specular_weight` 0, `base_weight` 1, and no metalness, coat, fuzz, transmission, thin-walled subsurface, diffuse roughness or emission), which is how Mitsuba's `diffuse` imports, now shades with the renderer's Lambert fast path (base colour / π) instead of preparing the full OpenPBR BSDF. The image is unchanged: the OpenPBR BSDF has the same value and PDF there, which `tests/Fix_lambert-limit.swift` checks.
 
 ## 0.4.0 — 2026-11-13
 

@@ -477,8 +477,8 @@ if metalFXAvailable {
     print("Cornell 32-frame MetalFX/raw energy: surfaces \(cornellRatio), visible emitters \(metalFXEnergyRatio(lastDisplay, cornell32, cornellEmitters))")
     require(abs(cornellRatio - 1) < 0.08, "MetalFX preserves diffuse Cornell radiance within 8%")
 }
-let bypass = render(makeUniforms(scene: 0, mode: 1, width: 47, height: 31), samples: 2, denoise: true)
-require(bypass == lastDisplay, "non-ReSTIR denoiser bypass")
+let bypass = render(makeUniforms(scene: 0, mode: 2, width: 47, height: 31), samples: 2, denoise: true)
+require(bypass == lastDisplay, "Light-only denoiser bypass")
 _ = render(makeUniforms(scene: 0, mode: 0, width: 64, height: 48), samples: 2, denoise: true)
 print("PASS: raw invariance, non-ReSTIR bypass, and resize")
 
