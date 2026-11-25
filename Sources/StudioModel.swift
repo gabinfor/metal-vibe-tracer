@@ -1294,6 +1294,9 @@ extension MaterialLibrary {
     return true
   }
 
+  // The environment's sampling tables: a 2 × H texture whose columns are the marginal row CDFs and a W × 2H
+  // texture whose rows are the conditional column CDFs, the compensated table first (ENV_COMPENSATED and
+  // ENV_ORIGINAL in the shader).
   func environmentImportance(_ pixels: UnsafeBufferPointer<Float>, width: Int, height: Int) throws -> (MTLTexture, MTLTexture) {
     guard pixels.count == width * height * 4, width > 0, height > 0 else {
       throw Self.error("Invalid environment sampling dimensions.")
@@ -1315,49 +1318,73 @@ extension MaterialLibrary {
                                    luminance[base + (x + 1) % width])
       }
     }
-    var rowWeights = Array(repeating: Float(0), count: height)
-    var columnWeights = Array(repeating: Float(0), count: width * height)
+    // MIS compensation (KARLIK2019, Eq. 14 with half the samples from each strategy): the compensated table
+    // samples max(0, L − mean L), the mean over solid angle, and leaves the texels below the mean to BSDF
+    // sampling. The original table samples L. Both use the dilated luminance times sin θ.
+    var meanSum = 0.0, angleSum = 0.0
+    for y in 0..<height {
+      let sinTheta = Double(max(1e-4, sin((.pi * (Float(y) + 0.5)) / Float(height))))
+      var row = 0.0
+      for x in 0..<width { row += Double(luminance[y * width + x]) }
+      meanSum += row * sinTheta
+      angleSum += sinTheta * Double(width)
+    }
+    let mean = Float(meanSum / angleSum)
+    var rowWeights = Array(repeating: Float(0), count: 2 * height)
+    var columnWeights = Array(repeating: Float(0), count: 2 * width * height)
+    var compensatedTotal: Float = 0
     for y in 0..<height {
       let theta = (.pi * (Float(y) + 0.5)) / Float(height)
       let sinTheta = max(1e-4, sin(theta))
       let above = max(0, y - 1) * width, here = y * width, below = min(height - 1, y + 1) * width
       for x in 0..<width {
         let dilated = max(horizontal[above + x], horizontal[here + x], horizontal[below + x])
-        let weight = dilated * sinTheta
-        rowWeights[y] += weight
-        columnWeights[here + x] = weight
+        let compensated = max(0, dilated - mean) * sinTheta, original = dilated * sinTheta
+        rowWeights[2 * y] += compensated
+        rowWeights[2 * y + 1] += original
+        columnWeights[here + x] = compensated
+        columnWeights[width * height + here + x] = original
+        compensatedTotal += compensated
       }
     }
-    // Convert weights to CDFs in place; no second full-size CPU copy.
-    func cdf(_ weights: inout [Float], count: Int, rows: Int) {
+    // A map without texels above its mean (a uniform one) samples its luminance in both tables.
+    if !(compensatedTotal > 0) {
+      for y in 0..<height { rowWeights[2 * y] = rowWeights[2 * y + 1] }
+      for i in 0..<width * height { columnWeights[i] = columnWeights[width * height + i] }
+    }
+    // Convert weights to CDFs in place; no second full-size CPU copy. A table's row whose weights are all
+    // zero has zero probability in its marginal CDF and is never searched.
+    func cdf(_ weights: inout [Float], count: Int, rows: Int, stride: Int, step: Int) {
       for row in 0..<rows {
-        let start = row * count
-        let total = max(1e-12, weights[start..<start + count].reduce(0, +))
+        let start = row * stride
+        var total: Float = 0
+        for index in 0..<count { total += weights[start + index * step] }
+        total = max(1e-12, total)
         var sum: Float = 0
         for index in 0..<count {
-          sum += weights[start + index] / total
-          weights[start + index] = index == count - 1 ? 1 : sum
+          sum += weights[start + index * step] / total
+          weights[start + index * step] = index == count - 1 ? 1 : sum
         }
       }
     }
-    cdf(&rowWeights, count: height, rows: 1)
-    cdf(&columnWeights, count: width, rows: height)
+    cdf(&rowWeights, count: height, rows: 2, stride: 1, step: 2)
+    cdf(&columnWeights, count: width, rows: 2 * height, stride: width, step: 1)
     let rows = rowWeights, columns = columnWeights
     let rowDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-      pixelFormat: .r32Float, width: 1, height: height, mipmapped: false)
+      pixelFormat: .r32Float, width: 2, height: height, mipmapped: false)
     rowDescriptor.storageMode = .shared
     rowDescriptor.usage = .shaderRead
     let columnDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-      pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+      pixelFormat: .r32Float, width: width, height: 2 * height, mipmapped: false)
     columnDescriptor.storageMode = .shared
     columnDescriptor.usage = .shaderRead
     guard let rowTexture = device.makeTexture(descriptor: rowDescriptor),
       let columnTexture = device.makeTexture(descriptor: columnDescriptor) else {
       throw Self.error("Could not allocate environment sampling data.")
     }
-    rowTexture.replace(region: MTLRegionMake2D(0, 0, 1, height), mipmapLevel: 0,
-      withBytes: rows, bytesPerRow: MemoryLayout<Float>.stride)
-    columnTexture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
+    rowTexture.replace(region: MTLRegionMake2D(0, 0, 2, height), mipmapLevel: 0,
+      withBytes: rows, bytesPerRow: 2 * MemoryLayout<Float>.stride)
+    columnTexture.replace(region: MTLRegionMake2D(0, 0, width, 2 * height), mipmapLevel: 0,
       withBytes: columns, bytesPerRow: width * MemoryLayout<Float>.stride)
     return (rowTexture, columnTexture)
   }
@@ -1379,8 +1406,8 @@ extension MaterialLibrary {
     else { throw Self.error("Could not decode the environment image (maximum 16384×8192).") }
     let w = Int(image.extent.width)
     let h = Int(image.extent.height)
-    // RGBA32F image and R32F column CDF per pixel, plus an R32F row CDF.
-    let required = UInt64(w) * UInt64(h) * 20 + UInt64(h) * 4
+    // RGBA32F image and two R32F column CDFs per pixel, plus two R32F row CDFs.
+    let required = UInt64(w) * UInt64(h) * 24 + UInt64(h) * 8
     guard residentBytes + required <= textureBudget
     else { throw Self.error("Environment image exceeds the safe GPU memory budget.") }
     var pixels = Array(repeating: Float(0), count: w * h * 4)

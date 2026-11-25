@@ -1,3 +1,38 @@
+# MIS compensation of environment sampling — November 25, 2026
+
+`MaterialLibrary.environmentImportance` builds a second, compensated environment table from max(0, L − L̄), the dilated luminance less its solid-angle mean (`KARLIK2019`, Eq. 14 with half the samples from each strategy), used by next-event estimates whose BSDF or phase continuation covers the texels it leaves at zero; sole-strategy estimates keep the original table (`ENV_COMPENSATED` in main.swift). Apple M4, 320×180, the Architectural Pavilion at the `pavilion-hdri` view, undenoised, path depth 16. Reference: 4,096 samples per pixel with the uncompensated distribution, separate from the runs scored against it. Error: mean linear and tone-mapped (x / (1 + x)) MSE of four independent 64-sample accumulations per setting (two of 256 for the synthetic sky), from a temporary switch in a copy of `scripts/measure_light_sampling.py` (not in the tree). Only the host-built table changes, so GPU time per frame is unchanged (medians agree within run-to-run spread, ±1 ms); equal samples are equal time. Mean: the runs' mean luminance over the reference's.
+
+The prototype measured applied one table to every estimate: compensated with α = 0.5 or 1 (the subtracted constant α L̄), alone (ε = 0) or mixed with a share ε = 0.1 of the original. α = 1, ε = 0 is what the tree uses, except that the last vertex and the other sole-strategy estimates now read the original table, which at depth 16 carries little light.
+
+| Scene | Strategy | Linear MSE, α = 0 | α = 0.5, ε = 0.1 | α = 1, ε = 0.1 | α = 1, ε = 0 | Tone-mapped, α = 1, ε = 0 | Mean, α = 1, ε = 0 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Art Studio | Standard MIS, RGB | 0.0162 | −25% | −31% | −28% | −29% | 1.0001 |
+| Art Studio | Standard MIS, spectral | 0.01629 | −16% | −23% | −23% | −29% | 1.0004 |
+| Art Studio | ReSTIR GI, RGB | 0.01298 | −2% | −7% | −16% | −26% | 0.9875 |
+| Art Studio | ReSTIR GI, spectral | 0.0147 | −6% | −9% | −17% | −25% | 0.9865 |
+| Art Studio | ReSTIR PT, spectral | 0.01185 | −3% | −7% | −12% | −21% | 0.9994 |
+| Studio Small 01 | Standard MIS, RGB | 0.3439 | −8% | −5% | −8% | −1% | 1.0011 |
+| Studio Small 01 | Standard MIS, spectral | 0.3276 | +7% | +12% | +6% | +0% | 1.0033 |
+| Studio Small 01 | ReSTIR GI, RGB | 0.3355 | −6% | −6% | −13% | −3% | 0.9967 |
+| Studio Small 01 | ReSTIR GI, spectral | 0.3672 | +2% | −8% | +1% | −2% | 1.0002 |
+| Studio Small 01 | ReSTIR PT, spectral | 0.3062 | +2% | −6% | +2% | −1% | 0.9953 |
+| Photo Studio Loft Hall | Standard MIS, RGB | 0.02224 | −7% | −3% | −7% | −10% | 0.9992 |
+| Photo Studio Loft Hall | Standard MIS, spectral | 0.0241 | −5% | −5% | −7% | −8% | 0.9993 |
+| Synthetic dim sky and 4° sun (below) | Standard MIS, RGB | 0.2185 | −14% | −4% | −18% | −8% | 0.9987 |
+| Synthetic sky | Light sampling only | 0.316 | +278% | +87% | −20% | −44% | 1.0035 |
+| Synthetic sky | ReSTIR GI, RGB | 0.2472 | −27% | −14% | −28% | −20% | 1.0015 |
+| Synthetic sky | ReSTIR PT (indirect), spectral | 0.2264 | +27% | +58% | −6% | −26% | 0.9997 |
+| Lantern Arcade (416 lamps) + Studio Small 01 | Standard MIS, spectral | 6.585 | −5% | −9% | +5% | not usable | 1.0005 |
+| Lantern Arcade + Studio Small 01 | ReSTIR PT (unified), spectral | 6.149 | −8% | −9% | +6% | not usable | 1.0011 |
+
+- The mean column is the α = 1, ε = 0 runs' mean over the α = 0 runs' mean (both against the same reference). Under ReSTIR GI the 64-sample runs are brighter than the 4,096-sample reference already without compensation (3–4%: its accumulation converges from above), and compensation reduces that; the synthetic sky's 512-sample runs agree within 0.4%. All other means agree within 0.5%.
+- The gain is largest for a map with a dominant bright region over a dim remainder (Art Studio's lamps, the synthetic sun): 21–29% lower tone-mapped error in every strategy. Studio Small 01, whose error is dominated by fireflies from its small bright softboxes, does not change beyond the spread (about ±10% here). The Loft Hall's ReSTIR runs were not completed (a frame timed out while another process used the GPU).
+- Synthetic sky: a 1024×512 map with a sky of luminance 0.59 over the upper hemisphere, ground 0.07 and a 4°-wide sun (82% of a horizontal floor's irradiance; the map's mean luminance is 1.51, so the compensated table leaves the whole sky to BSDF sampling). Compensation does not lose the sky light in any strategy, including light sampling alone: at every vertex with a continuation, a BSDF sample that finds the environment where the table is zero takes full weight (`emission_weight`).
+- The defensive mixture (ε = 0.1) is worse than either table alone wherever the light sample is not MIS-weighted (light sampling only: +190% tone-mapped; ReSTIR PT: +1,186% in one run): it gives the sky a tenth of its original density while BSDF hits there get no weight.
+- Lantern Arcade at night under Studio Small 01 (emitters and environment, `imported_light_probability` 0.5): the linear error changes within the spread. Its tone-mapped error is not usable (it exceeds 1, from pixels whose spectral-to-RGB value is negative), so it is not compared.
+- The prototype's single table was biased at the last vertex, which has no continuation; the tree samples the original table there (`tests/Fix_lights.swift` checks a furnace at path depth 1, where the last vertex is the only one).
+
+
 # Dilated environment sampling — November 25, 2026
 
 `MaterialLibrary.environmentImportance` builds the sampling weights from a separable 3×3 maximum of the texels' luminance (`MUTRACER2026`), because radiance is read bilinearly but the PDF is constant per texel. Only the host-built CDF changes, so the GPU time per frame is the same (the table below agrees within 0.1 ms). Apple M4, 320×180, the Architectural Pavilion lit by an environment image at the `pavilion-hdri` view, undenoised. Reference: 512 samples per pixel, the mean of a build with the dilation and one without (4,096 samples per build for the one-texel-sun Standard MIS case, below). Error: MSE of three independent 64-sample accumulations per setting against the reference, measured by a temporary switch (not in the tree) in a copy of `scripts/measure_light_sampling.py`. Equal sample count is equal time here. Fireflies: pixel channels whose tone-mapped value is off the reference by more than 0.1, over the three accumulations; at 64 samples this counts general noise as well.

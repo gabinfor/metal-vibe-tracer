@@ -4,25 +4,33 @@
   let folder = testOutputDirectory.appendingPathComponent("lights", isDirectory: true)
   try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
   let kernels = """
-  kernel void fix_lights_environment(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
-      device float4 *out [[buffer(3)]], device atomic_uint *hist [[buffer(4)]], uint tid [[thread_position_in_grid]]) {
+  void fix_lights_environment_table(constant Uniforms &u, constant MaterialResources &images,
+      device float4 *out, device atomic_uint *hist, uint tid, uint table) {
       uint seed = pcg_hash(tid * 7919u + 13u);
       uint width = images.environmentMap.get_width(), height = images.environmentMap.get_height();
       float3 p = float3(0), n = float3(0, 1, 0);
       float mismatches = 0, normalization = 0, invalid = 0;
       for (uint i = 0; i < 256; ++i) {
-          LightSample ls = sample_direct_light(p, n, u, seed, images);
+          LightSample ls = sample_direct_light(p, n, u, seed, images, table);
           if (!(ls.pdf > 0.0f) || ls.isDirectional != 1) { invalid += 1; continue; }
           float theta = acos(clamp(ls.wi.y, -1.0f, 1.0f));
           float2 uv = float2(fract(atan2(ls.wi.z, ls.wi.x) / TWO_PI + 0.5f + u.environment.y / TWO_PI), theta / PI);
           uint x = min(width - 1, uint(uv.x * float(width))), y = min(height - 1, uint(uv.y * float(height)));
           atomic_fetch_add_explicit(&hist[y * width + x], 1u, memory_order_relaxed);
-          if (abs(eval_environment_pdf(ls.wi, n, u, images) - ls.pdf) > 1e-3f * ls.pdf) mismatches += 1;
+          if (abs(eval_environment_pdf(ls.wi, n, u, images, table) - ls.pdf) > 1e-3f * ls.pdf) mismatches += 1;
           float2 r = rand_f2(seed);
           float z = 1.0f - 2.0f * r.x, s = sqrt(max(0.0f, 1.0f - z * z));
-          normalization += eval_environment_pdf(float3(s * cos(TWO_PI * r.y), z, s * sin(TWO_PI * r.y)), n, u, images) * 4.0f * PI;
+          normalization += eval_environment_pdf(float3(s * cos(TWO_PI * r.y), z, s * sin(TWO_PI * r.y)), n, u, images, table) * 4.0f * PI;
       }
       out[tid] = float4(mismatches, normalization / 256.0f, invalid, 0);
+  }
+  kernel void fix_lights_environment(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+      device float4 *out [[buffer(3)]], device atomic_uint *hist [[buffer(4)]], uint tid [[thread_position_in_grid]]) {
+      fix_lights_environment_table(u, images, out, hist, tid, ENV_COMPENSATED);
+  }
+  kernel void fix_lights_environment_original(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
+      device float4 *out [[buffer(3)]], device atomic_uint *hist [[buffer(4)]], uint tid [[thread_position_in_grid]]) {
+      fix_lights_environment_table(u, images, out, hist, tid, ENV_ORIGINAL);
   }
   kernel void fix_lights_sun(constant Uniforms &u [[buffer(0)]], constant MaterialResources &images [[buffer(2)]],
       device float4 *out [[buffer(3)]], device atomic_uint *hist [[buffer(4)]], uint tid [[thread_position_in_grid]]) {
@@ -202,7 +210,8 @@
   try controller.restore(environmentDocument)
   let stored = readTexture(testRenderer.materials.environmentTexture)
   require(stored.count == width * height, "HDRI fixture dimensions")
-  // Expected weights: the luminance's separable 3x3 maximum (wrapping in x, clamped in y) times sin(theta).
+  // Expected weights: the luminance's separable 3x3 maximum (wrapping in x, clamped in y) times sin(theta) for the
+  // original table; for the compensated table (KARLIK2019) the maximum less the luminance's solid-angle mean, floored at 0.
   var luminance = [Double]()
   for p in stored { luminance.append(max(1e-6, 0.2126 * Double(p.x) + 0.7152 * Double(p.y) + 0.0722 * Double(p.z))) }
   var horizontal = luminance
@@ -210,56 +219,77 @@
     horizontal[y * width + x] = max(luminance[y * width + x], luminance[y * width + (x + width - 1) % width],
       luminance[y * width + (x + 1) % width])
   }}
-  var weights = [Double]()
+  var meanSum = 0.0, angleSum = 0.0
+  for y in 0..<height {
+    let sinTheta = max(1e-4, sin(Double.pi * (Double(y) + 0.5) / Double(height)))
+    for x in 0..<width { meanSum += luminance[y * width + x] * sinTheta; angleSum += sinTheta }
+  }
+  var originalWeights = [Double](), compensatedWeights = [Double]()
   for y in 0..<height { for x in 0..<width {
     let dilated = max(horizontal[max(0, y - 1) * width + x], horizontal[y * width + x], horizontal[min(height - 1, y + 1) * width + x])
-    weights.append(dilated * max(1e-4, sin(Double.pi * (Double(y) + 0.5) / Double(height))))
+    let sinTheta = max(1e-4, sin(Double.pi * (Double(y) + 0.5) / Double(height)))
+    originalWeights.append(dilated * sinTheta)
+    compensatedWeights.append(max(0, dilated - meanSum / angleSum) * sinTheta)
   }}
-  let weightSum = weights.reduce(0, +)
+  let compensatedZeros = compensatedWeights.filter { $0 == 0 }.count
+  require(compensatedZeros > width && compensatedZeros < width * (height - 1),
+    "the compensated HDRI table leaves part of the fixture to BSDF sampling")
   var environmentView = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
   environmentView.environment = SIMD4(1, 0, 1, 0)
   environmentView.sunParams.w = 0
-  let (environmentResults, histogram) = try dispatch("fix_lights_environment", environmentView, threads: 4096, bins: width * height)
-  let samples = Double(histogram.reduce(0) { $0 + UInt64($1) })
-  var chiSquare = 0.0, rowError = 0.0
-  for i in 0..<(width * height) {
-    let expected = samples * weights[i] / weightSum
-    chiSquare += pow(Double(histogram[i]) - expected, 2) / expected
+  for (kernel, weights) in [("fix_lights_environment", compensatedWeights), ("fix_lights_environment_original", originalWeights)] {
+    let weightSum = weights.reduce(0, +)
+    let (environmentResults, histogram) = try dispatch(kernel, environmentView, threads: 4096, bins: width * height)
+    let samples = Double(histogram.reduce(0) { $0 + UInt64($1) })
+    var chiSquare = 0.0, rowError = 0.0, outside = 0
+    for i in 0..<(width * height) {
+      let expected = samples * weights[i] / weightSum
+      if expected == 0 { outside += Int(histogram[i]); continue }
+      chiSquare += pow(Double(histogram[i]) - expected, 2) / expected
+    }
+    for y in 0..<height {
+      let expected = (0..<width).reduce(0.0) { $0 + samples * weights[y * width + $1] / weightSum }
+      let observedRow = Double((0..<width).reduce(0) { $0 + histogram[y * width + $1] })
+      if expected > 0 { rowError = max(rowError, abs(observedRow - expected) / (5 * expected.squareRoot() + 0.02 * expected)) }
+    }
+    let dof = Double(weights.filter { $0 > 0 }.count - 1)
+    let mismatches = Double(environmentResults.reduce(0) { $0 + $1.x })
+    let normalization = Double(environmentResults.reduce(0) { $0 + $1.y }) / Double(environmentResults.count)
+    let invalid = environmentResults.reduce(0) { $0 + $1.z }
+    print("HDRI importance (\(kernel)): samples \(samples), chi-square \(chiSquare) / \(dof) dof, row score \(rowError), samples in zero cells \(outside), PDF mismatches \(mismatches), normalization \(normalization), invalid \(invalid)")
+    // `invalid` checks each sample's own PDF; re-binning its direction can move a sample on a cell edge into a
+    // zero neighbour, so a few in a million are tolerated there.
+    require(samples == 4096 * 256 && invalid == 0 && Double(outside) < 1e-5 * samples, "every HDRI proposal has a positive PDF")
+    require(chiSquare < dof + 6 * (2 * dof).squareRoot() && rowError < 1, "HDRI samples follow their table's cells")
+    require(mismatches < 1e-3 * samples, "HDRI sampled and evaluated PDFs agree")
+    require(abs(normalization - 1) < 0.02, "HDRI mixture PDF integrates to one")
   }
-  for y in 0..<height {
-    let expected = (0..<width).reduce(0.0) { $0 + samples * weights[y * width + $1] / weightSum }
-    let observedRow = Double((0..<width).reduce(0) { $0 + histogram[y * width + $1] })
-    rowError = max(rowError, abs(observedRow - expected) / (5 * expected.squareRoot() + 0.02 * expected))
-  }
-  let dof = Double(width * height - 1)
-  let mismatches = Double(environmentResults.reduce(0) { $0 + $1.x })
-  let normalization = Double(environmentResults.reduce(0) { $0 + $1.y }) / Double(environmentResults.count)
-  let invalid = environmentResults.reduce(0) { $0 + $1.z }
-  print("HDRI importance: samples \(samples), chi-square \(chiSquare) / \(dof) dof, row score \(rowError), PDF mismatches \(mismatches), normalization \(normalization), invalid \(invalid)")
-  require(samples == 4096 * 256 && invalid == 0, "every HDRI proposal has a positive PDF")
-  require(chiSquare < dof + 6 * (2 * dof).squareRoot() && rowError < 1, "HDRI samples follow dilated luminance x sin(theta) cells")
-  require(mismatches < 1e-3 * samples, "HDRI sampled and evaluated PDFs agree")
-  require(abs(normalization - 1) < 0.02, "HDRI mixture PDF integrates to one")
 
   // HDRI furnace: Light, BSDF, MIS and ReSTIR agree; a white map returns the albedo.
   testRenderer.materials.settings[1].enabled = 0
   var furnace = view(makeUniforms(scene: 6, mode: 3, width: 64, height: 48), eye: SIMD3(0, 0.6, -2.2), target: SIMD3(0, -1, 0.4))
   furnace.environment = SIMD4(1, 0, 1, 0)
   furnace.sunParams.w = 0
+  // The non-uniform map's lower rows are below its mean, so the compensated table leaves them to BSDF sampling;
+  // at path depth 1 (direct light only) every strategy's last vertex samples the original table instead.
   for (name, map) in [("non-uniform", hdri), ("white", white)] {
     try testRenderer.materials.setEnvironment(map)
-    var ratios = [Float]()
-    for mode in [UInt32(3), 2, 1, 0] {
-      furnace.samplingMode = mode
-      ratios.append(floorRatio(render(furnace, samples: 64)))
+    for depth in [Float(16), 1] {
+      furnace.cameraTarget.w = depth
+      var ratios = [Float]()
+      for mode in [UInt32(3), 2, 1, 0] {
+        furnace.samplingMode = mode
+        ratios.append(floorRatio(render(furnace, samples: 64)))
+      }
+      print("HDRI furnace \(name), depth \(Int(depth)) (BSDF, Light, MIS, ReSTIR): \(ratios)")
+      for (i, ratio) in ratios.enumerated().dropFirst() {
+        require(abs(ratio - ratios[0]) < (i == 3 ? 0.05 : 0.03) * ratios[0], "HDRI \(name) furnace strategy \(i) at depth \(Int(depth)) matches BSDF sampling")
+      }
+      if name == "white" && depth > 1 { require(ratios.allSatisfy { abs($0 - 1) < 0.03 }, "white HDRI furnace returns the albedo") }
     }
-    print("HDRI furnace \(name) (BSDF, Light, MIS, ReSTIR): \(ratios)")
-    for (i, ratio) in ratios.enumerated().dropFirst() {
-      require(abs(ratio - ratios[0]) < (i == 3 ? 0.05 : 0.03) * ratios[0], "HDRI \(name) furnace strategy \(i) matches BSDF sampling")
-    }
-    if name == "white" { require(ratios.allSatisfy { abs($0 - 1) < 0.03 }, "white HDRI furnace returns the albedo") }
   }
-  print("PASS: HDRI row/column sampling (chi-square), sampled/evaluated PDFs, normalization and four-strategy furnace")
+  furnace.cameraTarget.w = 16
+  print("PASS: HDRI row/column sampling of both tables (chi-square), sampled/evaluated PDFs, normalization and four-strategy furnace at depths 16 and 1")
 
   // R-07 / R-119: imported distant lights light the scene independently of the
   // environment, for rotated/oblique suns on Y-up and Z-up stages.
