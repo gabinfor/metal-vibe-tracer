@@ -1,3 +1,55 @@
+# Z++ sampler re-measured at equal time — November 25, 2026
+
+The October 2 Z++ figures (see "Z++ sampler — October 2, 2026" below) predate the 2026-10-04 key-layout fix, and **Sampler → Automatic** resolved to PCG until Z++ was measured again. `scripts/measure_sampler.py` (an extension of `scripts/measure_light_sampling.py`; unlike the October scratch drivers it is in the repository) repeats the measurement through the production `renderFrame` path: Apple M4 (10-core GPU, 16 GB), macOS 27, source `866c176` plus the script, 320×180, path depth 16, MetalFX and OIDN off, one sample per pixel per frame. For every scene, strategy (Standard MIS, ReSTIR GI, ReSTIR PT, unified ReSTIR PT) and transport (RGB, spectral) it renders a reference of 512 frames per sampler (PCG and Z++ averaged; Shader Ball 256), then 2 independent accumulations of 256 frames per sampler (Shader Ball 3 of 64), alternating the two, and reports the MSE at 16, 64 and 256 frames, the median GPU frame time and the equal-time ratio (Z++ MSE × time) / (PCG MSE × time), below 1 where Z++ wins. Reference noise adds the same amount to both MSEs and pulls the ratios toward 1; other GPU work was serialized with a lock. The unedited report is [`PERFORMANCE-sampler-raw.txt`](PERFORMANCE-sampler-raw.txt). The scenes are the Pavilion (default view and the HDRI showcase view, here with the default sky), Cornell box, Cornell glass & mirror, Veach MIS benchmark, Reflective ring and two imported USD scenes (the ASWF Shader Ball and the Lantern arcade); the downloadable archive scenes were not installed.
+
+Linear MSE change at equal sample count, Z++ against PCG at 256 frames (Shader Ball 64), RGB / spectral:
+
+| Scene | MIS | ReSTIR GI | ReSTIR PT | Unified PT |
+| --- | ---: | ---: | ---: | ---: |
+| Cornell box | -33% / -37% | -9% / -12% | -10% / -10% | -9% / -14% |
+| Pavilion | -20% / -7% | +1% / +3% | -12% / -6% | -12% / -10% |
+| Cornell glass & mirror | -13% / -13% | -11% / -13% | -15% / -16% | -16% / -14% |
+| Reflective ring | -9% / -15% | -7% / -12% | -11% / -19% | -4% / -5% |
+| Lantern arcade (USD) | -11% / -14% | -13% / -12% | -5% / -15% | -11% / -9% |
+| Pavilion, showcase view | -27% / -26% | -13% / -15% | -26% / -18% | -20% / -31% |
+| Shader ball (USD) | -35% / -44% | -36% / -41% | -36% / -36% | -18% / -22% |
+
+Linear MSE equal-time ratio at the same frame counts, RGB / spectral:
+
+| Scene | MIS | ReSTIR GI | ReSTIR PT | Unified PT |
+| --- | ---: | ---: | ---: | ---: |
+| Cornell box | 0.69 / 0.61 | 0.99 / 1.06 | 0.91 / 0.93 | 0.92 / 0.91 |
+| Pavilion | 0.81 / 0.97 | 1.11 / 1.05 | 0.89 / 0.96 | 0.89 / 0.91 |
+| Cornell glass & mirror | 0.90 / 0.83 | 0.93 / 0.90 | 0.89 / 0.87 | 0.93 / 0.93 |
+| Reflective ring | 0.97 / 0.91 | 0.96 / 0.91 | 0.97 / 0.87 | 0.98 / 0.96 |
+| Lantern arcade (USD) | 0.90 / 0.87 | 0.88 / 0.89 | 0.96 / 0.86 | 0.88 / 0.90 |
+| Pavilion, showcase view | 0.75 / 0.76 | 0.94 / 0.88 | 0.76 / 0.84 | 0.81 / 0.71 |
+| Shader ball (USD) | 0.66 / 0.58 | 0.66 / 0.61 | 0.66 / 0.65 | 0.84 / 0.79 |
+
+Tone-mapped (x / (1 + x)) MSE equal-time ratio, RGB / spectral:
+
+| Scene | MIS | ReSTIR GI | ReSTIR PT | Unified PT |
+| --- | ---: | ---: | ---: | ---: |
+| Cornell box | 0.55 / 0.52 | 0.86 / 0.97 | 0.75 / 0.82 | 0.75 / 0.77 |
+| Pavilion | 0.91 / 0.96 | 1.08 / 0.98 | 0.99 / 1.02 | 0.97 / 1.01 |
+| Cornell glass & mirror | 1.00 / 0.93 | 0.99 / 1.02 | 0.99 / 0.99 | 1.01 / 1.07 |
+| Reflective ring | 0.99 / 1.01 | 0.97 / 0.97 | 1.03 / 0.97 | 1.00 / 0.97 |
+| Lantern arcade (USD) | 0.95 / 1.23 | 0.91 / 0.29 | 0.94 / 0.71 | 0.94 / 2.46 |
+| Pavilion, showcase view | 0.94 / 0.92 | 1.01 / 0.95 | 0.96 / 1.01 | 0.98 / 0.98 |
+| Shader ball (USD) | 0.67 / 0.51 | 0.67 / 0.63 | 0.69 / 0.68 | 0.83 / 0.80 |
+
+Across the 56 scene, strategy and transport cases (Veach excluded, below), the linear equal-time ratio at 64 frames was below 1 in 49 and at most 1.05 in 53; at 256 frames it was below 1 in 45 of 48 and at most 1.05 in 46 (range 0.58–1.11). The tone-mapped ratio, which is what the display shows, was below 1 in 43 of 56 at 64 frames and 34 of 48 at 256 (the ones above 1 are 1.01–1.08 in the Pavilion, Cornell glass & mirror and Reflective ring, within the seed-to-seed spread of the earlier tables, plus the Lantern arcade's spectral rows below). Z++ costs a median 2.5% more frame time (−4% to +20% over the 56 cases at 64 frames; single configurations vary with the GPU's clocks). The gain is largest where the first vertices decide the pixel (Cornell box with MIS −33 to −37% MSE at equal samples, the Shader Ball −18 to −44%) and smallest in the Pavilion's ReSTIR GI (+1 to +3% MSE: break-even at equal samples; 1.01–1.21 at equal time in the linear metric, 0.92–1.08 tone-mapped) and in the scenes dominated by specular chains, where it still does not lose beyond noise.
+
+**Caveats.** The Veach scene's linear MSE is dominated by the four lamps' own anti-aliasing, and its frame times varied between 2 and 9 ms for one configuration in both runs (the GPU's clocks at this small size), so its equal-time ratios are not given; its tone-mapped MSE fell at equal samples by 27 / 35% (MIS), 14 / 48% (ReSTIR GI), 30 / 32% (ReSTIR PT) and 25 / 8% (unified PT) at 256 frames (RGB / spectral), while its linear MSE changed by −50% at 16 frames, +20% at 64 and +25% at 256 (first run, RGB; −21% at 64 frames in the second run), which is a few lamp pixels' noise. The Lantern arcade's spectral tone-mapped MSE ratios (0.29 to 2.46 at 256 frames, up to 560 at 64) come from a handful of bright lamp pixels in an otherwise dark image and are not meaningful; its linear equal-time ratios are 0.86–0.96 in all eight cases, and its images show Z++ cleaner than PCG. The Pavilion's tone-mapped ReSTIR PT spectral ratio of 0.35 at 64 frames is one firefly. The two samplers' references agree in mean radiance within 0.26% in every case (Z++ / PCG 0.9983–1.0026; the largest differences are in the Pavilion and Lantern arcade, whose means carry fireflies) and within 0.03% in the Cornell box and Shader Ball.
+
+## Block artefacts
+
+For each case the script computes the tone-mapped luma error after 64 frames and its block statistics: the energy of the mean error of aligned s × s pixel blocks relative to independent noise (1 without block correlation), s = 2, 4, 8, and the correlation of horizontally adjacent pixels' errors. Cornell box (MIS, RGB): PCG 1.00 / 1.04 / 1.03, Z++ 1.07 / 1.10 / 1.06; adjacent correlation −0.001 and 0.014. Shader Ball (unified, RGB): PCG 1.01 / 1.04 / 1.12, Z++ 1.02 / 1.06 / 1.07; −0.00 and 0.00. In the Pavilion, the Lantern arcade and Cornell with ReSTIR GI the excess is large for both samplers (3–9 at 8 pixels) and equal for both (Pavilion MIS 1.16 / 1.62 / 3.21 against 1.17 / 1.68 / 3.42): the error there is the low-frequency structure of the image (sky, specular reflections, ReSTIR's spatial reuse), not a property of the sampler. Over all 64 cases the difference of Z++'s excess from PCG's is −0.21 to +0.07 at 2 pixels, −0.81 to +0.27 at 4 and −2.48 to +0.84 at 8 (the extremes are in the Lantern arcade's spectral cases, where Z++ is lower, and in the Pavilion's ReSTIR PT spectral case, where it is higher), so Z++ is not systematically above PCG; in the Cornell box with MIS, ReSTIR PT and unified PT it is +0.02 to +0.17, which agrees with the 2026-10-04 check of `tests/Fix_zsampler-blocks.swift` (1.03 / 1.10 / 1.24 against 1.01 / 1.05 / 1.19). Error images of the Cornell box and Lantern arcade (written by `--dump`) show fine-grained noise without square tiles.
+
+## Default
+
+**Sampler → Automatic** resolves to Z++ (`SamplerMode.resolved`). Z++ matched or beat PCG at equal time in every strategy and in both transports, except for noise-level losses (Pavilion with ReSTIR GI in RGB, up to 1.21 in the linear metric), with no block-correlated error beyond the 2026-10-04 level. `VIBE_SAMPLER=pcg|z` still selects either sampler in `-D VIBE_TESTING` builds. Moving-camera and MetalFX figures were not repeated; the October 2 results below (within about ±1%, up to −12%) still describe the temporal behaviour, which the key-layout fix changed only for still accumulations.
+
 # GPU load limit — November 15, 2026
 
 **Render › Limit GPU Load** (`PathTracerRenderer.gpuLoadLimit`, 0.9 when on) leaves a tenth of the GPU's time free. `scripts/measure_gpu_load.py` on the Apple M4 (16 GB, macOS 27): a second command queue copies a 2560×1600 texture 60 times a second, a stand-in for another GPU client such as the window server, and its commit-to-completion latency is recorded while the app renders (idle: 2–5 ms median). Viewport: a simulated 60 Hz display on a 1280×800 drawable, camera still, 6 s. Export: raw 1920×1080 through `StudioController.startExport`.
@@ -319,7 +371,7 @@ With **Light transport → RGB** (and Automatic in RGB scenes) every procedural 
 
 # Z++ sampler — October 2, 2026
 
-**Update, October 4:** the key-layout fix passed its GPU block check on 2026-10-04 (`tests/Fix_zsampler-blocks.swift`, Pavilion ReSTIR GI, 16 frames: luma block-error excess at 2/4/8 px 1.03/1.10/1.24 for Z++ against 1.01/1.05/1.19 for PCG; adjacent-pixel correlation 0.0047 against 0.0039). The measurements in this section predate the key-layout fix (`REFERENCES.md` `ZPP2026`, "One key per pixel and frame"). Before the fix, still accumulations shared sample sets across aligned pixel blocks and showed square tiles. The static, moving-camera, bias and timing tables below have to be re-measured with the fixed layout; `tests/Fix_zsampler-blocks.swift` checks the absence of block-correlated error against PCG. **Sampler → Automatic** resolves to PCG until then.
+**Update, October 4:** the key-layout fix passed its GPU block check on 2026-10-04 (`tests/Fix_zsampler-blocks.swift`, Pavilion ReSTIR GI, 16 frames: luma block-error excess at 2/4/8 px 1.03/1.10/1.24 for Z++ against 1.01/1.05/1.19 for PCG; adjacent-pixel correlation 0.0047 against 0.0039). The measurements in this section predate the key-layout fix (`REFERENCES.md` `ZPP2026`, "One key per pixel and frame"). Before the fix, still accumulations shared sample sets across aligned pixel blocks and showed square tiles. The static equal-time comparison was repeated with the fixed layout on November 25, 2026 (section above); the static, moving-camera, bias and timing tables below are the October figures, and `tests/Fix_zsampler-blocks.swift` checks the absence of block-correlated error against PCG. **Sampler → Automatic** resolved to PCG until that re-measurement.
 
 The Z++ sampler (`REFERENCES.md` `ZPP2026`; `SamplerMode.zSampling`, **Sampler → Z++**) against the earlier per-pixel PCG streams (`SamplerMode.pcg`). Setup: Apple M4 (10-core GPU, 16 GB), macOS 27.0, source `1124b00` plus this change (uncommitted at measurement; the shaders measured equal the committed ones except that the static and timing runs used the PerPixel temporal model, which renders still views statistically identically to the default ReShuffle-like model; and, before the last change, every accumulation shared one Owen scramble, which leaves error magnitudes unchanged; the bias runs below use the final shaders). Scratch drivers render through the production `renderFrame` path at 320×240 (errors) and 640×480 (times), path depth 16; other GPU work shared the machine. The unedited figures are in [`PERFORMANCE-zsampling-raw.txt`](PERFORMANCE-zsampling-raw.txt).
 
@@ -373,7 +425,7 @@ No GPU memory is added: the sampler state lives in registers, and ReSTIR PT keep
 
 ## Default
 
-`SamplerMode.automatic` resolved to Z++ until October 3, 2026 (now PCG; see the update above): it lowered static equal-sample MSE in 22 of 23 measured scene/strategy pairs (Cornell glass & mirror with ReSTIR GI: +0.3%) at 256 frames, for 0.4–4.9% more frame time, and kept moving-camera errors within about +1% (MetalFX −12% to +1%). `VIBE_SAMPLER=pcg|z` and `VIBE_Z_TEMPORAL=perpixel|tz|stz|reshuffle` select the variants in `-D VIBE_TESTING` builds.
+`SamplerMode.automatic` resolved to Z++ until October 3, 2026, to PCG until November 25, 2026, and to Z++ again since the re-measurement above: it lowered static equal-sample MSE in 22 of 23 measured scene/strategy pairs (Cornell glass & mirror with ReSTIR GI: +0.3%) at 256 frames, for 0.4–4.9% more frame time, and kept moving-camera errors within about +1% (MetalFX −12% to +1%). `VIBE_SAMPLER=pcg|z` and `VIBE_Z_TEMPORAL=perpixel|tz|stz|reshuffle` select the variants in `-D VIBE_TESTING` builds.
 
 # Spatio-temporal control variates (ReSTCV) — September 29, 2026
 
