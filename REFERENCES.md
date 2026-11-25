@@ -353,6 +353,18 @@ Trevor Hedstrom, Markus Kettunen, Daqi Lin, Chris Wyman, and Tzu-Mao Li. **ReSTI
 
 **Relationship:** motivates caustic light tracing (docs/CAUSTICS_DESIGN.md §2): its caustics come from light tracing ("light tracing techniques (t ≤ 1), which are often most efficient for sampling effects such as caustics"), reused through per-pixel caustic reservoirs. This renderer implements only the unreused light tracing of those paths, with a fixed split instead of MIS; the bidirectional shift mappings, reservoirs and 8.2 GB of 1080p state are not implemented. Its stated limits (specular-diffuse-specular paths; offline efficiency) shaped the design's phase 2.
 
+### ZHENG2024COROUTINES — GPU coroutines for splitting rendering kernels (related work, not implemented)
+
+Shaokun Zheng, Xin Chen, Zhong Shi, Ling-Qi Yan, and Kun Xu. **GPU Coroutines for Flexible Splitting and Scheduling of Rendering Tasks.** *ACM Transactions on Graphics* 43(6), Article 281, 24 pages, 2024 (SIGGRAPH Asia 2024). [Author PDF](https://xukun85.github.io/pub/2024/GPUCoroutines.pdf) (full text read 2026-11-20). [DOI: 10.1145/3687766](https://doi.org/10.1145/3687766).
+
+**Relationship:** a compiler pass in the LuisaCompute DSL turns a megakernel into coroutines at marked suspension points and runs them under wavefront or persistent-threads schedulers, evaluated on CUDA and DirectX only. For path tracing it suspends before intersection, on a miss, before light sampling and before material evaluation, and attributes its speed-up over LuisaRender's megakernel to lower register pressure and divergence once surface evaluation runs in its own kernel; LuisaRender's hand-written wavefront stays faster. `docs/KERNEL_SPLIT_DESIGN.md` uses these split points as the candidate design for `restir_pt_initial_kernel`; no code or compiler pass is used.
+
+### LUISARENDER2022 — LuisaRender (related work, not implemented)
+
+Shaokun Zheng, Zhiqian Zhou, Xin Chen, Difei Yan, Chuyan Zhang, Yuefeng Geng, Yan Gu, and Kun Xu. **LuisaRender: A High-Performance Rendering Framework with Layered and Unified Interfaces on Stream Architectures.** *ACM Transactions on Graphics* 41(6), Article 232, 19 pages, 2022 (SIGGRAPH Asia 2022). [Author PDF](https://xukun85.github.io/pub/2022LuisaRender/LuisaRender_SIGA2022.pdf) (full text read 2026-11-20). [DOI: 10.1145/3550454.3555463](https://doi.org/10.1145/3550454.3555463).
+
+**Relationship:** background for `docs/KERNEL_SPLIT_DESIGN.md`. Its Sec. 8.3 measures a wavefront path tracer at twice its megakernel's speed on an M1 Max GPU ("more sensitive to thread divergence") but small or negative gains on an RTX 3080 Ti, de-virtualized material calls at up to 39% less rendering time, and automatic command scheduling at up to 19%. Its 4–16x speed-up over Mitsuba 3 is measured on NVIDIA GPUs against other renderers and does not transfer to this renderer. Adopting the framework is outside the renderer direction in `AGENTS.md`.
+
 ### CONTY2018 — Many-light sampling with a light BVH
 
 Alejandro Conty Estevez and Christopher Kulla. **Importance Sampling of Many Lights with Adaptive Tree Splitting.** *Proceedings of the ACM on Computer Graphics and Interactive Techniques* 1(2), article 25 (HPG 2018). [DOI: 10.1145/3233305](https://doi.org/10.1145/3233305); [authors' PDF](https://fpsunflower.github.io/ckulla/data/many-lights-hpg2018.pdf) (checked 2026-11-04). Implemented as formulated in `PBRT2023` [§12.6.3, BVH Light Sampling](https://pbr-book.org/4ed/Light_Sources/Light_Sampling) (`BVHLightSampler`, `LightBounds`, `CompactLightBounds::Importance`, `EvaluateCost`).

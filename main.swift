@@ -9449,6 +9449,67 @@ final class MaterialLibrary {
     }
 }
 
+#if VIBE_TESTING
+// GPU timestamps at the start and end of each compute encoder that PathTracerRenderer.encodeSample
+// creates (Metal counter sampling at stage boundaries), summed per encoder label. One frame may be in
+// flight: collect() resolves the samples of the frames encoded since the last call.
+@MainActor final class PassTimer {
+    let buffer: MTLCounterSampleBuffer
+    private var encoders: [MTLComputeCommandEncoder] = []
+    private(set) var nanoseconds: [String: Double] = [:]
+    // A CPU/GPU timestamp pair: GPU ticks are converted to nanoseconds by the CPU clock's rate since then.
+    private let device: MTLDevice
+    private var calibration: (cpu: MTLTimestamp, gpu: MTLTimestamp)
+
+    init?(device: MTLDevice, capacity: Int = 512) {
+        guard device.supportsCounterSampling(.atStageBoundary),
+              let set = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else { return nil }
+        let descriptor = MTLCounterSampleBufferDescriptor()
+        descriptor.counterSet = set
+        descriptor.sampleCount = capacity
+        descriptor.storageMode = .shared
+        guard let buffer = try? device.makeCounterSampleBuffer(descriptor: descriptor) else { return nil }
+        self.buffer = buffer
+        self.device = device
+        let (cpu, gpu) = device.sampleTimestamps()
+        calibration = (cpu, gpu)
+    }
+
+    func encoder(_ command: MTLCommandBuffer) -> MTLComputeCommandEncoder? {
+        let index = encoders.count * 2
+        guard index + 1 < buffer.sampleCount else { return command.makeComputeCommandEncoder() }
+        let pass = MTLComputePassDescriptor()
+        pass.sampleBufferAttachments[0].sampleBuffer = buffer
+        pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = index
+        pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = index + 1
+        guard let encoder = command.makeComputeCommandEncoder(descriptor: pass) else { return nil }
+        encoders.append(encoder)
+        return encoder
+    }
+
+    // Adds the finished frames' pass times to `nanoseconds`; call once their command buffers completed.
+    func collect() {
+        defer { encoders.removeAll() }
+        guard !encoders.isEmpty, let data = try? buffer.resolveCounterRange(0..<encoders.count * 2) else { return }
+        let (cpu, gpu) = device.sampleTimestamps()
+        let ticksPerCPU = gpu > calibration.gpu && cpu > calibration.cpu
+            ? Double(gpu - calibration.gpu) / Double(cpu - calibration.cpu) : 1
+        // MTLDevice.sampleTimestamps reports the CPU time in nanoseconds.
+        let nanosecondsPerTick = 1 / ticksPerCPU
+        data.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+            for (i, encoder) in encoders.enumerated() {
+                let start = samples[2 * i].timestamp, end = samples[2 * i + 1].timestamp
+                guard start != MTLCounterErrorValue, end != MTLCounterErrorValue, end >= start else { continue }
+                nanoseconds[encoder.label ?? "?", default: 0] += Double(end - start) * nanosecondsPerTick
+            }
+        }
+    }
+
+    func reset() { nanoseconds.removeAll() }
+}
+#endif
+
 @MainActor
 class PathTracerRenderer: NSObject, MTKViewDelegate {
     struct FrameResourcePlan {
@@ -9887,6 +9948,9 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     // presentation path on MetalFX-capable GPUs.
     func restartSampleSequence(at index: UInt32 = 0) { sampleIndex = index }
     static var simulateUnsupportedMetalFX = false
+    // Per-pass GPU timestamps (scripts/measure_passes.py): when set, encodeSample's compute passes
+    // sample the GPU clock at their encoder boundaries.
+    var passTimer: PassTimer?
 #endif
 
     var sceneIndex: UInt32 = 0 { didSet { if oldValue != sceneIndex { applyDefaultCamera() } } }
@@ -11150,6 +11214,12 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
     private func encodeSample(_ cmdBuffer: MTLCommandBuffer, output: MTLTexture, w: Int, h: Int, needsReSTIR: Bool,
                               indirectReuse: IndirectReuse, usesPT: Bool, present: Bool)
         -> (frame: UInt32, spectralWeights: [Float]?)? {
+        func computeEncoder() -> MTLComputeCommandEncoder? {
+#if VIBE_TESTING
+            if let passTimer { return passTimer.encoder(cmdBuffer) }
+#endif
+            return cmdBuffer.makeComputeCommandEncoder()
+        }
         guard let accum = accumTexture, let samples = sampleTexture,
               let gPos = gbufferPosDepth,
               let gNorm = gbufferNormalMat,
@@ -11320,7 +11390,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 
         // PASS 1: G-Buffer & ReSTIR Temporal Reuse
-        guard let enc1 = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+        guard let enc1 = computeEncoder() else { return nil }
         do {
             enc1.label = "Pass 1: G-Buffer & ReSTIR Temporal"
             enc1.setComputePipelineState(sceneKernels.temporal)
@@ -11369,7 +11439,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             passes.append(("Splat: reservoir splats", kernels.reservoirs, pixels + slots))
             if usesDIReservoirs { passes.append(("Splat: DI/GI temporal reuse", kernels.temporal, pixels + slots)) }
             for (label, pipeline, count) in passes {
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+                guard let encoder = computeEncoder() else { return nil }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
                 let textures: [MTLTexture] = [gPos, gNorm, hPos, hNorm, duplication, rPosA, rEmitA, rWeightA, rPosB, rEmitB, rWeightB,
@@ -11409,7 +11479,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             guard spmis != nil, let kernels = sceneKernels.spmis else { return true }
             for (label, pipeline) in [("Stochastic pairwise MIS: reuse cells", kernels.cells),
                                       ("Stochastic pairwise MIS: cell choice", kernels.select)] {
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return false }
+                guard let encoder = computeEncoder() else { return false }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
                 for (index, texture) in [gPos, gNorm, rWeightA, giWeightA].enumerated() { encoder.setTexture(texture, index: index) }
@@ -11462,7 +11532,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                     guard encodeSPMISCells(ptReservoirs: current) else { return nil }
                     continue
                 }
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+                guard let encoder = computeEncoder() else { return nil }
                 encoder.label = label
                 encoder.setComputePipelineState(pipeline)
                 for (index, texture) in [gPos, gNorm, hPos, hNorm, duplication, ptOut].enumerated() { encoder.setTexture(texture, index: index) }
@@ -11512,7 +11582,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
             }
             blit.endEncoding()
             if guideFrame, let guide = causticGuide, let build = causticKernels?.guide {
-                guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+                guard let encoder = computeEncoder() else { return nil }
                 encoder.label = "Caustics: emission guide"
                 encoder.setComputePipelineState(build)
                 encoder.setBuffer(guide.weights, offset: 0, index: 0)
@@ -11521,7 +11591,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
                                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
                 encoder.endEncoding()
             }
-            guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+            guard let encoder = computeEncoder() else { return nil }
             encoder.label = "Caustics: light tracing"
             encoder.setComputePipelineState(kernel)
             guard materials.bind(encoder) else {
@@ -11547,7 +11617,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
         }
 
         // PASS 2: Spatial Resampling & Full Path Tracing
-        guard let enc2 = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+        guard let enc2 = computeEncoder() else { return nil }
         do {
             enc2.label = "Pass 2: Spatial Resampling & Shading"
             enc2.setComputePipelineState(spectralFrame && activeMediaPhotons
@@ -11586,7 +11656,7 @@ class PathTracerRenderer: NSObject, MTKViewDelegate {
 
         // Caustic photons (docs/CAUSTICS_DESIGN.md §6): gather at the receivers the shading pass recorded.
         if photonFrame, let gather = causticKernels?.gather, let photons = causticPhotons {
-            guard let encoder = cmdBuffer.makeComputeCommandEncoder() else { return nil }
+            guard let encoder = computeEncoder() else { return nil }
             encoder.label = "Caustics: photon gather"
             encoder.setComputePipelineState(gather)
             guard materials.bind(encoder) else {
