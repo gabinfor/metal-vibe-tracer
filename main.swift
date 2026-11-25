@@ -8420,8 +8420,8 @@ enum SamplerMode: UInt32, Sendable {
     // shuffled Morton curve, with Z++ temporal indexing (MSL z_pixel_key, Sampler).
     case zSampling = 1
     // Host-side default: Z++. Measured at equal time with the key layout of 2026-10-04 (each pixel
-    // accumulates its own scrambled nets), it matched or beat PCG in every strategy and both transports
-    // for 0-6% more frame time, without block-correlated error (tests/PERFORMANCE.md, "Z++ sampler
+    // accumulates its own scrambled nets), it beat PCG in 45 of 48 strategy/transport/scene cases (the
+    // rest within 11%) for a median 2.5% more frame time, without block-correlated error (tests/PERFORMANCE.md, "Z++ sampler
     // re-measured at equal time").
     case automatic = 2
     func resolved() -> SamplerMode {
