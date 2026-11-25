@@ -8419,12 +8419,13 @@ enum SamplerMode: UInt32, Sendable {
     // Z++: Owen-scrambled 1D / 2D Sobol' and 3D O2m3 constituents indexed along a recursively
     // shuffled Morton curve, with Z++ temporal indexing (MSL z_pixel_key, Sampler).
     case zSampling = 1
-    // Host-side default: PCG until the Z++ key-layout fix of 2026-10-04 (each pixel accumulates its
-    // own scrambled nets instead of sharing its block's sample sets) is re-measured at equal time;
-    // Z++ stays selectable. See tests/PERFORMANCE.md.
+    // Host-side default: Z++. Measured at equal time with the key layout of 2026-10-04 (each pixel
+    // accumulates its own scrambled nets), it matched or beat PCG in every strategy and both transports
+    // for 0-6% more frame time, without block-correlated error (tests/PERFORMANCE.md, "Z++ sampler
+    // re-measured at equal time").
     case automatic = 2
     func resolved() -> SamplerMode {
-        self == .automatic ? .pcg : self
+        self == .automatic ? .zSampling : self
     }
 }
 
