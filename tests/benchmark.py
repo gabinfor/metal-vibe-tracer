@@ -159,13 +159,75 @@ do {
     }
     try instanced.validate()
 }
+let repository = URL(fileURLWithPath: runtimeRepositoryRoot()!)
+// MaterialX graphs on every hit and in traversal: 400 leaf quads whose material reads a colour image
+// and cuts out a disc (geometry_opacity from a mask image) over a floor of Examples/MaterialX/Paint.mtlx.
+var leaves = SceneGraph(), leafState = SceneState()
+do {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("vibe-benchmark-leaves-\(getpid())", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    func png(_ name: String, _ texel: (Float, Float) -> SIMD3<Float>) throws {
+        let side = 64, image = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8,
+            samplesPerPixel: 3, hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 3 * side, bitsPerPixel: 24)!
+        for y in 0..<side { for x in 0..<side {
+            let c = texel((Float(x) + 0.5) / Float(side), (Float(y) + 0.5) / Float(side))
+            for k in 0..<3 { image.bitmapData![3 * (y * side + x) + k] = UInt8(max(0, min(255, c[k] * 255))) }
+        }}
+        try image.representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent(name))
+    }
+    try png("mask.png") { x, y in SIMD3(repeating: (x - 0.5) * (x - 0.5) + (y - 0.5) * (y - 0.5) < 0.2 ? 1 : 0) }
+    try png("colour.png") { x, y in SIMD3(0.15 + 0.2 * x, 0.35 + 0.3 * y, 0.1) }
+    let leaf = try MaterialXImporter.read(Data("""
+        <materialx version="1.39">
+         <image name="mask" type="float"><input name="file" type="filename" value="mask.png"/></image>
+         <image name="colour" type="color3"><input name="file" type="filename" value="colour.png"/></image>
+         <open_pbr_surface name="Leaf" type="surfaceshader"><input name="base_color" type="color3" nodename="colour"/>
+          <input name="geometry_opacity" type="float" nodename="mask"/></open_pbr_surface>
+        </materialx>
+        """.utf8), baseURL: folder, source: "Leaf.mtlx").materials[0]
+    let paintURL = repository.appendingPathComponent("Examples/MaterialX/Paint.mtlx")
+    let paint = try MaterialXImporter.read(Data(contentsOf: paintURL), baseURL: paintURL.deletingLastPathComponent(),
+                                           source: "Paint.mtlx").materials[0]
+    try? FileManager.default.removeItem(at: folder)
+    let up = SIMD4<Float>(0, 1, 0, 0)
+    func quad(_ x: Float, _ y: Float, _ z: Float, _ size: Float) -> [MeshTriangle] {
+        func p(_ dx: Float, _ dz: Float) -> SIMD4<Float> { SIMD4(x + dx * size, y, z + dz * size, 1) }
+        return [MeshTriangle(a: p(0, 0), b: p(0, 1), c: p(1, 1), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 0, 1), uvc: SIMD4(1, 1, 0, 0)),
+                MeshTriangle(a: p(0, 0), b: p(1, 1), c: p(1, 0), na: up, nb: up, nc: up, uvab: SIMD4(0, 0, 1, 1), uvc: SIMD4(1, 0, 0, 0))]
+    }
+    let leafMaterial = try leaves.addMaterial("Leaf"), floorMaterial = try leaves.addMaterial("Paint")
+    var canopy: [MeshTriangle] = []
+    for i in 0..<20 { for j in 0..<20 {
+        canopy += quad(Float(i) * 0.15 - 1.5, 0.1 + 0.05 * Float((i * 7 + j * 3) % 5), Float(j) * 0.15 - 1.5, 0.2)
+    }}
+    for (name, triangles, material) in [("canopy", canopy, leafMaterial), ("floor", quad(-3, -0.75, -3, 6), floorMaterial)] {
+        let asset = MeshAsset(name: name, triangles: triangles, subsets: ["S"])
+        leaves.assets.append(asset)
+        leaves.nodes.append(SceneNode(name: name, mesh: asset.id, transform: ObjectSettings(positionScale: SIMD4(0, 0, 0, 1)),
+                                      bindings: [material.id]))
+    }
+    try leaves.validate()
+    leafState.materialX = [leafMaterial.slot: leaf, floorMaterial.slot: paint]
+}
+// The ASWF Standard Shader Ball (UsdPreviewSurface and MaterialX graphs), when
+// scripts/fetch_reference_scene.py has downloaded it.
+let shaderBallURL = repository.appendingPathComponent("build/reference-scenes/ShaderBall-triangulated.usda")
+let shaderBall = FileManager.default.fileExists(atPath: shaderBallURL.path)
+    ? try USDImporter.load(shaderBallURL, into: ProjectDocument()).document : nil
+if shaderBall == nil { print("ASWF Standard Shader Ball not downloaded: its scenario is skipped") }
 let scenarios: [(String, UInt32, UInt32)] = [("Default Pavilion", 0, 0), ("Pavilion with coated OpenPBR floor", 0, 0),
     ("Cornell box", 1, 0), ("Imported mesh (scene 6, \(mesh.count) triangles)", 6, 0), ("Default Pavilion, MIS", 0, 1),
     ("Instanced scene graph (scene 6, 25 x 19,968 triangles)", 6, 0),
-    ("Default Pavilion, orbiting", 0, 0), ("Imported mesh (scene 6), orbiting", 6, 0)]
+    ("Default Pavilion, orbiting", 0, 0), ("Imported mesh (scene 6), orbiting", 6, 0),
+    ("MaterialX cutout leaves over Paint.mtlx (scene graph)", 6, 0)]
+    + (shaderBall == nil ? [] : [("ASWF Standard Shader Ball (USD, MaterialX)", 6, 0)])
+let initialCamera = CameraState(testRenderer)
 // Orbiting scenarios move the camera every frame (render(orbit:)): temporal reuse runs on every frame.
 func orbiting(_ scenario: Int) -> Bool { scenarios[scenario].0.hasSuffix(", orbiting") }
 @MainActor func prepare(_ renderer: PathTracerRenderer, _ scenario: Int) throws {
+    let state = scenario == 8 ? leafState : scenario == 9 ? shaderBall!.scenes[6] ?? SceneState() : SceneState()
+    if !renderer.materials.materialX.isEmpty || !(state.materialX ?? [:]).isEmpty { try renderer.materials.restore(state) }
+    try renderer.materials.setEnvironment(scenario == 9 ? shaderBall!.environmentData : nil)
     renderer.materials.settings = Array(repeating: SurfaceSettings(), count: SceneLimits.materials)
     if scenario == 1 {
         var coated = SurfaceSettings(); coated.enabled = 1
@@ -173,13 +235,18 @@ func orbiting(_ scenario: Int) -> Bool { scenarios[scenario].0.hasSuffix(", orbi
         renderer.materials.settings[1] = coated
     }
     if scenario == 5 { try renderer.materials.setMesh(instanced) }
+    else if scenario == 8 { try renderer.materials.setMesh(leaves) }
+    else if scenario == 9 { try renderer.materials.setMesh(shaderBall!) }
     else { try renderer.materials.setMesh(scenarios[scenario].1 == 6 ? mesh : []) }
-    renderer.materials.hasSceneGraph = scenario == 5
+    renderer.materials.hasSceneGraph = scenario == 5 || scenario == 8 || (scenario == 9 && shaderBall!.graph != nil)
+    // The Shader Ball's own camera; every other scenario keeps the renderer's initial view.
+    (scenario == 9 ? shaderBall!.camera : initialCamera).apply(renderer)
 }
 @MainActor func view(_ scenario: Int) -> Uniforms {
     var u = makeUniforms(scene: scenarios[scenario].1, mode: scenarios[scenario].2, width: 640, height: 480)
     u.environment.w = Float(testRenderer.materials.nodeCount)
-    if scenario == 5 { u.lens.z = 1 }
+    if testRenderer.materials.environmentData != nil { u.environment.x = 1; u.environment.z = 1 }
+    if testRenderer.materials.hasSceneGraph { u.lens.z = 1 }
     return u
 }
 // Warm every renderer and MetalFX instance before collecting interleaved observations.
