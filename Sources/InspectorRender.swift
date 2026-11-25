@@ -62,7 +62,7 @@ extension StudioController {
   static let indirectClampHelp =
     "Caps the luminance each sample's indirect light can add, which removes fireflies. It is biased: bright indirect effects such as caustics lose energy, the more so the lower the cap. Off keeps the unbiased render. Values of about 10–50 times a lit surface's brightness rarely change anything but the fireflies. With ReSTIR PT on imported scenes it caps the whole reused estimate, direct light included."
   static let metalFXHelp =
-    "Denoises the interactive view with MetalFX while samples accumulate (ReSTIR Direct + Indirect only). Accumulated samples are kept when it is switched."
+    "Denoises the interactive view with MetalFX while samples accumulate (ReSTIR Direct + Indirect and Standard MIS). Accumulated samples are kept when it is switched."
   static let oidnOptionHelp =
     "These options affect only Open Image Denoise output (Denoise Current Frame and denoised exports); raw accumulation is preserved."
 
@@ -125,8 +125,8 @@ extension StudioController {
     }
     if !r.supportsMetalFX {
       hint("MetalFX is not supported by this GPU.")
-    } else if r.denoiserEnabled && r.activeSamplingMode != 0 {
-      hint("MetalFX needs ReSTIR; the view shows raw samples.")
+    } else if r.denoiserEnabled && r.activeSamplingMode > 1 {
+      hint("MetalFX needs ReSTIR or Standard MIS; the view shows raw samples.")
     }
     if r.denoiserEnabled {
       option(
