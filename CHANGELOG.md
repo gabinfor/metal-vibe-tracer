@@ -4,6 +4,10 @@ Metal Vibe Tracer is in early development: releases are validated builds, not st
 
 ## Unreleased
 
+### Rendering
+
+- **Environment sampling spreads a bright texel's weight to its neighbours:** an environment image is read with bilinear filtering but sampled with one probability per texel, so the texels around a very bright one (a sharp sun) were sampled too rarely for the light they receive. The sampling distribution is now built from the 3×3 maximum of the luminance (`MUTRACER2026`). The estimate stays unbiased, GPU time is unchanged, and the effect shows only for a sun about one texel wide: under Standard MIS the error of a synthetic one-texel sun fell by 55%, the three Poly Haven studio maps did not change measurably ([tests/PERFORMANCE.md](tests/PERFORMANCE.md), dilated environment sampling).
+
 ### Interface
 
 - **Tabs replace the page popup and the Settings page:** the inspector's **Inspector page** popup is now a tab bar under the scene row with six always-visible tabs, **Render**, **Camera**, **Lighting**, **Materials** (was Materials & Textures), **Objects** and **Export** (was Project & Export), switched with ⌘1 to ⌘6 or the **View** menu. The scene row and the tab bar stay at the top while a long tab scrolls, a new tab starts at its top, and a narrow inspector shows an icon per tab. The Settings page, **Settings…** and ⌘, are gone: their controls are on the Render tab.

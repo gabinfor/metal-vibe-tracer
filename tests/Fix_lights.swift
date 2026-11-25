@@ -202,11 +202,18 @@
   try controller.restore(environmentDocument)
   let stored = readTexture(testRenderer.materials.environmentTexture)
   require(stored.count == width * height, "HDRI fixture dimensions")
+  // Expected weights: the luminance's separable 3x3 maximum (wrapping in x, clamped in y) times sin(theta).
+  var luminance = [Double]()
+  for p in stored { luminance.append(max(1e-6, 0.2126 * Double(p.x) + 0.7152 * Double(p.y) + 0.0722 * Double(p.z))) }
+  var horizontal = luminance
+  for y in 0..<height { for x in 0..<width {
+    horizontal[y * width + x] = max(luminance[y * width + x], luminance[y * width + (x + width - 1) % width],
+      luminance[y * width + (x + 1) % width])
+  }}
   var weights = [Double]()
   for y in 0..<height { for x in 0..<width {
-    let p = stored[y * width + x]
-    let luminance = max(1e-6, 0.2126 * Double(p.x) + 0.7152 * Double(p.y) + 0.0722 * Double(p.z))
-    weights.append(luminance * max(1e-4, sin(Double.pi * (Double(y) + 0.5) / Double(height))))
+    let dilated = max(horizontal[max(0, y - 1) * width + x], horizontal[y * width + x], horizontal[min(height - 1, y + 1) * width + x])
+    weights.append(dilated * max(1e-4, sin(Double.pi * (Double(y) + 0.5) / Double(height))))
   }}
   let weightSum = weights.reduce(0, +)
   var environmentView = makeUniforms(scene: 6, mode: 1, width: 1, height: 1)
@@ -230,7 +237,7 @@
   let invalid = environmentResults.reduce(0) { $0 + $1.z }
   print("HDRI importance: samples \(samples), chi-square \(chiSquare) / \(dof) dof, row score \(rowError), PDF mismatches \(mismatches), normalization \(normalization), invalid \(invalid)")
   require(samples == 4096 * 256 && invalid == 0, "every HDRI proposal has a positive PDF")
-  require(chiSquare < dof + 6 * (2 * dof).squareRoot() && rowError < 1, "HDRI samples follow luminance x sin(theta) cells")
+  require(chiSquare < dof + 6 * (2 * dof).squareRoot() && rowError < 1, "HDRI samples follow dilated luminance x sin(theta) cells")
   require(mismatches < 1e-3 * samples, "HDRI sampled and evaluated PDFs agree")
   require(abs(normalization - 1) < 0.02, "HDRI mixture PDF integrates to one")
 

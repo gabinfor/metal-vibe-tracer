@@ -1,3 +1,26 @@
+# Dilated environment sampling — November 25, 2026
+
+`MaterialLibrary.environmentImportance` builds the sampling weights from a separable 3×3 maximum of the texels' luminance (`MUTRACER2026`), because radiance is read bilinearly but the PDF is constant per texel. Only the host-built CDF changes, so the GPU time per frame is the same (the table below agrees within 0.1 ms). Apple M4, 320×180, the Architectural Pavilion lit by an environment image at the `pavilion-hdri` view, undenoised. Reference: 512 samples per pixel, the mean of a build with the dilation and one without. Error: MSE of three independent 64-sample accumulations per setting against the reference, measured by a temporary switch (not in the tree) in a copy of `scripts/measure_light_sampling.py`. Equal sample count is equal time here. Fireflies: pixel channels whose tone-mapped value is off the reference by more than 0.1, over the three accumulations; at 64 samples this counts general noise as well.
+
+| Environment image | Strategy | MSE without | MSE with | Change | Fireflies without / with | Mean with / without |
+| --- | --- | --- | --- | --- | --- | --- |
+| Art Studio (Poly Haven, 4K) | ReSTIR | 0.01564 | 0.01467 | −6% | 11,996 / 11,773 | 0.9998 |
+| Art Studio | Standard MIS | 0.01615 | 0.01623 | +0% | 13,569 / 13,525 | 1.0005 |
+| Studio Small 01 | ReSTIR | 0.3806 | 0.3528 | −7% | 36,507 / 36,572 | 0.9976 |
+| Studio Small 01 | Standard MIS | 0.3637 | 0.3703 | +2% | 47,973 / 48,054 | 1.0029 |
+| Photo Studio Loft Hall | ReSTIR | 0.02245 | 0.02216 | −1% | 24,784 / 24,831 | 0.9999 |
+| Photo Studio Loft Hall | Standard MIS | 0.02422 | 0.02447 | +1% | 30,203 / 30,720 | 1.0002 |
+| Synthetic sky, Gaussian sun (σ 0.26°, peak 60,000, 2048×1024) | ReSTIR | 0.005134 | 0.005117 | −0% | 4,519 / 4,764 | 1.0003 |
+| Synthetic sky, Gaussian sun | Standard MIS | 0.003113 | 0.003028 | −3% | 335 / 332 | 1.0000 |
+| Synthetic sky, one-texel sun (60,000) | ReSTIR | 0.1658 | 0.1585 | −4% | 2,075 / 2,122 | 1.0015 |
+| Synthetic sky, one-texel sun | Standard MIS | 0.5993 | 0.2681 | −55% | 771 / 773 | 1.0016 |
+
+- The three Poly Haven studio maps have no sharp sun, and the dilation does not change the error beyond the run-to-run spread (about ±7%). A sun a few texels wide gives no change either: its own texels already carry the weight.
+- Only a sun one texel wide, the case the dilation targets, changes the error clearly: under Standard MIS the linear MSE fell from 0.599 to 0.268. The tone-mapped MSE of that row rose (its values are small, and the two references' mean differs by 0.16%), so the gain is in the bright outliers the linear error weighs and not in the displayed image. Under ReSTIR the change is −4%, inside the spread.
+- The two builds' reference means agree within 0.3%, as the unbiased estimate requires (the mean of the one-texel-sun reference differs by 0.15%).
+- The Poly Haven maps are local (`Examples/HDRI`, not in the repository); the synthetic maps were generated for the measurement and are not kept.
+
+
 # GPU load limit — November 15, 2026
 
 **Render › Limit GPU Load** (`PathTracerRenderer.gpuLoadLimit`, 0.9 when on) leaves a tenth of the GPU's time free. `scripts/measure_gpu_load.py` on the Apple M4 (16 GB, macOS 27): a second command queue copies a 2560×1600 texture 60 times a second, a stand-in for another GPU client such as the window server, and its commit-to-completion latency is recorded while the app renders (idle: 2–5 ms median). Viewport: a simulated 60 Hz display on a 1280×800 drawable, camera still, 6 s. Export: raw 1920×1080 through `StudioController.startExport`.

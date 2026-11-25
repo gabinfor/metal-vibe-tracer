@@ -1298,17 +1298,34 @@ extension MaterialLibrary {
     guard pixels.count == width * height * 4, width > 0, height > 0 else {
       throw Self.error("Invalid environment sampling dimensions.")
     }
+    var luminance = Array(repeating: Float(0), count: width * height)
+    for i in 0..<width * height {
+      let offset = i * 4
+      luminance[i] = max(1e-6, 0.2126 * pixels[offset] + 0.7152 * pixels[offset + 1] + 0.0722 * pixels[offset + 2])
+    }
+    // The shader looks radiance up bilinearly but the PDF is constant per cell, so a bright texel
+    // shines into its neighbours. A separable 3×3 maximum (wrapping in longitude, clamped in
+    // latitude) gives those neighbours the same weight. The PDF is derived from the same CDFs,
+    // so the estimate stays unbiased.
+    var horizontal = luminance
+    for y in 0..<height {
+      for x in 0..<width {
+        let base = y * width
+        horizontal[base + x] = max(luminance[base + x], luminance[base + (x + width - 1) % width],
+                                   luminance[base + (x + 1) % width])
+      }
+    }
     var rowWeights = Array(repeating: Float(0), count: height)
     var columnWeights = Array(repeating: Float(0), count: width * height)
     for y in 0..<height {
       let theta = (.pi * (Float(y) + 0.5)) / Float(height)
       let sinTheta = max(1e-4, sin(theta))
+      let above = max(0, y - 1) * width, here = y * width, below = min(height - 1, y + 1) * width
       for x in 0..<width {
-        let offset = (y * width + x) * 4
-        let luminance = max(0, 0.2126 * pixels[offset] + 0.7152 * pixels[offset + 1] + 0.0722 * pixels[offset + 2])
-        let weight = max(1e-6, luminance) * sinTheta
+        let dilated = max(horizontal[above + x], horizontal[here + x], horizontal[below + x])
+        let weight = dilated * sinTheta
         rowWeights[y] += weight
-        columnWeights[y * width + x] = weight
+        columnWeights[here + x] = weight
       }
     }
     // Convert weights to CDFs in place; no second full-size CPU copy.
