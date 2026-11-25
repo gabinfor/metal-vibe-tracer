@@ -6,7 +6,7 @@ Metal Vibe Tracer is in early development: releases are validated builds, not st
 
 ### Rendering
 
-- **Environment sampling spreads a bright texel's weight to its neighbours:** an environment image is read with bilinear filtering but sampled with one probability per texel, so the texels around a very bright one (a sharp sun) were sampled too rarely for the light they receive. The sampling distribution is now built from the 3×3 maximum of the luminance (`MUTRACER2026`). The estimate stays unbiased, GPU time is unchanged, and the effect shows only for a sun about one texel wide: under Standard MIS the error of a synthetic one-texel sun fell by 55%, the three Poly Haven studio maps did not change measurably ([tests/PERFORMANCE.md](tests/PERFORMANCE.md), dilated environment sampling).
+- **Environment sampling spreads a bright texel's weight to its neighbours:** an environment image is read with bilinear filtering but sampled with one probability per texel, so the texels around a very bright one (a sharp sun) were sampled too rarely for the light they receive. The sampling distribution is now built from the 3×3 maximum of the luminance (`MUTRACER2026`). The estimate stays unbiased and GPU time is unchanged. The effect is small: for a synthetic sun one texel wide under Standard MIS the linear error fell by 14% and the tone-mapped error did not change; the three Poly Haven studio maps and a sun a few texels wide did not change measurably ([tests/PERFORMANCE.md](tests/PERFORMANCE.md), dilated environment sampling).
 
 ### Interface
 

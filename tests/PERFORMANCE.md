@@ -1,6 +1,6 @@
 # Dilated environment sampling — November 25, 2026
 
-`MaterialLibrary.environmentImportance` builds the sampling weights from a separable 3×3 maximum of the texels' luminance (`MUTRACER2026`), because radiance is read bilinearly but the PDF is constant per texel. Only the host-built CDF changes, so the GPU time per frame is the same (the table below agrees within 0.1 ms). Apple M4, 320×180, the Architectural Pavilion lit by an environment image at the `pavilion-hdri` view, undenoised. Reference: 512 samples per pixel, the mean of a build with the dilation and one without. Error: MSE of three independent 64-sample accumulations per setting against the reference, measured by a temporary switch (not in the tree) in a copy of `scripts/measure_light_sampling.py`. Equal sample count is equal time here. Fireflies: pixel channels whose tone-mapped value is off the reference by more than 0.1, over the three accumulations; at 64 samples this counts general noise as well.
+`MaterialLibrary.environmentImportance` builds the sampling weights from a separable 3×3 maximum of the texels' luminance (`MUTRACER2026`), because radiance is read bilinearly but the PDF is constant per texel. Only the host-built CDF changes, so the GPU time per frame is the same (the table below agrees within 0.1 ms). Apple M4, 320×180, the Architectural Pavilion lit by an environment image at the `pavilion-hdri` view, undenoised. Reference: 512 samples per pixel, the mean of a build with the dilation and one without (4,096 samples per build for the one-texel-sun Standard MIS case, below). Error: MSE of three independent 64-sample accumulations per setting against the reference, measured by a temporary switch (not in the tree) in a copy of `scripts/measure_light_sampling.py`. Equal sample count is equal time here. Fireflies: pixel channels whose tone-mapped value is off the reference by more than 0.1, over the three accumulations; at 64 samples this counts general noise as well.
 
 | Environment image | Strategy | MSE without | MSE with | Change | Fireflies without / with | Mean with / without |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -13,11 +13,20 @@
 | Synthetic sky, Gaussian sun (σ 0.26°, peak 60,000, 2048×1024) | ReSTIR | 0.005134 | 0.005117 | −0% | 4,519 / 4,764 | 1.0003 |
 | Synthetic sky, Gaussian sun | Standard MIS | 0.003113 | 0.003028 | −3% | 335 / 332 | 1.0000 |
 | Synthetic sky, one-texel sun (60,000) | ReSTIR | 0.1658 | 0.1585 | −4% | 2,075 / 2,122 | 1.0015 |
-| Synthetic sky, one-texel sun | Standard MIS | 0.5993 | 0.2681 | −55% | 771 / 773 | 1.0016 |
+| Synthetic sky, one-texel sun, 4,096-spp reference per build (below) | Standard MIS | 0.4089 | 0.3531 | −14% | 2,070 / 2,012 | 1.0003 |
 
 - The three Poly Haven studio maps have no sharp sun, and the dilation does not change the error beyond the run-to-run spread (about ±7%). A sun a few texels wide gives no change either: its own texels already carry the weight.
-- Only a sun one texel wide, the case the dilation targets, changes the error clearly: under Standard MIS the linear MSE fell from 0.599 to 0.268. The tone-mapped MSE of that row rose (its values are small, and the two references' mean differs by 0.16%), so the gain is in the bright outliers the linear error weighs and not in the displayed image. Under ReSTIR the change is −4%, inside the spread.
-- The two builds' reference means agree within 0.3%, as the unbiased estimate requires (the mean of the one-texel-sun reference differs by 0.15%).
+- Only a sun one texel wide, the case the dilation targets, changes the error, and only the linear error, modestly. A first run (512-spp reference, the mean of both builds) showed the linear MSE falling by 55% and the tone-mapped MSE rising by 1,233%; that was an artefact of the small shared reference, whose own noise dominated the small tone-mapped error. Re-measured with a separate 4,096-spp reference per build (Standard MIS, three 64-sample runs each), against each build's own reference and against the other's:
+
+  | Build | Reference | Linear MSE | Tone-mapped MSE | Outlier channels |
+  | --- | --- | --- | --- | --- |
+  | raw | raw | 0.4089 | 0.000645 | 2,070 |
+  | raw | dilated | 0.4095 | 0.000651 | 2,032 |
+  | dilated | raw | 0.3525 | 0.000644 | 2,079 |
+  | dilated | dilated | 0.3531 | 0.000650 | 2,012 |
+
+  The result does not depend on which reference is used: the dilation lowers the linear MSE by 14% (the bright outliers it spreads out) and leaves the tone-mapped MSE and the outlier count unchanged (±1%). The reference means differ by 0.03%. Under ReSTIR the one-texel-sun change is −4%, inside the spread.
+- The two builds' reference means agree within 0.3%, as the unbiased estimate requires .
 - The Poly Haven maps are local (`Examples/HDRI`, not in the repository); the synthetic maps were generated for the measurement and are not kept.
 
 
