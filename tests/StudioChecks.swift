@@ -102,10 +102,11 @@ try testRenderer.materials.setEnvironment(exrData)
 let environmentPixels=readTexture(testRenderer.materials.environmentTexture)
 print("EXR roundtrip pixels: \(environmentPixels)")
 require(environmentPixels.contains(where:{$0.x>3.9 && $0.y<0.01}),"EXR preserves values above one")
-require(testRenderer.materials.environmentRows.width == 1
+// Two sampling tables (compensated and original): 2 x H row CDFs and W x 2H column CDFs.
+require(testRenderer.materials.environmentRows.width == 2
   && testRenderer.materials.environmentRows.height == 2
   && testRenderer.materials.environmentColumns.width == 2
-  && testRenderer.materials.environmentColumns.height == 2,
+  && testRenderer.materials.environmentColumns.height == 4,
   "HDRI luminance sampling CDF matches environment dimensions")
 let pngURL=studioDirectory.appendingPathComponent("orientation.png")
 try RenderImage.write(texture:hdrTexture,url:pngURL,hdr:false)

@@ -346,7 +346,7 @@
   require(m.environmentData == nil, "rejected environment is not published")
   m.textureBudgetOverride = nil
   try m.setEnvironment(environmentData)
-  require(m.environmentColumns.width == 512 && m.uniqueTextureBytes(m.residentTextures) >= base + 512 * 256 * 20,
+  require(m.environmentColumns.width == 512 && m.uniqueTextureBytes(m.residentTextures) >= base + 512 * 256 * 24,
     "resident textures include the environment CDFs")
   var slotZero = SceneState(); slotZero.maps[0] = mapData; slotZero.surfaces[0].mapMask = 1
   try m.restore(slotZero)
