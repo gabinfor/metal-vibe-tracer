@@ -42,4 +42,4 @@ A sample can fail where every emitter below a node faces away from p although th
 
 - The receiver-normal bound (§2), which would need the shading normal in every `eval_light_pdf` caller.
 - Splitting (`CONTY2018`'s adaptive tree splitting into several samples per shading point).
-- The sun and environment keep their fixed share of light samples; the tree covers emitter triangles only.
+- The sun and environment keep their fixed share of light samples (half, with the sun 60% of the environment's); the tree covers emitter triangles only. A share from the emitters' power against the environment's (`MUTRACER2026`) was measured and not adopted: it was worse than the even split in most scenes ([tests/PERFORMANCE.md](../tests/PERFORMANCE.md), "Emitter and environment light selection").

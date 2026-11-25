@@ -1,3 +1,28 @@
+# Emitter and environment light selection — November 25, 2026 (not adopted)
+
+Imported scenes with both emitter triangles and an environment or sun send half their light samples to each (`imported_light_probability`). A branch replaced the half by the emitters' estimated share of the light (`MUTRACER2026`): their flux, π × Σ area × selection weight, against the environment's flux through the scene's bounding sphere, πR² × (brightness × the luminance integral over the sphere + the sun's irradiance), clamped to [0.1, 0.9], passed in a new `Uniforms` field that every pdf of both strategies read. Apple M4, 16 GB, macOS 27; every imported README shot with emitters and a sky, plus Bistro exterior with its lamps on (emission × 1 and × 60, the twilight sky); 320×180, preview scale 1, each shot's own strategy and transport (ReSTIR PT, spectral); linear and tone-mapped (x / (1 + x)) MSE of 32 accumulated frames against a 512-frame reference at 0.5, mean of 3 sequences, times the median GPU frame time, as a ratio to 0.5 (below 1 is better). Mean radiance agreed with 0.5 within 1% everywhere (spectral fireflies), as any share in (0, 1) must.
+
+| Scene | Power estimate | 0.1 | 0.25 | 0.75 | 0.9 | At the estimate |
+| --- | --- | --- | --- | --- | --- | --- |
+| Newton Series | 0.10 | 1.27 / 1.44 | 1.06 / 1.15 | 0.95 / 0.91 | 0.96 / 0.89 | 1.26 / 1.44 |
+| Lamp Spectra | 0.10 | 4.92 / 2.82 | 2.21 / 1.62 | 0.79 / 0.72 | 2.20 / 0.61 | 11.2 / 2.78 |
+| Lantern Arcade | 0.90 | 1.16 / 0.70 | 1.27 / 1.70 | 1.01 / 0.11 | 0.98 / 0.07 | 0.96 / 3.95 |
+| Abbe Row | 0.10 | 0.96 / 8.10 | 1.00 / 29.7 | 1.01 / 1.17 | 1.03 / 1.45 | 0.95 / 65.4 |
+| San Miguel | 0.10 | 1.06 / 1.06 | 1.01 / 1.02 | 1.07 / 1.08 | 1.40 / 1.39 | 1.15 / 1.15 |
+| Bistro interior | 0.35 | 0.91 / 1.47 | 0.81 / 1.14 | 0.99 / 0.94 | 1.23 / 0.91 | 0.92 / 1.10 |
+| Bedroom | 0.56 | 0.69 / 0.68 | 0.73 / 0.75 | 1.44 / 1.39 | 1.75 / 1.62 | 1.06 / 1.05 |
+| Fireplace Room | 0.17 | 1.03 / 1.18 | 1.01 / 1.10 | 0.97 / 0.97 | 0.95 / 0.94 | 1.03 / 1.13 |
+| Living Room | 0.14 | 1.37 / 1.42 | 1.14 / 1.17 | 0.92 / 0.91 | 0.92 / 0.87 | 1.34 / 1.33 |
+| Bistro exterior, lamps × 1 | 0.10 | 1.17 / 0.89 | 1.59 / 0.98 | 1.52 / 1.20 | 2.01 / 1.49 | 0.98 / 0.89 |
+| Bistro exterior, lamps × 60 | 0.13 | 1.08 / 1.62 | 0.94 / 1.17 | 0.81 / 0.92 | 1.03 / 0.96 | 0.94 / 1.45 |
+
+Equal-time ratio to 0.5, linear / tone-mapped. The power estimate is the share the branch computed; its column repeats the run at that share.
+
+- At the estimate, tone-mapped error was higher than with the even split in 10 of 11 scenes (lower only in Bistro exterior with its lamps × 1, 0.89); linear error was higher in 6, up to 11× (Lamp Spectra), and at most 8% lower in the other 5. It points the wrong way in most rooms and studio scenes: πR² counts sky that walls and large ground planes keep from the receivers, and the sky's light is also found by BSDF sampling, while small emitters are found almost only by light samples. The best fixed share differs by scene (0.1 in the Bedroom, 0.75–0.9 in Lamp Spectra, Living Room and Newton Series, 0.25–0.5 in San Miguel) and no power ratio, with or without the scene's area, ranks them correctly; MuTracer's own units (the environment's luminance integral against luminance × π × area) would give 0.9 in the Bedroom and Bistro exterior, the two scenes where 0.9 is worst.
+- Single tone-mapped entries such as Abbe Row's 29.7 and Lantern Arcade's 0.07 against 3.95 at the same share come from a few spectral fireflies in 32 frames; the conclusion rests on the consistent rows.
+- `imported_light_probability` keeps 0.5, and the sun keeps its 0.60 share of the environment's samples (not measured). An estimate from the image itself, like `caustic_source_share`'s count of what each source has added, would need the light each strategy contributes in every shading pass and was not tried.
+- Scripts: a variant of `scripts/measure_light_sampling.py` that overrides the share (not in the repository).
+
 # GPU load limit — November 15, 2026
 
 **Render › Limit GPU Load** (`PathTracerRenderer.gpuLoadLimit`, 0.9 when on) leaves a tenth of the GPU's time free. `scripts/measure_gpu_load.py` on the Apple M4 (16 GB, macOS 27): a second command queue copies a 2560×1600 texture 60 times a second, a stand-in for another GPU client such as the window server, and its commit-to-completion latency is recorded while the app renders (idle: 2–5 ms median). Viewport: a simulated 60 Hz display on a 1280×800 drawable, camera still, 6 s. Export: raw 1920×1080 through `StudioController.startExport`.
